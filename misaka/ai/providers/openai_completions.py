@@ -1,20 +1,20 @@
-"""OpenAI Chat Completions provider adapter."""
+"""OpenAI Chat Completions provider adapter (pi ``api/openai-completions.ts``)."""
 
 from __future__ import annotations
 
 import contextlib
 import json
-import os
+import re
 import time
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 
 try:
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI, omit
 except ImportError:  # optional extra: misaka[openai]
-    AsyncOpenAI = None
+    AsyncOpenAI = omit = None
 
-from misaka.ai.env_api_keys import get_env_api_key
 from misaka.ai.models import calculate_cost, clamp_thinking_level
 from misaka.ai.providers._common import (
     _await_maybe_with_signal,
@@ -22,12 +22,9 @@ from misaka.ai.providers._common import (
     _empty_usage,
     _iterate_async_iterable,
     _option,
-    assign_sampling_params,
     resolve_cache_retention,
-)
-from misaka.ai.providers.cloudflare import (
-    is_cloudflare_provider,
-    resolve_cloudflare_base_url,
+    split_sdk_headers,
+    split_sdk_params,
 )
 from misaka.ai.providers.constrained_sampling import (
     GrammarToolInputJsonBuffer,
@@ -77,12 +74,10 @@ from misaka.ai.types import (
     Usage,
     UsageCost,
 )
+from misaka.ai.utils.error_body import format_provider_error, normalize_provider_error
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
-from misaka.ai.utils.headers import (
-    apply_provider_headers,
-    headers_to_record,
-    provider_headers_to_record,
-)
+from misaka.ai.utils.hash import short_hash
+from misaka.ai.utils.headers import headers_to_record
 from misaka.ai.utils.json_parse import StreamingArgs
 from misaka.ai.utils.provider_retry import retry_provider_request
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
@@ -96,127 +91,63 @@ from misaka.ai.utils.user_agent import get_misaka_user_agent
 from misaka.utils.values import maybe_await, read_field, signal_aborted
 
 
-def _set_extra(params: dict[str, Any], key: str, value: Any) -> None:
-    """Route a non-standard param through extra_body.
-
-    Python equivalent of TypeScript's (params as any).key = value,
-    which passes unknown properties through to the API request body.
-    """
-    if "extra_body" not in params:
-        params["extra_body"] = {}
-    params["extra_body"][key] = value
-
-
-def _resolve_thinking_token_budget_field(compat: Mapping[str, Any]) -> str | None:
-    """Which top-level field carries the thinking budget, if any."""
-    field = compat.get("thinkingTokenBudgetField")
-    if field:
-        return field
-    return "thinking_token_budget" if compat.get("supportsThinkingTokenBudget") else None
-
-
-def _resolve_clamped_thinking_budget(model: Model, options: Any, params: Mapping[str, Any]) -> int | None:
-    """The budget this request may spend on thinking, clamped to leave room for an answer."""
-    reasoning_effort = _option(options, "reasoningEffort")
-    if not reasoning_effort or not model.reasoning:
-        return None
-    ceiling = params.get("max_tokens")
-    if ceiling is None:
-        ceiling = params.get("max_completion_tokens")
-    if ceiling is None:
-        ceiling = model.maxTokens
-    budget = clamp_thinking_budget_to_answer_room(
-        thinking_budget_for_level(reasoning_effort, _option(options, "thinkingBudgets")), ceiling
+def has_header(headers: Mapping[str, Any] | None, name: str) -> bool:
+    if not headers:
+        return False
+    expected = name.lower()
+    return any(
+        str(key).lower() == expected and value is not None and len(str(value).strip()) > 0
+        for key, value in headers.items()
     )
-    return budget if budget > 0 else None
 
 
-_OMIT = object()  # "do not send this key", which `None` cannot express
+def get_client_api_key(provider: str, api_key: str | None, headers: Mapping[str, Any] | None) -> str:
+    if api_key:
+        return api_key
+    if has_header(headers, "authorization") or has_header(headers, "cf-aig-authorization"):
+        return "unused"
+    raise RuntimeError(f"No API key for provider: {provider}")
 
 
-def _resolve_chat_template_value(model: Model, reasoning_effort: Any, value: Any, thinking_budget: Any) -> Any:
-    """One ``chat_template_kwargs`` entry, with ``{"$var": ...}`` placeholders resolved.
+def has_tool_history(messages: list[Any]) -> bool:
+    """Check if conversation messages contain tool calls or tool results.
 
-    A literal passes through. An object is a placeholder: ``thinking.enabled`` becomes the
-    boolean, ``thinking.budget`` the token budget, anything else the mapped thinking level.
-    ``omitWhenOff`` drops the entry entirely when thinking is off, which is how a template
-    that has no "off" spelling stays silent instead of sending a wrong one.
-
-    Returns ``_OMIT`` for "do not send this key" -- distinct from ``None``, which is a
-    value a template may legitimately want.
+    This is needed because Anthropic (via proxy) requires the tools param
+    to be present when messages include tool_calls or tool role messages.
     """
-    if not isinstance(value, Mapping):
-        return value
-    if not reasoning_effort and value.get("omitWhenOff"):
-        return _OMIT
-    variable = value.get("$var")
-    if variable == "thinking.enabled":
-        return bool(reasoning_effort)
-    if variable == "thinking.budget":
-        return thinking_budget
-    mapped = _mapped_thinking_effort(model, reasoning_effort) if reasoning_effort else (
-        model.thinkingLevelMap.get("off") if model.thinkingLevelMap else None
+    for msg in messages:
+        if msg.role == "toolResult":
+            return True
+        if msg.role == "assistant" and any(block.type == "toolCall" for block in msg.content):
+            return True
+    return False
+
+
+def _is_reasoning_detail_object(detail: Any) -> bool:
+    return isinstance(detail, Mapping)
+
+
+def _has_valid_common_reasoning_detail_fields(candidate: Mapping[str, Any]) -> bool:
+    return (
+        (candidate.get("id") is None or isinstance(candidate.get("id"), str))
+        and ("format" not in candidate or isinstance(candidate.get("format"), str))
+        and ("index" not in candidate or isinstance(candidate.get("index"), (int, float)))
     )
-    if reasoning_effort:
-        # `mapped === undefined ? reasoningEffort : typeof mapped === "string" ? mapped : undefined`
-        return mapped if isinstance(mapped, str) else (reasoning_effort if mapped is reasoning_effort else _OMIT)
-    return mapped if isinstance(mapped, str) else _OMIT
 
 
-def _build_chat_template_values(
-    model: Model, reasoning_effort: Any, values: Any, thinking_budget: Any
-) -> dict[str, Any] | None:
-    """Every entry resolved; ``None`` when nothing survives, so the key is not sent at all."""
-    if not isinstance(values, Mapping):
-        return None
-    resolved = {
-        key: value
-        for key, value in (
-            (key, _resolve_chat_template_value(model, reasoning_effort, raw, thinking_budget))
-            for key, raw in values.items()
+def is_openai_reasoning_detail(detail: Any) -> bool:
+    if not _is_reasoning_detail_object(detail) or not _has_valid_common_reasoning_detail_fields(detail):
+        return False
+    kind = detail.get("type")
+    if kind == "reasoning.summary":
+        return isinstance(detail.get("summary"), str)
+    if kind == "reasoning.encrypted":
+        return isinstance(detail.get("data"), str)
+    if kind == "reasoning.text":
+        return isinstance(detail.get("text"), str) and (
+            detail.get("signature") is None or isinstance(detail.get("signature"), str)
         )
-        if value is not _OMIT
-    }
-    return resolved or None
-
-
-def _mapped_thinking_effort(model: Model, level: str) -> Any:
-    """pi's ``mapped === undefined ? level : mapped``: an explicit null suppresses the field."""
-    if model.thinkingLevelMap is None or level not in model.thinkingLevelMap:
-        return level
-    return model.thinkingLevelMap[level]
-
-
-def _coalesced_thinking_effort(model: Model, level: str) -> Any:
-    """pi's ``mapped ?? level``: a null mapping falls back to the requested level."""
-    mapped = model.thinkingLevelMap.get(level) if model.thinkingLevelMap else None
-    return level if mapped is None else mapped
-
-
-def _thinking_off_is_suppressed(model: Model) -> bool:
-    """pi's ``model.thinkingLevelMap?.off !== null`` guard: an explicit null means "send nothing"."""
-    return model.thinkingLevelMap is not None and model.thinkingLevelMap.get("off", "") is None
-
-
-def _dump_model(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
-        return value.model_dump(exclude_none=True)
-    return value
-
-
-class OpenAICompletionsOptions(TypedDict, total=False):
-    apiKey: str
-    headers: dict[str, str]
-    signal: Any
-    sessionId: str
-    cacheRetention: str
-    onPayload: Any
-    onResponse: Any
-    onProviderStreamEvent: Any
-    timeoutMs: int
-    maxRetries: int
-    toolChoice: Literal["auto", "none", "required"] | OpenAICompletionsToolChoiceObject
-    reasoningEffort: Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+    return False
 
 
 class OpenAICompletionsToolChoiceFunction(TypedDict):
@@ -228,13 +159,110 @@ class OpenAICompletionsToolChoiceObject(TypedDict):
     function: OpenAICompletionsToolChoiceFunction
 
 
-def has_tool_history(messages: list[Any]) -> bool:
-    for message in messages:
-        if message.role == "toolResult":
-            return True
-        if message.role == "assistant" and any(block.type == "toolCall" for block in message.content):
-            return True
-    return False
+class OpenAICompletionsOptions(TypedDict, total=False):
+    apiKey: str
+    headers: dict[str, str | None]
+    env: dict[str, str]
+    signal: Any
+    sessionId: str
+    cacheRetention: str
+    onPayload: Any
+    onResponse: Any
+    onProviderStreamEvent: Any
+    timeoutMs: int
+    maxRetries: int
+    maxRetryDelayMs: int
+    toolChoice: Literal["auto", "none", "required"] | OpenAICompletionsToolChoiceObject
+    reasoningEffort: Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+    # Token budgets per thinking level. Used when `compat.thinkingTokenBudgetField` or
+    # `compat.supportsThinkingTokenBudget` is set, or by `{ "$var": "thinking.budget" }`.
+    thinkingBudgets: Any
+
+
+def parse_openai_reasoning_details(signature: str | None) -> list[dict[str, Any]] | None:
+    if not signature:
+        return None
+    try:
+        parsed = json.loads(signature)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, list) and parsed and all(map(is_openai_reasoning_detail, parsed)) else None
+
+
+def parse_legacy_encrypted_reasoning_detail(signature: str | None) -> dict[str, Any] | None:
+    if not signature:
+        return None
+    try:
+        parsed = json.loads(signature)
+    except ValueError:
+        return None
+    return (
+        parsed
+        if is_openai_reasoning_detail(parsed)
+        and parsed.get("type") == "reasoning.encrypted"
+        and isinstance(parsed.get("id"), str)
+        and len(parsed["id"]) > 0
+        and len(parsed["data"]) > 0
+        else None
+    )
+
+
+def _fill_missing_common_reasoning_detail_fields(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    if target.get("id") is None:
+        target["id"] = source.get("id")
+    if not target.get("format"):
+        target["format"] = source.get("format")
+    if target.get("index") is None:
+        target["index"] = source.get("index")
+    for key in ("id", "format", "index"):
+        if target.get(key) is None:
+            target.pop(key, None)
+
+
+def append_openai_reasoning_detail(details: list[dict[str, Any]], detail: Mapping[str, Any]) -> None:
+    last_detail = details[-1] if details else None
+    if detail.get("type") == "reasoning.text" and last_detail is not None and last_detail.get("type") == "reasoning.text":
+        last_detail["text"] += detail["text"]
+        if not last_detail.get("signature"):
+            last_detail["signature"] = detail.get("signature")
+            if last_detail["signature"] is None:
+                del last_detail["signature"]
+        _fill_missing_common_reasoning_detail_fields(last_detail, detail)
+        return
+    if (
+        detail.get("type") == "reasoning.summary"
+        and last_detail is not None
+        and last_detail.get("type") == "reasoning.summary"
+    ):
+        last_detail["summary"] += detail["summary"]
+        _fill_missing_common_reasoning_detail_fields(last_detail, detail)
+        return
+    details.append(dict(detail))
+
+
+OPENAI_COMPLETIONS_REASONING_FIELDS = ("reasoning", "reasoning_content", "reasoning_text")
+
+
+def is_openai_completions_reasoning_field(field: str | None) -> bool:
+    return field in OPENAI_COMPLETIONS_REASONING_FIELDS
+
+
+@dataclass
+class _CustomToolCallInput:
+    property: str
+    jsonBuffer: GrammarToolInputJsonBuffer
+
+
+@dataclass
+class _StreamingToolCallScratch:
+    """MISAKA fork: pi widens the block with ``partialArgs``/``customInput``/``streamIndex`` and
+    deletes them when the call finishes; pydantic blocks forbid extra fields, so they live
+    here, beside the block. ``partialArgs`` is a ``StreamingArgs`` so the live view does not
+    re-parse the whole buffer on every delta."""
+
+    partialArgs: StreamingArgs | None = None
+    customInput: _CustomToolCallInput | None = None
+    streamIndex: int | None = None
 
 
 def stream_openai_completions(
@@ -252,19 +280,31 @@ def stream_openai_completions(
             provider=model.provider,
             model=model.id,
             usage=_empty_usage(),
-            stopReason="stop",
+            stopReason="pending",
             timestamp=time.time_ns() // 1_000_000,
         )
 
         chunks = None
+        # `reasoning_details` are replay metadata, not user-visible stream deltas.
+        # Keep them in memory during streaming and serialize once when the block is finalized.
+        streamed_reasoning_details: list[dict[str, Any]] | None = None
+
+        def apply_streamed_reasoning_details(block: ThinkingContent) -> None:
+            if streamed_reasoning_details is not None:
+                block.thinkingSignature = json.dumps(streamed_reasoning_details, separators=(",", ":"))
+
         try:
             compat = get_compat(model)
+            grammar_tool_input_properties = create_grammar_tool_input_properties(
+                get_declared_tools(normalized_context.messages),
+                bool(compat.get("supportsOpenAIGrammarTools")),
+            )
+            cache_retention = resolve_cache_retention(_option(options, "cacheRetention"), _option(options, "env"))
             client = _option(options, "client")
             if client is None:
-                api_key = _option(options, "apiKey") or get_env_api_key(model.provider) or ""
-                cache_retention = resolve_cache_retention(_option(options, "cacheRetention"), _option(options, "env"))
+                api_key = get_client_api_key(model.provider, _option(options, "apiKey"), _option(options, "headers"))
                 cache_session_id = None if cache_retention == "none" else _option(options, "sessionId")
-                client = create_client(
+                client, request_headers = create_client(
                     model,
                     normalized_context,
                     api_key,
@@ -272,16 +312,23 @@ def stream_openai_completions(
                     cache_session_id,
                     compat,
                 )
-
-            params = build_params(model, normalized_context, options, compat)
+            else:
+                request_headers = {}
+            params = build_params(
+                model,
+                normalized_context,
+                options,
+                compat,
+                cache_retention,
+                grammar_tool_input_properties,
+            )
             on_payload = _option(options, "onPayload")
             if callable(on_payload):
                 next_params = await maybe_await(on_payload(params, model))
                 if next_params is not None:
                     params = next_params
-
             openai_stream = await retry_provider_request(
-                lambda: _create_completion_stream(client, params, options, model),
+                lambda: _create_completion_stream(client, params, options, model, request_headers),
                 max_retries=_option(options, "maxRetries") or 0,
                 max_retry_delay_ms=_option(options, "maxRetryDelayMs"),
                 signal=_option(options, "signal"),
@@ -291,137 +338,188 @@ def stream_openai_completions(
             text_block: TextContent | None = None
             thinking_block: ThinkingContent | None = None
             has_finish_reason = False
-            tool_call_index_by_stream_index: dict[int, int] = {}
-            tool_call_index_by_id: dict[str, int] = {}
-            tool_call_partial_args: dict[int, StreamingArgs] = {}
-            # One JSON re-encoder per grammar tool call in flight.
-            tool_call_custom_buffers: dict[int, GrammarToolInputJsonBuffer] = {}
-            grammar_tool_input_properties = create_grammar_tool_input_properties(
-                get_declared_tools(normalized_context.messages),
-                bool(get_compat(model).get("supportsOpenAIGrammarTools")),
-            )
+            tool_call_blocks_by_index: dict[int, ToolCall] = {}
+            tool_call_blocks_by_id: dict[str, ToolCall] = {}
+            scratch_by_block: dict[int, _StreamingToolCallScratch] = {}
+            blocks = output.content
 
-            def content_index_for(block: TextContent | ThinkingContent | ToolCall) -> int:
-                return output.content.index(block)
+            def get_content_index(block: Any) -> int:
+                return next((i for i, candidate in enumerate(blocks) if candidate is block), -1)
 
-            def finish_block(block: TextContent | ThinkingContent | ToolCall) -> None:
-                index = content_index_for(block)
-                if isinstance(block, TextContent):
-                    stream.push(TextEndEvent(contentIndex=index, content=block.text, partial=output))
-                elif isinstance(block, ThinkingContent):
-                    stream.push(ThinkingEndEvent(contentIndex=index, content=block.thinking, partial=output))
-                else:
-                    partial_args = tool_call_partial_args.get(index)
-                    if partial_args is not None and partial_args.raw:
-                        partial_args.finish_into(block)
-                    stream.push(ToolCallEndEvent(contentIndex=index, toolCall=block, partial=output))
+            def scratch_of(block: ToolCall) -> _StreamingToolCallScratch:
+                return scratch_by_block.setdefault(id(block), _StreamingToolCallScratch())
+
+            def get_custom_tool_call_input(block: ToolCall) -> str:
+                custom_input = scratch_of(block).customInput
+                if custom_input is None:
+                    return ""
+                value = block.arguments.get(custom_input.property)
+                return value if isinstance(value, str) else ""
+
+            def append_custom_tool_call_input(block: ToolCall, next_input: str, close: bool) -> str | None:
+                custom_input = scratch_of(block).customInput
+                if custom_input is None:
+                    return None
+                delta = append_grammar_tool_input_json_delta(
+                    custom_input.jsonBuffer, custom_input.property, next_input, close
+                )
+                block.arguments = {custom_input.property: next_input}
+                return delta
+
+            def finish_block(block: Any) -> None:
+                content_index = get_content_index(block)
+                if content_index == -1:
+                    return
+                if block.type == "text":
+                    stream.push(TextEndEvent(contentIndex=content_index, content=block.text, partial=output))
+                elif block.type == "thinking":
+                    apply_streamed_reasoning_details(block)
+                    stream.push(ThinkingEndEvent(contentIndex=content_index, content=block.thinking, partial=output))
+                elif block.type == "toolCall":
+                    scratch = scratch_of(block)
+                    if scratch.customInput is not None:
+                        delta = append_custom_tool_call_input(block, get_custom_tool_call_input(block), True)
+                        if delta is not None:
+                            stream.push(ToolCallDeltaEvent(contentIndex=content_index, delta=delta, partial=output))
+                    elif scratch.partialArgs is not None and scratch.partialArgs.raw:
+                        # MISAKA fork: final arguments go through `finish_into`, which records a
+                        # malformed object as `argumentsError` instead of running a repaired prefix.
+                        scratch.partialArgs.finish_into(block)
+                    else:
+                        block.arguments = {}
+                    # Finalize in-place and strip the scratch buffers so replay only
+                    # carries parsed arguments.
+                    scratch_by_block.pop(id(block), None)
+                    stream.push(ToolCallEndEvent(contentIndex=content_index, toolCall=block, partial=output))
 
             def ensure_text_block() -> TextContent:
                 nonlocal text_block
                 if text_block is None:
                     text_block = TextContent(text="")
-                    output.content.append(text_block)
-                    stream.push(TextStartEvent(contentIndex=content_index_for(text_block), partial=output))
+                    blocks.append(text_block)
+                    stream.push(TextStartEvent(contentIndex=get_content_index(text_block), partial=output))
                 return text_block
-
-            # Every `reasoning_details` entry this stream carried, merged as upstream merges
-            # them, and stashed on the thinking block's signature when the stream ends.
-            streamed_reasoning_details: list[dict[str, Any]] = []
 
             def ensure_thinking_block(thinking_signature: str) -> ThinkingContent:
                 nonlocal thinking_block
                 if thinking_block is None:
                     thinking_block = ThinkingContent(thinking="", thinkingSignature=thinking_signature)
-                    output.content.append(thinking_block)
-                    stream.push(ThinkingStartEvent(contentIndex=content_index_for(thinking_block), partial=output))
+                    blocks.append(thinking_block)
+                    stream.push(ThinkingStartEvent(contentIndex=get_content_index(thinking_block), partial=output))
                 return thinking_block
 
-            def ensure_tool_call_block(tool_call: Mapping[str, Any]) -> tuple[int, ToolCall]:
-                stream_index = tool_call.get("index")
-                existing_index: int | None = None
-                if isinstance(stream_index, int):
-                    existing_index = tool_call_index_by_stream_index.get(stream_index)
-                if existing_index is None and isinstance(tool_call.get("id"), str):
-                    existing_index = tool_call_index_by_id.get(tool_call["id"])
-
-                if existing_index is None:
-                    block = ToolCall(
-                        id=str(tool_call.get("id") or ""),
-                        name=str((tool_call.get("function") or {}).get("name") or ""),
-                        arguments={},
+            def ensure_tool_call_block(tool_call: Mapping[str, Any]) -> ToolCall:
+                stream_index = tool_call.get("index") if isinstance(tool_call.get("index"), int) else None
+                function = tool_call.get("function") if isinstance(tool_call.get("function"), Mapping) else None
+                custom = tool_call.get("custom") if isinstance(tool_call.get("custom"), Mapping) else None
+                name = (function or {}).get("name") or (custom or {}).get("name") or ""
+                tool_call_id = tool_call.get("id")
+                block = tool_call_blocks_by_index.get(stream_index) if stream_index is not None else None
+                if block is None and tool_call_id:
+                    block = tool_call_blocks_by_id.get(tool_call_id)
+                if block is None:
+                    # Note: the "input" fallback here should/must not be taken.  in case the LLM makes up
+                    # a tool we don't knwo about, we at least have a place to stash our stuff.
+                    custom_input_property = (
+                        (grammar_tool_input_properties.get(name) or "input") if custom and not function else None
                     )
-                    output.content.append(block)
-                    existing_index = len(output.content) - 1
-                    stream.push(ToolCallStartEvent(contentIndex=existing_index, partial=output))
-                else:
-                    block = output.content[existing_index]
-                    if not isinstance(block, ToolCall):
-                        raise RuntimeError("Tool call stream index collided with non-tool block")
-
-                if isinstance(stream_index, int):
-                    tool_call_index_by_stream_index[stream_index] = existing_index
-                if isinstance(tool_call.get("id"), str):
-                    tool_call_index_by_id[tool_call["id"]] = existing_index
-                return existing_index, block
+                    has_custom_input = custom_input_property is not None
+                    block = ToolCall(
+                        id=tool_call_id or "",
+                        name=name,
+                        arguments={custom_input_property: ""} if has_custom_input else {},
+                    )
+                    scratch_by_block[id(block)] = _StreamingToolCallScratch(
+                        partialArgs=None if has_custom_input else StreamingArgs(),
+                        customInput=(
+                            _CustomToolCallInput(property=custom_input_property, jsonBuffer=GrammarToolInputJsonBuffer())
+                            if has_custom_input
+                            else None
+                        ),
+                        streamIndex=stream_index,
+                    )
+                    if stream_index is not None:
+                        tool_call_blocks_by_index[stream_index] = block
+                    if tool_call_id:
+                        tool_call_blocks_by_id[tool_call_id] = block
+                    blocks.append(block)
+                    stream.push(ToolCallStartEvent(contentIndex=get_content_index(block), partial=output))
+                scratch = scratch_of(block)
+                if stream_index is not None and scratch.streamIndex is None:
+                    scratch.streamIndex = stream_index
+                    tool_call_blocks_by_index[stream_index] = block
+                if tool_call_id:
+                    tool_call_blocks_by_id[tool_call_id] = block
+                if not block.name and name:
+                    block.name = name
+                if custom and not function and scratch.customInput is None:
+                    custom_input_property = grammar_tool_input_properties.get(block.name) or "input"
+                    block.arguments = {custom_input_property: ""}
+                    scratch.customInput = _CustomToolCallInput(
+                        property=custom_input_property, jsonBuffer=GrammarToolInputJsonBuffer()
+                    )
+                    scratch.partialArgs = None
+                return block
 
             on_provider_stream_event = _option(options, "onProviderStreamEvent")
+            # MISAKA fork: kept so the finally below closes it with the reply (GitHub issue #6).
             chunks = _iterate_stream(openai_stream, _option(options, "signal"))
-            async for raw_chunk in chunks:
+            async for chunk in chunks:
                 if callable(on_provider_stream_event):
-                    await maybe_await(on_provider_stream_event(raw_chunk, model))
-                if not isinstance(raw_chunk, Mapping):
+                    await maybe_await(on_provider_stream_event(chunk, model))
+                if not isinstance(chunk, Mapping):
                     continue
 
-                chunk_id = raw_chunk.get("id")
-                if isinstance(chunk_id, str) and not output.responseId:
-                    output.responseId = chunk_id
-                chunk_model = raw_chunk.get("model")
-                if isinstance(chunk_model, str) and chunk_model and chunk_model != model.id:
-                    output.responseModel = chunk_model
+                # OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
+                # and each chunk in a streamed completion carries the same id.
+                output.responseId = output.responseId or chunk.get("id")
+                chunk_model = chunk.get("model")
+                if isinstance(chunk_model, str) and len(chunk_model) > 0 and chunk_model != model.id:
+                    output.responseModel = output.responseModel or chunk_model
+                if chunk.get("usage"):
+                    output.usage = parse_chunk_usage(chunk["usage"], model)
 
-                usage = raw_chunk.get("usage")
-                if isinstance(usage, Mapping):
-                    output.usage = parse_chunk_usage(usage, model)
-
-                choices = raw_chunk.get("choices")
-                if not isinstance(choices, list) or not choices:
-                    continue
-                choice = choices[0]
+                choices = chunk.get("choices")
+                choice = choices[0] if isinstance(choices, list) and choices else None
                 if not isinstance(choice, Mapping):
                     continue
 
-                if usage is None and isinstance(choice.get("usage"), Mapping):
+                # Fallback: some providers (e.g., Moonshot) return usage
+                # in choice.usage instead of the standard chunk.usage
+                if not chunk.get("usage") and choice.get("usage"):
                     output.usage = parse_chunk_usage(choice["usage"], model)
 
-                finish_reason = choice.get("finish_reason")
-                if finish_reason is not None:
-                    finish_reason_result = map_stop_reason(str(finish_reason))
+                if choice.get("finish_reason"):
+                    output.rawStopReason = choice["finish_reason"]
+                    finish_reason_result = map_stop_reason(choice["finish_reason"])
                     output.stopReason = finish_reason_result["stopReason"]
                     if finish_reason_result.get("errorMessage"):
                         output.errorMessage = finish_reason_result["errorMessage"]
                     has_finish_reason = True
 
                 delta = choice.get("delta")
-                if not isinstance(delta, Mapping):
-                    continue
+                if isinstance(delta, Mapping):
+                    content = delta.get("content")
+                    if isinstance(content, str) and len(content) > 0:
+                        block = ensure_text_block()
+                        block.text += content
+                        stream.push(TextDeltaEvent(contentIndex=get_content_index(block), delta=content, partial=output))
 
-                content_delta = delta.get("content")
-                if isinstance(content_delta, str) and content_delta:
-                    block = ensure_text_block()
-                    block.text += content_delta
-                    stream.push(TextDeltaEvent(contentIndex=content_index_for(block), delta=content_delta, partial=output))
+                    # Some endpoints return reasoning in reasoning_content (llama.cpp),
+                    # or reasoning (other openai compatible endpoints)
+                    # Use the first non-empty reasoning field to avoid duplication
+                    # (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
+                    found_reasoning_field = next(
+                        (
+                            field
+                            for field in ("reasoning_content", "reasoning", "reasoning_text")
+                            if isinstance(delta.get(field), str) and len(delta[field]) > 0
+                        ),
+                        None,
+                    )
 
-                reasoning_fields = ("reasoning_content", "reasoning", "reasoning_text")
-                found_reasoning_field: str | None = None
-                for field in reasoning_fields:
-                    value = delta.get(field)
-                    if isinstance(value, str) and value:
-                        found_reasoning_field = field
-                        break
-
-                if found_reasoning_field:
-                    reasoning_delta = delta.get(found_reasoning_field)
-                    if isinstance(reasoning_delta, str) and reasoning_delta:
+                    if found_reasoning_field:
+                        reasoning_delta = delta[found_reasoning_field]
                         thinking_signature = (
                             "reasoning_content"
                             if model.provider == "opencode-go" and found_reasoning_field == "reasoning"
@@ -429,119 +527,82 @@ def stream_openai_completions(
                         )
                         block = ensure_thinking_block(thinking_signature)
                         block.thinking += reasoning_delta
-                        stream.push(
-                            ThinkingDeltaEvent(
-                                contentIndex=content_index_for(block),
-                                delta=reasoning_delta,
-                                partial=output,
-                            )
-                        )
+                        stream.push(ThinkingDeltaEvent(
+                            contentIndex=get_content_index(block), delta=reasoning_delta, partial=output
+                        ))
 
-                tool_calls = delta.get("tool_calls")
-                if isinstance(tool_calls, list):
-                    for tool_call in tool_calls:
-                        if not isinstance(tool_call, Mapping):
-                            continue
-                        content_index, block = ensure_tool_call_block(tool_call)
-                        tool_id = tool_call.get("id")
-                        function = tool_call.get("function")
-                        if not block.id and isinstance(tool_id, str):
-                            block.id = tool_id
-                            tool_call_index_by_id[tool_id] = content_index
-                        custom = tool_call.get("custom")
-                        is_custom = isinstance(custom, Mapping) and not isinstance(function, Mapping)
-                        if not block.name:
-                            for source in (function, custom):
-                                if isinstance(source, Mapping) and isinstance(source.get("name"), str):
-                                    block.name = source["name"]
-                                    break
+                    if delta.get("tool_calls"):
+                        for tool_call in delta["tool_calls"]:
+                            if not isinstance(tool_call, Mapping):
+                                continue
+                            block = ensure_tool_call_block(tool_call)
+                            if not block.id and tool_call.get("id"):
+                                block.id = tool_call["id"]
+                                tool_call_blocks_by_id[tool_call["id"]] = block
+                            function = tool_call.get("function") if isinstance(tool_call.get("function"), Mapping) else {}
+                            custom = tool_call.get("custom") if isinstance(tool_call.get("custom"), Mapping) else {}
+                            name = function.get("name") or custom.get("name")
+                            if not block.name and name:
+                                block.name = name
 
-                        tool_delta = ""
-                        if is_custom:
-                            # A grammar tool streams free text, not JSON. It is surfaced as an
-                            # ordinary tool call whose single argument is that text, and the
-                            # delta is re-encoded as the growing JSON of that one property --
-                            # consumers of `toolcall_delta` are fed JSON either way.
-                            property_name = grammar_tool_input_properties.get(block.name) or "input"
-                            buffer = tool_call_custom_buffers.get(content_index)
-                            if buffer is None:
-                                buffer = GrammarToolInputJsonBuffer()
-                                tool_call_custom_buffers[content_index] = buffer
-                                block.arguments = {property_name: ""}
-                            existing = block.arguments.get(property_name)
-                            next_input = (existing if isinstance(existing, str) else "") + str(
-                                custom.get("input") or ""
-                            )
-                            tool_delta = (
-                                append_grammar_tool_input_json_delta(
-                                    buffer, property_name, next_input, False
-                                )
-                                or ""
-                            )
-                            block.arguments = {property_name: next_input}
-                        elif isinstance(function, Mapping) and isinstance(function.get("arguments"), str):
-                            tool_delta = function["arguments"]
-                            accumulated = tool_call_partial_args.setdefault(content_index, StreamingArgs())
-                            accumulated.append(tool_delta)
-                            block.arguments = accumulated.arguments
-                        stream.push(ToolCallDeltaEvent(contentIndex=content_index, delta=tool_delta, partial=output))
+                            tool_delta = ""
+                            scratch = scratch_of(block)
+                            if function.get("arguments"):
+                                tool_delta = function["arguments"]
+                                if scratch.partialArgs is None:
+                                    scratch.partialArgs = StreamingArgs()
+                                scratch.partialArgs.append(tool_delta)
+                                block.arguments = scratch.partialArgs.arguments
+                            elif custom.get("input"):
+                                next_input = get_custom_tool_call_input(block) + custom["input"]
+                                tool_delta = append_custom_tool_call_input(block, next_input, False) or ""
+                            stream.push(ToolCallDeltaEvent(
+                                contentIndex=get_content_index(block), delta=tool_delta, partial=output
+                            ))
 
-                reasoning_details = delta.get("reasoning_details")
-                if isinstance(reasoning_details, list):
-                    for detail in reasoning_details:
-                        if not _is_openai_reasoning_detail(detail):
-                            continue
-                        # Provider replay data lives in the thinking block's signature slot.
-                        # These arrive as deltas, so they are merged rather than appended --
-                        # see `append_openai_reasoning_detail`.
-                        ensure_thinking_block("")
-                        append_openai_reasoning_detail(streamed_reasoning_details, detail)
-                        if (
-                            detail.get("type") == "reasoning.encrypted"
-                            and isinstance(detail.get("id"), str)
-                            and detail.get("data")
-                        ):
-                            tool_index = tool_call_index_by_id.get(detail["id"])
-                            if tool_index is not None:
-                                block = output.content[tool_index]
-                                if isinstance(block, ToolCall):
-                                    block.thoughtSignature = json.dumps(detail, separators=(",", ":"))
+                    reasoning_details = delta.get("reasoning_details")
+                    if isinstance(reasoning_details, list):
+                        for detail in reasoning_details:
+                            if not is_openai_reasoning_detail(detail):
+                                continue
+                            ensure_thinking_block("")
+                            if streamed_reasoning_details is None:
+                                streamed_reasoning_details = []
+                            # Keep provider replay data in the existing signature slot. OpenRouter streams
+                            # reasoning_details as deltas: consecutive text/summary deltas are merged into
+                            # logical entries, while encrypted entries remain opaque and discrete.
+                            append_openai_reasoning_detail(streamed_reasoning_details, detail)
 
-            if streamed_reasoning_details and thinking_block is not None:
-                thinking_block.thinkingSignature = json.dumps(
-                    streamed_reasoning_details, separators=(",", ":")
-                )
-
-            for block in list(output.content):
+            for block in list(blocks):
                 finish_block(block)
-
             if signal_aborted(_option(options, "signal")):
                 raise RuntimeError("Request was aborted")
+
             if output.stopReason == "aborted":
                 raise RuntimeError("Request was aborted")
             if not has_finish_reason and not compat["supportsFinishReason"]:
-                output.stopReason = (
-                    "toolUse"
-                    if any(isinstance(block, ToolCall) for block in output.content)
-                    else "stop"
-                )
+                output.stopReason = "toolUse" if any(block.type == "toolCall" for block in output.content) else "stop"
             if output.stopReason == "error":
                 raise RuntimeError(output.errorMessage or "Provider returned an error stop reason")
-            if compat["supportsFinishReason"] and not has_finish_reason:
+            if (compat["supportsFinishReason"] and not has_finish_reason) or output.stopReason == "pending":
                 raise RuntimeError("Stream ended without finish_reason")
 
             stream.push(DoneEvent(reason=output.stopReason, message=output))
         except Exception as error:  # noqa: BLE001
+            for block in output.content:
+                if block.type == "thinking":
+                    apply_streamed_reasoning_details(block)
             output.stopReason = "aborted" if signal_aborted(_option(options, "signal")) else "error"
-            output.errorMessage = _format_completion_error(error)
+            output.errorMessage = format_provider_error(normalize_provider_error(error))
+            # Some providers via OpenRouter give additional information in this field.
+            # normalize_provider_error already stringifies the parsed body (error.error)
+            # into errorMessage, so only append the raw metadata when it is not already
+            # present to avoid double-printing it.
             error_payload = getattr(error, "error", None)
-            raw_metadata = (
-                error_payload.get("metadata")
-                if isinstance(error_payload, Mapping)
-                else getattr(error_payload, "metadata", None)
-            )
-            if isinstance(raw_metadata, Mapping) and raw_metadata.get("raw"):
-                output.errorMessage = f"{output.errorMessage}\n{raw_metadata['raw']}"
+            metadata = read_field(error_payload, "metadata") if error_payload is not None else None
+            raw_metadata = read_field(metadata, "raw") if metadata is not None else None
+            if raw_metadata and str(raw_metadata) not in output.errorMessage:
+                output.errorMessage += f"\n{raw_metadata}"
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
             if chunks is not None:          # closed now, its abort task with it, not when GC finds it
@@ -558,50 +619,44 @@ def stream_simple_openai_completions(
     context: TranscriptContext,
     options: SimpleStreamOptions | None = None,
 ) -> AssistantMessageEventStream:
-    api_key = _option(options, "apiKey") or get_env_api_key(model.provider)
-    if not api_key:
-        raise RuntimeError(f"No API key for provider: {model.provider}")
+    get_client_api_key(model.provider, _option(options, "apiKey"), _option(options, "headers"))
 
-    base = build_base_options(model, context, options, api_key)
+    base = {
+        **build_base_options(model, context, options, _option(options, "apiKey")).model_dump(),
+        "toolChoice": _option(options, "toolChoice"),
+    }
     clamped_reasoning = clamp_thinking_level(model, options.reasoning) if options and options.reasoning else None
     reasoning_effort = None if clamped_reasoning == "off" else clamped_reasoning
-    tool_choice = _option(options, "toolChoice")
+
     return stream_openai_completions(
         model,
         context,
-        {**base.model_dump(), "reasoningEffort": reasoning_effort, "toolChoice": tool_choice},
+        {
+            **base,
+            "reasoningEffort": reasoning_effort,
+            "thinkingBudgets": _option(options, "thinkingBudgets"),
+        },
     )
 
 
-def build_request_headers(
+def create_client(
     model: Model,
-    compat: Mapping[str, Any],
-    context: TranscriptContext | None = None,
-    options_headers: Mapping[str, str] | None = None,
+    context: TranscriptContext,
+    api_key: str,
+    options_headers: Mapping[str, Any] | None = None,
     session_id: str | None = None,
-) -> dict[str, Any]:
-    """The headers one request carries, in upstream's precedence order.
-
-    Its own function, as upstream's ``buildRequestHeaders`` is: session affinity has three
-    shapes and no test could reach any of them while this was inlined in client
-    construction behind an SDK call.
-    """
-    # Upstream seeds the same base and lets `model.headers` spread over it
-    # (openai-completions.ts:751), so a catalog entry can still replace it.
-    headers: dict[str, Any] = {"User-Agent": get_misaka_user_agent()}
-    apply_provider_headers(headers, model.headers)
-    if model.provider == "github-copilot" and context is not None:
-        headers.update(
-            build_copilot_dynamic_headers(
-                messages=context.messages,
-                hasImages=has_copilot_vision_input(context.messages),
-            )
-        )
+    compat: Mapping[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Returns the client and (MISAKA fork, see ``split_sdk_headers``) the headers every
+    request has to carry."""
+    compat = compat or get_compat(model)
+    headers: dict[str, Any] = {"User-Agent": get_misaka_user_agent(), **(model.headers or {})}
+    if model.provider == "github-copilot":
+        has_images = has_copilot_vision_input(context.messages)
+        copilot_headers = build_copilot_dynamic_headers(messages=context.messages, hasImages=has_images)
+        headers.update(copilot_headers)
 
     if session_id and compat.get("sendSessionAffinityHeaders"):
-        # Three shapes, not one: OpenRouter threads a conversation with its own header and
-        # accepts none of the others, and an endpoint that is neither still wants the
-        # request/affinity pair without OpenAI's `session_id`.
         if compat.get("sessionAffinityFormat") == "openrouter":
             headers["x-session-id"] = session_id
         else:
@@ -610,52 +665,17 @@ def build_request_headers(
             headers["x-client-request-id"] = session_id
             headers["x-session-affinity"] = session_id
 
-    # Caller headers last, so they override anything above -- and a `None` among them
-    # removes the header rather than becoming its value.
-    apply_provider_headers(headers, options_headers)
-    return headers
+    # Merge options headers last so they can override defaults
+    if options_headers:
+        headers.update(options_headers)
 
-
-def create_client(
-    model: Model,
-    context: TranscriptContext,
-    api_key: str | None = None,
-    options_headers: Mapping[str, str] | None = None,
-    session_id: str | None = None,
-    compat: Mapping[str, Any] | None = None,
-) -> AsyncOpenAI:
-    if not api_key:
-        env_key = os.environ.get("OPENAI_API_KEY")
-        if not env_key:
-            raise RuntimeError(
-                "OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass it as an argument."
-            )
-        api_key = env_key
-
-    compat = compat or get_compat(model)
-    headers = build_request_headers(model, compat, context, options_headers, session_id)
-
-    default_headers: dict[str, Any]
-    if model.provider == "cloudflare-ai-gateway":
-        # The gateway's own header replaces the provider's, and resolved auth marks the
-        # displaced ones with `None`. httpx refuses a `None` header value outright, so the
-        # merge is filtered rather than passed through -- upstream's
-        # `providerHeadersToRecord` drops them for the same reason.
-        default_headers = provider_headers_to_record(
-            {
-                **headers,
-                "Authorization": headers.get("Authorization"),
-                "cf-aig-authorization": f"Bearer {api_key}",
-            }
-        ) or {}
-    else:
-        default_headers = headers
-
-    return require(AsyncOpenAI, "openai")(
+    default_headers, request_headers = split_sdk_headers(headers, omit)
+    client = require(AsyncOpenAI, "openai")(
         api_key=api_key,
-        base_url=resolve_cloudflare_base_url(model) if is_cloudflare_provider(model.provider) else model.baseUrl,
+        base_url=model.baseUrl,
         default_headers=default_headers,
     )
+    return client, request_headers
 
 
 def build_params(
@@ -664,21 +684,21 @@ def build_params(
     options: Any = None,
     compat: Mapping[str, Any] | None = None,
     cache_retention: CacheRetention | None = None,
+    grammar_tool_input_properties: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     compat = compat or get_compat(model)
-    resolved_cache_retention = resolve_cache_retention(
-        _option(options, "cacheRetention") if cache_retention is None else cache_retention,
-        _option(options, "env"),
-    )
-    grammar_tool_input_properties = create_grammar_tool_input_properties(
-        get_declared_tools(context.messages), bool(compat.get("supportsOpenAIGrammarTools"))
-    )
+    if cache_retention is None:
+        cache_retention = resolve_cache_retention(_option(options, "cacheRetention"), _option(options, "env"))
+    if grammar_tool_input_properties is None:
+        grammar_tool_input_properties = create_grammar_tool_input_properties(
+            get_declared_tools(context.messages), bool(compat.get("supportsOpenAIGrammarTools"))
+        )
     transcript_tools = resolve_transcript_tools(
         context.messages,
         compat.get("supportsMidConvoSystemMessages") is True and compat.get("supportsMidConvoToolAdditions") is True,
     )
-    messages = convert_messages(model, context, compat, grammar_tool_input_properties)
-    cache_control = get_compat_cache_control(compat, resolved_cache_retention)
+    messages = convert_messages(model, context, compat, {"grammarToolInputProperties": grammar_tool_input_properties})
+    cache_control = get_compat_cache_control(compat, cache_retention)
 
     params: dict[str, Any] = {
         "model": model.id,
@@ -686,28 +706,27 @@ def build_params(
         "stream": True,
         "prompt_cache_key": (
             clamp_openai_prompt_cache_key(_option(options, "sessionId"))
-            if (
-                ("api.openai.com" in model.baseUrl and resolved_cache_retention != "none")
-                or (resolved_cache_retention == "long" and compat.get("supportsLongCacheRetention"))
-            )
+            if ("api.openai.com" in model.baseUrl and cache_retention != "none")
+            or (cache_retention == "long" and compat.get("supportsLongCacheRetention"))
             else None
+        ),
+        "prompt_cache_retention": (
+            "24h" if cache_retention == "long" and compat.get("supportsLongCacheRetention") else None
         ),
     }
 
-    if resolved_cache_retention == "long" and compat.get("supportsLongCacheRetention"):
-        _set_extra(params, "prompt_cache_retention", "24h")
-
     if compat.get("supportsUsageInStreaming") is not False:
         params["stream_options"] = {"include_usage": True}
+
     if compat.get("supportsStore"):
         params["store"] = False
 
-    max_tokens = _option(options, "maxTokens")
-    if max_tokens:
+    if _option(options, "maxTokens"):
         if compat.get("maxTokensField") == "max_tokens":
-            params["max_tokens"] = max_tokens
+            # Deprecated by OpenAI, but some OpenAI-compatible providers only accept max_tokens.
+            params["max_tokens"] = _option(options, "maxTokens")
         else:
-            params["max_completion_tokens"] = max_tokens
+            params["max_completion_tokens"] = _option(options, "maxTokens")
 
     if _option(options, "temperature") is not None:
         params["temperature"] = _option(options, "temperature")
@@ -715,137 +734,214 @@ def build_params(
     if len(transcript_tools.requestTools) > 0:
         params["tools"] = convert_tools(transcript_tools.requestTools, compat)
         if compat.get("zaiToolStream"):
-            _set_extra(params, "tool_stream", True)
+            params["tool_stream"] = True
     elif has_tool_history(context.messages):
+        # Anthropic (via LiteLLM/proxy) requires tools param when conversation has tool_calls/tool_results
         params["tools"] = []
 
     if cache_control:
         apply_anthropic_cache_control(messages, params.get("tools"), cache_control)
 
-    tool_choice = _option(options, "toolChoice")
-    if tool_choice:
-        params["tool_choice"] = tool_choice
+    if _option(options, "toolChoice"):
+        params["tool_choice"] = _option(options, "toolChoice")
+
     if compat.get("vllmPriority") is not None:
-        _set_extra(params, "priority", compat["vllmPriority"])
+        params["priority"] = compat["vllmPriority"]
 
     reasoning_effort = _option(options, "reasoningEffort")
-    thinking_token_budget_field = _resolve_thinking_token_budget_field(compat)
-    thinking_budget = _resolve_clamped_thinking_budget(model, options, params)
+    thinking_level_map = model.thinkingLevelMap or {}
+    thinking_token_budget_field = resolve_thinking_token_budget_field(compat)
+    thinking_budget = resolve_clamped_thinking_budget(model, options, params)
 
     if compat.get("thinkingFormat") == "zai" and model.reasoning:
-        # z.ai speaks `thinking: {type, clear_thinking}`; `enable_thinking` is qwen's field.
-        _set_extra(
-            params,
-            "thinking",
-            {"type": "enabled", "clear_thinking": False} if reasoning_effort else {"type": "disabled"},
-        )
+        params["thinking"] = {"type": "enabled", "clear_thinking": False} if reasoning_effort else {"type": "disabled"}
         if reasoning_effort and compat.get("supportsReasoningEffort"):
-            effort = _mapped_thinking_effort(model, reasoning_effort)
+            effort = thinking_level_map.get(reasoning_effort, reasoning_effort)
             if isinstance(effort, str):
                 params["reasoning_effort"] = effort
     elif compat.get("thinkingFormat") == "qwen" and model.reasoning:
-        _set_extra(params, "enable_thinking", bool(reasoning_effort))
+        params["enable_thinking"] = bool(reasoning_effort)
         if reasoning_effort and compat.get("supportsReasoningEffort"):
-            effort = _coalesced_thinking_effort(model, reasoning_effort)
+            effort = _coalesce(thinking_level_map.get(reasoning_effort), reasoning_effort)
             if isinstance(effort, str):
                 params["reasoning_effort"] = effort
     elif compat.get("thinkingFormat") == "qwen-chat-template" and model.reasoning:
-        _set_extra(params, "chat_template_kwargs", {"enable_thinking": bool(reasoning_effort), "preserve_thinking": True})
+        params["chat_template_kwargs"] = {
+            "enable_thinking": bool(reasoning_effort),
+            "preserve_thinking": True,
+        }
     elif compat.get("thinkingFormat") == "chat-template" and model.reasoning:
-        chat_template_kwargs = _build_chat_template_values(
-            model, reasoning_effort, compat.get("chatTemplateKwargs"), thinking_budget
+        chat_template_kwargs = build_chat_template_values(
+            model, options, compat.get("chatTemplateKwargs") or {}, thinking_budget
         )
         if chat_template_kwargs:
-            _set_extra(params, "chat_template_kwargs", chat_template_kwargs)
+            params["chat_template_kwargs"] = chat_template_kwargs
     elif compat.get("thinkingFormat") == "baseten" and model.reasoning:
-        chat_template_args = _build_chat_template_values(
-            model, reasoning_effort, compat.get("chatTemplateArgs"), thinking_budget
+        chat_template_args = build_chat_template_values(
+            model, options, compat.get("chatTemplateArgs") or {}, thinking_budget
         )
         if chat_template_args:
-            _set_extra(params, "chat_template_args", chat_template_args)
+            params["chat_template_args"] = chat_template_args
         if compat.get("supportsReasoningEffort"):
-            effort = (
-                _mapped_thinking_effort(model, reasoning_effort)
-                if reasoning_effort
-                else (model.thinkingLevelMap.get("off") if model.thinkingLevelMap else None)
-            )
-            if effort is None and reasoning_effort and not model.thinkingLevelMap:
-                effort = reasoning_effort
+            key = reasoning_effort if reasoning_effort else "off"
+            mapped_effort = thinking_level_map.get(key, _UNDEFINED)
+            effort = reasoning_effort if mapped_effort is _UNDEFINED else mapped_effort
             if isinstance(effort, str):
                 params["reasoning_effort"] = effort
-    elif compat.get("thinkingFormat") == "ant-ling" and model.reasoning and reasoning_effort:
-        effort = model.thinkingLevelMap.get(reasoning_effort) if model.thinkingLevelMap else None
-        if isinstance(effort, str):
-            _set_extra(params, "reasoning", {"effort": effort})
-    elif compat.get("thinkingFormat") == "string-thinking" and model.reasoning:
-        if reasoning_effort:
-            _set_extra(params, "thinking", _coalesced_thinking_effort(model, reasoning_effort))
-        elif not _thinking_off_is_suppressed(model):
-            off_value = model.thinkingLevelMap.get("off") if model.thinkingLevelMap else None
-            _set_extra(params, "thinking", "none" if off_value is None else off_value)
     elif compat.get("thinkingFormat") == "deepseek" and model.reasoning:
         if reasoning_effort:
-            _set_extra(params, "thinking", {"type": "enabled"})
-        elif not _thinking_off_is_suppressed(model):
-            _set_extra(params, "thinking", {"type": "disabled"})
+            params["thinking"] = {"type": "enabled"}
+        elif _thinking_off(model) is not None:
+            params["thinking"] = {"type": "disabled"}
         if reasoning_effort and compat.get("supportsReasoningEffort"):
-            params["reasoning_effort"] = _coalesced_thinking_effort(model, reasoning_effort)
+            params["reasoning_effort"] = _coalesce(thinking_level_map.get(reasoning_effort), reasoning_effort)
     elif compat.get("thinkingFormat") == "openrouter" and model.reasoning:
+        # OpenRouter normalizes reasoning across providers via a nested reasoning object.
         if reasoning_effort:
-            _set_extra(params, "reasoning", {"effort": _coalesced_thinking_effort(model, reasoning_effort)})
-        else:
-            has_off_override = False
-            off_value: Any = None
-            if model.thinkingLevelMap is not None:
-                has_off_override = "off" in model.thinkingLevelMap
-                off_value = model.thinkingLevelMap.get("off")
-            if model.thinkingLevelMap is None or not has_off_override or off_value is not None:
-                _set_extra(params, "reasoning", {"effort": "none" if off_value is None else off_value})
+            params["reasoning"] = {"effort": _coalesce(thinking_level_map.get(reasoning_effort), reasoning_effort)}
+        elif _thinking_off(model) is not None:
+            params["reasoning"] = {"effort": _coalesce(thinking_level_map.get("off"), "none")}
+    elif compat.get("thinkingFormat") == "ant-ling" and model.reasoning and reasoning_effort:
+        effort = thinking_level_map.get(reasoning_effort)
+        if isinstance(effort, str):
+            params["reasoning"] = {"effort": effort}
     elif compat.get("thinkingFormat") == "together" and model.reasoning:
-        _set_extra(params, "reasoning", {"enabled": bool(reasoning_effort)})
+        params["reasoning"] = {"enabled": bool(reasoning_effort)}
         if reasoning_effort and compat.get("supportsReasoningEffort"):
-            params["reasoning_effort"] = _coalesced_thinking_effort(model, reasoning_effort)
+            params["reasoning_effort"] = _coalesce(thinking_level_map.get(reasoning_effort), reasoning_effort)
+    elif compat.get("thinkingFormat") == "string-thinking" and model.reasoning:
+        if reasoning_effort:
+            params["thinking"] = _coalesce(thinking_level_map.get(reasoning_effort), reasoning_effort)
+        elif _thinking_off(model) is not None:
+            params["thinking"] = _coalesce(thinking_level_map.get("off"), "none")
     elif reasoning_effort and model.reasoning and compat.get("supportsReasoningEffort"):
-        params["reasoning_effort"] = _coalesced_thinking_effort(model, reasoning_effort)
+        # OpenAI-style reasoning_effort
+        params["reasoning_effort"] = _coalesce(thinking_level_map.get(reasoning_effort), reasoning_effort)
     elif not reasoning_effort and model.reasoning and compat.get("supportsReasoningEffort"):
-        off_value = model.thinkingLevelMap.get("off") if model.thinkingLevelMap else None
+        off_value = thinking_level_map.get("off")
         if isinstance(off_value, str):
             params["reasoning_effort"] = off_value
 
-    # A server that caps reasoning by token count wants it as a top-level field, whichever
-    # name it spells it with.
+    # Cap reasoning with a top-level budget field. Independent of thinkingFormat: the
+    # same server can serve zai, qwen or chat-template models. Reasoning and the answer
+    # share max_tokens here, so an uncapped reasoning phase can consume the whole
+    # response and leave no answer and no tool call.
     if thinking_token_budget_field and thinking_budget is not None:
-        _set_extra(params, thinking_token_budget_field, thinking_budget)
+        params[thinking_token_budget_field] = thinking_budget
 
-    if "openrouter.ai" in model.baseUrl and read_field(model.compat, "openRouterRouting"):
-        _set_extra(params, "provider", _dump_model(read_field(model.compat, "openRouterRouting")))
-    if "ai-gateway.vercel.sh" in model.baseUrl and read_field(model.compat, "vercelGatewayRouting"):
-        routing = _dump_model(read_field(model.compat, "vercelGatewayRouting"))
-        gateway_options: dict[str, list[str]] = {}
-        if routing.get("only"):
-            gateway_options["only"] = routing["only"]
-        if routing.get("order"):
-            gateway_options["order"] = routing["order"]
-        if gateway_options:
-            _set_extra(params, "providerOptions", {"gateway": gateway_options})
+    # OpenRouter provider routing preferences
+    open_router_routing = getattr(model.compat, "openRouterRouting", None)
+    if open_router_routing is not None:
+        params["provider"] = _dump_model(open_router_routing)
+
+    # Vercel AI Gateway provider routing preferences
+    vercel_gateway_routing = getattr(model.compat, "vercelGatewayRouting", None)
+    if vercel_gateway_routing is not None:
+        routing = _dump_model(vercel_gateway_routing)
+        if routing.get("only") or routing.get("order"):
+            gateway_options: dict[str, list[str]] = {}
+            if routing.get("only"):
+                gateway_options["only"] = routing["only"]
+            if routing.get("order"):
+                gateway_options["order"] = routing["order"]
+            params["providerOptions"] = {"gateway": gateway_options}
 
     # Last so custom keys override the named request fields. Per-request keys override model defaults.
-    assign_sampling_params(params, model.samplingParams, _option(options, "samplingParams"))
+    params.update(model.samplingParams or {})
+    params.update(_option(options, "samplingParams") or {})
 
-    return {key: value for key, value in params.items() if value is not None}
+    return params
 
 
-def get_compat_cache_control(
-    compat: Mapping[str, Any],
-    cache_retention: CacheRetention,
+_UNDEFINED = object()
+
+
+def _coalesce(value: Any, fallback: Any) -> Any:
+    """``value ?? fallback``."""
+    return fallback if value is None else value
+
+
+def _thinking_off(model: Model) -> Any:
+    """``model.thinkingLevelMap?.off``, with a missing key or map as ``_UNDEFINED`` so the
+    callers' ``!== null`` test tells an explicit null from an absent entry."""
+    if model.thinkingLevelMap is None or "off" not in model.thinkingLevelMap:
+        return _UNDEFINED
+    return model.thinkingLevelMap["off"]
+
+
+def _dump_model(value: Any) -> Any:
+    return value.model_dump(exclude_none=True) if hasattr(value, "model_dump") else value
+
+
+def resolve_thinking_token_budget_field(compat: Mapping[str, Any]) -> str | None:
+    if compat.get("thinkingTokenBudgetField"):
+        return compat["thinkingTokenBudgetField"]
+    if compat.get("supportsThinkingTokenBudget"):
+        return "thinking_token_budget"
+    return None
+
+
+def resolve_clamped_thinking_budget(model: Model, options: Any, params: Mapping[str, Any]) -> int | None:
+    reasoning_effort = _option(options, "reasoningEffort")
+    if not reasoning_effort or not model.reasoning:
+        return None
+    ceiling = _coalesce(params.get("max_tokens"), _coalesce(params.get("max_completion_tokens"), model.maxTokens))
+    budget = clamp_thinking_budget_to_answer_room(
+        thinking_budget_for_level(reasoning_effort, _option(options, "thinkingBudgets")),
+        ceiling,
+    )
+    return budget if budget > 0 else None
+
+
+def build_chat_template_values(
+    model: Model,
+    options: Any,
+    values: Mapping[str, Any],
+    thinking_budget: int | None = None,
 ) -> dict[str, Any] | None:
+    resolved_values: dict[str, Any] = {}
+
+    for key, value in values.items():
+        resolved = resolve_chat_template_kwarg_value(model, options, value, thinking_budget)
+        if resolved is not _UNDEFINED:
+            resolved_values[key] = resolved
+
+    return resolved_values or None
+
+
+def resolve_chat_template_kwarg_value(
+    model: Model,
+    options: Any,
+    value: Any,
+    thinking_budget: int | None = None,
+) -> Any:
+    """``_UNDEFINED`` for "do not send this key" -- distinct from ``None``, which a template
+    may legitimately want."""
+    if not isinstance(value, Mapping):
+        return value
+
+    reasoning_effort = _option(options, "reasoningEffort")
+    if not reasoning_effort and value.get("omitWhenOff"):
+        return _UNDEFINED
+    if value.get("$var") == "thinking.enabled":
+        return bool(reasoning_effort)
+    if value.get("$var") == "thinking.budget":
+        return _UNDEFINED if thinking_budget is None else thinking_budget
+
+    thinking_level_map = model.thinkingLevelMap or {}
+    key = reasoning_effort if reasoning_effort else "off"
+    mapped_value = thinking_level_map.get(key, _UNDEFINED)
+    if mapped_value is _UNDEFINED:
+        return reasoning_effort if reasoning_effort else _UNDEFINED
+    return mapped_value if isinstance(mapped_value, str) else _UNDEFINED
+
+
+def get_compat_cache_control(compat: Mapping[str, Any], cache_retention: CacheRetention) -> dict[str, Any] | None:
     if compat.get("cacheControlFormat") != "anthropic" or cache_retention == "none":
         return None
+
     ttl = "1h" if cache_retention == "long" and compat.get("supportsLongCacheRetention") else None
-    cache_control: dict[str, Any] = {"type": "ephemeral"}
-    if ttl:
-        cache_control["ttl"] = ttl
-    return cache_control
+    return {"type": "ephemeral", **({"ttl": ttl} if ttl else {})}
 
 
 def apply_anthropic_cache_control(
@@ -867,175 +963,72 @@ def add_cache_control_to_system_prompt(messages: list[dict[str, Any]], cache_con
 
 def add_cache_control_to_last_conversation_message(messages: list[dict[str, Any]], cache_control: dict[str, Any]) -> None:
     for message in reversed(messages):
-        if message.get("role") in {"user", "assistant"} and add_cache_control_to_text_content(message, cache_control):
+        if message.get("role") in {"user", "assistant", "tool"} and add_cache_control_to_text_content(
+            message, cache_control
+        ):
             return
 
 
 def add_cache_control_to_last_tool(tools: list[dict[str, Any]] | None, cache_control: dict[str, Any]) -> None:
-    if tools:
-        tools[-1]["cache_control"] = cache_control
+    if not tools:
+        return
+    tools[-1]["cache_control"] = cache_control
 
 
 def add_cache_control_to_text_content(message: dict[str, Any], cache_control: dict[str, Any]) -> bool:
     content = message.get("content")
     if isinstance(content, str):
-        if not content:
+        if len(content) == 0:
             return False
         message["content"] = [{"type": "text", "text": content, "cache_control": cache_control}]
         return True
+
     if not isinstance(content, list):
         return False
+
     for part in reversed(content):
         if isinstance(part, dict) and part.get("type") == "text":
             part["cache_control"] = cache_control
             return True
+
     return False
 
 
-OPENAI_COMPLETIONS_REASONING_FIELDS = ("reasoning", "reasoning_content", "reasoning_text")
-
-
-def is_openai_completions_reasoning_field(field: str | None) -> bool:
-    """``True`` only for a name that is a reasoning field on an assistant message.
-
-    ``thinkingSignature`` is a slot with several tenants: on llama.cpp and gpt-oss it
-    names the field the reasoning came out of, but everywhere else it holds a provider's
-    opaque signature. Without this check that signature becomes a top-level key on the
-    request, which is a member the endpoint never declared.
-    """
-    return field in OPENAI_COMPLETIONS_REASONING_FIELDS
-
-
-def _has_valid_common_reasoning_detail_fields(candidate: Mapping[str, Any]) -> bool:
-    return (
-        candidate.get("id") is None or isinstance(candidate.get("id"), str)
-    ) and (
-        "format" not in candidate or isinstance(candidate.get("format"), str)
-    ) and (
-        "index" not in candidate or isinstance(candidate.get("index"), (int, float))
-    )
-
-
-def _is_openai_reasoning_detail(detail: Any) -> bool:
-    """One entry of OpenRouter's ``reasoning_details``, in any of its three shapes."""
-    if not isinstance(detail, Mapping) or not _has_valid_common_reasoning_detail_fields(detail):
-        return False
-    kind = detail.get("type")
-    if kind == "reasoning.summary":
-        return isinstance(detail.get("summary"), str)
-    if kind == "reasoning.encrypted":
-        return isinstance(detail.get("data"), str)
-    if kind == "reasoning.text":
-        return isinstance(detail.get("text"), str) and (
-            detail.get("signature") is None or isinstance(detail.get("signature"), str)
-        )
-    return False
-
-
-def _fill_missing_common_reasoning_detail_fields(target: dict[str, Any], source: Mapping[str, Any]) -> None:
-    if target.get("id") is None and source.get("id") is not None:
-        target["id"] = source["id"]
-    if not target.get("format") and source.get("format"):
-        target["format"] = source["format"]
-    if target.get("index") is None and source.get("index") is not None:
-        target["index"] = source["index"]
-
-
-def append_openai_reasoning_detail(details: list[dict[str, Any]], detail: Mapping[str, Any]) -> None:
-    """Merge a streamed detail into the run, the way upstream's replay expects to read it.
-
-    OpenRouter streams these as deltas: consecutive text or summary entries are one logical
-    entry arriving in pieces, while an encrypted entry is opaque and stays discrete. Pushing
-    every delta as its own entry would replay the reasoning as hundreds of fragments.
-    """
-    last = details[-1] if details else None
-    kind = detail.get("type")
-    if kind == "reasoning.text" and last is not None and last.get("type") == "reasoning.text":
-        last["text"] = last.get("text", "") + detail.get("text", "")
-        if not last.get("signature") and detail.get("signature"):
-            last["signature"] = detail["signature"]
-        _fill_missing_common_reasoning_detail_fields(last, detail)
-        return
-    if kind == "reasoning.summary" and last is not None and last.get("type") == "reasoning.summary":
-        last["summary"] = last.get("summary", "") + detail.get("summary", "")
-        _fill_missing_common_reasoning_detail_fields(last, detail)
-        return
-    details.append(dict(detail))
-
-
-def parse_openai_reasoning_details(signature: str | None) -> list[dict[str, Any]] | None:
-    """A whole run of details, as stashed on a thinking block's signature."""
-    if not signature:
-        return None
-    try:
-        parsed = json.loads(signature)
-    except ValueError:
-        return None
-    if isinstance(parsed, list) and parsed and all(_is_openai_reasoning_detail(d) for d in parsed):
-        return parsed
-    return None
-
-
-def parse_legacy_encrypted_reasoning_detail(signature: str | None) -> dict[str, Any] | None:
-    """The older single-encrypted-entry form, stashed on a tool call instead."""
-    if not signature:
-        return None
-    try:
-        parsed = json.loads(signature)
-    except ValueError:
-        return None
-    if (
-        _is_openai_reasoning_detail(parsed)
-        and parsed.get("type") == "reasoning.encrypted"
-        and isinstance(parsed.get("id"), str)
-        and parsed["id"]
-        and parsed.get("data")
-    ):
-        return parsed
-    return None
-
-
-def _replay_tool_call(tool_call: ToolCall, grammar_properties: Mapping[str, str]) -> dict[str, Any]:
-    """One prior tool call, on whichever channel it came back from.
-
-    A grammar tool's call carried free text, not JSON arguments, and has to be replayed the
-    same way -- sending it back as a `function` call with stringified arguments is not the
-    message the model produced.
-    """
-    custom_input_property = grammar_properties.get(tool_call.name)
-    if custom_input_property is not None:
-        return {
-            "id": tool_call.id,
-            "type": "custom",
-            "custom": {
-                "name": tool_call.name,
-                "input": sanitize_surrogates(
-                    get_grammar_tool_input(tool_call.name, tool_call.arguments, custom_input_property)
-                ),
-            },
-        }
-    return {
-        "id": tool_call.id,
-        "type": "function",
-        "function": {"name": tool_call.name, "arguments": json.dumps(tool_call.arguments)},
-    }
+_TOOL_CALL_ID_DISALLOWED = re.compile(r"[^a-zA-Z0-9_-]")
 
 
 def convert_messages(
     model: Model,
     context: TranscriptContext,
     compat: Mapping[str, Any],
-    grammar_tool_input_properties: Mapping[str, str] | None = None,
+    options: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     normalized_context = resolve_transcript(context, compat.get("supportsMidConvoSystemMessages"))
     params: list[dict[str, Any]] = []
+    grammar_tool_input_properties = (options or {}).get("grammarToolInputProperties") or {}
 
-    def normalize_tool_call_id(tool_call_id: str, _target_model: Model, _source: AssistantMessage) -> str:
+    def normalize_tool_call_id(tool_call_id: str, _target_model: Any = None, _source: Any = None) -> str:
+        # Handle pipe-separated IDs from OpenAI Responses API
+        # Format: {call_id}|{id} where {id} can be 400+ chars with special chars (+, /, =)
+        # These come from providers like github-copilot, openai-codex, opencode
+        # Extract just the call_id part and normalize it
+        # Multiple tool calls in the same turn can share call_id but differ by item_id.
+        # Preserve item-level uniqueness when replaying into Chat Completions, which
+        # requires distinct tool call ids.
         if "|" in tool_call_id:
-            call_id, _, _ = tool_call_id.partition("|")
-            return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in call_id)[:40]
+            # Sanitize to allowed chars and truncate to 40 chars (OpenAI limit)
+            separator_index = tool_call_id.index("|")
+            call_id = _TOOL_CALL_ID_DISALLOWED.sub("_", tool_call_id[:separator_index])
+            item_id = _TOOL_CALL_ID_DISALLOWED.sub("_", tool_call_id[separator_index + 1 :])
+            combined_id = f"{call_id}_{item_id}" if len(item_id) > 0 else call_id
+            if len(combined_id) <= 40:
+                return combined_id
+            hash_value = short_hash(tool_call_id)[:8]
+            prefix = call_id[: max(1, 40 - len(hash_value) - 1)]
+            return f"{prefix}_{hash_value}"
+
         if model.provider == "openai":
-            return tool_call_id[:40]
+            return tool_call_id[:40] if len(tool_call_id) > 40 else tool_call_id
         return tool_call_id
 
     transformed_messages = transform_messages(normalized_context.messages, model, normalize_tool_call_id)
@@ -1046,182 +1039,192 @@ def convert_messages(
     instruction_role = "developer" if model.reasoning and compat.get("supportsDeveloperRole") else "system"
 
     last_role: str | None = None
-    index = 0
-    while index < len(transformed_messages):
-        message = transformed_messages[index]
-        if compat.get("requiresAssistantAfterToolResult") and last_role == "toolResult" and message.role == "user":
+
+    i = 0
+    while i < len(transformed_messages):
+        msg = transformed_messages[i]
+        # Some providers don't allow user messages directly after tool results
+        # Insert a synthetic assistant message to bridge the gap
+        if compat.get("requiresAssistantAfterToolResult") and last_role == "toolResult" and msg.role == "user":
             params.append({"role": "assistant", "content": "I have processed the tool results."})
 
-        if message.role == "system":
-            added_tools = (message.toolsAdded or []) if index > 0 and transcript_tools.anchorsAdditions else []
+        if msg.role == "system":
+            added_tools = (msg.toolsAdded or []) if i > 0 and transcript_tools.anchorsAdditions else []
             if len(added_tools) > 0:
-                # Kimi accepts a system message with tools but omits the standard content field.
                 kimi_tool_message = {"role": "system", "tools": convert_tools(added_tools, compat)}
                 params.append(kimi_tool_message)
-            text = get_system_message_text(message) if index == 0 else render_system_message_update(message)
+            text = get_system_message_text(msg) if i == 0 else render_system_message_update(msg)
             if len(text) > 0:
                 params.append({"role": instruction_role, "content": sanitize_surrogates(text)})
-            last_role = message.role
-            index += 1
-            continue
-
-        if message.role == "user":
-            if isinstance(message.content, str):
-                params.append({"role": "user", "content": sanitize_surrogates(message.content)})
+        elif msg.role == "user":
+            if isinstance(msg.content, str):
+                params.append({"role": "user", "content": sanitize_surrogates(msg.content)})
             else:
-                content: list[dict[str, Any]] = []
-                for item in message.content:
-                    if item.type == "text" and len(item.text) == 0:
-                        # An image-only message must not carry an empty text part; some
-                        # OpenAI-compatible providers reject it (pi #9797).
-                        continue
-                    if item.type == "text":
-                        content.append({"type": "text", "text": sanitize_surrogates(item.text)})
-                    else:
-                        content.append(
-                            {"type": "image_url", "image_url": {"url": f"data:{item.mimeType};base64,{item.data}"}}
-                        )
-                if content:
-                    params.append({"role": "user", "content": content})
-            last_role = message.role
-            index += 1
-            continue
-
-        if message.role == "assistant":
-            assistant_message: dict[str, Any] = {
+                content = [
+                    {"type": "text", "text": sanitize_surrogates(item.text)}
+                    if item.type == "text"
+                    else {"type": "image_url", "image_url": {"url": f"data:{item.mimeType};base64,{item.data}"}}
+                    for item in msg.content
+                    if item.type != "text" or len(item.text) > 0
+                ]
+                if len(content) == 0:
+                    i += 1
+                    continue
+                params.append({"role": "user", "content": content})
+        elif msg.role == "assistant":
+            # Some providers don't accept null content, use empty string instead
+            assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": "" if compat.get("requiresAssistantAfterToolResult") else None,
             }
 
             assistant_text_parts = [
                 {"type": "text", "text": sanitize_surrogates(block.text)}
-                for block in message.content
-                if block.type == "text" and block.text.strip()
+                for block in msg.content
+                if block.type == "text" and len(block.text.strip()) > 0
             ]
             assistant_text = "".join(part["text"] for part in assistant_text_parts)
 
-            thinking_blocks = [block for block in message.content if block.type == "thinking"]
-            tool_calls = [block for block in message.content if block.type == "toolCall"]
-            # A whole run stashed on a thinking block wins over the older per-tool-call
-            # single encrypted entry, which is what upstream falls back to.
-            preserved_reasoning_details: list[dict[str, Any]] | None = next(
+            thinking_blocks = [block for block in msg.content if block.type == "thinking"]
+            tool_calls = [block for block in msg.content if block.type == "toolCall"]
+            signed_reasoning_details = next(
                 (
-                    parsed
-                    for parsed in (
-                        parse_openai_reasoning_details(block.thinkingSignature)
-                        for block in thinking_blocks
-                    )
-                    if parsed is not None
+                    details
+                    for details in (parse_openai_reasoning_details(block.thinkingSignature) for block in thinking_blocks)
+                    if details is not None
                 ),
                 None,
             )
-            if preserved_reasoning_details is None:
-                legacy = [
-                    detail
-                    for detail in (
-                        parse_legacy_encrypted_reasoning_detail(tool_call.thoughtSignature)
-                        for tool_call in tool_calls
-                    )
-                    if detail is not None
-                ]
-                preserved_reasoning_details = legacy or None
+            legacy_reasoning_details = [
+                detail
+                for detail in (
+                    parse_legacy_encrypted_reasoning_detail(tool_call.thoughtSignature) for tool_call in tool_calls
+                )
+                if detail is not None
+            ]
+            preserved_reasoning_details = signed_reasoning_details or (legacy_reasoning_details or None)
 
-            non_empty_thinking_blocks = [block for block in thinking_blocks if block.thinking.strip()]
-            if non_empty_thinking_blocks:
+            non_empty_thinking_blocks = [block for block in thinking_blocks if len(block.thinking.strip()) > 0]
+            if len(non_empty_thinking_blocks) > 0:
                 if compat.get("requiresThinkingAsText"):
+                    # Convert thinking blocks to plain text (no tags to avoid model mimicking them)
                     thinking_text = "\n\n".join(sanitize_surrogates(block.thinking) for block in non_empty_thinking_blocks)
-                    assistant_message["content"] = [{"type": "text", "text": thinking_text}, *assistant_text_parts]
+                    assistant_msg["content"] = [{"type": "text", "text": thinking_text}, *assistant_text_parts]
                 else:
-                    if assistant_text:
-                        assistant_message["content"] = assistant_text
-                    # The structured `reasoning_details` is the alternative to a raw
-                    # reasoning field, not a companion to it: sending both replays the
-                    # same reasoning twice, once in a shape the endpoint cannot match up.
+                    # Always send assistant content as a plain string (OpenAI Chat Completions
+                    # API standard format). Sending as an array of {type:"text", text:"..."}
+                    # objects is non-standard and causes some models (e.g. DeepSeek V3.2 via
+                    # NVIDIA NIM) to mirror the content-block structure literally in their
+                    # output, producing recursive nesting like [{'type':'text','text':'[{...}]'}].
+                    if len(assistant_text) > 0:
+                        assistant_msg["content"] = assistant_text
+
+                    # reasoning_details is the structured alternative to a raw reasoning field.
                     if not preserved_reasoning_details:
+                        # Use the signature from the first thinking block if available (for llama.cpp server + gpt-oss)
                         signature = non_empty_thinking_blocks[0].thinkingSignature
                         if model.provider == "opencode-go" and signature == "reasoning":
                             signature = "reasoning_content"
-                        if is_openai_completions_reasoning_field(signature):
-                            assistant_message[signature] = "\n".join(
-                                block.thinking for block in non_empty_thinking_blocks
-                            )
-            elif assistant_text:
-                assistant_message["content"] = assistant_text
+                        if signature and is_openai_completions_reasoning_field(signature):
+                            assistant_msg[signature] = "\n".join(block.thinking for block in non_empty_thinking_blocks)
+            elif len(assistant_text) > 0:
+                # Always send assistant content as a plain string (see above).
+                assistant_msg["content"] = assistant_text
 
-            if tool_calls:
-                assistant_message["tool_calls"] = [
-                    _replay_tool_call(tool_call, grammar_tool_input_properties or {})
-                    for tool_call in tool_calls
-                ]
-
-            # Outside the tool-call branch, as upstream is: a turn that only thought and
-            # answered still has reasoning to replay.
+            if len(tool_calls) > 0:
+                assistant_msg["tool_calls"] = []
+                for tool_call in tool_calls:
+                    custom_input_property = grammar_tool_input_properties.get(tool_call.name)
+                    if custom_input_property is not None:
+                        assistant_msg["tool_calls"].append({
+                            "id": tool_call.id,
+                            "type": "custom",
+                            "custom": {
+                                "name": tool_call.name,
+                                "input": sanitize_surrogates(
+                                    get_grammar_tool_input(tool_call.name, tool_call.arguments, custom_input_property)
+                                ),
+                            },
+                        })
+                    else:
+                        assistant_msg["tool_calls"].append({
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.name,
+                                "arguments": json.dumps(tool_call.arguments, separators=(",", ":"), ensure_ascii=False),
+                            },
+                        })
             if preserved_reasoning_details:
-                assistant_message["reasoning_details"] = preserved_reasoning_details
-
+                assistant_msg["reasoning_details"] = preserved_reasoning_details
             if (
                 compat.get("requiresReasoningContentOnAssistantMessages")
                 and model.reasoning
-                and "reasoning_content" not in assistant_message
+                and "reasoning_content" not in assistant_msg
             ):
-                assistant_message["reasoning_content"] = ""
-
-            content = assistant_message.get("content")
-            has_content = content is not None and (len(content) > 0 if isinstance(content, (str, list)) else True)
-            if not has_content and "tool_calls" not in assistant_message:
-                index += 1
+                assistant_msg["reasoning_content"] = ""
+            # Skip assistant messages that have no content and no tool calls.
+            # Some providers require "either content or tool_calls, but not none".
+            # Other providers also don't accept empty assistant messages.
+            # This handles aborted assistant responses that got no content.
+            content = assistant_msg["content"]
+            has_content = content is not None and len(content) > 0
+            if not has_content and "tool_calls" not in assistant_msg:
+                i += 1
                 continue
-            params.append(assistant_message)
-            last_role = message.role
-            index += 1
-            continue
-
-        if message.role == "toolResult":
+            params.append(assistant_msg)
+        elif msg.role == "toolResult":
             image_blocks: list[dict[str, Any]] = []
-            lookahead = index
-            while lookahead < len(transformed_messages) and transformed_messages[lookahead].role == "toolResult":
-                tool_message = transformed_messages[lookahead]
-                if not isinstance(tool_message, ToolResultMessage):
-                    break
+            j = i
 
-                text_result = "\n".join(block.text for block in tool_message.content if block.type == "text")
-                has_images = any(block.type == "image" for block in tool_message.content)
-                tool_result_message: dict[str, Any] = {
+            while j < len(transformed_messages) and transformed_messages[j].role == "toolResult":
+                tool_msg: ToolResultMessage = transformed_messages[j]
+
+                # Extract text and image content
+                text_result = "\n".join(block.text for block in tool_msg.content if block.type == "text")
+                has_images = any(block.type == "image" for block in tool_msg.content)
+
+                # Always send tool result with text (or placeholder if only images)
+                has_text = len(text_result) > 0
+                tool_result_text = text_result if has_text else "(see attached image)" if has_images else "(no tool output)"
+                # Some providers require the 'name' field in tool results
+                tool_result_msg: dict[str, Any] = {
                     "role": "tool",
-                    "content": sanitize_surrogates(text_result if text_result else "(see attached image)"),
-                    "tool_call_id": tool_message.toolCallId,
+                    "content": sanitize_surrogates(tool_result_text),
+                    "tool_call_id": tool_msg.toolCallId,
                 }
-                if compat.get("requiresToolResultName") and tool_message.toolName:
-                    tool_result_message["name"] = tool_message.toolName
-                params.append(tool_result_message)
+                if compat.get("requiresToolResultName") and tool_msg.toolName:
+                    tool_result_msg["name"] = tool_msg.toolName
+                params.append(tool_result_msg)
 
                 if has_images and "image" in model.input:
-                    for block in tool_message.content:
+                    for block in tool_msg.content:
                         if block.type == "image":
-                            image_blocks.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
-                                }
-                            )
-                lookahead += 1
+                            image_blocks.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
+                            })
+                j += 1
 
-            if image_blocks:
+            i = j - 1
+
+            if len(image_blocks) > 0:
                 if compat.get("requiresAssistantAfterToolResult"):
                     params.append({"role": "assistant", "content": "I have processed the tool results."})
-                params.append(
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": "Attached image(s) from tool result:"}, *image_blocks],
-                    }
-                )
+
+                params.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Attached image(s) from tool result:"}, *image_blocks],
+                })
                 last_role = "user"
             else:
                 last_role = "toolResult"
-            index = lookahead
+
+            i += 1
             continue
 
-        index += 1
+        last_role = msg.role
+        i += 1
 
     return params
 
@@ -1229,63 +1232,61 @@ def convert_messages(
 def convert_tools(tools: list[Tool], compat: Mapping[str, Any]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for tool in tools:
-        grammar = resolve_grammar_constrained_sampling(
-            tool, bool(compat.get("supportsOpenAIGrammarTools"))
-        )
+        grammar = resolve_grammar_constrained_sampling(tool, bool(compat.get("supportsOpenAIGrammarTools")))
         if grammar:
-            # A grammar tool is not a function tool: the model emits free text the grammar
-            # constrains, and it comes back as a `custom` tool call rather than JSON
-            # arguments. Note the extra nesting -- completions wraps the grammar one level
-            # deeper than the responses API does.
-            converted.append(
-                {
-                    "type": "custom",
-                    "custom": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "format": {
-                            "type": "grammar",
-                            "grammar": {"syntax": grammar.format, "definition": grammar.definition},
-                        },
+            converted.append({
+                "type": "custom",
+                "custom": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "format": {
+                        "type": "grammar",
+                        "grammar": {"syntax": grammar.format, "definition": grammar.definition},
                     },
-                }
-            )
+                },
+            })
             continue
 
         strict = resolve_json_schema_strict_sampling(tool, compat.get("supportsStrictMode") is not False)
-        function_spec: dict[str, Any] = {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": get_json_schema_tool_parameters(tool, strict),
-        }
-        # Only sent where the provider understands it; some reject unknown fields.
-        if compat.get("supportsStrictMode") is not False:
-            function_spec["strict"] = strict if strict is not None else False
-        converted.append({"type": "function", "function": function_spec})
+        converted.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": get_json_schema_tool_parameters(tool, strict),
+                # Only include strict if provider supports it. Some reject unknown fields.
+                **({"strict": _coalesce(strict, False)} if compat.get("supportsStrictMode") is not False else {}),
+            },
+        })
     return converted
 
 
 def parse_chunk_usage(raw_usage: Mapping[str, Any], model: Model) -> Usage:
-    prompt_tokens = int(raw_usage.get("prompt_tokens") or 0)
-    prompt_details = raw_usage.get("prompt_tokens_details")
-    prompt_details = prompt_details if isinstance(prompt_details, Mapping) else {}
-    # Where providers put cache hits (pi parseChunkUsage): OpenAI/OpenRouter in
-    # prompt_tokens_details, DeepSeek as prompt_cache_hit_tokens, Kimi at the top level.
-    cache_read_tokens = int(prompt_details.get("cached_tokens") or raw_usage.get("prompt_cache_hit_tokens")
-                            or raw_usage.get("cached_tokens") or 0)
-    cache_write_tokens = int(prompt_details.get("cache_write_tokens") or 0)
-    input_tokens = max(0, prompt_tokens - cache_read_tokens - cache_write_tokens)
-    # completion_tokens already includes the reasoning tokens; the breakdown is reported apart.
-    output_tokens = int(raw_usage.get("completion_tokens") or 0)
-    completion_details = raw_usage.get("completion_tokens_details")
-    completion_details = completion_details if isinstance(completion_details, Mapping) else {}
+    prompt_tokens = raw_usage.get("prompt_tokens") or 0
+    prompt_details = raw_usage.get("prompt_tokens_details") or {}
+    cache_read_tokens = _coalesce(
+        prompt_details.get("cached_tokens"),
+        _coalesce(raw_usage.get("prompt_cache_hit_tokens"), _coalesce(raw_usage.get("cached_tokens"), 0)),
+    )
+    cache_write_tokens = prompt_details.get("cache_write_tokens") or 0
 
+    # Follow documented OpenAI/OpenRouter semantics: cached_tokens is cache-read
+    # tokens (hits). Providers disagree on placement: OpenAI/OpenRouter use
+    # prompt_tokens_details.cached_tokens, DeepSeek uses prompt_cache_hit_tokens,
+    # and Kimi documents top-level usage.cached_tokens on the final usage chunk.
+    # OpenAI does not document or emit cache_write_tokens, but
+    # OpenRouter-compatible providers can include it as a separate write count.
+    # Do not subtract writes from cached_tokens, otherwise spec-compliant
+    # providers are under-reported.
+    input_tokens = max(0, prompt_tokens - cache_read_tokens - cache_write_tokens)
+    # OpenAI completion_tokens already includes reasoning_tokens.
+    output_tokens = raw_usage.get("completion_tokens") or 0
     usage = Usage(
         input=input_tokens,
         output=output_tokens,
         cacheRead=cache_read_tokens,
         cacheWrite=cache_write_tokens,
-        reasoning=int(completion_details.get("reasoning_tokens") or 0),
+        reasoning=(raw_usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0,
         totalTokens=input_tokens + output_tokens + cache_read_tokens + cache_write_tokens,
         cost=UsageCost(input=0, output=0, cacheRead=0, cacheWrite=0, total=0),
     )
@@ -1310,18 +1311,25 @@ def map_stop_reason(reason: str | None) -> dict[str, str]:
 
 
 def detect_compat(model: Model) -> dict[str, Any]:
+    """Auto-detect compatibility settings from provider name and baseUrl.
+
+    Used as the base when model.compat is not set; explicit model.compat entries override
+    these detected values.
+    """
     provider = model.provider
     base_url = model.baseUrl
 
     is_zai = provider in {"zai", "zai-coding-cn"} or "api.z.ai" in base_url or "open.bigmodel.cn" in base_url
     is_together = provider == "together" or "api.together.ai" in base_url or "api.together.xyz" in base_url
     is_moonshot = provider in {"moonshotai", "moonshotai-cn"} or "api.moonshot." in base_url
-    is_openrouter = provider == "openrouter" or "openrouter.ai" in base_url
+    is_open_router = provider == "openrouter" or "openrouter.ai" in base_url
     is_cloudflare_workers_ai = provider == "cloudflare-workers-ai" or "api.cloudflare.com" in base_url
     is_cloudflare_ai_gateway = provider == "cloudflare-ai-gateway" or "gateway.ai.cloudflare.com" in base_url
     is_nvidia = provider == "nvidia" or "integrate.api.nvidia.com" in base_url
+    is_ant_ling = provider == "ant-ling" or "api.ant-ling.com" in base_url
     is_cerebras = provider == "cerebras" or "cerebras.ai" in base_url
-    is_deepseek = provider == "deepseek" or "deepseek.com" in base_url.lower()
+    is_deep_seek = provider == "deepseek" or "deepseek.com" in base_url.lower()
+
     is_non_standard = (
         is_nvidia
         or is_cerebras
@@ -1329,73 +1337,83 @@ def detect_compat(model: Model) -> dict[str, Any]:
         or "api.x.ai" in base_url
         or is_together
         or "chutes.ai" in base_url
-        or is_deepseek
+        or is_deep_seek
         or is_zai
         or is_moonshot
         or provider == "opencode"
         or "opencode.ai" in base_url
         or is_cloudflare_workers_ai
         or is_cloudflare_ai_gateway
+        or is_ant_ling
     )
+
     use_max_tokens = (
         "chutes.ai" in base_url
-        or is_deepseek
+        or is_deep_seek
         or is_moonshot
         or is_cloudflare_ai_gateway
         or is_together
         or is_nvidia
+        or is_ant_ling
         or is_zai
     )
+
     is_grok = provider == "xai" or "api.x.ai" in base_url
-    is_openrouter_developer_role_model = is_openrouter and model.id.startswith(("anthropic/", "openai/"))
+    is_open_router_developer_role_model = is_open_router and model.id.startswith(("anthropic/", "openai/"))
     cache_control_format = "anthropic" if provider == "openrouter" and model.id.startswith("anthropic/") else None
 
     return {
         "supportsStore": not is_non_standard,
-        "supportsDeveloperRole": is_openrouter_developer_role_model or (not is_non_standard and not is_openrouter),
+        "supportsDeveloperRole": is_open_router_developer_role_model or (not is_non_standard and not is_open_router),
         "supportsReasoningEffort": not (
-            is_grok or is_zai or is_moonshot or is_together or is_cloudflare_ai_gateway or is_nvidia
+            is_grok or is_zai or is_moonshot or is_together or is_cloudflare_ai_gateway or is_nvidia or is_ant_ling
         ),
         "supportsUsageInStreaming": True,
+        "supportsFinishReason": True,
         "maxTokensField": "max_tokens" if use_max_tokens else "max_completion_tokens",
         "requiresToolResultName": False,
         "requiresAssistantAfterToolResult": False,
         "requiresThinkingAsText": False,
-        "requiresReasoningContentOnAssistantMessages": is_deepseek,
+        "requiresReasoningContentOnAssistantMessages": is_deep_seek,
         "thinkingFormat": (
             "deepseek"
-            if is_deepseek
+            if is_deep_seek
             else "zai"
             if is_zai
             else "together"
             if is_together
+            else "ant-ling"
+            if is_ant_ling
             else "openrouter"
-            if is_openrouter
+            if is_open_router
             else "openai"
         ),
         "openRouterRouting": {},
         "vercelGatewayRouting": {},
+        "chatTemplateKwargs": {},
+        "chatTemplateArgs": {},
         "zaiToolStream": False,
+        "supportsThinkingTokenBudget": False,
+        "thinkingTokenBudgetField": None,
         # OpenAI compatibility alone does not imply strict JSON-schema tool support.
         "supportsStrictMode": False,
+        "supportsOpenAIGrammarTools": False,
         "supportsMidConvoSystemMessages": False,
         "supportsMidConvoToolAdditions": False,
         "cacheControlFormat": cache_control_format,
-        "sendSessionAffinityHeaders": is_openrouter,
-        "sessionAffinityFormat": "openrouter" if is_openrouter else "openai",
-        "chatTemplateKwargs": {},
-        "chatTemplateArgs": {},
-        "supportsThinkingTokenBudget": False,
-        "thinkingTokenBudgetField": None,
-        "supportsOpenAIGrammarTools": False,
-        "supportsFinishReason": True,
+        "sendSessionAffinityHeaders": is_open_router,
+        "sessionAffinityFormat": "openrouter" if is_open_router else "openai",
         "supportsLongCacheRetention": not (
-            is_together or is_cloudflare_workers_ai or is_cloudflare_ai_gateway or is_nvidia
+            is_together or is_cloudflare_workers_ai or is_cloudflare_ai_gateway or is_nvidia or is_ant_ling
         ),
     }
 
 
 def get_compat(model: Model) -> dict[str, Any]:
+    """Get resolved compatibility settings for a model.
+
+    Auto-detects from provider/URL then overrides with explicit model.compat.
+    """
     detected = detect_compat(model)
     compat = model.compat
     if compat is None:
@@ -1406,6 +1424,7 @@ def get_compat(model: Model) -> dict[str, Any]:
         "supportsDeveloperRole": read_field(compat, "supportsDeveloperRole", detected["supportsDeveloperRole"]),
         "supportsReasoningEffort": read_field(compat, "supportsReasoningEffort", detected["supportsReasoningEffort"]),
         "supportsUsageInStreaming": read_field(compat, "supportsUsageInStreaming", detected["supportsUsageInStreaming"]),
+        "supportsFinishReason": read_field(compat, "supportsFinishReason", detected["supportsFinishReason"]),
         "maxTokensField": read_field(compat, "maxTokensField", detected["maxTokensField"]),
         "requiresToolResultName": read_field(compat, "requiresToolResultName", detected["requiresToolResultName"]),
         "requiresAssistantAfterToolResult": read_field(
@@ -1420,20 +1439,14 @@ def get_compat(model: Model) -> dict[str, Any]:
         "thinkingFormat": read_field(compat, "thinkingFormat", detected["thinkingFormat"]),
         "openRouterRouting": read_field(compat, "openRouterRouting", {}),
         "vercelGatewayRouting": read_field(compat, "vercelGatewayRouting", detected["vercelGatewayRouting"]),
-        "zaiToolStream": read_field(compat, "zaiToolStream", detected["zaiToolStream"]),
-        "supportsStrictMode": read_field(compat, "supportsStrictMode", detected["supportsStrictMode"]),
-        "cacheControlFormat": read_field(compat, "cacheControlFormat", detected["cacheControlFormat"]),
-        "sessionAffinityFormat": read_field(
-            compat, "sessionAffinityFormat", detected["sessionAffinityFormat"]
-        ),
         "chatTemplateKwargs": read_field(compat, "chatTemplateKwargs", detected["chatTemplateKwargs"]),
         "chatTemplateArgs": read_field(compat, "chatTemplateArgs", detected["chatTemplateArgs"]),
+        "zaiToolStream": read_field(compat, "zaiToolStream", detected["zaiToolStream"]),
         "supportsThinkingTokenBudget": read_field(
             compat, "supportsThinkingTokenBudget", detected["supportsThinkingTokenBudget"]
         ),
-        "thinkingTokenBudgetField": read_field(
-            compat, "thinkingTokenBudgetField", detected["thinkingTokenBudgetField"]
-        ),
+        "thinkingTokenBudgetField": read_field(compat, "thinkingTokenBudgetField", detected["thinkingTokenBudgetField"]),
+        "supportsStrictMode": read_field(compat, "supportsStrictMode", detected["supportsStrictMode"]),
         "supportsOpenAIGrammarTools": read_field(
             compat, "supportsOpenAIGrammarTools", detected["supportsOpenAIGrammarTools"]
         ),
@@ -1443,10 +1456,11 @@ def get_compat(model: Model) -> dict[str, Any]:
         "supportsMidConvoToolAdditions": read_field(
             compat, "supportsMidConvoToolAdditions", detected["supportsMidConvoToolAdditions"]
         ),
-        "supportsFinishReason": read_field(compat, "supportsFinishReason", detected["supportsFinishReason"]),
+        "cacheControlFormat": read_field(compat, "cacheControlFormat", detected["cacheControlFormat"]),
         "sendSessionAffinityHeaders": read_field(
             compat, "sendSessionAffinityHeaders", detected["sendSessionAffinityHeaders"]
         ),
+        "sessionAffinityFormat": read_field(compat, "sessionAffinityFormat", detected["sessionAffinityFormat"]),
         "supportsLongCacheRetention": read_field(
             compat, "supportsLongCacheRetention", detected["supportsLongCacheRetention"]
         ),
@@ -1454,23 +1468,27 @@ def get_compat(model: Model) -> dict[str, Any]:
     }
 
 
-async def _create_completion_stream(client: Any, params: dict[str, Any], options: Any, model: Model) -> Any:
-    signal = _option(options, "signal")
-    request_client = client
-    request_client_kwargs: dict[str, Any] = {}
-    timeout_ms = _option(options, "timeoutMs")
-    if timeout_ms is not None:
-        request_client_kwargs["timeout"] = timeout_ms / 1000
-    # Upstream disables the SDK's own retry and retries the request itself
-    # (`maxRetries: 0` in its requestOptions), so the policy that decides *what* is
-    # worth retrying is `utils/provider_retry`, not whichever heuristic the SDK ships.
-    request_client_kwargs["max_retries"] = 0
-    if request_client_kwargs and hasattr(client, "with_options"):
-        request_client = client.with_options(**request_client_kwargs)
+# --- MISAKA: Python SDK plumbing ---------------------------------------------------------
 
-    if hasattr(getattr(getattr(request_client, "chat", None), "completions", None), "with_raw_response"):
+
+async def _create_completion_stream(
+    client: Any, params: dict[str, Any], options: Any, model: Model, request_headers: dict[str, Any] | None = None
+) -> Any:
+    """``client.chat.completions.create(params, {signal, timeout, maxRetries: 0}).withResponse()``.
+
+    The SDK's own retry is always off: ``utils/provider_retry`` decides what is worth retrying.
+    """
+    signal = _option(options, "signal")
+    request_options: dict[str, Any] = {"max_retries": 0}
+    if _option(options, "timeoutMs") is not None:
+        request_options["timeout"] = _option(options, "timeoutMs") / 1000
+    request_client = client.with_options(**request_options) if hasattr(client, "with_options") else client
+    completions = request_client.chat.completions
+    call_options = {"extra_headers": dict(request_headers)} if request_headers else {}
+
+    if hasattr(completions, "with_raw_response"):
         raw_response = await _await_maybe_with_signal(
-            request_client.chat.completions.with_raw_response.create(**params),
+            completions.with_raw_response.create(**split_sdk_params(completions.create, params), **call_options),
             signal,
         )
         on_response = _option(options, "onResponse")
@@ -1486,27 +1504,17 @@ async def _create_completion_stream(client: Any, params: dict[str, Any], options
             )
         return await _await_maybe_with_signal(raw_response.parse(), signal)
 
-    created = await _await_maybe_with_signal(request_client.chat.completions.create(**params), signal)
-    if hasattr(created, "withResponse"):
-        wrapped = await _await_maybe_with_signal(created.withResponse(), signal)
-        on_response = _option(options, "onResponse")
-        if callable(on_response):
-            await maybe_await(
-                on_response(
-                    {"status": wrapped["response"].status, "headers": headers_to_record(wrapped["response"].headers)},
-                    model,
-                )
-            )
-        return wrapped["data"]
-    return created
+    return await _await_maybe_with_signal(
+        completions.create(**split_sdk_params(completions.create, params), **call_options), signal
+    )
 
 
 async def _iterate_stream(stream_obj: Any, signal: Any = None) -> AsyncIterator[dict[str, Any]]:
-    # One abort task for the whole stream (_iterate_async_iterable), not one per SSE item: a task
-    # per item cost several loop turns per event, which a busy TUI turned into a stream that fell
-    # minutes behind the provider (GitHub issue #6).
-    # Closed with this generator, so its abort task goes with it (a turn that ended in an
-    # error left a pending signal.wait() behind until the cyclic GC destroyed it).
+    # MISAKA fork: one abort task for the whole stream (_iterate_async_iterable), not one per SSE
+    # item: a task per item cost several loop turns per event, which a busy TUI turned into a stream
+    # that fell minutes behind the provider (GitHub issue #6). Closed with this generator, so its
+    # abort task goes with it (a turn that ended in an error left a pending signal.wait() behind
+    # until the cyclic GC destroyed it).
     async with contextlib.aclosing(
             _iterate_async_iterable(stream_obj, signal, on_abort=lambda: _close_stream(stream_obj))) as items:
         async for chunk in items:
@@ -1519,32 +1527,6 @@ async def _iterate_stream(stream_obj: Any, signal: Any = None) -> AsyncIterator[
                 yield chunk
                 continue
             yield json.loads(json.dumps(chunk, default=lambda value: value.__dict__))
-
-
-def _format_completion_error(error: Any) -> str:
-    if not isinstance(error, Exception):
-        return json.dumps(error, default=str)
-    message = str(error)
-    # The SDK's "Connection error." says nothing of what failed; the transport exception it was
-    # raised from does (a read timeout, a reset, a peer that closed mid-body). Name the innermost
-    # one so a report can tell them apart (GitHub issue #6). The SDK's text stays first, which is
-    # what the retry classifier matches on.
-    cause = error.__cause__
-    for _ in range(8):  # a chain is a handful deep; the bound only guards `raise e from e`
-        if cause is None or cause.__cause__ is None:
-            break
-        cause = cause.__cause__
-    if cause is None:
-        return message
-    name = type(cause).__name__
-    if name == "LocalProtocolError":
-        # The request this side built was refused before it was sent, and the refusal quotes it:
-        # an API key with a trailing space or line break came back whole (0.18.9 sweep).
-        return f"{message} ({name}: the request could not be sent -- does the API key end in a space or a line break?)"
-    from misaka.utils.redact import redact
-    detail = redact(str(cause)).strip()
-    said = f"({name}: {detail})" if detail and detail != message.strip() else f"({name})"
-    return f"{message} {said}" if message.strip() else said
 
 
 streamOpenAICompletions = stream_openai_completions
@@ -1562,7 +1544,6 @@ __all__ = [
     "has_tool_history",
     "map_stop_reason",
     "parse_chunk_usage",
-    "resolve_cache_retention",
     "streamOpenAICompletions",
     "streamSimpleOpenAICompletions",
     "stream_openai_completions",

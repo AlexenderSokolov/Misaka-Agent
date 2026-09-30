@@ -22,6 +22,8 @@ from misaka.ai.types import (
     Model,
     ProviderStreamOptions,
     SimpleStreamOptions,
+    TextContent,
+    ToolCall,
     UserMessage,
 )
 from misaka.ai.utils.event_stream import AssistantMessageEventStream
@@ -101,8 +103,8 @@ async def test_model_sampling_params_apply_with_request_keys_taking_precedence(a
 
     payload = await _capture_payload(model, samplingParams={"top_p": 0.5})
 
-    assert payload["extra_body"]["top_p"] == 0.5
-    assert payload["extra_body"]["min_p"] == 0.05
+    assert payload["top_p"] == 0.5
+    assert payload["min_p"] == 0.05
 
 
 # --- mistral-reasoning-mode.test.ts --------------------------------------------------------
@@ -889,3 +891,192 @@ def test_env_api_key_reads_scoped_env_first(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_OAUTH_TOKEN", raising=False)
     assert get_env_api_key("anthropic") is None
+
+
+# --- B1b-2: OpenAI completions / responses / azure --------------------------------------------
+
+
+def _openai_wire(monkeypatch, module, sse_body: str):
+    import httpx2  # the OpenAI SDK's own HTTP client
+
+    requests: list = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx2.Response(200, text=sse_body, headers={"content-type": "text/event-stream"})
+
+    original = module.create_client
+
+    def create_client(*args, **kwargs):
+        client, request_headers = original(*args, **kwargs)
+        client._client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler), base_url=str(client.base_url))
+        return client, request_headers
+
+    monkeypatch.setattr(module, "create_client", create_client)
+    return requests
+
+
+_COMPLETIONS_SSE = (
+    'data: {"id":"c1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,'
+    '"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+    'data: {"id":"c1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,'
+    '"delta":{},"finish_reason":"stop"}]}\n\n'
+    "data: [DONE]\n\n"
+)
+
+
+async def test_completions_sends_the_request_body_with_upstream_top_level_fields(monkeypatch):
+    requests = _openai_wire(monkeypatch, openai_completions, _COMPLETIONS_SSE)
+    model = _model(
+        "openai-completions",
+        reasoning=True,
+        compat={"thinkingFormat": "qwen-chat-template"},
+        samplingParams={"top_k": 20},
+    )
+
+    result = await openai_completions.stream_openai_completions(
+        model,
+        normalize_context(CONTEXT),
+        {"apiKey": "k", "reasoningEffort": "high", "headers": {"Authorization": None, "x-extra": "1"}},
+    ).result()
+
+    assert result.stopReason == "stop", result.errorMessage
+    assert result.rawStopReason == "stop"
+    [request] = requests
+    body = json.loads(request.content)
+    assert body["chat_template_kwargs"] == {"enable_thinking": True, "preserve_thinking": True}
+    assert body["top_k"] == 20
+    assert None not in body.values()
+    assert "authorization" not in request.headers and request.headers["x-extra"] == "1"
+
+
+async def test_completions_header_owned_auth_uses_the_unused_key(monkeypatch):
+    requests = _openai_wire(monkeypatch, openai_completions, _COMPLETIONS_SSE)
+
+    result = await openai_completions.stream_openai_completions(
+        _model("openai-completions"), normalize_context(CONTEXT), {"headers": {"cf-aig-authorization": "Bearer gw"}}
+    ).result()
+
+    assert result.stopReason == "stop", result.errorMessage
+    assert requests[0].headers["cf-aig-authorization"] == "Bearer gw"
+    with pytest.raises(RuntimeError, match="No API key for provider: fixture"):
+        openai_completions.stream_simple_openai_completions(_model("openai-completions"), normalize_context(CONTEXT))
+
+
+def test_completions_usage_reads_kimi_top_level_cached_tokens_and_reasoning():
+    usage = openai_completions.parse_chunk_usage(
+        {"prompt_tokens": 100, "completion_tokens": 20, "cached_tokens": 30,
+         "completion_tokens_details": {"reasoning_tokens": 7}},
+        _model("openai-completions"),
+    )
+
+    assert (usage.input, usage.cacheRead, usage.output, usage.reasoning) == (70, 30, 20, 7)
+
+
+def test_completions_replays_pipe_ids_with_their_item_ids():
+    from misaka.ai.types import ToolResultMessage
+
+    model = _model("openai-completions", provider="openai")
+    source = _output(_model("openai-responses", provider="openai")).model_copy(update={
+        "content": [
+            ToolCall(id="call_1|fc_a", name="t", arguments={}),
+            ToolCall(id="call_1|fc_b", name="t", arguments={}),
+            ToolCall(id="call_2|" + "x" * 60, name="t", arguments={}),
+        ],
+        "stopReason": "toolUse",
+    })
+    results = [
+        ToolResultMessage(toolCallId=call.id, toolName="t", content=[], isError=False, timestamp=0)
+        for call in source.content
+    ]
+    messages = openai_completions.convert_messages(
+        model, normalize_context(Context(messages=[UserMessage(content="q", timestamp=0), source, *results])),
+        openai_completions.get_compat(model),
+    )
+
+    ids = [call["id"] for call in messages[1]["tool_calls"]]
+    assert ids[:2] == ["call_1_fc_a", "call_1_fc_b"]
+    assert len(ids[2]) <= 40 and ids[2].startswith("call_2_")
+    assert [m["content"] for m in messages[2:]] == ["(no tool output)"] * 3
+
+
+def test_completions_cache_breakpoint_lands_on_a_trailing_tool_result():
+    from misaka.ai.types import ToolResultMessage
+
+    model = _model("openai-completions", provider="openrouter", id="anthropic/claude-x", baseUrl="https://openrouter.ai/api/v1")
+    call = ToolCall(id="call_1", name="t", arguments={})
+    source = _output(model).model_copy(update={"content": [call], "stopReason": "toolUse"})
+    context = Context(messages=[
+        UserMessage(content="q", timestamp=0),
+        source,
+        ToolResultMessage(toolCallId="call_1", toolName="t", content=[TextContent(text="r")], isError=False, timestamp=0),
+    ])
+
+    params = openai_completions.build_params(model, normalize_context(context), {"cacheRetention": "short"})
+
+    assert params["messages"][-1]["role"] == "tool"
+    assert params["messages"][-1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_completions_detects_ant_ling():
+    compat = openai_completions.detect_compat(_model("openai-completions", provider="ant-ling"))
+
+    assert (compat["thinkingFormat"], compat["maxTokensField"], compat["supportsReasoningEffort"]) == (
+        "ant-ling", "max_tokens", False,
+    )
+
+
+async def test_completions_stream_without_finish_reason_is_an_error(monkeypatch):
+    async def chunks():
+        yield {"id": "c1", "choices": [{"index": 0, "delta": {"content": "half"}}]}
+
+    monkeypatch.setattr(openai_completions, "_create_completion_stream", AsyncMock(return_value=chunks()))
+    result = await openai_completions.stream_openai_completions(
+        _model("openai-completions"), normalize_context(CONTEXT), {"client": object()}
+    ).result()
+
+    assert result.stopReason == "error"
+    assert result.errorMessage == "Stream ended without finish_reason"
+
+
+def test_responses_fallback_message_ids_and_empty_tool_output():
+    from misaka.ai.providers.openai_responses_shared import convert_responses_messages
+    from misaka.ai.types import ToolResultMessage
+
+    model = _responses_model()
+    assistant = _output(model).model_copy(update={
+        "content": [TextContent(text="one"), TextContent(text="two"), ToolCall(id="call_1", name="t", arguments={})],
+        "stopReason": "toolUse",
+    })
+    context = Context(messages=[
+        UserMessage(content="q", timestamp=0),
+        assistant,
+        ToolResultMessage(toolCallId="call_1", toolName="t", content=[], isError=False, timestamp=0),
+    ])
+
+    items = convert_responses_messages(model, normalize_context(context), {"openai"})
+
+    assert [item.get("id") for item in items if item.get("type") == "message"] == ["msg_pi_1", "msg_pi_1_1"]
+    function_call = next(item for item in items if item.get("type") == "function_call")
+    assert "id" not in function_call
+    assert items[-1]["output"] == "(no tool output)"
+
+
+def test_responses_requires_a_key_or_an_auth_header():
+    with pytest.raises(RuntimeError, match="No API key for provider: openai"):
+        openai_responses.stream_simple_openai_responses(_responses_model(), normalize_context(CONTEXT))
+    assert openai_responses.get_client_api_key("openai", None, {"authorization": "Bearer x"}) == "unused"
+
+
+def test_azure_reads_its_configuration_from_the_request_env():
+    from misaka.ai.providers import azure_openai_responses as azure
+
+    config = azure.resolve_azure_config(
+        _model("azure-openai-responses", baseUrl=""),
+        {"env": {"AZURE_OPENAI_RESOURCE_NAME": "res", "AZURE_OPENAI_API_VERSION": "2025-01-01"}},
+    )
+
+    assert config == {"baseUrl": "https://res.openai.azure.com/openai/v1", "apiVersion": "2025-01-01"}
+    assert azure.resolve_deployment_name(
+        _model("azure-openai-responses", id="gpt"), {"env": {"AZURE_OPENAI_DEPLOYMENT_NAME_MAP": "gpt=dep"}}
+    ) == "dep"

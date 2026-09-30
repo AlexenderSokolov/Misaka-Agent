@@ -104,6 +104,28 @@ def parse_text_signature(signature: str | None) -> dict[str, str] | None:
     return {"id": signature}
 
 
+def convert_tool_result_output(model: Model, content: list[Any]) -> str | list[dict[str, Any]]:
+    text_result = "\n".join(block.text for block in content if block.type == "text")
+    images = [block for block in content if block.type == "image"]
+    has_text = len(text_result) > 0
+
+    if len(images) == 0 or "image" not in model.input:
+        return sanitize_surrogates(
+            text_result if has_text else "(see attached image)" if len(images) > 0 else "(no tool output)"
+        )
+
+    output: list[dict[str, Any]] = []
+    if has_text:
+        output.append({"type": "input_text", "text": sanitize_surrogates(text_result)})
+    for image in images:
+        output.append({
+            "type": "input_image",
+            "detail": "auto",
+            "image_url": f"data:{image.mimeType};base64,{image.data}",
+        })
+    return output
+
+
 def _normalize_id_part(part: str) -> str:
     sanitized = _TOOL_CALL_ID_PART_PATTERN.sub("_", part)
     normalized = sanitized[:64] if len(sanitized) > 64 else sanitized
@@ -232,11 +254,12 @@ def convert_responses_messages(
         elif message.role == "assistant":
             output: list[dict[str, Any]] = []
             assistant_message = message
-            is_different_model = (
-                assistant_message.model != model.id
-                and assistant_message.provider == model.provider
-                and assistant_message.api == model.api
+            is_same_provider_and_api = (
+                assistant_message.provider == model.provider and assistant_message.api == model.api
             )
+            is_same_model = is_same_provider_and_api and assistant_message.model == model.id
+            is_different_model = is_same_provider_and_api and assistant_message.model != model.id
+            text_block_index = 0
 
             for block in assistant_message.content:
                 if block.type == "thinking":
@@ -244,8 +267,15 @@ def convert_responses_messages(
                         output.append(json.loads(block.thinkingSignature))
                 elif block.type == "text":
                     parsed_signature = parse_text_signature(block.textSignature)
-                    msg_id = parsed_signature["id"] if parsed_signature else f"msg_{msg_index}"
-                    if len(msg_id) > 64:
+                    fallback_message_id = (
+                        f"msg_pi_{msg_index}" if text_block_index == 0 else f"msg_pi_{msg_index}_{text_block_index}"
+                    )
+                    text_block_index += 1
+                    # OpenAI requires id to be max 64 characters
+                    msg_id = parsed_signature["id"] if parsed_signature else None
+                    if not msg_id:
+                        msg_id = fallback_message_id
+                    elif len(msg_id) > 64:
                         msg_id = f"msg_{short_hash(msg_id)}"
                     message_item: dict[str, Any] = {
                         "type": "message",
@@ -272,15 +302,16 @@ def convert_responses_messages(
                     ):
                         item_id = None
                     namespace = (
-                        {"namespace": block.namespace}
-                        if not is_different_model and block.namespace is not None
-                        else {}
+                        {"namespace": block.namespace} if is_same_model and block.namespace is not None else {}
                     )
+                    # MISAKA fork: pi's `id: undefined` leaves the key out of the JSON; a Python
+                    # `None` would be sent as `null`.
+                    item_id_field = {} if item_id is None else {"id": item_id}
                     if custom_input_property is not None:
                         output.append(
                             {
                                 "type": "custom_tool_call",
-                                "id": item_id,
+                                **item_id_field,
                                 "call_id": call_id,
                                 "name": block.name,
                                 "input": sanitize_surrogates(
@@ -295,37 +326,18 @@ def convert_responses_messages(
                         output.append(
                             {
                                 "type": "function_call",
-                                "id": item_id,
+                                **item_id_field,
                                 "call_id": call_id,
                                 "name": block.name,
-                                "arguments": json.dumps(block.arguments),
+                                "arguments": json.dumps(block.arguments, separators=(",", ":"), ensure_ascii=False),
                                 **namespace,
                             }
                         )
             if output:
                 messages.extend(output)
         elif message.role == "toolResult":
-            text_result = "\n".join(block.text for block in message.content if block.type == "text")
-            has_images = any(block.type == "image" for block in message.content)
-            has_text = len(text_result) > 0
             call_id = message.toolCallId.split("|", 1)[0]
-
-            if has_images and "image" in model.input:
-                output_parts: list[dict[str, Any]] = []
-                if has_text:
-                    output_parts.append({"type": "input_text", "text": sanitize_surrogates(text_result)})
-                for block in message.content:
-                    if block.type == "image":
-                        output_parts.append(
-                            {
-                                "type": "input_image",
-                                "detail": "auto",
-                                "image_url": f"data:{block.mimeType};base64,{block.data}",
-                            }
-                        )
-                output_value: str | list[dict[str, Any]] = output_parts
-            else:
-                output_value = sanitize_surrogates(text_result if has_text else "(see attached image)")
+            output_value = convert_tool_result_output(model, message.content)
 
             # A grammar tool's result goes back on the custom-tool channel it came from.
             messages.append(

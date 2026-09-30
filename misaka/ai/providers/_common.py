@@ -11,6 +11,7 @@ the one that also handles what the others missed.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -112,14 +113,53 @@ async def _iterate_async_iterable(iterable: Any, signal: Any = None, *, on_abort
             abort_task.cancel()
 
 
-def assign_sampling_params(params: dict[str, Any], *sources: Mapping[str, Any] | None) -> None:
-    """``Object.assign(params, model.samplingParams, options?.samplingParams)``, last in each
-    OpenAI-compatible builder: every key reaches the request body and overrides a named field of
-    the same name. The SDK's ``create()`` accepts only the fields it declares, so the keys travel
-    in ``extra_body``, which the SDK merges into the JSON body after the named fields."""
-    for source in sources:
-        if source:
-            params.setdefault("extra_body", {}).update(source)
+def split_sdk_params(create: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+    """Keyword arguments for an OpenAI SDK ``create()`` from a pi-shaped request body.
+
+    MISAKA fork: pi builds the body with every field at the top level and the JS SDK sends
+    whatever it is given. The Python SDK's ``create()`` accepts only the fields it declares,
+    so the rest travel in ``extra_body`` (merged into the body after the named fields), and
+    a ``None`` -- pi's ``undefined`` -- is not sent at all.
+    """
+    try:
+        known = set(inspect.signature(create).parameters)
+    except (TypeError, ValueError):
+        known = set()
+    named: dict[str, Any] = {}
+    extra: dict[str, Any] = dict(params.get("extra_body") or {})
+    for key, value in params.items():
+        if key == "extra_body" or value is None:
+            continue
+        if key in known:
+            named[key] = value
+        else:
+            extra[key] = value
+    if extra:
+        named["extra_body"] = extra
+    return named
+
+
+_CANONICAL_AUTH_HEADERS = {"authorization": "Authorization", "x-api-key": "X-Api-Key"}
+
+
+def split_sdk_headers(headers: Mapping[str, Any], omit: Any) -> tuple[dict[str, str], dict[str, Any]]:
+    """The client's default headers, and the headers every request has to carry.
+
+    MISAKA fork: pi hands the SDK ``null`` for a header it must not send. The Python SDKs
+    take ``omit`` for that, and honour it only per request: one in ``default_headers`` fails
+    their request-time auth check. Names are matched case-insensitively, the way a JS
+    ``Headers`` merge collapses ``Authorization`` and ``authorization`` into one.
+    """
+    merged: dict[str, Any] = {}
+    for name, value in headers.items():
+        for existing in [key for key in merged if key.lower() == str(name).lower()]:
+            del merged[existing]
+        merged[str(name)] = value
+    default_headers = {name: value for name, value in merged.items() if value is not None}
+    request_headers = {
+        _CANONICAL_AUTH_HEADERS.get(name.lower(), name): omit for name, value in merged.items() if value is None
+    }
+    return default_headers, request_headers
 
 
 def _empty_usage() -> Usage:
