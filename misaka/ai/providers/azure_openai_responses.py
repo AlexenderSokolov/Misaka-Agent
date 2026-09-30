@@ -23,6 +23,7 @@ from misaka.ai.providers._common import (
     _empty_usage,
     _iterate_async_iterable,
     _option,
+    assign_sampling_params,
 )
 from misaka.ai.providers.constrained_sampling import (
     create_grammar_tool_input_properties,
@@ -69,6 +70,7 @@ class AzureOpenAIResponsesOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     reasoningEffort: Literal["minimal", "low", "medium", "high", "xhigh", "max"]
@@ -253,12 +255,8 @@ def build_params(model: Model, context: TranscriptContext, options: Any, deploym
             if not off_is_explicitly_null:
                 params["reasoning"] = {"effort": thinking_level_map.get("off") or "none"}
 
-    # Upstream applies samplingParams last with `Object.assign` (azure-openai-responses.ts:333-334);
-    # custom keys override the named request fields above. Same note as openai_responses:
-    # openai_completions deviates the other way, by declared choice.
-    sampling = _option(options, "samplingParams")
-    if isinstance(sampling, dict) and sampling:
-        params.update(sampling)
+    # Last so custom keys override the named request fields. Per-request keys override model defaults.
+    assign_sampling_params(params, model.samplingParams, _option(options, "samplingParams"))
 
     return params
 
@@ -374,6 +372,7 @@ def stream_azure_openai_responses(
                     stream,
                     model,
                     {
+                        "onProviderStreamEvent": _option(options, "onProviderStreamEvent"),
                         "grammarToolInputProperties": create_grammar_tool_input_properties(
                             get_declared_tools(normalized_context.messages),
                             bool(_compat_field(model, "supportsOpenAIGrammarTools", False)),

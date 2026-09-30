@@ -71,7 +71,7 @@ from misaka.utils.values import maybe_await, signal_aborted
 MISTRAL_TOOL_CALL_ID_LENGTH = 9
 _MISTRAL_ID_DISALLOWED = re.compile(r"[^a-zA-Z0-9]")
 MAX_MISTRAL_ERROR_BODY_CHARS = 4000
-MistralReasoningEffort = Literal["none", "high"]
+MistralReasoningEffort = Literal["none", "low", "medium", "high", "max"]
 
 
 class MistralToolChoiceFunction(TypedDict):
@@ -91,6 +91,7 @@ class MistralOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     toolChoice: Literal["auto", "none", "any", "required"] | MistralToolChoiceObject
@@ -173,7 +174,7 @@ def stream_mistral(
                     )
             stream.push(StartEvent(partial=output))
             saw_finish_reason = await consume_chat_stream(
-                model, output, stream, mistral_stream, _option(options, "signal")
+                model, output, stream, mistral_stream, _option(options, "onProviderStreamEvent"), _option(options, "signal")
             )
 
             if signal_aborted(_option(options, "signal")):
@@ -210,15 +211,23 @@ def stream_simple_mistral(
     base = build_base_options(model, context, options, api_key)
     clamped_reasoning = clamp_thinking_level(model, options.reasoning) if options and options.reasoning else None
     reasoning = None if clamped_reasoning == "off" else clamped_reasoning
-    should_use_reasoning = bool(model.reasoning and reasoning is not None)
+    # Models with a thinking level map use `reasoning_effort`; other reasoning models use `prompt_mode`.
+    effort_map = model.thinkingLevelMap if model.reasoning else None
+    reasoning_effort = None
+    if effort_map is not None:
+        if reasoning:
+            mapped = effort_map.get(reasoning)
+            reasoning_effort = "high" if mapped is None else mapped
+        else:
+            reasoning_effort = effort_map.get("off")
 
     return stream_mistral(
         model,
         context,
         {
             **base.model_dump(),
-            "promptMode": "reasoning" if should_use_reasoning and uses_prompt_mode_reasoning(model) else None,
-            "reasoningEffort": map_reasoning_effort(model, reasoning) if should_use_reasoning and uses_reasoning_effort(model) else None,
+            "promptMode": "reasoning" if model.reasoning and effort_map is None and reasoning else None,
+            "reasoningEffort": reasoning_effort,
         },
     )
 
@@ -536,6 +545,7 @@ async def consume_chat_stream(
     output: AssistantMessage,
     stream: AssistantMessageEventStream,
     mistral_stream: AsyncIterable[Any],
+    on_provider_stream_event: Any = None,
     signal: Any = None,
 ) -> bool:
     """Drain the SDK stream into ``output``; returns whether a ``finish_reason`` arrived.
@@ -562,6 +572,8 @@ async def consume_chat_stream(
 
     async for event in _iterate_async_iterable(mistral_stream, signal):
         chunk = _coalesce_attr(event, "data") or event
+        if callable(on_provider_stream_event):
+            await maybe_await(on_provider_stream_event(chunk, model))
         output.responseId = output.responseId or _coalesce_attr(chunk, "id")
 
         usage = _coalesce_attr(chunk, "usage")
@@ -601,6 +613,10 @@ async def consume_chat_stream(
             for item in content_items:
                 if isinstance(item, str):
                     text_delta = sanitize_surrogates(item)
+                    # GLM models on Mistral send empty content deltas around thinking and tool calls.
+                    # Opening a block for them splits thinking into multiple blocks, which Mistral rejects on replay.
+                    if not text_delta:
+                        continue
                     if current_block is None or current_block.type != "text":
                         finish_current_block(current_block)
                         current_block = TextContent(text="")
@@ -633,6 +649,8 @@ async def consume_chat_stream(
                 if item_type == "text":
                     text_value = item.get("text") if isinstance(item, dict) else _coalesce_attr(item, "text")
                     text_delta = sanitize_surrogates(str(text_value or ""))
+                    if not text_delta:
+                        continue
                     if current_block is None or current_block.type != "text":
                         finish_current_block(current_block)
                         current_block = TextContent(text="")
@@ -833,26 +851,6 @@ def build_tool_result_text(text: str, has_images: bool, supports_images: bool, i
             else "(image omitted: model does not support images)"
         )
     return "[tool error] (no tool output)" if is_error else "(no tool output)"
-
-
-def uses_reasoning_effort(model: Model) -> bool:
-    return (
-        model.id == "mistral-small-2603"
-        or model.id == "mistral-small-latest"
-        or model.id.startswith("mistral-medium-")
-        or model.id == "zai-glm-5-2"
-    )
-
-
-def uses_prompt_mode_reasoning(model: Model) -> bool:
-    return bool(model.reasoning and not uses_reasoning_effort(model))
-
-
-def map_reasoning_effort(model: Model, level: str | None) -> MistralReasoningEffort:
-    if level is None:
-        return "high"
-    mapped = (model.thinkingLevelMap or {}).get(level)
-    return "high" if mapped is None else mapped  # type: ignore[return-value]
 
 
 def map_tool_choice(choice: Any) -> Any:

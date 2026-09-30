@@ -21,18 +21,8 @@ def build_base_options(
     options: SimpleStreamOptions | None = None,
     api_key: str | None = None,
 ) -> StreamOptions:
-    # Model-level sampling defaults merged under request-level ones, upstream's
-    # `{...model.samplingParams, ...options?.samplingParams}` (api/simple-options.ts:27-33).
-    # openai_completions additionally re-merges the same two sources itself with a
-    # declared, deliberate twist (named request fields win there); the re-merge is
-    # idempotent over this one, so both stand until the owner unifies them.
-    model_sampling = model.samplingParams
-    options_sampling = options.samplingParams if options is not None else None
-    sampling = (
-        {**(model_sampling or {}), **(options_sampling or {})}
-        if (model_sampling or options_sampling)
-        else None
-    )
+    # The builders merge `model.samplingParams` under these (api/simple-options.ts:29).
+    sampling = options.samplingParams if options is not None else None
     # `?? model.maxTokens`, then clamped to what the window can still hold
     # (api/simple-options.ts:34). Passing the caller's value straight through meant a
     # request with no explicit maxTokens sent none at all -- and one near a full window
@@ -55,6 +45,7 @@ def build_base_options(
         headers=options.headers,
         onPayload=options.onPayload,
         onResponse=options.onResponse,
+        onProviderStreamEvent=options.onProviderStreamEvent,
         timeoutMs=options.timeoutMs,
         maxRetries=options.maxRetries,
         maxRetryDelayMs=options.maxRetryDelayMs,

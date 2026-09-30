@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterable, Iterable, Mapping
-from typing import Any, TypedDict
+from dataclasses import dataclass
+from typing import Any, Literal, TypedDict
 
 from misaka.ai.models import calculate_cost
-from misaka.ai.providers._common import _empty_usage
 from misaka.ai.providers.constrained_sampling import (
     GrammarToolInputJsonBuffer,
     append_grammar_tool_input_json_delta,
@@ -21,7 +21,6 @@ from misaka.ai.providers.transform_messages import transform_messages
 from misaka.ai.types import (
     AssistantMessage,
     Model,
-    StopReason,
     TextContent,
     TextDeltaEvent,
     TextEndEvent,
@@ -46,11 +45,13 @@ from misaka.ai.utils.json_parse import StreamingArgs
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
 from misaka.ai.utils.text import get_system_message_text, render_system_message_update
 from misaka.ai.utils.transcript import resolve_transcript, resolve_transcript_tools
+from misaka.utils.values import maybe_await
 
 _TOOL_CALL_ID_PART_PATTERN = re.compile(r"[^a-zA-Z0-9_-]")
 
 
 class OpenAIResponsesStreamOptions(TypedDict, total=False):
+    onProviderStreamEvent: Any
     serviceTier: Any
     resolveServiceTier: Any
     applyServiceTierPricing: Any
@@ -390,41 +391,54 @@ def convert_responses_tools(
     return converted
 
 
-def _map_stop_reason(status: str | None) -> StopReason:
-    if not status:
-        return "stop"
-    if status == "completed":
-        return "stop"
-    if status == "incomplete":
-        return "length"
-    if status in {"failed", "cancelled"}:
-        return "error"
-    if status in {"in_progress", "queued"}:
-        return "stop"
-    raise RuntimeError(f"Unhandled stop reason: {status}")
+# =============================================================================
+# Stream processing
+# =============================================================================
 
 
-def _custom_tool_call_input(block: ToolCall, property_name: str) -> str:
-    value = block.arguments.get(property_name)
+@dataclass
+class _CustomToolCallInput:
+    property: str
+    jsonBuffer: GrammarToolInputJsonBuffer
+
+
+@dataclass
+class _StreamingToolCallScratch:
+    """MISAKA fork: upstream's ``StreamingToolCall`` widens the block itself with the
+    scratch fields ``partialJson`` and ``customInput`` and deletes them once the call is
+    finished. Pydantic blocks forbid extra fields, so the scratch rides beside the block,
+    keyed by content index; ``None`` stands for a deleted field. ``partialJson`` is a
+    ``StreamingArgs`` so the live view does not re-parse the whole buffer on every delta.
+    """
+
+    partialJson: StreamingArgs | None = None
+    customInput: _CustomToolCallInput | None = None
+
+
+def _get_custom_tool_call_input(block: ToolCall, scratch: _StreamingToolCallScratch) -> str:
+    prop = scratch.customInput.property if scratch.customInput is not None else None
+    if prop is None:
+        return ""
+    value = block.arguments.get(prop)
     return value if isinstance(value, str) else ""
 
 
 def _append_custom_tool_call_input(
-    block: ToolCall,
-    property_name: str,
-    buffer: GrammarToolInputJsonBuffer,
-    next_input: str,
-    close: bool,
+    block: ToolCall, scratch: _StreamingToolCallScratch, next_input: str, close: bool
 ) -> str | None:
-    """Advance a grammar tool's text and report the JSON delta a consumer would see.
-
-    Consumers of ``toolcall_delta`` are fed JSON, because that is what a function tool
-    streams. A grammar tool streams raw text, so the buffer re-encodes it as the growing
-    JSON of ``{"<property>": "<text>"}`` and hands back only the newly added slice.
-    """
-    delta = append_grammar_tool_input_json_delta(buffer, property_name, next_input, close)
-    block.arguments = {property_name: next_input}
+    custom_input = scratch.customInput
+    if custom_input is None:
+        return None
+    delta = append_grammar_tool_input_json_delta(custom_input.jsonBuffer, custom_input.property, next_input, close)
+    block.arguments = {custom_input.property: next_input}
     return delta
+
+
+@dataclass
+class _ResponsesOutputSlot:
+    type: Literal["thinking", "text", "toolCall"]
+    block: Any
+    contentIndex: int
 
 
 async def process_responses_stream(
@@ -434,292 +448,342 @@ async def process_responses_stream(
     model: Model,
     options: OpenAIResponsesStreamOptions | None = None,
 ) -> None:
-    current_item: dict[str, Any] | None = None
-    current_block: ThinkingContent | TextContent | ToolCall | None = None
-    current_tool_args = StreamingArgs()
-    blocks = output.content
-    saw_terminal = False
-
-    def block_index() -> int:
-        return len(blocks) - 1
-
-    custom_input_property = "input"
-    custom_input_buffer: GrammarToolInputJsonBuffer | None = None
+    saw_terminal_response_event = False
+    output_slots: dict[Any, _ResponsesOutputSlot] = {}
+    reasoning_blocks_by_id: dict[str, ThinkingContent] = {}
+    streaming_tool_calls: dict[int, _StreamingToolCallScratch] = {}
     grammar_tool_input_properties: Mapping[str, str] = (
         {} if options is None else options.get("grammarToolInputProperties") or {}
     )
+    on_provider_stream_event = None if options is None else options.get("onProviderStreamEvent")
+
+    def apply_message_phase_stop_reason(item: dict[str, Any]) -> None:
+        if item.get("type") == "message" and item.get("phase") == "final_answer":
+            output.stopReason = "stop"
+
+    def get_slot(output_index: Any, slot_type: str) -> _ResponsesOutputSlot | None:
+        slot = output_slots.get(output_index)
+        return slot if slot is not None and slot.type == slot_type else None
+
+    def push_tool_call_delta(slot: _ResponsesOutputSlot, delta: str | None) -> None:
+        if delta is None:
+            return
+        stream.push(ToolCallDeltaEvent(contentIndex=slot.contentIndex, delta=delta, partial=output))
+
+    def create_slot(output_index: Any, item: dict[str, Any]) -> _ResponsesOutputSlot | None:
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            block = ThinkingContent(thinking="")
+            output.content.append(block)
+            slot = _ResponsesOutputSlot(type="thinking", block=block, contentIndex=len(output.content) - 1)
+            output_slots[output_index] = slot
+            stream.push(ThinkingStartEvent(contentIndex=slot.contentIndex, partial=output))
+            return slot
+        if item_type == "message":
+            apply_message_phase_stop_reason(item)
+            block = TextContent(text="")
+            output.content.append(block)
+            slot = _ResponsesOutputSlot(type="text", block=block, contentIndex=len(output.content) - 1)
+            output_slots[output_index] = slot
+            stream.push(TextStartEvent(contentIndex=slot.contentIndex, partial=output))
+            return slot
+        if item_type == "function_call":
+            block = ToolCall(
+                id=f"{item.get('call_id', '')}|{item.get('id', '')}",
+                name=item.get("name", ""),
+                arguments={},
+                namespace=item.get("namespace"),
+            )
+            output.content.append(block)
+            slot = _ResponsesOutputSlot(type="toolCall", block=block, contentIndex=len(output.content) - 1)
+            streaming_tool_calls[slot.contentIndex] = _StreamingToolCallScratch(
+                partialJson=StreamingArgs(item.get("arguments") or "")
+            )
+            output_slots[output_index] = slot
+            stream.push(ToolCallStartEvent(contentIndex=slot.contentIndex, partial=output))
+            return slot
+        if item_type == "custom_tool_call":
+            input_property = grammar_tool_input_properties.get(item.get("name", "")) or "input"
+            input_value = item.get("input") or ""
+            block = ToolCall(
+                id=f"{item.get('call_id', '')}|{item.get('id', '')}",
+                name=item.get("name", ""),
+                arguments={input_property: input_value},
+                namespace=item.get("namespace"),
+            )
+            output.content.append(block)
+            slot = _ResponsesOutputSlot(type="toolCall", block=block, contentIndex=len(output.content) - 1)
+            streaming_tool_calls[slot.contentIndex] = _StreamingToolCallScratch(
+                customInput=_CustomToolCallInput(property=input_property, jsonBuffer=GrammarToolInputJsonBuffer())
+            )
+            output_slots[output_index] = slot
+            stream.push(ToolCallStartEvent(contentIndex=slot.contentIndex, partial=output))
+            return slot
+        return None
+
+    def get_or_create_slot(output_index: Any, item: dict[str, Any]) -> _ResponsesOutputSlot | None:
+        slot = output_slots.get(output_index)
+        return slot if slot is not None else create_slot(output_index, item)
+
+    # Azure OpenAI can omit reasoning.encrypted_content from response.output_item.done
+    # and provide it only in response.completed.response.output. Backfill the
+    # persisted reasoning signature from the terminal response to keep store:false
+    # multi-turn replay stateless. See https://github.com/earendil-works/pi/issues/6409.
+    def backfill_reasoning_signatures(response_output: list[Any]) -> None:
+        for item in response_output:
+            if not isinstance(item, dict) or item.get("type") != "reasoning" or not item.get("encrypted_content"):
+                continue
+            block = reasoning_blocks_by_id.get(item.get("id"))
+            if block is None or not block.thinkingSignature:
+                continue
+
+            stored_item = json.loads(block.thinkingSignature)
+            if stored_item.get("encrypted_content"):
+                continue
+            block.thinkingSignature = json.dumps(
+                {**stored_item, "encrypted_content": item["encrypted_content"]}, separators=(",", ":")
+            )
+
+    def finalize_response(response: Any) -> None:
+        nonlocal saw_terminal_response_event
+        saw_terminal_response_event = True
+        response = response if isinstance(response, dict) else {}
+        backfill_reasoning_signatures(response.get("output") or [])
+        if response.get("id"):
+            output.responseId = response["id"]
+        usage = response.get("usage")
+        if usage:
+            input_details = usage.get("input_tokens_details") or {}
+            cached_tokens = input_details.get("cached_tokens") or 0
+            cache_write_tokens = input_details.get("cache_write_tokens") or 0
+            output.usage = Usage(
+                # OpenAI includes cached and cache-write tokens in input_tokens, so subtract both.
+                input=max(0, (usage.get("input_tokens") or 0) - cached_tokens - cache_write_tokens),
+                output=usage.get("output_tokens") or 0,
+                cacheRead=cached_tokens,
+                cacheWrite=cache_write_tokens,
+                reasoning=(usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0,
+                totalTokens=usage.get("total_tokens") or 0,
+                cost=UsageCost(input=0, output=0, cacheRead=0, cacheWrite=0, total=0),
+            )
+        calculate_cost(model, output.usage)
+        if options and options.get("applyServiceTierPricing"):
+            resolve_service_tier = options.get("resolveServiceTier")
+            service_tier = (
+                resolve_service_tier(response.get("service_tier"), options.get("serviceTier"))
+                if resolve_service_tier
+                else response.get("service_tier") or options.get("serviceTier")
+            )
+            options["applyServiceTierPricing"](output.usage, service_tier)
+        # Map status to stop reason. For incomplete responses, retain the provider's
+        # specific reason so max-output truncation and content filtering stay distinct.
+        status = response.get("status")
+        incomplete_details = response.get("incomplete_details")
+        reason = incomplete_details.get("reason") if isinstance(incomplete_details, dict) else None
+        incomplete_reason = reason if isinstance(reason, str) else None
+        output.rawStopReason = f"{status}.{incomplete_reason}" if incomplete_reason else status
+        mapped_stop = _map_stop_reason(status, incomplete_reason)
+        output.stopReason = mapped_stop["stopReason"]
+        output.errorMessage = mapped_stop.get("errorMessage")
+        if any(block.type == "toolCall" for block in output.content) and output.stopReason == "stop":
+            output.stopReason = "toolUse"
 
     async for event in openai_stream:
+        if callable(on_provider_stream_event):
+            await maybe_await(on_provider_stream_event(event, model))
         event_type = event.get("type")
+        output_index = event.get("output_index")
         if event_type == "response.created":
             response = event.get("response")
             if isinstance(response, dict) and isinstance(response.get("id"), str):
                 output.responseId = response["id"]
         elif event_type == "response.output_item.added":
             item = event.get("item")
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            if item_type == "reasoning":
-                current_item = item
-                current_tool_args = StreamingArgs()
-                current_block = ThinkingContent(thinking="")
-                blocks.append(current_block)
-                stream.push(ThinkingStartEvent(contentIndex=block_index(), partial=output))
-            elif item_type == "message":
-                current_item = item
-                current_tool_args = StreamingArgs()
-                current_block = TextContent(text="")
-                blocks.append(current_block)
-                stream.push(TextStartEvent(contentIndex=block_index(), partial=output))
-            elif item_type == "function_call":
-                current_item = item
-                # An item that inlines its arguments seeds the buffer; the block itself
-                # stays ``{}`` until the item is done, exactly as before.
-                current_tool_args = StreamingArgs(item.get("arguments") or "")
-                current_block = ToolCall(
-                    id=f"{item.get('call_id', '')}|{item.get('id', '')}",
-                    name=item.get("name", ""),
-                    arguments={},
-                )
-                blocks.append(current_block)
-                stream.push(ToolCallStartEvent(contentIndex=block_index(), partial=output))
-            elif item_type == "custom_tool_call":
-                # A grammar tool answers with free text, not JSON. It is surfaced as an
-                # ordinary tool call whose single argument is that text, so nothing
-                # downstream needs to know the difference.
-                current_item = item
-                current_tool_args = StreamingArgs()
-                custom_input_property = grammar_tool_input_properties.get(item.get("name", ""), "input")
-                custom_input_buffer = GrammarToolInputJsonBuffer()
-                current_block = ToolCall(
-                    id=f"{item.get('call_id', '')}|{item.get('id', '')}",
-                    name=item.get("name", ""),
-                    arguments={custom_input_property: item.get("input") or ""},
-                )
-                blocks.append(current_block)
-                stream.push(ToolCallStartEvent(contentIndex=block_index(), partial=output))
-        elif event_type == "response.reasoning_summary_part.added":
-            if isinstance(current_item, dict) and current_item.get("type") == "reasoning":
-                current_item.setdefault("summary", []).append(event.get("part"))
+            if isinstance(item, dict):
+                create_slot(output_index, item)
         elif event_type == "response.reasoning_summary_text.delta":
-            if (
-                isinstance(current_item, dict)
-                and current_item.get("type") == "reasoning"
-                and isinstance(current_block, ThinkingContent)
-            ):
-                summary = current_item.setdefault("summary", [])
-                if summary:
-                    last_part = summary[-1]
-                    if isinstance(last_part, dict):
-                        delta = event.get("delta", "")
-                        last_part["text"] = f"{last_part.get('text', '')}{event.get('delta', '')}"
-                        current_block.thinking += delta
-                        stream.push(ThinkingDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
+            slot = get_slot(output_index, "thinking")
+            if slot is None:
+                continue
+            slot.block.thinking += event.get("delta", "")
+            stream.push(ThinkingDeltaEvent(contentIndex=slot.contentIndex, delta=event.get("delta", ""), partial=output))
         elif event_type == "response.reasoning_summary_part.done":
-            if (
-                isinstance(current_item, dict)
-                and current_item.get("type") == "reasoning"
-                and isinstance(current_block, ThinkingContent)
-            ):
-                summary = current_item.setdefault("summary", [])
-                if summary:
-                    last_part = summary[-1]
-                    if isinstance(last_part, dict):
-                        last_part["text"] = f"{last_part.get('text', '')}\n\n"
-                        current_block.thinking += "\n\n"
-                        stream.push(ThinkingDeltaEvent(contentIndex=block_index(), delta="\n\n", partial=output))
+            slot = get_slot(output_index, "thinking")
+            if slot is None:
+                continue
+            slot.block.thinking += "\n\n"
+            stream.push(ThinkingDeltaEvent(contentIndex=slot.contentIndex, delta="\n\n", partial=output))
         elif event_type == "response.reasoning_text.delta":
-            if (
-                isinstance(current_item, dict)
-                and current_item.get("type") == "reasoning"
-                and isinstance(current_block, ThinkingContent)
-            ):
-                delta = event.get("delta", "")
-                current_block.thinking += delta
-                stream.push(ThinkingDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
-        elif event_type == "response.content_part.added":
-            if isinstance(current_item, dict) and current_item.get("type") == "message":
-                part = event.get("part")
-                if isinstance(part, dict) and part.get("type") in {"output_text", "refusal"}:
-                    current_item.setdefault("content", []).append(part)
-        elif event_type == "response.output_text.delta":
-            if isinstance(current_item, dict) and current_item.get("type") == "message" and isinstance(current_block, TextContent):
-                content = current_item.get("content") or []
-                if isinstance(content, list) and content:
-                    last_part = content[-1]
-                    if isinstance(last_part, dict) and last_part.get("type") == "output_text":
-                        delta = event.get("delta", "")
-                        last_part["text"] = f"{last_part.get('text', '')}{delta}"
-                        current_block.text += delta
-                        stream.push(TextDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
-        elif event_type == "response.refusal.delta":
-            if isinstance(current_item, dict) and current_item.get("type") == "message" and isinstance(current_block, TextContent):
-                content = current_item.get("content") or []
-                if isinstance(content, list) and content:
-                    last_part = content[-1]
-                    if isinstance(last_part, dict) and last_part.get("type") == "refusal":
-                        delta = event.get("delta", "")
-                        last_part["refusal"] = f"{last_part.get('refusal', '')}{delta}"
-                        current_block.text += delta
-                        stream.push(TextDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
+            slot = get_slot(output_index, "thinking")
+            if slot is None:
+                continue
+            slot.block.thinking += event.get("delta", "")
+            stream.push(ThinkingDeltaEvent(contentIndex=slot.contentIndex, delta=event.get("delta", ""), partial=output))
+        elif event_type == "response.output_text.delta" or event_type == "response.refusal.delta":
+            slot = get_slot(output_index, "text")
+            if slot is None:
+                continue
+            slot.block.text += event.get("delta", "")
+            stream.push(TextDeltaEvent(contentIndex=slot.contentIndex, delta=event.get("delta", ""), partial=output))
         elif event_type == "response.function_call_arguments.delta":
-            if isinstance(current_item, dict) and current_item.get("type") == "function_call" and isinstance(current_block, ToolCall):
-                delta = event.get("delta", "")
-                current_tool_args.append(delta)
-                current_block.arguments = current_tool_args.arguments
-                stream.push(ToolCallDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
+            slot = get_slot(output_index, "toolCall")
+            scratch = streaming_tool_calls.get(slot.contentIndex) if slot is not None else None
+            if slot is None or scratch is None or scratch.partialJson is None:
+                continue
+            scratch.partialJson.append(event.get("delta", ""))
+            slot.block.arguments = scratch.partialJson.arguments
+            push_tool_call_delta(slot, event.get("delta", ""))
         elif event_type == "response.function_call_arguments.done":
-            if isinstance(current_item, dict) and current_item.get("type") == "function_call" and isinstance(current_block, ToolCall):
-                previous_partial_json = current_tool_args.raw
-                # The arguments are complete here: replace the buffer and parse it whole.
-                current_tool_args = StreamingArgs(event.get("arguments", ""))
-                current_tool_args.finish_into(current_block)
-                if current_tool_args.raw.startswith(previous_partial_json):
-                    delta = current_tool_args.raw[len(previous_partial_json) :]
-                    if delta:
-                        stream.push(ToolCallDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
+            slot = get_slot(output_index, "toolCall")
+            scratch = streaming_tool_calls.get(slot.contentIndex) if slot is not None else None
+            if slot is None or scratch is None or scratch.partialJson is None:
+                continue
+            previous_partial_json = scratch.partialJson.raw
+            arguments = event.get("arguments", "")
+            scratch.partialJson = StreamingArgs(arguments)
+            slot.block.arguments = scratch.partialJson.arguments
+
+            if arguments.startswith(previous_partial_json):
+                delta = arguments[len(previous_partial_json) :]
+                if len(delta) > 0:
+                    push_tool_call_delta(slot, delta)
         elif event_type == "response.custom_tool_call_input.delta":
-            if (
-                isinstance(current_item, dict)
-                and current_item.get("type") == "custom_tool_call"
-                and isinstance(current_block, ToolCall)
-                and custom_input_buffer is not None
-            ):
-                next_input = _custom_tool_call_input(current_block, custom_input_property) + event.get("delta", "")
-                delta = _append_custom_tool_call_input(
-                    current_block, custom_input_property, custom_input_buffer, next_input, False
-                )
-                if delta:
-                    stream.push(ToolCallDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
+            slot = get_slot(output_index, "toolCall")
+            scratch = streaming_tool_calls.get(slot.contentIndex) if slot is not None else None
+            if slot is None or scratch is None or scratch.customInput is None:
+                continue
+            push_tool_call_delta(
+                slot,
+                _append_custom_tool_call_input(
+                    slot.block, scratch, _get_custom_tool_call_input(slot.block, scratch) + event.get("delta", ""), False
+                ),
+            )
         elif event_type == "response.custom_tool_call_input.done":
-            if (
-                isinstance(current_item, dict)
-                and current_item.get("type") == "custom_tool_call"
-                and isinstance(current_block, ToolCall)
-                and custom_input_buffer is not None
-            ):
-                delta = _append_custom_tool_call_input(
-                    current_block, custom_input_property, custom_input_buffer, event.get("input", ""), True
-                )
-                if delta:
-                    stream.push(ToolCallDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
+            slot = get_slot(output_index, "toolCall")
+            scratch = streaming_tool_calls.get(slot.contentIndex) if slot is not None else None
+            if slot is None or scratch is None or scratch.customInput is None:
+                continue
+            push_tool_call_delta(slot, _append_custom_tool_call_input(slot.block, scratch, event.get("input", ""), True))
         elif event_type == "response.output_item.done":
             item = event.get("item")
             if not isinstance(item, dict):
                 continue
+            apply_message_phase_stop_reason(item)
+            slot = get_or_create_slot(output_index, item)
+            scratch = streaming_tool_calls.get(slot.contentIndex) if slot is not None else None
             item_type = item.get("type")
-            if item_type == "reasoning" and isinstance(current_block, ThinkingContent):
-                summary = item.get("summary") if isinstance(item.get("summary"), list) else []
-                content = item.get("content") if isinstance(item.get("content"), list) else []
-                summary_text = "\n\n".join(part.get("text", "") for part in summary if isinstance(part, dict))
-                content_text = "\n\n".join(part.get("text", "") for part in content if isinstance(part, dict))
-                current_block.thinking = summary_text or content_text or current_block.thinking
-                current_block.thinkingSignature = json.dumps(item, separators=(",", ":"))
-                stream.push(ThinkingEndEvent(contentIndex=block_index(), content=current_block.thinking, partial=output))
-                current_block = None
-            elif item_type == "message" and isinstance(current_block, TextContent):
-                content = item.get("content") if isinstance(item.get("content"), list) else []
-                text = "".join(
-                    part.get("text", "") if part.get("type") == "output_text" else part.get("refusal", "")
-                    for part in content
-                    if isinstance(part, dict)
-                )
-                current_block.text = text
-                current_block.textSignature = encode_text_signature_v1(item.get("id", ""), item.get("phase"))
-                stream.push(TextEndEvent(contentIndex=block_index(), content=current_block.text, partial=output))
-                current_block = None
-            elif item_type == "function_call":
-                call_id = f"{item.get('call_id', '')}|{item.get('id', '')}"
-                tool_call = next((block for block in output.content
-                                  if isinstance(block, ToolCall) and block.id == call_id), None)
-                if tool_call is None:
-                    tool_call = ToolCall(id=call_id, name=item.get("name", ""), arguments={})
-                    output.content.append(tool_call)
-                final_args = (current_tool_args if tool_call is current_block and current_tool_args.raw
-                              else StreamingArgs(item.get("arguments") or "{}"))
-                final_args.finish_into(tool_call)
-                if tool_call is current_block:
-                    current_tool_args = StreamingArgs()
-                    current_block = None
-                stream.push(ToolCallEndEvent(contentIndex=output.content.index(tool_call),
-                                            toolCall=tool_call, partial=output))
-            elif item_type == "custom_tool_call" and isinstance(current_block, ToolCall):
-                final_input = item.get("input")
-                if final_input is None:
-                    final_input = _custom_tool_call_input(current_block, custom_input_property)
-                if custom_input_buffer is not None:
-                    delta = _append_custom_tool_call_input(
-                        current_block, custom_input_property, custom_input_buffer, final_input, True
-                    )
-                    if delta:
-                        stream.push(ToolCallDeltaEvent(contentIndex=block_index(), delta=delta, partial=output))
-                tool_call = current_block
-                custom_input_buffer = None
-                current_tool_args = StreamingArgs()
-                current_block = None
-                stream.push(ToolCallEndEvent(contentIndex=block_index(), toolCall=tool_call, partial=output))
-        elif event_type == "response.completed":
-            saw_terminal = True
-            response = event.get("response")
-            if isinstance(response, dict):
-                if isinstance(response.get("id"), str):
-                    output.responseId = response["id"]
-                usage_data = response.get("usage")
-                if isinstance(usage_data, dict):
-                    cached_tokens = 0
-                    input_details = usage_data.get("input_tokens_details")
-                    if isinstance(input_details, dict):
-                        cached_tokens = int(input_details.get("cached_tokens") or 0)
-                    input_tokens = int(usage_data.get("input_tokens") or 0)
-                    output_tokens = int(usage_data.get("output_tokens") or 0)
-                    total_tokens = int(usage_data.get("total_tokens") or (input_tokens + output_tokens))
-                    output.usage = Usage(
-                        input=max(0, input_tokens - cached_tokens),
-                        output=output_tokens,
-                        cacheRead=cached_tokens,
-                        cacheWrite=0,
-                        totalTokens=total_tokens,
-                        cost=UsageCost(input=0, output=0, cacheRead=0, cacheWrite=0, total=0),
-                    )
-                else:
-                    output.usage = _empty_usage()
-                calculate_cost(model, output.usage)
-                if options and options.get("applyServiceTierPricing"):
-                    resolve_service_tier = options.get("resolveServiceTier")
-                    request_service_tier = options.get("serviceTier")
-                    response_service_tier = response.get("service_tier")
-                    service_tier = (
-                        resolve_service_tier(response_service_tier, request_service_tier)
-                        if callable(resolve_service_tier)
-                        else response_service_tier or request_service_tier
-                    )
-                    options["applyServiceTierPricing"](output.usage, service_tier)
-                output.stopReason = _map_stop_reason(response.get("status"))
-                if any(block.type == "toolCall" for block in output.content) and output.stopReason == "stop":
-                    output.stopReason = "toolUse"
-        elif event_type == "error":
-            code = event.get("code")
-            raise RuntimeError(f"Error Code {code}: {event.get('message')}")
-        elif event_type == "response.failed":
-            response = event.get("response") if isinstance(event.get("response"), dict) else {}
-            error = response.get("error") if isinstance(response, dict) else None
-            incomplete_details = response.get("incomplete_details") if isinstance(response, dict) else None
-            if isinstance(error, dict):
-                raise RuntimeError(f"{error.get('code', 'unknown')}: {error.get('message', 'no message')}")
-            if isinstance(incomplete_details, dict) and incomplete_details.get("reason"):
-                raise RuntimeError(f"incomplete: {incomplete_details['reason']}")
-            raise RuntimeError("Unknown error (no error details in response)")
 
-    if not saw_terminal:
-        # A proxy or an idle timeout can close the SSE connection cleanly mid-response.
-        # Without this the caller sees a normal return and reports the constructor's
-        # default stopReason="stop": half a message delivered as a finished turn, with
-        # zero usage and no TextEndEvent for the block still open. Every other family
-        # guards this (anthropic on message_stop, completions on finish_reason).
-        # An abort never reaches here -- it surfaces as an exception out of the event
-        # iterable, so it stays distinguishable from a truncated stream.
-        raise RuntimeError("Responses stream ended before response.completed")
+            if item_type == "reasoning" and slot is not None and slot.type == "thinking":
+                summary_text = "\n\n".join(s.get("text", "") for s in item.get("summary") or [] if isinstance(s, dict))
+                content_text = "\n\n".join(c.get("text", "") for c in item.get("content") or [] if isinstance(c, dict))
+                slot.block.thinking = summary_text or content_text or slot.block.thinking
+                slot.block.thinkingSignature = json.dumps(item, separators=(",", ":"))
+                reasoning_blocks_by_id[item.get("id")] = slot.block
+                stream.push(ThinkingEndEvent(contentIndex=slot.contentIndex, content=slot.block.thinking, partial=output))
+                output_slots.pop(output_index, None)
+            elif item_type == "message" and slot is not None and slot.type == "text":
+                slot.block.text = "".join(
+                    c.get("text", "") if c.get("type") == "output_text" else c.get("refusal", "")
+                    for c in item.get("content") or []
+                    if isinstance(c, dict)
+                )
+                slot.block.textSignature = encode_text_signature_v1(item.get("id", ""), item.get("phase"))
+                stream.push(TextEndEvent(contentIndex=slot.contentIndex, content=slot.block.text, partial=output))
+                output_slots.pop(output_index, None)
+            elif (
+                item_type == "function_call"
+                and slot is not None
+                and slot.type == "toolCall"
+                and scratch is not None
+                and scratch.partialJson is not None
+            ):
+                # MISAKA fork: the final arguments go through `finish_into`, which records a
+                # malformed object as `argumentsError` instead of running a repaired prefix.
+                item_arguments = item.get("arguments")
+                (StreamingArgs(item_arguments) if item_arguments else scratch.partialJson).finish_into(slot.block)
+                if item.get("namespace") is not None:
+                    slot.block.namespace = item["namespace"]
+                # Finalize in-place and strip the scratch buffer so replay only
+                # carries parsed arguments.
+                scratch.partialJson = None
+                stream.push(ToolCallEndEvent(contentIndex=slot.contentIndex, toolCall=slot.block, partial=output))
+                output_slots.pop(output_index, None)
+            elif (
+                item_type == "custom_tool_call"
+                and slot is not None
+                and slot.type == "toolCall"
+                and scratch is not None
+                and scratch.customInput is not None
+            ):
+                final_input = item.get("input")
+                push_tool_call_delta(
+                    slot,
+                    _append_custom_tool_call_input(
+                        slot.block,
+                        scratch,
+                        final_input if final_input is not None else _get_custom_tool_call_input(slot.block, scratch),
+                        True,
+                    ),
+                )
+                if item.get("namespace") is not None:
+                    slot.block.namespace = item["namespace"]
+                scratch.customInput = None
+                stream.push(ToolCallEndEvent(contentIndex=slot.contentIndex, toolCall=slot.block, partial=output))
+                output_slots.pop(output_index, None)
+        elif event_type in {"response.completed", "response.incomplete"}:
+            finalize_response(event.get("response"))
+        elif event_type == "error":
+            raise RuntimeError(f"Error Code {event.get('code')}: {event.get('message')}")
+        elif event_type == "response.failed":
+            saw_terminal_response_event = True
+            response = event.get("response") if isinstance(event.get("response"), dict) else {}
+            output.rawStopReason = response.get("status")
+            error = response.get("error")
+            details = response.get("incomplete_details")
+            if isinstance(error, dict):
+                msg = f"{error.get('code') or 'unknown'}: {error.get('message') or 'no message'}"
+            elif isinstance(details, dict) and details.get("reason"):
+                msg = f"incomplete: {details['reason']}"
+            else:
+                msg = "Unknown error (no error details in response)"
+            raise RuntimeError(msg)
+
+    if not saw_terminal_response_event:
+        raise RuntimeError("OpenAI Responses stream ended before a terminal response event")
+    # The agent runs every tool call in the final message. Refuse to hand over calls whose
+    # output_item.done never arrived: their arguments may be cut off or mixed up, e.g. when a
+    # non-compliant server omits output_index. Finished calls have their scratch buffers removed.
+    if output.stopReason == "toolUse":
+        for index, block in enumerate(output.content):
+            if block.type != "toolCall":
+                continue
+            scratch = streaming_tool_calls.get(index)
+            if scratch is not None and (scratch.partialJson is not None or scratch.customInput is not None):
+                raise RuntimeError(
+                    f"OpenAI Responses stream completed with an unfinished tool call: {block.name} ({block.id})"
+                )
+
+
+def _map_stop_reason(status: str | None, incomplete_reason: str | None = None) -> dict[str, Any]:
+    if not status:
+        return {"stopReason": "stop"}
+    if status == "completed":
+        return {"stopReason": "stop"}
+    if status == "incomplete":
+        if incomplete_reason == "max_output_tokens":
+            return {"stopReason": "length"}
+        return {
+            "stopReason": "error",
+            "errorMessage": f"Response incomplete: {incomplete_reason}"
+            if incomplete_reason
+            else "Response incomplete without a provider reason",
+        }
+    if status in {"failed", "cancelled"}:
+        return {"stopReason": "error"}
+    # These two are wonky ...
+    if status in {"in_progress", "queued"}:
+        return {"stopReason": "stop"}
+    raise RuntimeError(f"Unhandled stop reason: {status}")
 
 
 __all__ = [

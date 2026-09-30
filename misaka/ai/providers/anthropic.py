@@ -99,6 +99,7 @@ class AnthropicOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     thinkingEnabled: bool
@@ -1193,7 +1194,24 @@ def _fallback_usage_model(model: Model, answered_by: str) -> Model:
     return model
 
 
+def _set_usage_from_anthropic_message_start(output: AssistantMessage, usage: Mapping[str, Any], model: Model) -> None:
+    """pi anthropic-messages.ts ``message_start``: every count is set, an absent one to 0."""
+    # Capture initial token usage from message_start event
+    # This ensures we have input token counts even if the stream is aborted early
+    output.usage.input = int(usage.get("input_tokens") or 0)
+    output.usage.output = int(usage.get("output_tokens") or 0)
+    output.usage.cacheRead = int(usage.get("cache_read_input_tokens") or 0)
+    output.usage.cacheWrite = int(usage.get("cache_creation_input_tokens") or 0)
+    cache_creation = usage.get("cache_creation")
+    output.usage.cacheWrite1h = int(
+        (cache_creation.get("ephemeral_1h_input_tokens") if isinstance(cache_creation, Mapping) else 0) or 0)
+    # Anthropic doesn't provide total_tokens, compute from components
+    output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite
+    calculate_cost(model, output.usage)
+
+
 def _update_usage_from_anthropic_usage(output: AssistantMessage, usage: Mapping[str, Any], model: Model) -> None:
+    """pi anthropic-messages.ts ``message_delta``: only the counts the event carries."""
     input_tokens = usage.get("input_tokens")
     output_tokens = usage.get("output_tokens")
     cache_read_tokens = usage.get("cache_read_input_tokens")
@@ -1206,6 +1224,16 @@ def _update_usage_from_anthropic_usage(output: AssistantMessage, usage: Mapping[
         output.usage.cacheRead = int(cache_read_tokens)
     if cache_write_tokens is not None:
         output.usage.cacheWrite = int(cache_write_tokens)
+    # Vercel AI Gateway includes the TTL breakdown in deltas, though the SDK only types it on message_start.
+    cache_creation = usage.get("cache_creation")
+    if isinstance(cache_creation, Mapping) and cache_creation.get("ephemeral_1h_input_tokens") is not None:
+        output.usage.cacheWrite1h = int(cache_creation["ephemeral_1h_input_tokens"])
+    # Anthropic reports reasoning tokens as a subset of output tokens.
+    output_details = usage.get("output_tokens_details")
+    thinking_tokens = output_details.get("thinking_tokens") if isinstance(output_details, Mapping) else None
+    if thinking_tokens is not None:
+        output.usage.reasoning = int(thinking_tokens)
+    # Anthropic doesn't provide total_tokens, compute from components
     output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite
     calculate_cost(model, output.usage)
 
@@ -1303,7 +1331,10 @@ def stream_anthropic(
             else:
                 event_iter = _iter_event_objects(raw_response, _option(options, "signal"))
 
+            on_provider_stream_event = _option(options, "onProviderStreamEvent")
             async for event in event_iter:
+                if callable(on_provider_stream_event):
+                    await maybe_await(on_provider_stream_event(event, model))
                 event_type = event.get("type")
                 if event_type == "message_start":
                     message = event.get("message")
@@ -1318,7 +1349,7 @@ def stream_anthropic(
                             usage_model = _fallback_usage_model(model, response_model)
                         usage = message.get("usage")
                         if isinstance(usage, Mapping):
-                            _update_usage_from_anthropic_usage(output, usage, usage_model)
+                            _set_usage_from_anthropic_message_start(output, usage, usage_model)
                     continue
 
                 if event_type == "content_block_start":

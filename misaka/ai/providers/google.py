@@ -91,6 +91,7 @@ class GoogleOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     toolChoice: Literal["auto", "none", "any"]
@@ -297,8 +298,11 @@ def stream_google(
             stream.push(StartEvent(partial=output))
 
             current_block: TextContent | ThinkingContent | None = None
+            on_provider_stream_event = _option(options, "onProviderStreamEvent")
             async for chunk in _iterate_async_iterable(chunks_from(first, google_stream), signal,
                                                        on_abort=lambda: _close_stream(google_stream)):
+                if callable(on_provider_stream_event):
+                    await maybe_await(on_provider_stream_event(chunk, model))
                 if signal_aborted(signal):
                     raise RuntimeError("Request was aborted")
 

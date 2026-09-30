@@ -15,7 +15,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from misaka.ai.types import CacheRetention, Model, Usage, UsageCost
+from misaka.ai.types import CacheRetention, Usage, UsageCost
 from misaka.ai.utils.provider_env import get_provider_env_value
 from misaka.utils.values import maybe_await, signal_aborted
 
@@ -112,6 +112,16 @@ async def _iterate_async_iterable(iterable: Any, signal: Any = None, *, on_abort
             abort_task.cancel()
 
 
+def assign_sampling_params(params: dict[str, Any], *sources: Mapping[str, Any] | None) -> None:
+    """``Object.assign(params, model.samplingParams, options?.samplingParams)``, last in each
+    OpenAI-compatible builder: every key reaches the request body and overrides a named field of
+    the same name. The SDK's ``create()`` accepts only the fields it declares, so the keys travel
+    in ``extra_body``, which the SDK merges into the JSON body after the named fields."""
+    for source in sources:
+        if source:
+            params.setdefault("extra_body", {}).update(source)
+
+
 def _empty_usage() -> Usage:
     return Usage(
         input=0,
@@ -165,20 +175,3 @@ def safe_json_stringify(value: Any) -> str:
         return str(value)
 
 
-def get_service_tier_cost_multiplier(model: Model, service_tier: str | None) -> float:
-    if service_tier == "flex":
-        return 0.5
-    if service_tier == "priority":
-        return 2.5 if model.id == "gpt-5.5" else 2.0
-    return 1.0
-
-
-def apply_service_tier_pricing(usage: Usage, service_tier: str | None, model: Model) -> None:
-    multiplier = get_service_tier_cost_multiplier(model, service_tier)
-    if multiplier == 1:
-        return
-    usage.cost.input *= multiplier
-    usage.cost.output *= multiplier
-    usage.cost.cacheRead *= multiplier
-    usage.cost.cacheWrite *= multiplier
-    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite

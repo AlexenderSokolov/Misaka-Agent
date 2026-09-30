@@ -22,6 +22,7 @@ from misaka.ai.providers._common import (
     _empty_usage,
     _iterate_async_iterable,
     _option,
+    assign_sampling_params,
     resolve_cache_retention,
 )
 from misaka.ai.providers.cloudflare import (
@@ -211,6 +212,7 @@ class OpenAICompletionsOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     toolChoice: Literal["auto", "none", "required"] | OpenAICompletionsToolChoiceObject
@@ -362,8 +364,11 @@ def stream_openai_completions(
                     tool_call_index_by_id[tool_call["id"]] = existing_index
                 return existing_index, block
 
+            on_provider_stream_event = _option(options, "onProviderStreamEvent")
             chunks = _iterate_stream(openai_stream, _option(options, "signal"))
             async for raw_chunk in chunks:
+                if callable(on_provider_stream_event):
+                    await maybe_await(on_provider_stream_event(raw_chunk, model))
                 if not isinstance(raw_chunk, Mapping):
                     continue
 
@@ -707,21 +712,6 @@ def build_params(
     if _option(options, "temperature") is not None:
         params["temperature"] = _option(options, "temperature")
 
-    # Sampling passthrough: model-level defaults, request-level overrides.
-    # Keys already set explicitly above (temperature, max_tokens, ...) win here -- upstream
-    # goes the other way (`Object.assign` last, "so custom keys override the named request
-    # fields", api/openai-completions.ts:980-983).
-    sampling: dict[str, Any] = {}
-    model_sampling = getattr(model, "samplingParams", None)
-    if isinstance(model_sampling, dict):
-        sampling.update(model_sampling)
-    request_sampling = _option(options, "samplingParams")
-    if isinstance(request_sampling, dict):
-        sampling.update(request_sampling)
-    for key, value in sampling.items():
-        if value is not None and key not in params:
-            params[key] = value
-
     if len(transcript_tools.requestTools) > 0:
         params["tools"] = convert_tools(transcript_tools.requestTools, compat)
         if compat.get("zaiToolStream"):
@@ -838,6 +828,9 @@ def build_params(
             gateway_options["order"] = routing["order"]
         if gateway_options:
             _set_extra(params, "providerOptions", {"gateway": gateway_options})
+
+    # Last so custom keys override the named request fields. Per-request keys override model defaults.
+    assign_sampling_params(params, model.samplingParams, _option(options, "samplingParams"))
 
     return {key: value for key, value in params.items() if value is not None}
 

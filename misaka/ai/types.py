@@ -62,6 +62,10 @@ class StreamOptions(RuntimeModel):
     sessionId: str | None = None
     onPayload: Any | None = None
     onResponse: Any | None = None
+    # Optional observer for each parsed provider stream event before normalization.
+    # Event data is adapter-owned and must be treated as read-only. Adapter support is
+    # explicit; unsupported adapters do not invoke it.
+    onProviderStreamEvent: Any | None = None
     # A ``None`` value means "do not send this header" -- resolved auth uses it to
     # displace a provider's own credential header (the Cloudflare AI Gateway nulls out
     # ``Authorization`` and ``x-api-key``). Each SDK seam drops the ``None`` entries
@@ -209,14 +213,12 @@ class Usage(SchemaModel):
     cacheRead: int
     cacheWrite: int
     # Subset of `cacheWrite` written with 1h retention, priced differently -- see
-    # `calculate_cost`. Upstream reads `cache_creation.ephemeral_1h_input_tokens`
-    # (pi api/anthropic-messages.ts:606); no misaka adapter reads that field yet, so
-    # today nothing ever sets this.
+    # `calculate_cost`. Set from `cache_creation.ephemeral_1h_input_tokens` by the
+    # Anthropic adapter (message_start and deltas) and by Bedrock.
     cacheWrite1h: int | None = None
     # Reasoning tokens, when the provider reports them. A *subset* of `output`, not an
     # addition to it: adding the two would double-count. Optional rather than zero because
-    # providers that expose no breakdown leave it unset. The OpenAI-compatible adapter fills
-    # it from completion_tokens_details.reasoning_tokens, as pi's parseChunkUsage does.
+    # providers that expose no breakdown leave it unset.
     reasoning: int | None = None
     totalTokens: int
     cost: UsageCost

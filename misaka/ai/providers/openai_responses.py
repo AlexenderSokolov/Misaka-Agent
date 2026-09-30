@@ -22,7 +22,7 @@ from misaka.ai.providers._common import (
     _empty_usage,
     _iterate_async_iterable,
     _option,
-    apply_service_tier_pricing,
+    assign_sampling_params,
     resolve_cache_retention,
 )
 from misaka.ai.providers.cloudflare import (
@@ -54,6 +54,7 @@ from misaka.ai.types import (
     StartEvent,
     StreamOptions,
     TranscriptContext,
+    Usage,
 )
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import (
@@ -70,6 +71,19 @@ from misaka.ai.utils.transcript import (
 from misaka.utils.values import maybe_await, read_field, signal_aborted
 
 OPENAI_TOOL_CALL_PROVIDERS = {"openai", "openai-codex", "opencode"}
+CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage"
+
+
+def is_chatgpt_sign_in(model: Model, api_key: str | None) -> bool:
+    """OpenAI API keys start with `sk-`; a different credential sent directly to OpenAI
+    is a Sign in with ChatGPT access token.
+    """
+    return (
+        model.provider == "openai"
+        and model.baseUrl == "https://api.openai.com/v1"
+        and api_key is not None
+        and not api_key.startswith("sk-")
+    )
 
 
 class OpenAIResponsesOptions(TypedDict, total=False):
@@ -80,6 +94,7 @@ class OpenAIResponsesOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     maxTokens: int
@@ -240,6 +255,8 @@ def build_params(model: Model, context: TranscriptContext, options: Any = None) 
             "toolOptions": tool_options,
         },
     )
+    # Sign in with ChatGPT rejects these request fields.
+    omit_unsupported_fields = is_chatgpt_sign_in(model, _option(options, "apiKey"))
     params: dict[str, Any] = {
         "model": model.id,
         "input": messages,
@@ -247,16 +264,16 @@ def build_params(model: Model, context: TranscriptContext, options: Any = None) 
         "prompt_cache_key": (
             None if cache_retention == "none" else clamp_openai_prompt_cache_key(_option(options, "sessionId"))
         ),
-        "prompt_cache_retention": get_prompt_cache_retention(compat, cache_retention),
-        "prompt_cache_options": get_prompt_cache_options(compat, cache_retention),
+        "prompt_cache_retention": None if omit_unsupported_fields else get_prompt_cache_retention(compat, cache_retention),
+        "prompt_cache_options": None if omit_unsupported_fields else get_prompt_cache_options(compat, cache_retention),
         "store": False,
     }
 
     # The floor is the API's: a smaller ceiling is rejected, and a caller asking for one
     # means "as little as possible" rather than "fail".
-    if _option(options, "maxTokens") and compat["supportsMaxOutputTokens"]:
+    if _option(options, "maxTokens") and compat["supportsMaxOutputTokens"] and not omit_unsupported_fields:
         params["max_output_tokens"] = max(_option(options, "maxTokens"), MIN_OUTPUT_TOKENS)
-    if _option(options, "temperature") is not None:
+    if _option(options, "temperature") is not None and not omit_unsupported_fields:
         params["temperature"] = _option(options, "temperature")
     if _option(options, "serviceTier") is not None:
         params["service_tier"] = _option(options, "serviceTier")
@@ -285,15 +302,30 @@ def build_params(model: Model, context: TranscriptContext, options: Any = None) 
             if model.thinkingLevelMap is None or not has_off_override or off_value is not None:
                 params["reasoning"] = {"effort": "none" if off_value is None else off_value}
 
-    # Upstream applies samplingParams last with `Object.assign` (openai-responses.ts:342-343),
-    # so custom keys override the named request fields above. openai_completions carries a
-    # declared deviation in the other direction; this file follows upstream until the owner
-    # unifies the two.
-    sampling = _option(options, "samplingParams")
-    if isinstance(sampling, dict) and sampling:
-        params.update(sampling)
+    # Last so custom keys override the named request fields. Per-request keys override model defaults.
+    assign_sampling_params(params, model.samplingParams, _option(options, "samplingParams"))
 
     return params
+
+
+def get_service_tier_cost_multiplier(model: Model, service_tier: str | None) -> float:
+    if service_tier == "flex":
+        return 0.5
+    if service_tier == "priority" or service_tier == "fast":
+        return 2.5 if model.id == "gpt-5.5" else 2.0
+    return 1.0
+
+
+def apply_service_tier_pricing(usage: Usage, service_tier: str | None, model: Model) -> None:
+    multiplier = get_service_tier_cost_multiplier(model, service_tier)
+    if multiplier == 1:
+        return
+
+    usage.cost.input *= multiplier
+    usage.cost.output *= multiplier
+    usage.cost.cacheRead *= multiplier
+    usage.cost.cacheWrite *= multiplier
+    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite
 
 
 async def _iterate_stream(stream_obj: Any, signal: Any = None) -> AsyncIterator[dict[str, Any]]:
@@ -362,7 +394,7 @@ def stream_openai_responses(
             provider=model.provider,
             model=model.id,
             usage=_empty_usage(),
-            stopReason="stop",
+            stopReason="pending",
             timestamp=time.time_ns() // 1_000_000,
         )
 
@@ -399,6 +431,7 @@ def stream_openai_responses(
                     stream,
                     model,
                     {
+                        "onProviderStreamEvent": _option(options, "onProviderStreamEvent"),
                         "grammarToolInputProperties": create_grammar_tool_input_properties(
                             get_declared_tools(normalized_context.messages),
                             bool(getattr(getattr(model, "compat", None), "supportsOpenAIGrammarTools", None)),
@@ -410,18 +443,25 @@ def stream_openai_responses(
 
             if signal_aborted(signal):
                 raise RuntimeError("Request was aborted")
+
+            if output.stopReason == "pending":
+                raise RuntimeError("OpenAI Responses stream ended without a stop reason")
             if output.stopReason in {"aborted", "error"}:
-                raise RuntimeError("An unknown error occurred")
+                raise RuntimeError(output.errorMessage or "An unknown error occurred")
 
             stream.push(DoneEvent(reason=output.stopReason, message=output))
         except Exception as error:  # noqa: BLE001
-            for block in output.content:
-                for attr in ("index", "partialJson"):
-                    if hasattr(block, attr):
-                        delattr(block, attr)
+            # MISAKA fork: streaming scratch buffers live beside the blocks
+            # (`openai_responses_shared._StreamingToolCallScratch`), so there is nothing to strip here.
             signal = _option(options, "signal")
             output.stopReason = "aborted" if signal_aborted(signal) else "error"
-            output.errorMessage = format_openai_responses_error(error, model)
+            error_message = format_openai_responses_error(error, model)
+            # Sign in with ChatGPT shares the subscription's usage limit with other apps.
+            output.errorMessage = (
+                f"{error_message}\nCheck your ChatGPT usage: {CHATGPT_USAGE_URL}"
+                if "subscription_sharing_usage_limit_exceeded" in error_message
+                else error_message
+            )
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
             stream.end()

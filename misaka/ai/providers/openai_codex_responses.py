@@ -23,8 +23,6 @@ from misaka.ai.models import clamp_thinking_level
 from misaka.ai.providers._common import (
     _create_abort_wait_task,
     _option,
-    apply_service_tier_pricing,
-    get_service_tier_cost_multiplier,
 )
 from misaka.ai.providers.constrained_sampling import (
     create_grammar_tool_input_properties,
@@ -47,6 +45,7 @@ from misaka.ai.types import (
     StartEvent,
     StreamOptions,
     TranscriptContext,
+    Usage,
 )
 from misaka.ai.utils.diagnostics import (
     append_assistant_message_diagnostic,
@@ -92,6 +91,7 @@ class OpenAICodexResponsesOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     reasoningEffort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -119,6 +119,12 @@ class CodexProtocolError(RuntimeError):
     def __init__(self, message: str, *, payload: Any = None) -> None:
         super().__init__(message)
         self.payload = payload
+
+
+class ProviderStreamEventCallbackError(RuntimeError):
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(format_thrown_value(cause))
+        self.__cause__ = cause
 
 
 class WebSocketCloseError(RuntimeError):
@@ -465,7 +471,9 @@ async def process_stream(
     options: StreamOptions | dict[str, Any] | None = None,
 ) -> None:
     await process_responses_stream(
-        map_codex_events(parse_sse(response, _option(options, "signal"))),
+        map_codex_events(
+            parse_sse(response, _option(options, "signal")), output, model, _option(options, "onProviderStreamEvent")
+        ),
         output,
         stream,
         model,
@@ -490,11 +498,22 @@ def _is_previous_response_not_found_error(error: Any) -> bool:
 
 
 def is_codex_non_transport_error(error: BaseException | Any) -> bool:
-    return isinstance(error, (CodexApiError, CodexProtocolError))
+    return isinstance(error, (CodexApiError, CodexProtocolError, ProviderStreamEventCallbackError))
 
 
-async def map_codex_events(events: AsyncIterable[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
+async def map_codex_events(
+    events: AsyncIterable[dict[str, Any]],
+    output: AssistantMessage,
+    model: Model,
+    on_provider_stream_event: Any = None,
+) -> AsyncIterator[dict[str, Any]]:
     async for event in events:
+        try:
+            if callable(on_provider_stream_event):
+                await maybe_await(on_provider_stream_event(event, model))
+        except Exception as error:
+            # Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
+            raise ProviderStreamEventCallbackError(error) from error
         event_type = event.get("type")
         if not isinstance(event_type, str):
             continue
@@ -1105,7 +1124,10 @@ async def process_websocket_stream(
                     output,
                     stream,
                     on_start,
-                )
+                ),
+                output,
+                model,
+                _option(options, "onProviderStreamEvent"),
             ),
             output,
             stream,
@@ -1370,6 +1392,26 @@ def stream_simple_openai_codex_responses(
         context,
         {**base.model_dump(), "reasoningEffort": reasoning_effort},
     )
+
+
+def get_service_tier_cost_multiplier(model: Model, service_tier: str | None) -> float:
+    if service_tier == "flex":
+        return 0.5
+    if service_tier == "priority":
+        return 2.5 if model.id == "gpt-5.5" else 2.0
+    return 1.0
+
+
+def apply_service_tier_pricing(usage: Usage, service_tier: str | None, model: Model) -> None:
+    multiplier = get_service_tier_cost_multiplier(model, service_tier)
+    if multiplier == 1:
+        return
+
+    usage.cost.input *= multiplier
+    usage.cost.output *= multiplier
+    usage.cost.cacheRead *= multiplier
+    usage.cost.cacheWrite *= multiplier
+    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite
 
 
 streamOpenAICodexResponses = stream_openai_codex_responses

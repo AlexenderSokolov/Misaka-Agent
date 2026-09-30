@@ -99,6 +99,7 @@ class PiMessagesOptions(TypedDict, total=False):
     env: dict[str, str]
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     temperature: float
     maxTokens: int
     cacheRetention: CacheRetention
@@ -577,7 +578,10 @@ def stream_pi_messages(
                         )
 
                     terminated = False
+                    on_provider_stream_event = _option(options, "onProviderStreamEvent")
                     async for pi_event in _read_pi_messages_events(response, signal):
+                        if callable(on_provider_stream_event):
+                            await maybe_await(on_provider_stream_event(pi_event, model))
                         event = converter.convert(pi_event)
                         if event is None:
                             continue

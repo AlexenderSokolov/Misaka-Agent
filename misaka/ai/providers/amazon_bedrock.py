@@ -121,6 +121,7 @@ class BedrockOptions(TypedDict, total=False):
     cacheRetention: str
     onPayload: Any
     onResponse: Any
+    onProviderStreamEvent: Any
     timeoutMs: int
     maxRetries: int
     region: str
@@ -437,7 +438,10 @@ def stream_bedrock(
             response_stream = response.get("stream") if isinstance(response, dict) else None
             block_indices: dict[int, int] = {}
 
+            on_provider_stream_event = _option(options, "onProviderStreamEvent")
             async for item in iterate_stream_events(response_stream, signal):
+                if callable(on_provider_stream_event):
+                    await maybe_await(on_provider_stream_event(item, model))
                 if signal_aborted(signal):
                     raise RuntimeError("Request was aborted")
 
