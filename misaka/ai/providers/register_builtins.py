@@ -12,6 +12,7 @@ from misaka.ai.api_lazy import lazy_api
 from misaka.ai.api_registry import (
     ApiProvider,
     clear_api_providers,
+    get_api_provider,
     register_api_provider,
 )
 from misaka.ai.types import (
@@ -194,48 +195,45 @@ _stream_bedrock_lazy = _create_lazy_stream(_load_bedrock_provider_module)
 _stream_simple_bedrock_lazy = _create_lazy_simple_stream(_load_bedrock_provider_module)
 
 
-def register_built_in_api_providers() -> None:
-    register_api_provider(ApiProvider(api="anthropic-messages", stream=stream_anthropic, streamSimple=stream_simple_anthropic))
-    register_api_provider(
-        ApiProvider(
-            api="openai-completions",
-            stream=stream_openai_completions,
-            streamSimple=stream_simple_openai_completions,
-        )
-    )
-    register_api_provider(ApiProvider(api="mistral-conversations", stream=stream_mistral, streamSimple=stream_simple_mistral))
+_BUILTIN_APIS = (
+    ("anthropic-messages", stream_anthropic, stream_simple_anthropic),
+    ("openai-completions", stream_openai_completions, stream_simple_openai_completions),
+    ("openai-responses", stream_openai_responses, stream_simple_openai_responses),
+    ("openai-codex-responses", stream_openai_codex_responses, stream_simple_openai_codex_responses),
+    ("azure-openai-responses", stream_azure_openai_responses, stream_simple_azure_openai_responses),
+    ("google-generative-ai", stream_google, stream_simple_google),
+    ("google-vertex", stream_google_vertex, stream_simple_google_vertex),
+    ("mistral-conversations", stream_mistral, stream_simple_mistral),
+    ("bedrock-converse-stream", _stream_bedrock_lazy, _stream_simple_bedrock_lazy),
     # pi's own wire protocol rather than a vendor's: the whole context goes out as-is and
     # comes back as pi's event stream. The Radius gateway speaks it, and so does anything a
     # models.json custom provider points at with `"api": "pi-messages"`.
-    register_api_provider(
-        ApiProvider(api="pi-messages", stream=stream_pi_messages, streamSimple=stream_simple_pi_messages)
-    )
-    register_api_provider(ApiProvider(api="openai-responses", stream=stream_openai_responses, streamSimple=stream_simple_openai_responses))
-    register_api_provider(
-        ApiProvider(
-            api="azure-openai-responses",
-            stream=stream_azure_openai_responses,
-            streamSimple=stream_simple_azure_openai_responses,
-        )
-    )
-    register_api_provider(
-        ApiProvider(
-            api="openai-codex-responses",
-            stream=stream_openai_codex_responses,
-            streamSimple=stream_simple_openai_codex_responses,
-        )
-    )
-    register_api_provider(ApiProvider(api="google-generative-ai", stream=stream_google, streamSimple=stream_simple_google))
-    register_api_provider(
-        ApiProvider(api="google-vertex", stream=stream_google_vertex, streamSimple=stream_simple_google_vertex)
-    )
-    register_api_provider(
-        ApiProvider(api="bedrock-converse-stream", stream=_stream_bedrock_lazy, streamSimple=_stream_simple_bedrock_lazy)
-    )
+    ("pi-messages", stream_pi_messages, stream_simple_pi_messages),
+)
+
+_builtin_api_provider_instances: dict[str, ApiProvider | None] = {}
+
+
+def register_built_in_api_providers() -> None:
+    """Registers the builtin API implementations into the api-registry without
+    clobbering existing entries: this module may load after a test or extension has
+    already registered an override for a builtin api id.
+    """
+    for api, stream, stream_simple in _BUILTIN_APIS:
+        if get_api_provider(api) is None:
+            register_api_provider(ApiProvider(api=api, stream=stream, streamSimple=stream_simple))
+        _builtin_api_provider_instances[api] = get_api_provider(api)
+
+
+def get_builtin_api_provider_instance(api: str) -> ApiProvider | None:
+    """The registry entry the builtin registration left for ``api``; the stream facade only
+    routes through the builtin provider definitions while that entry is still in place."""
+    return _builtin_api_provider_instances.get(api)
 
 
 def reset_api_providers() -> None:
     clear_api_providers()
+    _builtin_api_provider_instances.clear()
     register_built_in_api_providers()
 
 

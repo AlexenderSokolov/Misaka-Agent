@@ -20,6 +20,7 @@ Provider: TypeAlias = str
 
 ImagesProvider: TypeAlias = str
 
+ToolChoice: TypeAlias = Literal["auto", "none"]
 ThinkingLevel: TypeAlias = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
 ModelThinkingLevel: TypeAlias = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 ThinkingLevelMap: TypeAlias = dict[ModelThinkingLevel, str | None]
@@ -55,6 +56,8 @@ class StreamOptions(RuntimeModel):
     temperature: float | None = None
     maxTokens: int | None = None
     signal: Any | None = None
+    # Explicit parent context for telemetry produced by this logical request.
+    telemetryContext: Any | None = None
     apiKey: str | None = None
     env: dict[str, str] | None = None
     transport: Transport | None = None
@@ -73,6 +76,10 @@ class StreamOptions(RuntimeModel):
     # request through the gateway fail validation before it went out.
     headers: dict[str, str | None] | None = None
     timeoutMs: int | None = None
+    # WebSocket connect timeout in milliseconds for providers that support WebSocket
+    # transports. This covers the connection/open handshake only; stream idleness after
+    # connection uses timeoutMs.
+    websocketConnectTimeoutMs: int | None = None
     maxRetries: int | None = None
     maxRetryDelayMs: int | None = None
     metadata: dict[str, Any] | None = None
@@ -131,7 +138,12 @@ DeferredCancelOptions: TypeAlias = StreamOptions
 
 
 class SimpleStreamOptions(StreamOptions):
+    # Provider-neutral tool selection for simple requests. When omitted, adapters use
+    # provider-specific behavior.
+    toolChoice: ToolChoice | None = None
     reasoning: ThinkingLevel | None = None
+    # Ask a capable provider to return a durable handle and continue the request asynchronously.
+    deferred: bool | dict[str, Any] | None = None
     thinkingBudgets: ThinkingBudgets | None = None
 
 

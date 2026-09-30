@@ -764,3 +764,128 @@ def test_prompt_disposition_types_match_upstream():
 
     assert set(typing.get_args(QueuedInputDisposition)) == {"handled", "queued"}
     assert set(typing.get_args(PromptDisposition)) == {"handled", "queued", "started"}
+
+
+# === B1b: ai/ layer aligned file by file with 0.99.1 =========================================
+
+_ANTHROPIC_SSE = (
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"MODEL",'
+    '"usage":{"input_tokens":3,"output_tokens":0}}}\n\n'
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    '"content_block":{"type":"text","text":""}}\n\n'
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    '"delta":{"type":"text_delta","text":"hi"}}\n\n'
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+    '"usage":{"output_tokens":1}}\n\n'
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+
+
+@pytest.fixture
+def anthropic_wire(monkeypatch):
+    """Real SDK client, fake HTTP: every request the adapter sends is recorded."""
+    requests: list[httpx.Request] = []
+    responses: list[httpx.Response] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if responses:
+            return responses.pop(0)
+        body = _ANTHROPIC_SSE.replace("MODEL", json.loads(request.content)["model"])
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    original = anthropic.create_client
+
+    def create_client(*args, **kwargs):
+        client, is_oauth, request_headers = original(*args, **kwargs)
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=client.base_url)
+        return client, is_oauth, request_headers
+
+    monkeypatch.setattr(anthropic, "create_client", create_client)
+    return requests, responses
+
+
+async def test_anthropic_fallback_models_go_through_the_beta_messages_api(anthropic_wire):
+    requests, _ = anthropic_wire
+    model = get_model("anthropic", "claude-fable-5")
+
+    result = await anthropic.stream_anthropic(model, normalize_context(CONTEXT), {"apiKey": "sk-ant-test"}).result()
+
+    assert result.stopReason == "stop", result.errorMessage
+    [request] = requests
+    body = json.loads(request.content)
+    assert [fallback["model"] for fallback in body["fallbacks"]] == [
+        fallback.model for fallback in model.compat.allowedFallbackModels
+    ]
+    assert anthropic.SERVER_SIDE_FALLBACK_BETA in request.headers["anthropic-beta"]
+    assert request.headers["x-api-key"] == "sk-ant-test"
+
+
+async def test_anthropic_sdk_does_not_retry_on_its_own(anthropic_wire):
+    requests, responses = anthropic_wire
+    responses.append(httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "boom"}}))
+
+    result = await anthropic.stream_anthropic(
+        get_model("anthropic", "claude-haiku-4-5"), normalize_context(CONTEXT), {"apiKey": "sk-ant-test"}
+    ).result()
+
+    assert result.stopReason == "error"
+    assert len(requests) == 1
+
+
+async def test_anthropic_header_owned_auth_honours_null_headers(anthropic_wire, monkeypatch):
+    requests, _ = anthropic_wire
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
+    headers = {"cf-aig-authorization": "Bearer gateway", "Authorization": None, "x-api-key": None}
+
+    result = await anthropic.stream_anthropic(
+        get_model("anthropic", "claude-haiku-4-5"), normalize_context(CONTEXT), {"headers": headers}
+    ).result()
+
+    assert result.stopReason == "stop", result.errorMessage
+    [request] = requests
+    assert request.headers["cf-aig-authorization"] == "Bearer gateway"
+    assert "x-api-key" not in request.headers and "authorization" not in request.headers
+
+
+def test_anthropic_refuses_a_request_without_any_auth():
+    with pytest.raises(RuntimeError, match="No API key for provider: anthropic"):
+        anthropic.stream_simple_anthropic(get_model("anthropic", "claude-haiku-4-5"), normalize_context(CONTEXT))
+
+
+def test_anthropic_configured_beta_header_replaces_the_computed_betas():
+    model = get_model("anthropic", "claude-fable-5")
+
+    configured = anthropic.build_params(model, normalize_context(CONTEXT), False, {"headers": {"anthropic-beta": "a, b,a"}})
+    suppressed = anthropic.build_params(model, normalize_context(CONTEXT), False, {"headers": {"Anthropic-Beta": None}})
+
+    assert configured["betas"] == ["a", "b"]
+    assert "betas" not in suppressed
+
+
+def test_anthropic_tool_call_ids_keep_only_ascii_word_characters():
+    assert anthropic.normalize_tool_call_id("call|é1-x") == "call__1-x"
+
+
+async def test_stream_facade_injects_the_environment_api_key(anthropic_wire, monkeypatch):
+    requests, _ = anthropic_wire
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
+
+    result = await complete_simple(get_model("anthropic", "claude-haiku-4-5"), CONTEXT)
+
+    assert result.stopReason == "stop", result.errorMessage
+    assert requests[0].headers["x-api-key"] == "sk-ant-from-env"
+
+
+def test_env_api_key_reads_scoped_env_first(monkeypatch):
+    from misaka.ai.env_api_keys import find_env_keys, get_env_api_key
+
+    monkeypatch.setenv("NVIDIA_API_KEY", "ambient")
+    assert get_env_api_key("nvidia") == "ambient"
+    assert get_env_api_key("nvidia", {"NVIDIA_API_KEY": "scoped"}) == "scoped"
+    assert find_env_keys("typesafe", {"TYPESAFE_API_KEY": "k"}) == ["TYPESAFE_API_KEY"]
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_OAUTH_TOKEN", raising=False)
+    assert get_env_api_key("anthropic") is None
