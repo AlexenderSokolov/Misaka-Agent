@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
+import warnings
 from collections.abc import Mapping
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
@@ -15,20 +15,23 @@ try:
 except ImportError:  # optional extra: misaka[google]
     GoogleGenAI = None
 
-from misaka.ai.models import calculate_cost, clamp_thinking_level
+from misaka.ai.auth.types import ProviderEnv
+from misaka.ai.models import clamp_thinking_level
 from misaka.ai.providers._common import (
     _close_stream,
     _iterate_async_iterable,
     _prepare_sdk_params,
 )
 from misaka.ai.providers.google import (
+    _apply_usage_metadata,
     _build_tool_call,
     _coalesce_attr,
+    _custom_budget,
     _empty_usage,
     _finish_current_block,
     _nested_option,
     _option,
-    get_google_budget,
+    _raw_finish_reason,
     maybe_await,
 )
 from misaka.ai.providers.google_shared import (
@@ -61,6 +64,7 @@ from misaka.ai.types import (
     TextContent,
     TextDeltaEvent,
     TextStartEvent,
+    ThinkingBudgets,
     ThinkingContent,
     ThinkingDeltaEvent,
     ThinkingStartEvent,
@@ -68,12 +72,12 @@ from misaka.ai.types import (
     ToolCallEndEvent,
     ToolCallStartEvent,
     TranscriptContext,
-    Usage,
-    UsageCost,
 )
 from misaka.ai.utils.abort import race_with_abort_signal
+from misaka.ai.utils.error_body import format_provider_error, normalize_provider_error
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import provider_headers_to_record
+from misaka.ai.utils.provider_env import get_provider_env_value
 from misaka.ai.utils.sanitize_unicode import sanitize_surrogates
 from misaka.ai.utils.text import get_system_message_text
 from misaka.ai.utils.transcript import (
@@ -107,10 +111,9 @@ API_VERSION = "v1"
 GCP_VERTEX_CREDENTIALS_MARKER = "gcp-vertex-credentials"
 _API_VERSION_PATTERN = re.compile(r"^v\d+(?:beta\d*)?$")
 _PLACEHOLDER_API_KEY_PATTERN = re.compile(r"^<[^>]+>$")
-
-
-def _format_google_vertex_error(error: Any) -> str:
-    return str(error) if isinstance(error, Exception) else json.dumps(error, default=str)
+# MISAKA fork: the scope google-auth-library applies for @google/genai by default; the
+# Python SDK only applies it on its own ADC path, so a key file loaded here names it.
+_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
 def stream_google_vertex(
@@ -128,31 +131,28 @@ def stream_google_vertex(
             provider=model.provider,
             model=model.id,
             usage=_empty_usage(),
-            stopReason="stop",
+            stopReason="pending",
             timestamp=time.time_ns() // 1_000_000,
         )
         signal = _option(options, "signal")
+        # MISAKA fork: a caller may hand in a ready SDK client (the tests do).
         client: Any = _option(options, "client")
 
         try:
             if client is None:
                 api_key = resolve_api_key(options)
-                if api_key:
-                    client = create_client_with_api_key(
-                        model,
-                        api_key,
-                        _option(options, "headers"),
-                        _option(options, "timeoutMs"),
-                    )
-                else:
-                    client = create_client(
+                # Create the client using either a Vertex API key, if provided, or ADC with project and location
+                client = (
+                    create_client_with_api_key(model, api_key, _option(options, "headers"))
+                    if api_key
+                    else create_client(
                         model,
                         resolve_project(options),
                         resolve_location(options),
                         _option(options, "headers"),
-                        _option(options, "timeoutMs"),
+                        _option(options, "env"),
                     )
-
+                )
             params = build_params(model, normalized_context, options)
             on_payload = _option(options, "onPayload")
             if callable(on_payload):
@@ -167,8 +167,8 @@ def stream_google_vertex(
                 lambda: open_content_stream(client, _prepare_sdk_params(params)),
                 options,
             ), signal)
-            stream.push(StartEvent(partial=output))
 
+            stream.push(StartEvent(partial=output))
             current_block: TextContent | ThinkingContent | None = None
             on_provider_stream_event = _option(options, "onProviderStreamEvent")
             async for chunk in _iterate_async_iterable(chunks_from(first, google_stream), signal,
@@ -177,7 +177,8 @@ def stream_google_vertex(
                     await maybe_await(on_provider_stream_event(chunk, model))
                 if signal_aborted(signal):
                     raise RuntimeError("Request was aborted")
-
+                # Vertex uses the same @google/genai GenerateContentResponse type as Gemini.
+                # responseId is documented there as an output-only identifier for each response.
                 output.responseId = output.responseId or _coalesce_attr(chunk, "response_id", "responseId")
                 candidates = _coalesce_attr(chunk, "candidates") or []
                 candidate = candidates[0] if candidates else None
@@ -187,12 +188,11 @@ def stream_google_vertex(
                     part_text = _coalesce_attr(part, "text")
                     if part_text is not None:
                         is_thinking = is_thinking_part(part)
-                        should_start_new_block = (
+                        if (
                             current_block is None
                             or (is_thinking and current_block.type != "thinking")
                             or (not is_thinking and current_block.type != "text")
-                        )
-                        if should_start_new_block:
+                        ):
                             _finish_current_block(current_block, output, stream)
                             if is_thinking:
                                 current_block = ThinkingContent(thinking="")
@@ -202,7 +202,6 @@ def stream_google_vertex(
                                 current_block = TextContent(text="")
                                 output.content.append(current_block)
                                 stream.push(TextStartEvent(contentIndex=len(output.content) - 1, partial=output))
-
                         if current_block.type == "thinking":
                             current_block.thinking += part_text
                             current_block.thinkingSignature = retain_thought_signature(
@@ -246,74 +245,37 @@ def stream_google_vertex(
                                 partial=output,
                             )
                         )
-                        stream.push(
-                            ToolCallEndEvent(
-                                contentIndex=content_index,
-                                toolCall=tool_call,
-                                partial=output,
-                            )
-                        )
+                        stream.push(ToolCallEndEvent(contentIndex=content_index, toolCall=tool_call, partial=output))
 
                 finish_reason = _coalesce_attr(candidate, "finish_reason", "finishReason")
-                if finish_reason is not None:
+                if finish_reason:
+                    output.rawStopReason = _raw_finish_reason(finish_reason)
                     output.stopReason = map_stop_reason(finish_reason)
-                    if any(block.type == "toolCall" for block in output.content):
+                    if any(block.type == "toolCall" for block in output.content) and output.stopReason == "stop":
                         output.stopReason = "toolUse"
 
                 usage_metadata = _coalesce_attr(chunk, "usage_metadata", "usageMetadata")
                 if usage_metadata is not None:
-                    usage = Usage(
-                        input=max(
-                            0,
-                            int(_coalesce_attr(usage_metadata, "prompt_token_count", "promptTokenCount") or 0)
-                            - int(
-                                _coalesce_attr(
-                                    usage_metadata,
-                                    "cached_content_token_count",
-                                    "cachedContentTokenCount",
-                                )
-                                or 0
-                            ),
-                        ),
-                        output=(
-                            int(
-                                _coalesce_attr(
-                                    usage_metadata,
-                                    "response_token_count",
-                                    "responseTokenCount",
-                                    "candidates_token_count",
-                                    "candidatesTokenCount",
-                                )
-                                or 0
-                            )
-                            + int(_coalesce_attr(usage_metadata, "thoughts_token_count", "thoughtsTokenCount") or 0)
-                        ),
-                        cacheRead=int(
-                            _coalesce_attr(
-                                usage_metadata,
-                                "cached_content_token_count",
-                                "cachedContentTokenCount",
-                            )
-                            or 0
-                        ),
-                        cacheWrite=0,
-                        totalTokens=int(_coalesce_attr(usage_metadata, "total_token_count", "totalTokenCount") or 0),
-                        cost=UsageCost(input=0, output=0, cacheRead=0, cacheWrite=0, total=0),
-                    )
-                    calculate_cost(model, usage)
-                    output.usage = usage
+                    _apply_usage_metadata(output, model, usage_metadata)
 
             _finish_current_block(current_block, output, stream)
 
             if signal_aborted(signal):
                 raise RuntimeError("Request was aborted")
+
+            if output.stopReason == "pending":
+                raise RuntimeError("Google Vertex stream ended without a finish reason")
             if output.stopReason in {"aborted", "error"}:
-                raise RuntimeError("An unknown error occurred")
+                raise RuntimeError(
+                    f"Provider stopped with: {output.rawStopReason}"
+                    if output.rawStopReason
+                    else "An unknown error occurred"
+                )
 
             stream.push(DoneEvent(reason=output.stopReason, message=output))
         except Exception as error:  # noqa: BLE001
             output.stopReason = "aborted" if signal_aborted(signal) else "error"
-            output.errorMessage = _format_google_vertex_error(error)
+            output.errorMessage = format_provider_error(normalize_provider_error(error))
             stream.push(ErrorEvent(reason=output.stopReason, error=output), cause=error)
         finally:
             aio_client = getattr(client, "aio", None)
@@ -334,35 +296,25 @@ def stream_simple_google_vertex(
     context: TranscriptContext,
     options: SimpleStreamOptions | None = None,
 ) -> AssistantMessageEventStream:
-    base = build_base_options(model, context, options, None)
+    base = {
+        **build_base_options(model, context, options, None).model_dump(),
+        "toolChoice": _option(options, "toolChoice"),
+    }
     reasoning = _option(options, "reasoning")
     if not reasoning:
-        return stream_google_vertex(
-            model,
-            context,
-            {
-                **base.model_dump(),
-                "thinking": {"enabled": False},
-            },
-        )
+        return stream_google_vertex(model, context, {**base, "thinking": {"enabled": False}})
 
     clamped_reasoning = clamp_thinking_level(model, reasoning)
     if clamped_reasoning == "off":
-        return stream_google_vertex(
-            model,
-            context,
-            {
-                **base.model_dump(),
-                "thinking": {"enabled": False},
-            },
-        )
+        return stream_google_vertex(model, context, {**base, "thinking": {"enabled": False}})
     resolved_level: ClampedThinkingLevel = resolve_google_thinking_level(model, clamped_reasoning)
+
     if uses_google_thinking_level(model):
         return stream_google_vertex(
             model,
             context,
             {
-                **base.model_dump(),
+                **base,
                 "thinking": {
                     "enabled": True,
                     "level": to_google_thinking_level(resolved_level),
@@ -374,7 +326,7 @@ def stream_simple_google_vertex(
         model,
         context,
         {
-            **base.model_dump(),
+            **base,
             "thinking": {
                 "enabled": True,
                 "budgetTokens": get_google_budget(model, resolved_level, _option(options, "thinkingBudgets")),
@@ -387,41 +339,43 @@ def create_client(
     model: Model,
     project: str,
     location: str,
-    options_headers: Mapping[str, str] | None = None,
-    timeout_ms: int | None = None,
+    options_headers: Mapping[str, str | None] | None = None,
+    env: ProviderEnv | None = None,
 ) -> GoogleGenAI:
-    http_options = build_http_options(model, options_headers, timeout_ms) or {}
-    http_options.setdefault("apiVersion", API_VERSION)
+    google_auth_options = build_google_auth_options(env)
     return require(GoogleGenAI, "google-genai")(
         vertexai=True,
         project=project,
         location=location,
-        http_options=http_options,
+        **({"credentials": _load_google_credentials(google_auth_options)} if google_auth_options else {}),
+        http_options=_with_api_version(build_http_options(model, options_headers)),
     )
 
 
 def create_client_with_api_key(
     model: Model,
     api_key: str,
-    options_headers: Mapping[str, str] | None = None,
-    timeout_ms: int | None = None,
+    options_headers: Mapping[str, str | None] | None = None,
 ) -> GoogleGenAI:
-    http_options = build_http_options(model, options_headers, timeout_ms) or {}
-    http_options.setdefault("apiVersion", API_VERSION)
     return require(GoogleGenAI, "google-genai")(
         vertexai=True,
         api_key=api_key,
-        http_options=http_options,
+        http_options=_with_api_version(build_http_options(model, options_headers)),
     )
+
+
+def _with_api_version(http_options: dict[str, Any] | None) -> dict[str, Any]:
+    """MISAKA fork: @google/genai takes ``apiVersion`` beside ``httpOptions`` and lets
+    ``httpOptions.apiVersion`` override it; the Python SDK reads it from the HTTP options
+    alone, so the default goes in there unless the options already set one."""
+    return {"apiVersion": API_VERSION, **(http_options or {})}
 
 
 def build_http_options(
     model: Model,
-    options_headers: Mapping[str, str] | None = None,
-    timeout_ms: int | None = None,
+    options_headers: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any] | None:
-    # The outer retry_google_request owns retries; disable the SDK's five-attempt default.
-    http_options: dict[str, Any] = {"retryOptions": {"attempts": 1}}
+    http_options: dict[str, Any] = {}
     base_url = resolve_custom_base_url(model.baseUrl)
     if base_url:
         http_options["baseUrl"] = base_url
@@ -429,19 +383,13 @@ def build_http_options(
         if base_url_includes_api_version(base_url):
             http_options["apiVersion"] = ""
 
-    # Unconditional, as upstream is: the client string goes out even when neither the
-    # catalog entry nor the caller contributes a header (google-generative-ai.ts:348).
-    http_options["headers"] = provider_headers_to_record(
-        {
-            "User-Agent": get_misaka_user_agent(),
-            **(model.headers or {}),
-            **dict(options_headers or {}),
-        }
+    headers = provider_headers_to_record(
+        {"User-Agent": get_misaka_user_agent(), **(model.headers or {}), **dict(options_headers or {})}
     )
-    if timeout_ms is not None:
-        http_options["timeout"] = timeout_ms
+    if headers:
+        http_options["headers"] = headers
 
-    return http_options or None
+    return http_options if len(http_options) > 0 else None
 
 
 def resolve_custom_base_url(base_url: str) -> str | None:
@@ -459,8 +407,27 @@ def base_url_includes_api_version(base_url: str) -> bool:
         return bool(re.search(r"(?:^|/)v\d+(?:beta\d*)?(?:/|$)", base_url))
 
 
+def build_google_auth_options(env: ProviderEnv | None = None) -> dict[str, str] | None:
+    key_filename = get_provider_env_value("GOOGLE_APPLICATION_CREDENTIALS", env)
+    return {"keyFilename": key_filename} if key_filename else None
+
+
+def _load_google_credentials(google_auth_options: Mapping[str, str]) -> Any:
+    """MISAKA fork: @google/genai takes ``googleAuthOptions`` and loads the key file itself;
+    the Python SDK takes loaded ``credentials``. The loader's deprecation warning is
+    silenced the way google-auth silences it for ``GOOGLE_APPLICATION_CREDENTIALS``."""
+    import google.auth
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        credentials, _project_id = google.auth.load_credentials_from_file(
+            google_auth_options["keyFilename"], scopes=[_CLOUD_PLATFORM_SCOPE]
+        )
+    return credentials
+
+
 def resolve_api_key(options: StreamOptions | Mapping[str, Any] | None = None) -> str | None:
-    api_key = (_option(options, "apiKey") or os.environ.get("GOOGLE_CLOUD_API_KEY") or "").strip()
+    api_key = (_option(options, "apiKey") or "").strip()
     if not api_key or api_key == GCP_VERTEX_CREDENTIALS_MARKER or is_placeholder_api_key(api_key):
         return None
     return api_key
@@ -471,7 +438,11 @@ def is_placeholder_api_key(api_key: str) -> bool:
 
 
 def resolve_project(options: StreamOptions | Mapping[str, Any] | None = None) -> str:
-    project = _option(options, "project") or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+    project = (
+        _option(options, "project")
+        or get_provider_env_value("GOOGLE_CLOUD_PROJECT", _option(options, "env"))
+        or get_provider_env_value("GCLOUD_PROJECT", _option(options, "env"))
+    )
     if not project:
         raise RuntimeError(
             "Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options."
@@ -480,7 +451,7 @@ def resolve_project(options: StreamOptions | Mapping[str, Any] | None = None) ->
 
 
 def resolve_location(options: StreamOptions | Mapping[str, Any] | None = None) -> str:
-    location = _option(options, "location") or os.environ.get("GOOGLE_CLOUD_LOCATION")
+    location = _option(options, "location") or get_provider_env_value("GOOGLE_CLOUD_LOCATION", _option(options, "env"))
     if not location:
         raise RuntimeError("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION or pass location in options.")
     return location
@@ -491,10 +462,6 @@ def build_params(
     context: TranscriptContext,
     options: StreamOptions | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    signal = _option(options, "signal")
-    if signal is not None and signal_aborted(signal):
-        raise RuntimeError("Request aborted")
-
     contents = convert_messages(model, context)
     initial_system_message = get_initial_system_message(context.messages)
     current_tools = get_current_tools(context.messages)
@@ -505,24 +472,20 @@ def build_params(
     if _option(options, "maxTokens") is not None:
         generation_config["maxOutputTokens"] = _option(options, "maxTokens")
 
-    config: dict[str, Any] = dict(generation_config)
-    system_instruction = get_system_message_text(initial_system_message) if initial_system_message else ""
-    if system_instruction:
-        config["systemInstruction"] = sanitize_surrogates(system_instruction)
     supports_strict_mode = supports_google_strict_tool_sampling(model.id)
-    if len(current_tools) > 0:
-        converted_tools = convert_tools(current_tools, supports_strict_mode=supports_strict_mode)
-        if converted_tools is not None:
-            config["tools"] = converted_tools
-
-    # `VALIDATED` is Google's half of strict sampling: sending the constrained schema
-    # without asking for the mode leaves the constraint unenforced.
-    mode = (
+    function_calling_mode = (
         resolve_google_function_calling_mode(current_tools, _option(options, "toolChoice"), supports_strict_mode)
         if len(current_tools) > 0
         else None
     )
-    config["toolConfig"] = {"functionCallingConfig": {"mode": mode}} if mode else None
+    system_instruction = get_system_message_text(initial_system_message) if initial_system_message else ""
+    config: dict[str, Any] = dict(generation_config)
+    if system_instruction:
+        config["systemInstruction"] = sanitize_surrogates(system_instruction)
+    if len(current_tools) > 0:
+        config["tools"] = convert_tools(current_tools, False, supports_strict_mode)
+    if function_calling_mode is not None:
+        config["toolConfig"] = {"functionCallingConfig": {"mode": function_calling_mode}}
 
     thinking = _option(options, "thinking")
     if _nested_option(thinking, "enabled") and model.reasoning:
@@ -532,10 +495,13 @@ def build_params(
         elif _nested_option(thinking, "budgetTokens") is not None:
             thinking_config["thinkingBudget"] = _nested_option(thinking, "budgetTokens")
         config["thinkingConfig"] = thinking_config
-    elif model.reasoning and thinking is not None and not _nested_option(thinking, "enabled", True):
+    elif model.reasoning and thinking is not None and not _nested_option(thinking, "enabled"):
         config["thinkingConfig"] = get_disabled_google_thinking_config(model)
 
+    signal = _option(options, "signal")
     if signal is not None:
+        if signal_aborted(signal):
+            raise RuntimeError("Request aborted")
         config["abortSignal"] = signal
 
     return {
@@ -543,6 +509,26 @@ def build_params(
         "contents": contents,
         "config": config,
     }
+
+
+def get_google_budget(
+    model: Model,
+    level: ClampedThinkingLevel,
+    custom_budgets: ThinkingBudgets | Mapping[str, int | None] | None = None,
+) -> int:
+    custom_budget = _custom_budget(custom_budgets, level)
+    if custom_budget is not None:
+        return custom_budget
+
+    if "2.5-pro" in model.id:
+        budgets = {"minimal": 128, "low": 2048, "medium": 8192, "high": 32768}
+        return budgets[level]
+
+    if "2.5-flash" in model.id:
+        budgets = {"minimal": 128, "low": 2048, "medium": 8192, "high": 24576}
+        return budgets[level]
+
+    return -1
 
 
 streamGoogleVertex = stream_google_vertex

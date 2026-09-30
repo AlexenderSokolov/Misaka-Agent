@@ -1208,3 +1208,175 @@ def test_codex_requires_an_api_key_and_honours_null_headers():
     headers = codex.build_sse_headers({"X-Model": "m"}, {"x-model": None, "X-Extra": "1"}, "acct", "tok", "sid")
     assert {name.lower() for name in headers} >= {"authorization", "session-id", "x-client-request-id", "x-extra"}
     assert "x-model" not in {name.lower() for name in headers}
+
+
+# --- B1b-4: Google / Vertex / google_shared -----------------------------------------------
+
+
+def _gemini_model(api: str = "google-generative-ai", **overrides) -> Model:
+    return _model(
+        api,
+        **{
+            "id": "gemini-2.5-flash",
+            "provider": "google" if api == "google-generative-ai" else "google-vertex",
+            "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+            "reasoning": True,
+            **overrides,
+        },
+    )
+
+
+@pytest.fixture
+def gemini_wire(monkeypatch):
+    from misaka.ai.providers import google
+
+    requests: list[httpx.Request] = []
+    chunks: list[dict] = []
+    real_client = google.GoogleGenAI
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body = "".join(f"data: {json.dumps(chunk)}\r\n\r\n" for chunk in chunks)
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    def client(**kwargs):
+        transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return real_client(**{**kwargs, "http_options": {**(kwargs["http_options"] or {}), "httpx_async_client": transport}})
+
+    monkeypatch.setattr(google, "GoogleGenAI", client)
+    return google, requests, chunks
+
+
+async def test_google_error_finish_reason_reports_the_raw_reason_and_upstream_usage(gemini_wire):
+    google, requests, chunks = gemini_wire
+    chunks += [
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "hel"}]}}], "responseId": "r1"},
+        {
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "lo"}]}, "finishReason": "SAFETY"}],
+            "usageMetadata": {
+                "promptTokenCount": 100, "cachedContentTokenCount": 30, "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 5, "totalTokenCount": 125,
+            },
+        },
+    ]
+
+    result = await google.stream_google(
+        _gemini_model(), normalize_context(CONTEXT), {"apiKey": "k", "headers": {"X-Extra": None}}
+    ).result()
+
+    assert (result.stopReason, result.rawStopReason) == ("error", "SAFETY")
+    assert result.errorMessage == "Provider stopped with: SAFETY"
+    assert (result.usage.input, result.usage.output, result.usage.cacheRead, result.usage.reasoning) == (70, 25, 30, 5)
+    assert result.responseId == "r1"
+    [request] = requests
+    assert "x-extra" not in request.headers and "toolConfig" not in json.loads(request.content)
+
+
+async def test_google_stream_without_finish_reason_is_an_error(gemini_wire):
+    google, _requests, chunks = gemini_wire
+    chunks.append({"candidates": [{"content": {"role": "model", "parts": [{"text": "half"}]}}]})
+
+    result = await google.stream_google(_gemini_model(), normalize_context(CONTEXT), {"apiKey": "k"}).result()
+
+    assert result.stopReason == "error"
+    assert result.errorMessage == "Google stream ended without a finish reason"
+
+
+async def test_google_tool_calls_turn_only_a_stop_into_tool_use(gemini_wire):
+    google, _requests, chunks = gemini_wire
+    call = {"functionCall": {"name": "t", "args": {"a": 1}}}
+    chunks.append({"candidates": [{"content": {"role": "model", "parts": [call]}, "finishReason": "MAX_TOKENS"}]})
+
+    result = await google.stream_google(_gemini_model(), normalize_context(CONTEXT), {"apiKey": "k"}).result()
+
+    assert result.stopReason == "length" and result.content[0].arguments == {"a": 1}
+
+
+async def test_google_requires_the_api_key_in_options(monkeypatch):
+    from misaka.ai.providers import google
+
+    monkeypatch.setenv("GEMINI_API_KEY", "from-env")
+    result = await google.stream_google(_gemini_model(), normalize_context(CONTEXT)).result()
+
+    assert result.errorMessage == "No API key for provider: google"
+    with pytest.raises(RuntimeError, match="No API key for provider: google"):
+        google.stream_simple_google(_gemini_model(), normalize_context(CONTEXT))
+
+
+def test_google_simple_options_carry_tool_choice(monkeypatch):
+    from misaka.ai.providers import google
+    from misaka.ai.types import Tool
+
+    seen: dict = {}
+    monkeypatch.setattr(google, "stream_google", lambda _model, _context, options: seen.update(options))
+    tool = Tool(name="t", description="d", parameters={"type": "object", "properties": {}})
+    context = normalize_context(Context(messages=[UserMessage(content="q", timestamp=0)], tools=[tool]))
+
+    google.stream_simple_google(_gemini_model(), context, SimpleStreamOptions(apiKey="k", toolChoice="none"))
+
+    assert seen["toolChoice"] == "none"
+    params = google.build_params(_gemini_model(), context, seen)
+    assert params["config"]["toolConfig"] == {"functionCallingConfig": {"mode": "NONE"}}
+    assert "toolConfig" not in google.build_params(_gemini_model(), context, {})["config"]
+
+
+def test_gemini_replay_keeps_empty_blocks_that_carry_a_signature():
+    from misaka.ai.providers.google_shared import convert_messages
+    from misaka.ai.types import ThinkingContent, ToolResultMessage
+
+    model = _gemini_model(id="gemini-3-pro-preview")
+    same = _output(model).model_copy(update={"content": [
+        TextContent(text="", textSignature="c2ln"),
+        ThinkingContent(thinking=" ", thinkingSignature="c2ln"),
+        TextContent(text="", textSignature=None),
+    ]})
+    other = _output(_gemini_model(id="gemini-2.5-pro")).model_copy(update={"content": [
+        ThinkingContent(thinking="", thinkingSignature="c2ln"),
+        TextContent(text="kept"),
+        ToolCall(id="call:é1", name="t", arguments={}),
+    ], "stopReason": "toolUse"})
+    context = Context(messages=[
+        UserMessage(content="q", timestamp=0), same, UserMessage(content="r", timestamp=0), other,
+        ToolResultMessage(toolCallId="call:é1", toolName="t", content=[], isError=False, timestamp=0),
+    ])
+
+    contents = convert_messages(model, normalize_context(context))
+
+    assert contents[1]["parts"] == [
+        {"text": "", "thoughtSignature": "c2ln"},
+        {"thought": True, "text": " ", "thoughtSignature": "c2ln"},
+    ]
+    assert contents[3]["parts"][0] == {"text": "kept"}
+    assert contents[3]["parts"][1]["functionCall"]["id"] == "call__1"
+    assert contents[4]["parts"][0]["functionResponse"]["id"] == "call__1"
+
+
+def test_vertex_reads_its_setup_from_the_request_env(tmp_path):
+    from misaka.ai.providers import google_vertex as vertex
+
+    key_file = tmp_path / "adc.json"
+    key_file.write_text(json.dumps(
+        {"type": "authorized_user", "client_id": "x", "client_secret": "y", "refresh_token": "z"}
+    ))
+    env = {"GOOGLE_CLOUD_PROJECT": "proj", "GOOGLE_CLOUD_LOCATION": "europe-west4",
+           "GOOGLE_APPLICATION_CREDENTIALS": str(key_file)}
+    options = {"env": env, "apiKey": "<authenticated>"}
+    model = _gemini_model("google-vertex", id="gemini-2.5-flash-lite",
+                          baseUrl="https://{location}-aiplatform.googleapis.com")
+
+    assert vertex.resolve_api_key(options) is None
+    assert vertex.resolve_api_key({"apiKey": "gcp-vertex-credentials"}) is None
+    assert (vertex.resolve_project(options), vertex.resolve_location(options)) == ("proj", "europe-west4")
+    client = vertex.create_client(model, "proj", "europe-west4", None, env)
+    assert client._api_client._credentials is not None
+    assert client._api_client._http_options.api_version == "v1"
+    assert vertex.get_google_budget(model, "minimal") == 128
+
+
+def test_provider_headers_merge_case_insensitively_and_null_removes():
+    from misaka.ai.utils.headers import provider_headers_to_record
+
+    assert provider_headers_to_record(
+        {"User-Agent": "a", "X-Gone": "1"}, {"user-agent": "b", "x-gone": None}, None
+    ) == {"user-agent": "b"}
+    assert provider_headers_to_record({"X": None}) is None

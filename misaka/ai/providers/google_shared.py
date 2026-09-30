@@ -171,8 +171,7 @@ def convert_messages(model: Model, context: TranscriptContext) -> list[dict[str,
     def normalize_tool_call_id(tool_call_id: str, _target_model: Model, _source: Any) -> str:
         if not requires_tool_call_id(model.id):
             return tool_call_id
-        normalized = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in tool_call_id)
-        return normalized[:64]
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", tool_call_id)[:64]
 
     transformed_messages = transform_messages(conversation, model, normalize_tool_call_id)
     for message in transformed_messages:
@@ -192,13 +191,18 @@ def convert_messages(model: Model, context: TranscriptContext) -> list[dict[str,
 
         if message.role == "assistant":
             parts: list[dict[str, Any]] = []
+            # Check if message is from same provider and model - only then keep thinking blocks
             is_same_provider_and_model = message.provider == model.provider and message.model == model.id
 
             for block in message.content:
                 if block.type == "text":
-                    if not block.text or not block.text.strip():
-                        continue
                     thought_signature = _resolve_thought_signature(is_same_provider_and_model, block.textSignature)
+                    # Skip empty text blocks — unless they carry a thought signature. Gemini can attach
+                    # the signature to a part whose visible text is empty and requires it echoed back;
+                    # dropping it breaks the reasoning chain and the model intermittently ends mid-task
+                    # turns with a thought-only STOP (empty completion, no tool call).
+                    if (not block.text or not block.text.strip()) and not thought_signature:
+                        continue
                     part: dict[str, Any] = {"text": sanitize_surrogates(block.text)}
                     if thought_signature:
                         part["thoughtSignature"] = thought_signature
@@ -206,17 +210,24 @@ def convert_messages(model: Model, context: TranscriptContext) -> list[dict[str,
                     continue
 
                 if block.type == "thinking":
-                    if not block.thinking or not block.thinking.strip():
-                        continue
+                    # Only keep as thinking block if same provider AND same model
+                    # Otherwise convert to plain text (no tags to avoid model mimicking them)
                     if is_same_provider_and_model:
                         thought_signature = _resolve_thought_signature(
                             is_same_provider_and_model, block.thinkingSignature
                         )
+                        # Same rule as text blocks: an empty thinking block is dropped only when it
+                        # carries no signature (mirrors the anthropic converter's handling).
+                        if (not block.thinking or not block.thinking.strip()) and not thought_signature:
+                            continue
                         part = {"thought": True, "text": sanitize_surrogates(block.thinking)}
                         if thought_signature:
                             part["thoughtSignature"] = thought_signature
                         parts.append(part)
                     else:
+                        # Cross-provider/model: the signature is unusable, empty blocks stay dropped.
+                        if not block.thinking or not block.thinking.strip():
+                            continue
                         parts.append({"text": sanitize_surrogates(block.thinking)})
                     continue
 

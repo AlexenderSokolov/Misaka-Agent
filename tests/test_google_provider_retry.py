@@ -1,8 +1,8 @@
 """Gemini and Vertex retry a transient failure the way every other provider does.
 
-Both providers turn the SDK's own retries down to one attempt because the outer
-``retry_google_request`` owns retrying -- but the stream call was never wrapped in it, so a
-503 failed the turn at once and ``retry.provider.maxRetries`` was ignored for Google.
+The SDK makes a single attempt unless told otherwise, so the outer ``retry_google_request``
+owns retrying -- but the stream call was once never wrapped in it, so a 503 failed the turn
+at once and ``retry.provider.maxRetries`` was ignored for Google.
 """
 import asyncio
 from types import SimpleNamespace

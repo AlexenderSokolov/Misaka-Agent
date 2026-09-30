@@ -13,22 +13,27 @@ def headers_to_record(headers: Mapping[str, str] | Iterable[tuple[str, str]]) ->
 
 
 def provider_headers_to_record(
-    headers: Mapping[str, str | None] | None,
+    *header_sources: Mapping[str, str | None] | None,
 ) -> dict[str, str] | None:
-    """Drop the headers whose value is ``None``, keep the rest.
+    """Merge header sources in order, matching names case-insensitively; ``None`` removes.
 
     A ``None`` value in ``ProviderHeaders`` means "do not send this header" -- it is how
     resolved auth displaces a provider's own header, which the Cloudflare AI Gateway does
     with ``Authorization`` and ``x-api-key``. Passing one through to an HTTP client raises
-    ``Header value must be str or bytes, not NoneType`` before the request goes out.
+    ``Header value must be str or bytes, not NoneType`` before the request goes out. The
+    last spelling of a name wins.
 
     Translated from pi's ``ai/src/utils/headers.ts``; ``None`` rather than an empty dict
     when nothing survives, so callers can tell "no headers" from "headers I removed".
     """
-    if not headers:
-        return None
-    kept = {name: value for name, value in headers.items() if value is not None}
-    return kept or None
+    merged: dict[str, tuple[str, str]] = {}
+    for source in header_sources:
+        for name, value in (source or {}).items():
+            normalized_name = name.lower()
+            merged.pop(normalized_name, None)
+            if value is not None:
+                merged[normalized_name] = (name, value)
+    return dict(merged.values()) if merged else None
 
 
 def apply_provider_headers(target: dict[str, Any], overrides: Mapping[str, Any] | None) -> None:
