@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -194,11 +195,11 @@ async def test_mistral_skips_empty_content_deltas():
     async def events():
         for content in [[{"type": "thinking", "thinking": [{"text": "a"}]}], "", [{"type": "text", "text": ""}],
                         [{"type": "thinking", "thinking": [{"text": "b"}]}]]:
-            yield {"choices": [{"delta": {"content": content}}]}
-        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+            yield {"data": {"choices": [{"delta": {"content": content}}]}}
+        yield {"data": {"choices": [{"delta": {}, "finish_reason": "stop"}]}}
 
     output = _output(model)
-    assert await mistral.consume_chat_stream(model, output, AssistantMessageEventStream(), events())
+    await mistral.consume_chat_stream(model, output, AssistantMessageEventStream(), events())
 
     assert [block.type for block in output.content] == ["thinking"]
     assert output.content[0].thinking == "ab"
@@ -1380,3 +1381,130 @@ def test_provider_headers_merge_case_insensitively_and_null_removes():
         {"User-Agent": "a", "X-Gone": "1"}, {"user-agent": "b", "x-gone": None}, None
     ) == {"user-agent": "b"}
     assert provider_headers_to_record({"X": None}) is None
+
+
+# --- B1b-5: Mistral over raw HTTP ---------------------------------------------------------
+
+
+def _mistral_model(**overrides) -> Model:
+    return _model("mistral-conversations", **{"provider": "mistral", "baseUrl": "https://api.mistral.ai", **overrides})
+
+
+@pytest.fixture
+def mistral_wire(monkeypatch):
+    requests: list[httpx.Request] = []
+    responses: list[httpx.Response] = []
+    real_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        mistral.httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs)
+    )
+    return requests, responses
+
+
+def _mistral_sse(*chunks: dict, done: bool = True, separator: str = "\r\n\r\n") -> str:
+    frames = [f"data: {json.dumps(chunk)}" for chunk in chunks] + (["data: [DONE]"] if done else [])
+    return separator.join(frames)
+
+
+async def test_mistral_posts_the_wire_payload_and_parses_the_event_stream(mistral_wire):
+    from misaka.ai.types import ToolResultMessage
+
+    requests, responses = mistral_wire
+    call = {"index": 0, "id": "abcDEF123", "function": {"name": "t", "arguments": '{"a":'}}
+    responses.append(httpx.Response(200, text=_mistral_sse(
+        {"id": "r1", "choices": [{"delta": {"content": "hi"}}]},
+        {"choices": [{"delta": {"tool_calls": [call]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "t", "arguments": "1}"}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+         "usage": {"prompt_tokens": 10, "completion_tokens": 4, "prompt_tokens_details": {"cached_tokens": 3}}},
+        done=False, separator="\n\n",
+    ), headers={"content-type": "text/event-stream"}))
+    seen: list[dict] = []
+    history = _output(_mistral_model()).model_copy(update={
+        "content": [ToolCall(id="call_1", name="t", arguments={})], "stopReason": "toolUse",
+    })
+    context = Context(messages=[
+        UserMessage(content="q", timestamp=0), history,
+        ToolResultMessage(toolCallId="call_1", toolName="t", content=[], isError=False, timestamp=0),
+    ])
+
+    result = await mistral.stream_mistral(_mistral_model(), normalize_context(context), {
+        "apiKey": "k", "sessionId": "s1", "maxTokens": 5, "headers": {"X-Drop": None},
+        "toolChoice": {"type": "function", "function": {"name": "t"}},
+        "onResponse": lambda response, _model: seen.append(response),
+    }).result()
+
+    assert result.stopReason == "toolUse", result.errorMessage
+    assert result.rawStopReason == "tool_calls" and result.responseId == "r1"
+    assert [block.type for block in result.content] == ["text", "toolCall"]
+    assert result.content[1].arguments == {"a": 1}
+    assert (result.usage.input, result.usage.cacheRead, result.usage.output) == (7, 3, 4)
+    [request] = requests
+    assert str(request.url) == "https://api.mistral.ai/v1/chat/completions"
+    assert request.headers["authorization"] == "Bearer k" and request.headers["x-affinity"] == "s1"
+    assert "x-drop" not in request.headers
+    body = json.loads(request.content)
+    assert (body["max_tokens"], body["prompt_cache_key"]) == (5, "s1")
+    assert body["tool_choice"] == {"type": "function", "function": {"name": "t"}}
+    assert body["messages"][1]["tool_calls"][0]["index"] == 0 and body["messages"][1]["prefix"] is False
+    assert body["messages"][2]["tool_call_id"] == body["messages"][1]["tool_calls"][0]["id"]
+    assert seen[0]["status"] == 200
+
+
+async def test_mistral_reports_http_errors_and_missing_finish_reasons(mistral_wire):
+    _requests, responses = mistral_wire
+    responses.append(httpx.Response(400, text='{"message":"bad"}'))
+    result = await mistral.stream_mistral(_mistral_model(), normalize_context(CONTEXT), {"apiKey": "k"}).result()
+    assert result.errorMessage == 'Mistral API error (400): {"message":"bad"}'
+
+    responses.append(httpx.Response(200, text=_mistral_sse({"choices": [{"delta": {"content": "half"}}]})))
+    result = await mistral.stream_mistral(_mistral_model(), normalize_context(CONTEXT), {"apiKey": "k"}).result()
+    assert result.errorMessage == "Mistral stream ended without a finish reason"
+
+    responses.append(httpx.Response(200, text='data: {"object":"x"}\n\n'))
+    result = await mistral.stream_mistral(_mistral_model(), normalize_context(CONTEXT), {"apiKey": "k"}).result()
+    assert result.errorMessage == "Invalid Mistral streaming event"
+
+
+async def test_mistral_timeout_bounds_the_whole_stream(mistral_wire):
+    _requests, responses = mistral_wire
+
+    class Hanging(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+            await asyncio.Event().wait()
+
+    responses.append(httpx.Response(200, stream=Hanging()))
+    result = await mistral.stream_mistral(
+        _mistral_model(), normalize_context(CONTEXT), {"apiKey": "k", "timeoutMs": 50}
+    ).result()
+
+    assert (result.stopReason, result.errorMessage) == ("error", "The operation was aborted due to timeout")
+
+
+def test_mistral_requires_an_api_key_in_options(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "from-env")
+    with pytest.raises(RuntimeError, match="No API key for provider: mistral"):
+        mistral.stream_simple_mistral(_mistral_model(), normalize_context(CONTEXT))
+
+
+async def test_abort_reason_of_a_combined_signal_is_the_first_input_that_fired():
+    from misaka.ai.utils.abort import (
+        AbortController,
+        TimeoutAbortSignal,
+        abort_reason,
+        combine_abort_signals,
+    )
+
+    user = AbortController()
+    timeout = TimeoutAbortSignal(0)
+    combined = combine_abort_signals(user, timeout)
+    assert isinstance(abort_reason(combined), TimeoutError)
+    user.abort()
+    assert str(abort_reason(combined)) == "Request was aborted"
+    await asyncio.wait_for(TimeoutAbortSignal(10).wait(), 1)

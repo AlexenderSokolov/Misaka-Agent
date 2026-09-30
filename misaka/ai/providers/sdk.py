@@ -2,7 +2,7 @@
 must not fail when the extra is missing: the client factory calls ``require`` instead, so
 the error names the extra to install rather than a bare ImportError at startup."""
 
-EXTRAS = {"anthropic": "anthropic", "openai": "openai", "google-genai": "google", "boto3": "bedrock", "mistralai": "mistral"}
+EXTRAS = {"anthropic": "anthropic", "openai": "openai", "google-genai": "google", "boto3": "bedrock"}
 
 
 def require(sdk, package):

@@ -930,12 +930,16 @@ async def test_chat_completion_finalization(provider, raw, monkeypatch):
         }
 
     if provider == "mistral":
+        async def events():
+            async for chunk in incoming():
+                yield {"data": chunk}
+
         output = message()
-        assert await mistral.consume_chat_stream(
+        await mistral.consume_chat_stream(
             model("mistral-conversations"),
             output,
             SimpleNamespace(push=lambda e: None),
-            incoming(),
+            events(),
         )
     else:
         monkeypatch.setattr(

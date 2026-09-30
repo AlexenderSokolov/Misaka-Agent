@@ -39,8 +39,9 @@ _PRINT_TIMEOUT_SECONDS = 15
 # provider modules import these behind ``try/except ImportError`` and only fail at the first
 # request, through ``misaka.ai.providers.sdk.require`` -- so a credential alone proves
 # nothing about whether the provider can serve a call. An api absent from this table
-# (``pi-messages``, ``openai-codex-responses``) speaks its protocol over httpx and needs no
-# extra. ``EXTRAS`` turns the package into the extra name for the pip command.
+# (``pi-messages``, ``openai-codex-responses``, ``mistral-conversations``) speaks its
+# protocol over httpx and needs no extra. ``EXTRAS`` turns the package into the extra name
+# for the pip command.
 _API_SDK_REQUIREMENTS = {
     "anthropic-messages": ("anthropic", "anthropic"),
     "openai-completions": ("openai", "openai"),
@@ -49,7 +50,6 @@ _API_SDK_REQUIREMENTS = {
     "google-generative-ai": ("google.genai", "google-genai"),
     "google-vertex": ("google.genai", "google-genai"),
     "bedrock-converse-stream": ("boto3", "boto3"),
-    "mistral-conversations": ("mistralai", "mistralai"),
 }
 
 

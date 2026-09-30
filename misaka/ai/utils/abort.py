@@ -15,6 +15,7 @@ for any more.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable
 from typing import Any
 
@@ -80,6 +81,11 @@ class CombinedAbortSignal:
     def aborted(self) -> bool:
         return any(signal_aborted(signal) for signal in self._signals)
 
+    @property
+    def reason(self) -> Any:
+        """The reason of the first input that aborted, as ``AbortSignal.any`` reports it."""
+        return next((getattr(signal, "reason", None) for signal in self._signals if signal_aborted(signal)), None)
+
     async def wait(self) -> None:
         if not self._signals:
             # Nothing can tell us about an abort, so waiting forever is honest; reporting
@@ -94,6 +100,22 @@ class CombinedAbortSignal:
                 task.cancel()
 
 
+class TimeoutAbortSignal:
+    """pi's ``AbortSignal.timeout(ms)``: aborts by itself once ``ms`` have passed, with a
+    ``TimeoutError`` as its reason."""
+
+    def __init__(self, ms: float) -> None:
+        self._deadline = time.monotonic() + max(0.0, ms) / 1000
+        self.reason = TimeoutError("The operation was aborted due to timeout")
+
+    @property
+    def aborted(self) -> bool:
+        return time.monotonic() >= self._deadline
+
+    async def wait(self) -> None:
+        await asyncio.sleep(max(0.0, self._deadline - time.monotonic()))
+
+
 def combine_abort_signals(*signals: Any) -> Any:
     """One signal covering them all, collapsing the trivial cases the way upstream does."""
     active = [signal for signal in signals if signal is not None]
@@ -102,6 +124,13 @@ def combine_abort_signals(*signals: Any) -> Any:
     if len(active) == 1:
         return active[0]
     return CombinedAbortSignal(*active)
+
+
+def abort_reason(signal: Any) -> BaseException:
+    """What an aborted ``signal`` rejects with: its ``reason`` when it carries one (pi's
+    ``signal.reason``), else the error the request path raises for an abort."""
+    reason = getattr(signal, "reason", None)
+    return reason if isinstance(reason, BaseException) else RuntimeError("Request was aborted")
 
 
 def throw_if_aborted(signal: Any) -> None:
@@ -175,6 +204,8 @@ __all__ = [
     "FLAG_POLL_INTERVAL_S",
     "AbortController",
     "CombinedAbortSignal",
+    "TimeoutAbortSignal",
+    "abort_reason",
     "combine_abort_signals",
     "race_with_abort_signal",
     "sleep",
