@@ -98,7 +98,7 @@ class _RadiusProvider:
         self.name = options.name or DEFAULT_RADIUS_PROVIDER_NAME
         self.gateway = normalize_radius_gateway_url(options.gateway or DEFAULT_RADIUS_GATEWAY)
         self._load_config = load_config or load_radius_gateway_config
-        # The public catalog (pi 0.86 `RADIUS_MODELS`, transcribed into `models_generated`)
+        # The public catalog (pi's `RADIUS_MODELS`, read from `providers/data/radius.json`)
         # makes Radius models selectable immediately and offline; the gateway's own catalog
         # overlays it once fetched. Another gateway has no baseline.
         self._baseline_models: list[Model] = (

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from misaka.ai.models_generated import BUILTIN_MODEL_DATA_GENERATED_AT, MODELS
+from misaka.ai.models_generated import MODEL_DATA_MANIFEST, MODELS
 from misaka.ai.types import (
     Model,
     ModelCost,
@@ -33,8 +33,8 @@ def get_builtin_model_data_generated_at() -> int | None:
     upstream's answer too -- an unknown generation must not make everything look stale.
     """
     try:
-        stamp = datetime.fromisoformat(BUILTIN_MODEL_DATA_GENERATED_AT)
-    except ValueError:
+        stamp = datetime.fromisoformat(MODEL_DATA_MANIFEST.get("generatedAt"))
+    except (TypeError, ValueError):
         return None
     return int(stamp.timestamp() * 1000)
 

@@ -692,6 +692,9 @@ class Model(SchemaModel):
     api: Api
     provider: Provider
     baseUrl: str
+    # pi 0.99: optional, because chat is the default model type -- a model without `type` is a
+    # chat model. Built-in entries carry "chat"; image and classifier models are other types.
+    type: Literal["chat"] | None = None
     reasoning: bool
     thinkingLevelMap: ThinkingLevelMap | None = None
     input: list[InputModality]

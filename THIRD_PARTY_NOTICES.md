@@ -15,6 +15,8 @@ MISAKA 的部分文件移植自其它项目。移植代码所附带的许可证�
 - 版权：Copyright (c) 2025 Mario Zechner
 - 许可证全文：`misaka/LICENSE.pi`，取自上游仓库 `v0.87.1` 的 `LICENSE`（npm 包本身不带 LICENSE 文件）
 - 对照件：`@earendil-works/pi-coding-agent` 0.87.1 的 `dist/`
+- 模型目录数据：`misaka/ai/providers/data/` 是 `@earendil-works/pi-ai` 0.99.1 发布包中 `dist/providers/data` 的原样拷贝，
+  用 `scripts/refresh_model_catalog.py` 按清单校验后更新
 - 本仓库位置：`misaka/ai/**`、`misaka/agent/**`、`misaka/ui/tui/**`，以及 `misaka/core/`
   的内核部分。逐目录、逐文件的归属清单是 `misaka/core/PI_ORIGIN.md`。
 - 说明：MISAKA 的内核是 Pi 的 Python 移植，是本仓库最大的单一上游来源。分叉处在代码里
