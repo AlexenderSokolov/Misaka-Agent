@@ -274,6 +274,9 @@ class AssistantMessage(SchemaModel):
     stopReason: StopReason
     errorMessage: str | None = None
     rawStopReason: str | None = None
+    # Provider indication of whether the model explicitly ended its turn.
+    # Preserved for debugging and does not currently affect agent control flow.
+    endTurn: bool | None = None
     timestamp: int
 
     _normalize_null_content = field_validator("content", mode="before")(_content_never_null)

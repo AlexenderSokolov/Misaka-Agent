@@ -1080,3 +1080,131 @@ def test_azure_reads_its_configuration_from_the_request_env():
     assert azure.resolve_deployment_name(
         _model("azure-openai-responses", id="gpt"), {"env": {"AZURE_OPENAI_DEPLOYMENT_NAME_MAP": "gpt=dep"}}
     ) == "dep"
+
+
+# --- B1b-3: OpenAI Codex ------------------------------------------------------------------
+
+
+def _codex_token(account_id: str = "acct_1") -> str:
+    import base64
+
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}).encode()
+    ).decode().rstrip("=")
+    return f"header.{payload}.sig"
+
+
+def _codex_model() -> Model:
+    return _model(
+        "openai-codex-responses", provider="openai-codex", baseUrl="https://chatgpt.com/backend-api", reasoning=True
+    )
+
+
+def _codex_sse(*events: dict) -> str:
+    return "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+
+@pytest.fixture
+def codex_wire(monkeypatch):
+    from misaka.ai.providers import openai_codex_responses as codex
+
+    requests: list[httpx.Request] = []
+    responses: list[httpx.Response] = []
+    real_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        codex.httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs)
+    )
+    return codex, requests, responses
+
+
+async def test_codex_incomplete_response_is_an_error_with_its_reason(codex_wire):
+    codex, requests, responses = codex_wire
+    responses.append(httpx.Response(200, text=_codex_sse(
+        {"type": "response.created", "response": {"id": "resp_1"}},
+        {"type": "response.incomplete", "response": {
+            "id": "resp_1", "status": "incomplete", "incomplete_details": {"reason": "content_filter"},
+            "end_turn": True,
+        }},
+    ), headers={"content-type": "text/event-stream"}))
+
+    result = await codex.stream_openai_codex_responses(
+        _codex_model(), normalize_context(CONTEXT),
+        {"apiKey": _codex_token(), "transport": "sse", "sessionId": "session-1", "toolChoice": "none"},
+    ).result()
+
+    assert result.stopReason == "error"
+    assert result.errorMessage == "Response incomplete: content_filter"
+    assert result.endTurn is True
+    [request] = requests
+    assert request.headers["session-id"] == "session-1"
+    assert request.headers["chatgpt-account-id"] == "acct_1"
+    assert "session_id" not in request.headers
+    body = json.loads(request.content) if request.headers.get("content-encoding") != "zstd" else None
+    if body is not None:
+        assert body["tool_choice"] == "none" and body["prompt_cache_key"] == "session-1"
+
+
+async def test_codex_does_not_retry_by_default_and_caps_retry_after(codex_wire):
+    codex, requests, responses = codex_wire
+    responses.append(httpx.Response(500, json={"error": {"message": "boom"}}))
+
+    result = await codex.stream_openai_codex_responses(
+        _codex_model(), normalize_context(CONTEXT), {"apiKey": _codex_token(), "transport": "sse"}
+    ).result()
+
+    assert result.stopReason == "error" and len(requests) == 1
+    assert "boom" in result.errorMessage
+
+    responses.append(httpx.Response(429, json={"error": {"message": "slow down"}}, headers={"retry-after": "120"}))
+    result = await codex.stream_openai_codex_responses(
+        _codex_model(), normalize_context(CONTEXT),
+        {"apiKey": _codex_token(), "transport": "sse", "maxRetries": 2, "maxRetryDelayMs": 1000},
+    ).result()
+
+    assert result.stopReason == "error"
+    assert result.errorMessage == "Server requested 120s retry delay (max: 1s)"
+
+
+async def test_codex_error_events_read_the_nested_code():
+    from misaka.ai.providers import openai_codex_responses as codex
+
+    async def events():
+        yield {"type": "error", "error": {"code": "previous_response_not_found", "message": "gone"}}
+
+    with pytest.raises(codex.CodexApiError) as caught:
+        async for _event in codex.map_codex_events(events(), _output(_codex_model()), _codex_model()):
+            pass
+
+    assert caught.value.code == "previous_response_not_found"
+    assert str(caught.value) == "Codex error: gone"
+    assert codex.is_previous_response_not_found_error(caught.value)
+
+
+def test_codex_terminal_rate_limits_are_not_retried():
+    from misaka.ai.providers import openai_codex_responses as codex
+
+    assert codex.is_retryable_error(429, "rate limit") is True
+    assert codex.is_retryable_error(429, "insufficient_quota: add billing") is False
+
+
+async def test_codex_sse_parses_a_final_frame_without_a_blank_line():
+    from misaka.ai.providers import openai_codex_responses as codex
+
+    response = httpx.Response(200, text='data: {"type":"a"}\n\ndata: {"type":"b"}')
+
+    assert [event["type"] async for event in codex.parse_sse(response)] == ["a", "b"]
+
+
+def test_codex_requires_an_api_key_and_honours_null_headers():
+    from misaka.ai.providers import openai_codex_responses as codex
+
+    with pytest.raises(RuntimeError, match="No API key for provider: openai-codex"):
+        codex.stream_simple_openai_codex_responses(_codex_model(), normalize_context(CONTEXT))
+    headers = codex.build_sse_headers({"X-Model": "m"}, {"x-model": None, "X-Extra": "1"}, "acct", "tok", "sid")
+    assert {name.lower() for name in headers} >= {"authorization", "session-id", "x-client-request-id", "x-extra"}
+    assert "x-model" not in {name.lower() for name in headers}
