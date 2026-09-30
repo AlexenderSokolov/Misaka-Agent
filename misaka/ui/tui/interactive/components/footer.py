@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from misaka.core.experimental import are_experimental_features_enabled
-from misaka.core.usage_totals import addUsageToTotals, createUsageTotals
+from misaka.core.usage_totals import UsageTotals, addUsageToTotals, createUsageTotals
 from misaka.ui.tui import truncateToWidth, visibleWidth
 from misaka.ui.tui.interactive.theme.theme import theme
 from misaka.utils.values import read_field
@@ -50,12 +51,24 @@ def format_tokens(count: int) -> str:
     return f"{round(count / 1000000)}M"
 
 
+@dataclass
+class SessionStats:
+    session: Any
+    sessionId: str
+    leafId: str | None
+    entryCount: int
+    limitsModel: Any
+    usageTotals: UsageTotals
+    latestCacheHitRate: float | None
+    contextUsage: Any
+
+
 class FooterComponent:
     def __init__(self, session: Any, footerData: Any) -> None:
         self.autoCompactEnabled = True
         self.session = session
         self.footerData = footerData
-        self.sessionStats: dict[str, Any] | None = None
+        self.sessionStats: SessionStats | None = None
 
     def setSession(self, session: Any) -> None:
         self.session = session
@@ -69,14 +82,12 @@ class FooterComponent:
     def dispose(self) -> None:
         return None
 
-    def getSessionStats(self) -> dict[str, Any]:
+    def getSessionStats(self) -> SessionStats:
         """Usage totals and context usage scan the whole session, and the footer renders on every frame.
-        Entries are append-only and every append moves the leaf, so the results only change with the
-        session, leaf, entry count, or the model whose context window applies (pi footer.ts).
 
-        PORT-NOTE: without this cache a streaming reply re-estimated the whole context, system prompt
-        included, on every frame: ~22 ms of a ~25 ms frame here, which left the event loop too
-        little time to read the stream (GitHub issue #6)."""
+        Entries are append-only and every append moves the leaf, so the results only change with the
+        session, leaf, entry count, or the model whose context window applies.
+        """
         session_manager = self.session.sessionManager
         entry_count = session_manager.getEntryCount()
         session_id = session_manager.getSessionId()
@@ -85,59 +96,66 @@ class FooterComponent:
         cached = self.sessionStats
         if (
             cached is not None
-            and cached["session"] is self.session
-            and cached["sessionId"] == session_id
-            and cached["leafId"] == leaf_id
-            and cached["entryCount"] == entry_count
-            and cached["limitsModel"] is limits_model
+            and cached.session is self.session
+            and cached.sessionId == session_id
+            and cached.leafId == leaf_id
+            and cached.entryCount == entry_count
+            and cached.limitsModel is limits_model
         ):
             return cached
 
+        # Calculate cumulative usage from ALL session entries (not just post-compaction messages)
         usage_totals = createUsageTotals()
         latest_cache_hit_rate: float | None = None
 
-        # pi footer.ts:92-105 counts three kinds of entry, not one: assistant messages,
-        # tool results that carry their own usage (subagent/summariser tools report back
-        # this way), and compaction / branch-summary entries that carry usage.
-        for entry in self.session.sessionManager.getEntries():
+        for entry in session_manager.getEntries():
             entry_type = read_field(entry, "type")
-            if entry_type == "message":
-                message = read_field(entry, "message")
-                role = read_field(message, "role")
-                if role == "assistant":
-                    usage = read_field(message, "usage") or {}
-                    addUsageToTotals(usage_totals, usage)
-                    prompt_tokens = (
-                        int(read_field(usage, "input", 0) or 0)
-                        + int(read_field(usage, "cacheRead", 0) or 0)
-                        + int(read_field(usage, "cacheWrite", 0) or 0)
-                    )
-                    cache_read = int(read_field(usage, "cacheRead", 0) or 0)
-                    latest_cache_hit_rate = (cache_read / prompt_tokens) * 100 if prompt_tokens > 0 else None
-                elif role == "toolResult" and read_field(message, "usage"):
-                    addUsageToTotals(usage_totals, read_field(message, "usage"))
+            message = read_field(entry, "message") if entry_type == "message" else None
+            role = read_field(message, "role")
+            if entry_type == "usage":
+                addUsageToTotals(usage_totals, read_field(entry, "usage"))
+            elif entry_type == "message" and role == "assistant":
+                usage = read_field(message, "usage") or {}
+                addUsageToTotals(usage_totals, usage)
+
+                latest_prompt_tokens = (
+                    int(read_field(usage, "input", 0) or 0)
+                    + int(read_field(usage, "cacheRead", 0) or 0)
+                    + int(read_field(usage, "cacheWrite", 0) or 0)
+                )
+                latest_cache_hit_rate = (
+                    (int(read_field(usage, "cacheRead", 0) or 0) / latest_prompt_tokens) * 100
+                    if latest_prompt_tokens > 0
+                    else None
+                )
+            elif entry_type == "message" and role == "toolResult" and read_field(message, "usage"):
+                addUsageToTotals(usage_totals, read_field(message, "usage"))
             elif entry_type in ("branch_summary", "compaction") and read_field(entry, "usage"):
                 addUsageToTotals(usage_totals, read_field(entry, "usage"))
 
-        self.sessionStats = {
-            "session": self.session,
-            "sessionId": session_id,
-            "leafId": leaf_id,
-            "entryCount": entry_count,
-            "limitsModel": limits_model,
-            "usageTotals": usage_totals,
-            "latestCacheHitRate": latest_cache_hit_rate,
-            # After compaction, tokens are unknown until the next LLM response.
-            "contextUsage": self.session.getContextUsage(),
-        }
+        # Calculate context usage from session (handles compaction correctly).
+        # After compaction, tokens are unknown until the next LLM response.
+        context_usage = self.session.getContextUsage()
+        self.sessionStats = SessionStats(
+            session=self.session,
+            sessionId=session_id,
+            leafId=leaf_id,
+            entryCount=entry_count,
+            limitsModel=limits_model,
+            usageTotals=usage_totals,
+            latestCacheHitRate=latest_cache_hit_rate,
+            contextUsage=context_usage,
+        )
         return self.sessionStats
 
     def render(self, width: int) -> list[str]:
         state = self.session.state
         stats = self.getSessionStats()
-        usage_totals = stats["usageTotals"]
-        latest_cache_hit_rate = stats["latestCacheHitRate"]
-        context_usage = stats["contextUsage"]
+        usage_totals, latest_cache_hit_rate, context_usage = (
+            stats.usageTotals,
+            stats.latestCacheHitRate,
+            stats.contextUsage,
+        )
         model = read_field(state, "model")
         context_window = int(read_field(context_usage, "contextWindow", read_field(model, "contextWindow", 0)) or 0)
         context_percent_value = float(read_field(context_usage, "percent", 0) or 0)

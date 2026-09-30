@@ -1145,7 +1145,7 @@ class InteractiveMode(Conversation):
                 # rechecks whether to queue or start after preparation finishes.
                 await self.session.prompt(text, {
                     "streamingBehavior": read_field(message, "mode"),
-                    "preflightResult": lambda success: accepted(message) if success else None,
+                    "preflightResult": lambda _disposition: accepted(message),
                 })
             elif read_field(message, "mode") == "followUp":
                 await self.session.followUp(text)
@@ -1181,10 +1181,14 @@ class InteractiveMode(Conversation):
                 if not preflight.done():
                     preflight.set_result(success)
 
+            def on_disposition(_disposition: str) -> None:
+                # prompt() calls this only for an accepted prompt.
+                report_preflight(True)
+
             task = asyncio.Task(
                 self.session.prompt(str(read_field(first_prompt, "text", "")), {
                     "streamingBehavior": read_field(first_prompt, "mode"),
-                    "preflightResult": report_preflight,
+                    "preflightResult": on_disposition,
                 }),
                 loop=asyncio.get_running_loop(),
                 eager_start=True,

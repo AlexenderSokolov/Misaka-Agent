@@ -146,7 +146,6 @@ class _BashRenderState:
 class _BashResultRenderState:
     cachedWidth: int | None = None
     cachedLines: list[str] | None = None
-    cachedSkipped: int | None = None
 
 
 class _BashResultRenderComponent(Container):
@@ -166,23 +165,23 @@ class _CollapsedBashPreview:
             truncate_to_visual_lines,
         )
 
+        # Cache the complete output: this renders on every frame for every bash result in the transcript.
         if self._state.cachedLines is None or self._state.cachedWidth != width:
             preview = truncate_to_visual_lines(self._styled_output, _BASH_PREVIEW_LINES, width)
-            self._state.cachedLines = preview.visualLines
-            self._state.cachedSkipped = preview.skippedCount
+            hint_lines: list[str] = []
+            if preview.skippedCount > 0:
+                hint = (
+                    theme.fg("muted", f"... ({preview.skippedCount} earlier lines,")
+                    + f" {key_hint('app.tools.expand', 'to expand')}{theme.fg('muted', ')')}"
+                )
+                hint_lines.append(truncateToWidth(hint, width, "..."))
+            self._state.cachedLines = ["", *hint_lines, *preview.visualLines]
             self._state.cachedWidth = width
-
-        if self._state.cachedSkipped and self._state.cachedSkipped > 0:
-            hint = theme.fg("muted", f"... ({self._state.cachedSkipped} earlier lines,") + (
-                f" {key_hint('app.tools.expand', 'to expand')})"
-            )
-            return ["", truncateToWidth(hint, width, "..."), *(self._state.cachedLines or [])]
-        return ["", *(self._state.cachedLines or [])]
+        return self._state.cachedLines
 
     def invalidate(self) -> None:
         self._state.cachedWidth = None
         self._state.cachedLines = None
-        self._state.cachedSkipped = None
 
 
 @dataclass(slots=True)

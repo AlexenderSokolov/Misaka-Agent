@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections.abc import Sequence
@@ -27,6 +28,7 @@ from misaka.utils.values import signal_aborted
 from .client import (
     LlamaClient,
     LlamaModelInfo,
+    LlamaServerProps,
     llamaInferenceUrl,
     normalizeLlamaServerUrl,
 )
@@ -81,13 +83,42 @@ async def _router_autoload_enabled(
         return False
 
 
-def _to_model(model: LlamaModelInfo, serverUrl: str) -> Model:
-    reported = (
-        (model.meta.n_ctx if model.meta.n_ctx is not None else model.meta.n_ctx_train)
-        if model.meta is not None
-        else None
-    )
-    context_window = reported if reported is not None and reported > 0 else 128_000
+def configuredContextWindow(model: LlamaModelInfo) -> int | None:
+    args = model.status.args or []
+    for index in range(len(args) - 1):
+        flag = args[index]
+        if flag not in {"--ctx-size", "-c", "-ctx"}:
+            continue
+        try:
+            context_window = int(args[index + 1])
+        except ValueError:
+            continue
+        if context_window > 0:
+            return context_window
+    return None
+
+
+def contextWindowOf(model: LlamaModelInfo, cachedContextWindow: int | None = None) -> int:
+    runtime_context_window = model.meta.n_ctx if model.meta is not None else None
+    if runtime_context_window and runtime_context_window > 0:
+        return runtime_context_window
+    configured_context = configuredContextWindow(model)
+    if configured_context:
+        return configured_context
+    if cachedContextWindow and cachedContextWindow > 0:
+        return cachedContextWindow
+    training_context_window = model.meta.n_ctx_train if model.meta is not None else None
+    return training_context_window if training_context_window and training_context_window > 0 else 128_000
+
+
+def _to_model(
+    model: LlamaModelInfo,
+    serverUrl: str,
+    props: LlamaServerProps | None = None,
+    cachedContextWindow: int | None = None,
+) -> Model:
+    context_window = contextWindowOf(model, cachedContextWindow)
+    reasoning = props is not None and props.chat_template is not None and "enable_thinking" in props.chat_template
     modalities = model.architecture.input_modalities if model.architecture else None
     return Model(
         id=model.id,
@@ -95,7 +126,12 @@ def _to_model(model: LlamaModelInfo, serverUrl: str) -> Model:
         api="openai-completions",
         provider=LLAMA_PROVIDER_ID,
         baseUrl=llamaInferenceUrl(serverUrl),
-        reasoning=False,
+        reasoning=reasoning,
+        thinkingLevelMap=(
+            {"off": "off", "minimal": None, "low": None, "medium": "medium", "high": None, "xhigh": None}
+            if reasoning
+            else None
+        ),
         input=["text", "image"] if modalities and "image" in modalities else ["text"],
         cost=ModelCost(input=0, output=0, cacheRead=0, cacheWrite=0),
         contextWindow=context_window,
@@ -107,6 +143,7 @@ def _to_model(model: LlamaModelInfo, serverUrl: str) -> Model:
             supportsUsageInStreaming=True,
             supportsStrictMode=False,
             maxTokensField="max_tokens",
+            thinkingFormat="qwen-chat-template" if reasoning else None,
         ),
     )
 
@@ -197,6 +234,7 @@ class _LlamaProvider:
         ]
 
     async def refreshModels(self, context: RefreshModelsContext) -> None:
+        cached_context_windows: dict[str, int] = {}
         if context.stored is not None:
             restored = [
                 model
@@ -204,6 +242,8 @@ class _LlamaProvider:
                 if model.provider == LLAMA_PROVIDER_ID
                 and model.api == "openai-completions"
             ]
+            for model in restored:
+                cached_context_windows[model.id] = model.contextWindow
 
             def apply_restored() -> None:
                 self._models = restored
@@ -229,11 +269,21 @@ class _LlamaProvider:
         )
         if signal_aborted(context.signal):
             return
-        refreshed = [
-            _to_model(model, server_url)
-            for model in catalog
-            if modelIsSelectable(model, router_autoload)
-        ]
+        selectable = [model for model in catalog if modelIsSelectable(model, router_autoload)]
+
+        async def to_model(model: LlamaModelInfo) -> Model:
+            cached_context_window = cached_context_windows.get(model.id)
+            # Only loaded models expose their template without side effects. Unloaded autoload presets
+            # would need to be loaded, while querying sleeping models may wake them. Those models remain
+            # unclassified until they are loaded or woken and a later catalog refresh discovers them.
+            if model.status.value != "loaded":
+                return _to_model(model, server_url, None, cached_context_window)
+            props = await client.props(model=model.id, signal=context.signal)
+            return _to_model(model, server_url, props, cached_context_window)
+
+        refreshed = list(await asyncio.gather(*(to_model(model) for model in selectable)))
+        if signal_aborted(context.signal):
+            return
 
         def apply_refreshed() -> None:
             self._models = refreshed

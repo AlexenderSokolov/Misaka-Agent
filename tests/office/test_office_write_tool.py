@@ -267,13 +267,14 @@ def test_office_is_a_registered_tool_with_a_prompt_snippet():
 async def test_office_is_active_by_default(tmp_path):
     """It is the only way to produce a deliverable, so it has to be in the default set --
     behind a flag it would be a capability nobody uses. Three lists decide that and they
-    are separate: the sdk's default, and the hardcoded fallbacks in system_prompt and
-    agent_session that apply when no list was configured."""
+    are separate: settings_manager's DEFAULT_TOOL_NAMES (the sdk's default), and the
+    hardcoded fallbacks in system_prompt and agent_session that apply when no list was
+    configured."""
     import inspect
 
-    from misaka.core import agent_session, sdk, system_prompt
+    from misaka.core import agent_session, settings_manager, system_prompt
 
-    for module in (sdk, system_prompt, agent_session):
+    for module in (settings_manager, system_prompt, agent_session):
         source = inspect.getsource(module)
         assert '"read", "bash", "edit", "write", "office"' in source, module.__name__
 

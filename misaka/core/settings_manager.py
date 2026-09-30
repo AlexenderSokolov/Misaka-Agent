@@ -59,19 +59,62 @@ class SettingsManagerOptions(TypedDict, total=False):
     projectTrusted: bool
 
 
-def deep_merge_settings(base: Settings, overrides: Settings) -> Settings:
-    """Deep merge settings: overrides take precedence, nested objects merge recursively.
+def _deep_merge_objects(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Overrides take precedence, nested objects merge recursively.
     (pi 97f0ccd #7572: previously everything below the first level was replaced wholesale,
     dropping sibling keys from base.)"""
     result = dict(base)
     for key, override_value in overrides.items():
         base_value = base.get(key)
         result[key] = (
-            deep_merge_settings(base_value, override_value)
+            _deep_merge_objects(base_value, override_value)
             if isinstance(base_value, dict) and isinstance(override_value, dict)
             else override_value
         )
     return result
+
+
+# Tools enabled at startup when `defaultTools` does not change them.
+# MISAKA fork: MISAKA's eight default tools, where pi has read/bash/edit/write.
+DEFAULT_TOOL_NAMES: tuple[str, ...] = ("read", "bash", "edit", "write", "office", "grep", "find", "ls")
+
+
+def _is_tool_modifier(entry: Any) -> bool:
+    return isinstance(entry, str) and entry.startswith(("+", "-"))
+
+
+def _merge_default_tools(base: Any, overrides: Any) -> Any:
+    """Merge `defaultTools` of two settings layers. A list with plain tool names replaces the inherited
+    one; a list of only `+name`/`-name` entries is appended, so it modifies the inherited selection."""
+    if overrides is None:
+        return base
+    # Settings files are not validated; a malformed value replaces instead of throwing here.
+    if not isinstance(base, list) or not isinstance(overrides, list) or not all(map(_is_tool_modifier, overrides)):
+        return overrides
+    return [*base, *overrides]
+
+
+def _resolve_default_tools(entries: list[str]) -> list[str]:
+    """Resolve a merged `defaultTools` list: plain names replace `DEFAULT_TOOL_NAMES`, then `+name` adds
+    and `-name` removes a tool, in list order."""
+    plain = [entry for entry in entries if not _is_tool_modifier(entry)]
+    tools = plain if plain or not entries else list(DEFAULT_TOOL_NAMES)
+    for entry in entries:
+        if not _is_tool_modifier(entry):
+            continue
+        name = entry[1:]
+        if entry.startswith("+") and name not in tools and name:
+            tools.append(name)
+        elif entry.startswith("-") and name in tools:
+            tools.remove(name)
+    return tools
+
+
+def deep_merge_settings(base: Settings, overrides: Settings) -> Settings:
+    """Deep merge settings: project/overrides take precedence, nested objects merge recursively."""
+    merged = _deep_merge_objects(base, overrides)
+    default_tools = _merge_default_tools(base.get("defaultTools"), overrides.get("defaultTools"))
+    return merged if default_tools is None else {**merged, "defaultTools": default_tools}
 
 
 @dataclass(slots=True)
@@ -357,6 +400,10 @@ class SettingsManager:
             return {"settings": cls.loadFromStorage(storage, scope, projectTrusted), "error": None}
         except Exception as error:  # noqa: BLE001
             return {"settings": {}, "error": error}
+
+    def getSettings(self) -> Settings:
+        """A copy of the effective settings: global and project settings merged, with overrides."""
+        return copy.deepcopy(self.settings)
 
     def getGlobalSettings(self) -> Settings:
         return copy.deepcopy(self.globalSettings)
@@ -804,9 +851,13 @@ class SettingsManager:
         self._set_global_value("followUpMode", mode)
 
     def getDefaultTools(self) -> list[str] | None:
-        """Built-in startup selection; extension/custom tools stay enabled. None when unset."""
+        """The resolved `defaultTools` selection, or None when no settings layer sets it."""
         tools = self.settings.get("defaultTools")
-        return list(tools) if isinstance(tools, list) else None
+        if tools is None:
+            return None
+        return _resolve_default_tools(
+            [tool for tool in tools if isinstance(tool, str)] if isinstance(tools, list) else []
+        )
 
     def getTheme(self) -> str | None:
         return self.settings.get("theme")

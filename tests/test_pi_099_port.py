@@ -1,9 +1,11 @@
 """The pi 0.87.1 -> 0.99.1 port (2026-09-30). Each test is an upstream test case from
-`packages/ai/test/`, named after the file it comes from."""
+`packages/ai/test/` or `packages/coding-agent/test/`, named after the file it comes from."""
 
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
@@ -470,3 +472,295 @@ async def test_anthropic_forwards_provider_stream_events(monkeypatch):
     ).result()
 
     assert [event["type"] for event in seen] == ["message_start", "message_delta", "message_stop"]
+
+
+# === B2: coding-agent kernel ===============================================================
+
+# --- session-manager/file-operations.test.ts ----------------------------------------------
+
+
+def _roles(path) -> list[str]:
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [row["message"]["role"] if row["type"] == "message" else row["type"] for row in rows]
+
+
+def test_session_file_is_not_created_for_setup_entries_only(tmp_path):
+    from misaka.core.session_manager import SessionManager
+
+    session = SessionManager.create(str(tmp_path), str(tmp_path))
+    session.appendModelChange("anthropic", "claude-sonnet-4-5")
+    session.appendThinkingLevelChange("off")
+
+    assert not os.path.exists(session.getSessionFile())
+
+
+# #10000: the first prompt must survive a first turn that never produces an assistant message
+def test_session_file_is_created_when_the_first_user_message_is_appended(tmp_path):
+    from misaka.core.session_manager import SessionManager
+
+    session = SessionManager.create(str(tmp_path), str(tmp_path))
+    session.appendModelChange("anthropic", "claude-sonnet-4-5")
+    session.appendMessage(UserMessage(content="first question", timestamp=0))
+
+    file = session.getSessionFile()
+    assert _roles(file) == ["session", "model_change", "user"]
+    assert len(SessionManager.open(file, str(tmp_path)).buildSessionContext().messages) == 1
+
+
+def test_session_file_appends_later_entries_without_rewriting(tmp_path):
+    from misaka.core.session_manager import SessionManager
+
+    session = SessionManager.create(str(tmp_path), str(tmp_path))
+    session.appendMessage(UserMessage(content="first question", timestamp=0))
+    session.appendCustomEntry("preset-state", {"name": "plan"})
+    session.appendMessage(_output(_model("openai-completions")).model_copy(update={"content": []}))
+
+    assert _roles(session.getSessionFile()) == ["session", "user", "custom", "assistant"]
+    assert session.getEntryCount() == 3
+
+
+# --- default-tools-setting.test.ts / settings-manager.test.ts ------------------------------
+
+
+def _settings(global_settings: dict, project_settings: dict | None = None):
+    from misaka.core.settings_manager import InMemorySettingsStorage, SettingsManager
+
+    storage = InMemorySettingsStorage()
+    storage.global_value = json.dumps(global_settings)
+    if project_settings is not None:
+        storage.project_value = json.dumps(project_settings)
+    return SettingsManager.fromStorage(storage, {"projectTrusted": True})
+
+
+@pytest.mark.parametrize(
+    ("global_tools", "project_tools", "expected"),
+    [
+        (None, None, None),
+        (["+todo", "-write"], None, ["read", "bash", "edit", "office", "grep", "find", "ls", "todo"]),
+        (["read", "bash"], ["+edit"], ["read", "bash", "edit"]),
+        (["read", "bash"], ["grep"], ["grep"]),
+        (["read"], ["-read", "+ls"], ["ls"]),
+        ([], None, []),
+    ],
+)
+def test_default_tools_modifiers_merge_across_layers(global_tools, project_tools, expected):
+    settings = _settings(
+        {} if global_tools is None else {"defaultTools": global_tools},
+        None if project_tools is None else {"defaultTools": project_tools},
+    )
+
+    assert settings.getDefaultTools() == expected
+
+
+# --- clipboard-image.test.ts --------------------------------------------------------------
+
+
+@pytest.fixture
+def x11_clipboard(monkeypatch):
+    from misaka.utils import clipboard_image
+
+    calls: list[list[str]] = []
+    native_reads: list[bool] = []
+
+    class Native:
+        async def get_image_binary(self):
+            native_reads.append(True)
+
+    monkeypatch.setattr(clipboard_image, "_get_native_clipboard", lambda: Native())
+    monkeypatch.setattr(clipboard_image, "is_wsl", lambda env=None: False)
+
+    def install(answer):
+        def run_command(command, args, *, timeout_ms=None, env=None):
+            calls.append(args)
+            return answer(args)
+
+        monkeypatch.setattr(clipboard_image, "run_command", run_command)
+
+    return clipboard_image, install, calls, native_reads
+
+
+# Regression test for #9786.
+async def test_x11_does_not_probe_image_types_when_targets_fails(x11_clipboard):
+    clipboard_image, install, calls, native_reads = x11_clipboard
+    command_result = clipboard_image._CommandResult
+    install(lambda args: command_result(stdout=b"", ok=False) if "TARGETS" in args else command_result(stdout=b"hello", ok=True))
+
+    assert await clipboard_image.read_clipboard_image({"platform": "linux", "env": {"DISPLAY": ":0"}}) is None
+    assert calls == [["-selection", "clipboard", "-t", "TARGETS", "-o"]]
+    assert native_reads == [True]
+
+
+async def test_x11_does_not_probe_unadvertised_image_types(x11_clipboard):
+    clipboard_image, install, calls, native_reads = x11_clipboard
+    command_result = clipboard_image._CommandResult
+
+    def answer(args):
+        if "TARGETS" in args:
+            return command_result(stdout=b"image/png\n", ok=True)
+        if "image/png" in args:
+            return command_result(stdout=b"", ok=False)
+        return command_result(stdout=b"hello", ok=True)
+
+    install(answer)
+
+    assert await clipboard_image.read_clipboard_image({"platform": "linux", "env": {"DISPLAY": ":0"}}) is None
+    assert [args[3] for args in calls] == ["TARGETS", "image/png"]
+    assert native_reads == [True]
+
+
+async def test_an_empty_wayland_clipboard_does_not_fall_through_to_x11(x11_clipboard):
+    clipboard_image, install, calls, native_reads = x11_clipboard
+    command_result = clipboard_image._CommandResult
+    install(lambda args: command_result(stdout=b"text/plain\n", ok=True))
+
+    assert await clipboard_image.read_clipboard_image({"platform": "linux", "env": {"WAYLAND_DISPLAY": "w"}}) is None
+    assert calls == [["--list-types"]]
+    assert native_reads == []
+
+
+# --- llama-extension.test.ts --------------------------------------------------------------
+
+
+async def test_llama_preserves_cached_context_for_unloaded_autoload_presets(monkeypatch):
+    from misaka.ai.auth.types import ApiKeyCredential
+    from misaka.ai.models_runtime import RefreshModelsContext
+    from misaka.extensions.llama import client as llama_client
+    from misaka.extensions.llama.provider import createLlamaProvider
+
+    state = {"loaded": True, "args": None}
+
+    async def request(self, path, *, method="GET", body=None, signal=None):
+        if path == "/models":
+            if state["loaded"]:
+                model = {"id": "qwen", "status": {"value": "loaded"}, "source": "preset",
+                         "meta": {"n_ctx": 65536, "n_ctx_train": 128000}}
+            else:
+                status = {"value": "unloaded", **({"args": state["args"]} if state["args"] else {})}
+                model = {"id": "qwen", "status": status, "source": "preset", "meta": {"n_ctx_train": 128000}}
+            return {"data": [model]}
+        if path == "/props?model=qwen&autoload=false":
+            return {}
+        if path == "/props":
+            return {"role": "router", "models_autoload": True}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(llama_client.LlamaClient, "_request", request)
+    stored: dict = {}
+
+    async def publish(publication):
+        if publication.persist_is_set:
+            stored["entry"] = publication.persist
+        if publication.update:
+            publication.update()
+        return True
+
+    credential = ApiKeyCredential(key="local", env={"LLAMA_BASE_URL": "http://127.0.0.1:9"})
+
+    def context():
+        return RefreshModelsContext(
+            credential=credential, stored=stored.get("entry"), publish=publish, allowNetwork=True, signal=None
+        )
+
+    def windows():
+        return [model.contextWindow for model in stored["entry"].models]
+
+    first = createLlamaProvider()
+    await first.provider.refreshModels(context())
+    assert windows() == [65536]
+
+    state["loaded"] = False
+    second = createLlamaProvider()
+    await second.provider.refreshModels(context())
+    assert [(m.id, m.contextWindow) for m in second.provider.getModels()] == [("qwen", 65536)]
+    assert windows() == [65536]
+
+    state["args"] = ["llama-server", "--ctx-size", "32768"]
+    await second.provider.refreshModels(context())
+    assert windows() == [32768]
+
+
+async def test_llama_detects_reasoning_from_the_chat_template(monkeypatch):
+    from misaka.ai.auth.types import ApiKeyCredential
+    from misaka.ai.models_runtime import RefreshModelsContext
+    from misaka.extensions.llama import client as llama_client
+    from misaka.extensions.llama.provider import createLlamaProvider
+
+    async def request(self, path, *, method="GET", body=None, signal=None):
+        if path == "/models":
+            return {"data": [{"id": "qwen", "status": {"value": "loaded"}, "meta": {"n_ctx": 4096}}]}
+        if path == "/props?model=qwen&autoload=false":
+            return {"chat_template": "{% if enable_thinking %}...{% endif %}"}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(llama_client.LlamaClient, "_request", request)
+
+    async def publish(publication):
+        if publication.update:
+            publication.update()
+        return True
+
+    controller = createLlamaProvider()
+    await controller.provider.refreshModels(RefreshModelsContext(
+        credential=ApiKeyCredential(key="local", env={"LLAMA_BASE_URL": "http://127.0.0.1:9"}),
+        stored=None, publish=publish, allowNetwork=True, signal=None,
+    ))
+
+    [model] = controller.provider.getModels()
+    assert model.reasoning and model.thinkingLevelMap["medium"] == "medium"
+    assert model.compat.thinkingFormat == "qwen-chat-template"
+
+
+# --- footer-width.test.ts -----------------------------------------------------------------
+
+
+def test_footer_updates_cached_usage_totals_after_an_entry_is_appended():
+    from types import SimpleNamespace
+
+    from misaka.ui.tui.interactive.components.footer import FooterComponent
+
+    usage = {"input": 10, "output": 1, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0.5}}
+    entries: list = [{"type": "message", "message": {"role": "assistant", "usage": usage}}]
+    manager = SimpleNamespace(
+        getEntries=lambda: entries,
+        getEntryCount=lambda: len(entries),
+        getSessionId=lambda: "test-session",
+        getLeafId=lambda: None,
+        getCwd=lambda: "/tmp",
+        getSessionName=lambda: None,
+    )
+    session = SimpleNamespace(
+        sessionManager=manager,
+        model=None,
+        state=SimpleNamespace(model=None, thinkingLevel="off"),
+        getContextUsage=lambda: None,
+        modelRegistry=SimpleNamespace(isUsingSubscription=lambda _model: False),
+    )
+    footer = FooterComponent(session, SimpleNamespace(getGitBranch=lambda: None, getExtensionStatuses=dict,
+                                                      getAvailableProviderCount=lambda: 1))
+
+    assert footer.getSessionStats().usageTotals.cost == 0.5
+    assert footer.getSessionStats() is footer.getSessionStats()
+    entries.append({"type": "message", "message": {"role": "assistant", "usage": usage}})
+    entries.append({"type": "usage", "usage": usage})
+    assert footer.getSessionStats().usageTotals.cost == 1.5
+
+
+# --- utils/shell.ts sanitizeBinaryOutput --------------------------------------------------
+
+
+def test_sanitize_binary_output_keeps_tabs_newlines_and_astral_characters():
+    from misaka.utils.shell import sanitize_binary_output
+
+    assert sanitize_binary_output("a\x00b\tc\nd\re\x1b[0m￺\U0001f600\x7f") == "ab\tc\nd\re[0m\U0001f600\x7f"
+
+
+# --- agent-session.ts prompt dispositions -------------------------------------------------
+
+
+def test_prompt_disposition_types_match_upstream():
+    import typing
+
+    from misaka.core.agent_session import PromptDisposition, QueuedInputDisposition
+
+    assert set(typing.get_args(QueuedInputDisposition)) == {"handled", "queued"}
+    assert set(typing.get_args(PromptDisposition)) == {"handled", "queued", "started"}

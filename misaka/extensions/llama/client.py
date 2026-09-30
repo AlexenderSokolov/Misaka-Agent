@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -53,6 +53,7 @@ class LlamaModelInfo:
 @dataclass(slots=True)
 class LlamaServerProps:
     models_autoload: bool | None = None
+    chat_template: str | None = None
 
 
 @dataclass(slots=True)
@@ -330,13 +331,16 @@ class LlamaClient:
             raise RuntimeError("Server is not running in llama.cpp router mode")
         return [model for model in models if model is not None]
 
-    async def props(self, *, signal: Any = None) -> LlamaServerProps:
-        payload = await self._request("/props", signal=signal)
+    async def props(self, *, model: str | None = None, signal: Any = None) -> LlamaServerProps:
+        query = f"?{urlencode({'model': model, 'autoload': 'false'})}" if model else ""
+        payload = await self._request(f"/props{query}", signal=signal)
         if not isinstance(payload, Mapping):
             return LlamaServerProps()
-        value = payload.get("models_autoload")
+        models_autoload = payload.get("models_autoload")
+        chat_template = payload.get("chat_template")
         return LlamaServerProps(
-            models_autoload=value if isinstance(value, bool) else None
+            models_autoload=models_autoload if isinstance(models_autoload, bool) else None,
+            chat_template=chat_template if isinstance(chat_template, str) else None,
         )
 
     async def load(self, model: str, signal: Any = None) -> None:

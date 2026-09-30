@@ -378,8 +378,7 @@ class AgentSessionRuntime:
             else:
                 if not os.path.exists(current_session_file):
                     raise RuntimeError(
-                        "This session has not been saved yet. "
-                        "Wait for the first assistant response before cloning or forking it."
+                        "This session has not been saved yet. Send a message before cloning or forking it."
                     )
                 session_manager = SessionManager.open(current_session_file, session_dir)
                 forked_session_path = session_manager.createBranchedSession(str(target_leaf_id))

@@ -99,7 +99,7 @@ async def test_command_delivers_once_with_real_context_and_persists(host, comman
     acknowledgements = []
     await host.session.prompt(command, {'preflightResult': acknowledgements.append})
     assert host.errors == []
-    assert acknowledgements == [True]
+    assert acknowledgements == ["started"]
     assert len(host.calls) == 1
     users = [m for m in host.session.state.messages if read_field(m, 'role') == 'user']
     assert len(users) == 1
@@ -149,7 +149,7 @@ async def test_compaction_rejects_before_loading_and_reports_preflight_failure(h
     acknowledgements = []
     with pytest.raises(RuntimeError, match='compaction'):
         await host.session.prompt('/agent-reach inspect', {'preflightResult': acknowledgements.append})
-    assert acknowledgements == [False]
+    assert acknowledgements == []
     activation.assert_not_called()
     assert host.calls == []
 
@@ -198,7 +198,7 @@ async def test_skill_error_propagates_and_does_not_acknowledge_acceptance(host, 
     acknowledgements = []
     with pytest.raises(ValueError, match='fixture activation failed'):
         await host.session.prompt('/agent-reach inspect', {'preflightResult': acknowledgements.append})
-    assert acknowledgements == [False] and host.calls == []
+    assert acknowledgements == [] and host.calls == []
     assert not host.part._read_lock.locked()
 
 
@@ -471,7 +471,7 @@ async def test_compaction_starting_in_preflight_does_not_persist_a_skill_message
     accepted = []
     with pytest.raises(RuntimeError, match='compaction'):
         await host.session.prompt('/agent-reach inspect', {'preflightResult': accepted.append})
-    assert accepted == [False] and host.calls == []
+    assert accepted == [] and host.calls == []
     assert not any(read_field(m, 'role') == 'user' for m in host.session.state.messages)
 
 
@@ -499,7 +499,7 @@ async def test_missing_skill_is_an_error_even_without_ui(host):
     accepted = []
     with pytest.raises(ValueError):
         await host.session.prompt('/skill missing-fixture', {'preflightResult': accepted.append})
-    assert accepted == [False] and host.calls == []
+    assert accepted == [] and host.calls == []
 
 
 @pytest.mark.parametrize('command', ['/agent-reach inspect', '/combo inspect'])
@@ -510,7 +510,7 @@ async def test_skill_disappearing_during_activation_is_not_acknowledged(host, mo
     accepted = []
     with pytest.raises(ValueError, match='no longer|no available'):
         await host.session.prompt(command, {'preflightResult': accepted.append})
-    assert accepted == [False] and host.calls == []
+    assert accepted == [] and host.calls == []
 
 
 async def test_learn_gate_remains_closed_and_failure_is_visible_without_ui(host, monkeypatch):
@@ -519,7 +519,7 @@ async def test_learn_gate_remains_closed_and_failure_is_visible_without_ui(host,
     accepted = []
     with pytest.raises(ValueError, match='disabled globally'):
         await host.session.prompt('/learn inspect', {'preflightResult': accepted.append})
-    assert accepted == [False] and host.calls == []
+    assert accepted == [] and host.calls == []
 
 
 @pytest.mark.parametrize('will_retry', [False, True])

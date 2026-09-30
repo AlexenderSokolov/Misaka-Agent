@@ -36,5 +36,5 @@ async def test_an_image_is_grabbed_once_off_the_loop(monkeypatch):
 async def test_an_empty_clipboard_reads_as_no_image(monkeypatch):
     fake = _Clipboard(None)
     monkeypatch.setattr(clipboard_image, "_get_native_clipboard", lambda: fake)
-    assert await clipboard_image.read_clipboard_image_via_native_clipboard() is None
+    assert not await clipboard_image.read_clipboard_image_via_native_clipboard()
     assert fake.grabs == [False]

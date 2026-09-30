@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from misaka.agent.agent import AbortController, Agent
 from misaka.agent.types import (
@@ -222,13 +222,18 @@ class SessionStats:
     contextUsage: dict[str, float | int | None] | None = None
 
 
+QueuedInputDisposition = Literal["handled", "queued"]
+PromptDisposition = Literal["handled", "queued", "started"]
+
+
 @dataclass(slots=True)
 class PromptOptions:
     expandPromptTemplates: bool = True
     images: list[ImageContent] | None = None
     streamingBehavior: str | None = None
     source: str = "interactive"
-    preflightResult: Callable[[bool], None] | None = None
+    # Observes how an accepted prompt was dispatched. Not called if the prompt is rejected.
+    preflightResult: Callable[[PromptDisposition], None] | None = None
 
 
 @dataclass(slots=True)
@@ -664,14 +669,10 @@ class AgentSession:
             self._deferredSettledActions.append(deferred_prompt)
             return
         resolved = options if isinstance(options, PromptOptions) else PromptOptions(**dict(options or {}))
-        preflight_reported = False
 
-        def report_preflight(success: bool) -> None:
-            nonlocal preflight_reported
-            if preflight_reported or resolved.preflightResult is None:
-                return
-            preflight_reported = True
-            resolved.preflightResult(success)
+        def report_preflight(disposition: PromptDisposition) -> None:
+            if resolved.preflightResult is not None:
+                resolved.preflightResult(disposition)
 
         def assert_not_compacting() -> None:
             if self._compactionAbortController is not None:
@@ -680,114 +681,111 @@ class AgentSession:
                     "Wait for compaction to finish and retry."
                 )
 
-        try:
-            # MISAKA fork: skill commands prepare text for this same submission.
-            # Keep its images, delivery mode, preflight and cancellation ownership.
-            prompt_command = self.getCorePromptCommand(text) if resolved.expandPromptTemplates else None
-            if (
-                resolved.expandPromptTemplates
-                and prompt_command is None
-                and text.startswith("/")
-                and (
-                    await self._try_execute_core_command(text)  # MISAKA fork: a part's command first
-                    or await self._try_execute_extension_command(text)
-                )
-            ):
-                report_preflight(True)
-                return
+        # MISAKA fork: skill commands prepare text for this same submission.
+        # Keep its images, delivery mode, preflight and cancellation ownership.
+        prompt_command = self.getCorePromptCommand(text) if resolved.expandPromptTemplates else None
+        if (
+            resolved.expandPromptTemplates
+            and prompt_command is None
+            and text.startswith("/")
+            and (
+                await self._try_execute_core_command(text)  # MISAKA fork: a part's command first
+                or await self._try_execute_extension_command(text)
+            )
+        ):
+            # Extension command executed, no prompt to send
+            report_preflight("handled")
+            return
 
-            # Compaction replaces agent.state.messages wholesale, so a prompt accepted while
-            # it runs would append into a list that is about to be thrown away.  pi refuses
-            # instead of racing (agent-session.ts:1155-1159).  The extension-command branch
-            # above stays reachable, exactly as in pi.
+        # Compaction replaces agent.state.messages wholesale, so a prompt accepted while
+        # it runs would append into a list that is about to be thrown away.  pi refuses
+        # instead of racing (agent-session.ts:1155-1159).  The extension-command branch
+        # above stays reachable, exactly as in pi.
+        assert_not_compacting()
+
+        current_text = await self._expand_core_prompt_command(prompt_command, text) if prompt_command else text
+        if current_text is None:
+            report_preflight("handled")
+            return
+        if prompt_command is not None:
             assert_not_compacting()
+        # Generated command messages retain sendUserMessage's input origin:
+        # /research's pending-question capture must not consume a skill scaffold.
+        input_source = "extension" if prompt_command else resolved.source
+        current_images = None if resolved.images is None else list(resolved.images)
+        processed_input = await self._run_input_handlers(
+            current_text,
+            current_images,
+            input_source,
+            resolved.streamingBehavior if self.isStreaming else None,
+        )
+        if processed_input is None:
+            report_preflight("handled")
+            return
+        current_text, current_images = processed_input
 
-            current_text = await self._expand_core_prompt_command(prompt_command, text) if prompt_command else text
-            if current_text is None:
-                report_preflight(True)
+        if resolved.expandPromptTemplates and prompt_command is None:
+            current_text = expand_prompt_template(current_text, self.promptTemplates)
+
+        if self.isStreaming:
+            if resolved.streamingBehavior == "followUp":
+                await self._queue_follow_up(current_text, current_images)
+                report_preflight("queued")
                 return
+            if resolved.streamingBehavior == "steer":
+                await self._queue_steer(current_text, current_images)
+                report_preflight("queued")
+                return
+            raise RuntimeError(
+                "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the "
+                "message."
+            )
+
+        self._flush_pending_bash_messages()
+        self._flush_pending_custom_messages()
+
+        if self.model is None:
+            raise RuntimeError(format_no_model_selected_message())
+        has_configured_auth = self._modelRegistry.hasConfiguredAuth(
+            self.model
+        ) or await self._modelRegistry.checkConfiguredAuth(self.model)
+        if not has_configured_auth:
+            if self._modelRegistry.isUsingOAuth(self.model):
+                raise RuntimeError(
+                    f'Authentication failed for "{self.model.provider}". '
+                    "Credentials may have expired or network is unavailable. "
+                    f"Run '/login {self.model.provider}' to re-authenticate."
+                )
+            raise RuntimeError(format_no_api_key_found_message(self.model.provider))
+
+        # Catch a response that was aborted or overflowed before the new prompt goes out.
+        # The user's new prompt is sent below, so do not continue the agent here
+        # (pi agent-session.ts:1230-1234): continuing would emit a whole agent run —
+        # agent_start / turn_* / agent_end — that the user never asked for.
+        last_assistant = self._find_last_assistant_message()
+        if last_assistant is not None:
+            await self._check_compaction(last_assistant, False)
+
+        # Emit before_agent_start before normalizing images so extension-driven model
+        # selection determines the resize profile used for the request and history.
+        normalized_images, hints = await self._normalize_prompt_images(current_images)
+        user_text = f"{current_text}\n\n" + "\n".join(hints) if hints else current_text
+        messages: list[Any] = []
+        messages.append(self._build_user_message(user_text, normalized_images))
+        pending_next_turn = self._pendingNextTurnMessages
+        messages.extend(pending_next_turn)
+        self._pendingNextTurnMessages = []
+        try:
+            messages = await self._prepare_agent_start(messages, current_text, current_images)
             if prompt_command is not None:
                 assert_not_compacting()
-            # Generated command messages retain sendUserMessage's input origin:
-            # /research's pending-question capture must not consume a skill scaffold.
-            input_source = "extension" if prompt_command else resolved.source
-            current_images = None if resolved.images is None else list(resolved.images)
-            processed_input = await self._run_input_handlers(
-                current_text,
-                current_images,
-                input_source,
-                resolved.streamingBehavior if self.isStreaming else None,
-            )
-            if processed_input is None:
-                report_preflight(True)
-                return
-            current_text, current_images = processed_input
-
-            if resolved.expandPromptTemplates and prompt_command is None:
-                current_text = expand_prompt_template(current_text, self.promptTemplates)
-
-            if self.isStreaming:
-                if resolved.streamingBehavior == "followUp":
-                    await self._queue_follow_up(current_text, current_images)
-                    report_preflight(True)
-                    return
-                if resolved.streamingBehavior == "steer":
-                    await self._queue_steer(current_text, current_images)
-                    report_preflight(True)
-                    return
-                raise RuntimeError(
-                    "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the "
-                    "message."
-                )
-
-            self._flush_pending_bash_messages()
-            self._flush_pending_custom_messages()
-
-            if self.model is None:
-                raise RuntimeError(format_no_model_selected_message())
-            has_configured_auth = self._modelRegistry.hasConfiguredAuth(
-                self.model
-            ) or await self._modelRegistry.checkConfiguredAuth(self.model)
-            if not has_configured_auth:
-                if self._modelRegistry.isUsingOAuth(self.model):
-                    raise RuntimeError(
-                        f'Authentication failed for "{self.model.provider}". '
-                        "Credentials may have expired or network is unavailable. "
-                        f"Run '/login {self.model.provider}' to re-authenticate."
-                    )
-                raise RuntimeError(format_no_api_key_found_message(self.model.provider))
-
-            # Catch a response that was aborted or overflowed before the new prompt goes out.
-            # The user's new prompt is sent below, so do not continue the agent here
-            # (pi agent-session.ts:1230-1234): continuing would emit a whole agent run —
-            # agent_start / turn_* / agent_end — that the user never asked for.
-            last_assistant = self._find_last_assistant_message()
-            if last_assistant is not None:
-                await self._check_compaction(last_assistant, False)
-
-            # Emit before_agent_start before normalizing images so extension-driven model
-            # selection determines the resize profile used for the request and history.
-            normalized_images, hints = await self._normalize_prompt_images(current_images)
-            user_text = f"{current_text}\n\n" + "\n".join(hints) if hints else current_text
-            messages: list[Any] = []
-            messages.append(self._build_user_message(user_text, normalized_images))
-            pending_next_turn = self._pendingNextTurnMessages
-            messages.extend(pending_next_turn)
-            self._pendingNextTurnMessages = []
-            try:
-                messages = await self._prepare_agent_start(messages, current_text, current_images)
-                if prompt_command is not None:
-                    assert_not_compacting()
-            except BaseException:
-                # Preflight did not accept this turn; preserve its notifications,
-                # including any which arrived while the hooks were running.
-                self._pendingNextTurnMessages = [*pending_next_turn, *self._pendingNextTurnMessages]
-                raise
-            report_preflight(True)
-            await self._run_agent_prompt(messages)
-        except Exception:
-            report_preflight(False)
+        except BaseException:
+            # Preflight did not accept this turn; preserve its notifications,
+            # including any which arrived while the hooks were running.
+            self._pendingNextTurnMessages = [*pending_next_turn, *self._pendingNextTurnMessages]
             raise
+        report_preflight("started")
+        await self._run_agent_prompt(messages)
 
     async def _prepare_agent_start(self, messages, current_text, current_images):
         """One hook/prompt assembly path for ordinary prompts and opted-in custom turns.
@@ -884,12 +882,12 @@ class AgentSession:
 
     async def _queue_user_input(
         self, text: str, images: Sequence[ImageContent] | None, behavior: str, source: Any
-    ) -> None:
+    ) -> QueuedInputDisposition:
         command = self.getCorePromptCommand(text)  # MISAKA fork: a part's prompt command first
         if command is not None:
             expanded = await self._expand_core_prompt_command(command, text)
             if expanded is None:
-                return
+                return "handled"
             text = expanded
         elif text.startswith("/"):
             self._throw_if_extension_command(text)
@@ -897,7 +895,7 @@ class AgentSession:
             text, None if images is None else list(images), source, behavior if self.isStreaming else None
         )
         if processed_input is None:
-            return
+            return "handled"
         expanded_text, processed_images = processed_input
         if command is None:
             expanded_text = expand_prompt_template(expanded_text, self.promptTemplates)
@@ -905,22 +903,23 @@ class AgentSession:
             await self._queue_steer(expanded_text, processed_images)
         else:
             await self._queue_follow_up(expanded_text, processed_images)
+        return "queued"
 
     async def steer(
         self, text: str, images: Sequence[ImageContent] | None = None, options: dict[str, Any] | None = None
-    ) -> None:
+    ) -> QueuedInputDisposition:
         """Queue a steering message while the agent is running. Delivered after the current
         assistant turn finishes executing its tool calls, before the next LLM call. Runs the
         `input` handlers, expands skill commands and prompt templates; errors on extension commands."""
-        await self._queue_user_input(text, images, "steer", (options or {}).get("source", "interactive"))
+        return await self._queue_user_input(text, images, "steer", (options or {}).get("source", "interactive"))
 
     async def followUp(
         self, text: str, images: Sequence[ImageContent] | None = None, options: dict[str, Any] | None = None
-    ) -> None:
+    ) -> QueuedInputDisposition:
         """Queue a follow-up message to be processed after the agent finishes. Delivered only
         when agent has no more tool calls or steering messages. Runs the `input` handlers,
         expands skill commands and prompt templates; errors on extension commands."""
-        await self._queue_user_input(text, images, "followUp", (options or {}).get("source", "interactive"))
+        return await self._queue_user_input(text, images, "followUp", (options or {}).get("source", "interactive"))
 
     def _emit_queue_update(self) -> None:
         self._emit(
@@ -2280,7 +2279,9 @@ class AgentSession:
                 self._flush_pending_custom_messages()
 
     def _emit(self, event: Any) -> None:
-        for listener in self._eventListeners:
+        # MISAKA fork: iterate a snapshot so listeners that unsubscribe during dispatch do not
+        # cause later listeners to miss this event (pi applies this to its RPC client's listeners).
+        for listener in list(self._eventListeners):
             listener(event)
 
     def getCorePromptCommand(self, text: str) -> CoreCommand | None:

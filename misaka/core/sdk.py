@@ -42,11 +42,10 @@ from misaka.core.prompt_templates import PromptTemplate
 from misaka.core.provider_attribution import merge_provider_attribution_headers
 from misaka.core.resource_loader import DefaultResourceLoader, ResourceLoader
 from misaka.core.session_manager import SessionManager, get_default_session_dir
-from misaka.core.settings_manager import SettingsManager
+from misaka.core.settings_manager import DEFAULT_TOOL_NAMES, SettingsManager
 from misaka.core.timings import time
 from misaka.core.tools import (
     Tool,
-    ToolName,
     create_bash_tool,
     create_coding_tools,
     create_edit_tool,
@@ -236,7 +235,6 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
         thinking_level = settings_manager.getDefaultThinkingLevel() or DEFAULT_THINKING_LEVEL
     thinking_level = "off" if model is None else clamp_thinking_level(model, thinking_level)
 
-    default_active_tool_names: list[ToolName] = ["read", "bash", "edit", "write", "office", "grep", "find", "ls"]
     # defaultTools selects initial built-ins; it does not populate the registry allowlist (pi 541045ae0).
     configured_default_tools = settings_manager.getDefaultTools()
     allowed_tool_names = resolved_options.get("tools")
@@ -253,7 +251,7 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
         if resolved_options.get("tools") is not None
         else ([] if resolved_options.get("noTools")
               else (list(configured_default_tools) if configured_default_tools is not None
-                    else default_active_tool_names))
+                    else list(DEFAULT_TOOL_NAMES)))
     )
     initial_active_tool_names = [
         name for name in initial_active_tool_names if name not in excluded_tool_name_set

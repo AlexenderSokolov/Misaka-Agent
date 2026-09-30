@@ -173,11 +173,10 @@ def create_session_id() -> str:
     return uuidv7()
 
 
-def generate_id(existing: Mapping[str, Any] | set[str]) -> str:
-    existing_ids = set(existing.keys()) if isinstance(existing, Mapping) else set(existing)
+def generate_id(byId: Mapping[str, Any] | set[str]) -> str:
     for _ in range(100):
         candidate = uuid.uuid4().hex[:8]
-        if candidate not in existing_ids:
+        if candidate not in byId:
             return candidate
     return uuid.uuid4().hex
 
@@ -247,10 +246,14 @@ def session_entry_to_display_messages(entry: SessionEntry) -> list[AgentMessage]
 
 
 def _entry_starts_transcript(entry: SessionEntry) -> bool:
-    """Keep empty UI/drafts lazy, but persist actual output and adopted checkpoints."""
+    """A user or assistant message starts the file (upstream `_hasConversation`).
+
+    MISAKA fork: a delivered custom message and an adopted compaction checkpoint start it
+    too, so mail receipts and imported checkpoints are durable before the first turn.
+    """
     return (entry.get("type") == "custom_message"
             or (entry.get("type") == "compaction" and entry.get("contextMessages") is not None)
-            or (entry.get("type") == "message" and _message_role(entry.get("message")) == "assistant"))
+            or (entry.get("type") == "message" and _message_role(entry.get("message")) in {"user", "assistant"}))
 
 
 def _copy_context_messages(messages: list[AgentMessage]) -> list[AgentMessage]:
@@ -750,6 +753,15 @@ class SessionManager:
     def getSessionFile(self) -> str | None:
         return self.sessionFile
 
+    def _hasConversation(self) -> bool:
+        """A new session file is created only once the session contains a user or assistant message.
+
+        Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
+        closing MISAKA without chatting leaves no file behind. Starting at the user message (not the
+        first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
+        """
+        return any(_entry_starts_transcript(item) for item in self.fileEntries)
+
     def _persist(self, entry: SessionEntry) -> bool:
         """Persist a candidate entry without changing the live session state."""
         if not self.persist or not self.sessionFile:
@@ -757,11 +769,11 @@ class SessionManager:
 
         serialized_entry = _dump_json(entry)
 
-        if (not self.flushed and not _entry_starts_transcript(entry)
-                and not any(_entry_starts_transcript(item) for item in self.fileEntries)):
-            return False
-
         if not self.flushed:
+            # MISAKA fork: the entry is persisted before it joins `fileEntries`, so it is
+            # checked alongside them.
+            if not self._hasConversation() and not _entry_starts_transcript(entry):
+                return False
             payload = f"{_dump_jsonl(self.fileEntries)}{serialized_entry}\n"
             atomic.write_text(self.sessionFile, payload, mode=0o600)
             return True
@@ -908,7 +920,9 @@ class SessionManager:
         return str(entry["id"])
 
     def getSessionName(self) -> str | None:
-        for entry in reversed(self.getEntries()):
+        # Reads fileEntries directly: the footer calls this on every frame, and getEntries()
+        # copies the whole session.
+        for entry in reversed(self.fileEntries):
             if entry.get("type") == "session_info":
                 name = entry.get("name")
                 return str(name).strip() or None if name is not None else None
@@ -1033,12 +1047,12 @@ class SessionManager:
         header = next((entry for entry in self.fileEntries if entry.get("type") == "session"), None)
         return header if isinstance(header, dict) else None
 
+    def getEntryCount(self) -> int:
+        """Number of session entries (excludes header), without copying them like `getEntries()`."""
+        return len(self.byId)
+
     def getEntries(self) -> list[SessionEntry]:
         return [entry for entry in self.fileEntries if entry.get("type") != "session"]
-
-    def getEntryCount(self) -> int:
-        """Number of session entries (excludes header), without copying them like ``getEntries()``."""
-        return len(self.byId)
 
     def getTree(self) -> list[SessionTreeNode]:
         entries = self.getEntries()

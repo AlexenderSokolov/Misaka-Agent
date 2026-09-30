@@ -146,19 +146,17 @@ def get_shell_env() -> dict[str, str]:
     return env
 
 
+_BINARY_OUTPUT_NOISE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufff9-\ufffb]")
+
+
 def sanitize_binary_output(value: str) -> str:
-    pieces: list[str] = []
-    for char in value:
-        code = ord(char)
-        if code in {0x09, 0x0A, 0x0D}:
-            pieces.append(char)
-            continue
-        if code <= 0x1F:
-            continue
-        if 0xFFF9 <= code <= 0xFFFB:
-            continue
-        pieces.append(char)
-    return "".join(pieces)
+    """Sanitize binary output for display/storage.
+
+    Removes characters that crash string-width or cause display issues:
+    - Control characters (except tab, newline, carriage return)
+    - Unicode interlinear annotation characters U+FFF9..U+FFFB (crash string-width due to a bug)
+    """
+    return _BINARY_OUTPUT_NOISE.sub("", value)
 
 
 _tracked_detached_child_pids: set[int] = set()

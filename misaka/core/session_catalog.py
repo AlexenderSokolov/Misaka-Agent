@@ -296,7 +296,7 @@ class CatalogPart:
         # neighbour.
         space = None if kind == "dm" else (_object(record).get("space")
                                            or os.environ.get("MISAKA_NET_SPACE") or None)
-        # A reserved filename is not history. Keep Pi's first-assistant flush;
+        # A reserved filename is not history. Keep Pi's first-message flush;
         # only this live-owner pointer makes an unsaved session visible.
         value = {"id": manager.getSessionId(), "path": os.path.realpath(path) if path else None,
                  "pending": bool(path and not manager.flushed and not os.path.exists(path)),
