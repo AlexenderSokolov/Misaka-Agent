@@ -16,10 +16,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from misaka.ai.session_resources import register_session_resource_cleanup
+from misaka.ai.session_resources import registerSessionResourceCleanup
 from misaka.config import get_sessions_dir, home, sessions
 from misaka.core.platform import processes
-from misaka.core.session_manager import iter_session_files, read_session_header
+from misaka.core.session_manager import iter_session_files, readSessionHeader
 from misaka.core.wiring import KINDS, sender_address
 from misaka.utils import atomic, local_socket
 
@@ -280,7 +280,7 @@ class CatalogPart:
             if (session_id is None or session_id == self.session_id
                     or self.session is not None and session_id == self.session.sessionId):
                 self._close()
-        self._unregister = register_session_resource_cleanup(cleanup)
+        self._unregister = registerSessionResourceCleanup(cleanup)
 
     def _publish(self, ctx, state):
         manager = ctx.sessionManager
@@ -429,7 +429,7 @@ def list_entries(con, *, extra_paths=()):
     for path in sorted(paths):
         record = records.get(path, {})
         pending = record.get("pending") and record.get("state") != "saved" and not os.path.exists(path)
-        header = record if pending else read_session_header(path)
+        header = record if pending else readSessionHeader(path)
         if not isinstance(header.get("id"), str) or not isinstance(header.get("cwd"), str):
             continue
         try:

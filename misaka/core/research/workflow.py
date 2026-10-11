@@ -2320,14 +2320,14 @@ def _prepare_sessions(con, run):
     of its ``graph.fork_source`` -- its parent, or for a join the lowest node its parents share --
     with ``fork_entry`` marking where its own turns begin. A fork written just before a crash is
     found in the node's own folder and adopted, since the node never ran in it."""
-    from misaka.core.session_manager import find_most_recent_session
+    from misaka.core.session_manager import findMostRecentSession
 
     for node in runs.nodes(con, run["id"]):
         if node["status"] != "queued" or node["session_file"] or runs.is_root(node):
             continue
         source = graph.fork_source(con, node)
         directory = planner._lo_session(run, node)
-        session = find_most_recent_session(directory)
+        session = findMostRecentSession(directory)
         entry = planner.session_leaf(session) if session else None
         if not session:
             session, entry = planner.fork_session(planner.lo_session_file(run, source), directory)

@@ -26,11 +26,19 @@ class FileOperations:
     edited: set[str] = field(default_factory=set)
 
 
-def create_file_ops() -> FileOperations:
+def createFileOps() -> FileOperations:
     return FileOperations()
 
 
-def extract_file_ops_from_message(message: Any, file_ops: FileOperations) -> None:
+def extractFileOpsFromMessage(message: Any, file_ops: FileOperations) -> None:
+    """Extract file operations from tool calls in an assistant message, or from the nested calls
+    recorded on a tool result."""
+    if read_field(message, "role") == "toolResult":
+        # Calls made from codemode scripts are recorded on the script's result.
+        nested_calls = read_field(message, "nestedCalls")
+        for call in read_field(nested_calls, "calls", []) if nested_calls is not None else []:
+            addFileOp(read_field(call, "name"), read_field(call, "arguments"), file_ops)
+        return
     if read_field(message, "role") != "assistant":
         return
     content = read_field(message, "content")
@@ -40,30 +48,29 @@ def extract_file_ops_from_message(message: Any, file_ops: FileOperations) -> Non
     for block in content:
         if read_field(block, "type") != "toolCall":
             continue
-        arguments = read_field(block, "arguments")
-        if not isinstance(arguments, dict):
-            continue
-        path = arguments.get("path")
-        if not isinstance(path, str) or not path:
-            continue
-
-        name = read_field(block, "name")
-        if name == "read":
-            file_ops.read.add(path)
-        elif name == "write":
-            file_ops.written.add(path)
-        elif name == "edit":
-            file_ops.edited.add(path)
+        addFileOp(read_field(block, "name"), read_field(block, "arguments"), file_ops)
 
 
-def compute_file_lists(file_ops: FileOperations) -> dict[str, list[str]]:
+def addFileOp(tool_name: Any, arguments: Any, file_ops: FileOperations) -> None:
+    path = arguments.get("path") if isinstance(arguments, dict) else None
+    if not isinstance(path, str) or not path:
+        return
+    if tool_name == "read":
+        file_ops.read.add(path)
+    elif tool_name == "write":
+        file_ops.written.add(path)
+    elif tool_name == "edit":
+        file_ops.edited.add(path)
+
+
+def computeFileLists(file_ops: FileOperations) -> dict[str, list[str]]:
     modified = {*file_ops.edited, *file_ops.written}
     read_files = sorted(path for path in file_ops.read if path not in modified)
     modified_files = sorted(modified)
     return {"readFiles": read_files, "modifiedFiles": modified_files}
 
 
-def format_file_operations(read_files: list[str], modified_files: list[str]) -> str:
+def formatFileOperations(read_files: list[str], modified_files: list[str]) -> str:
     sections: list[str] = []
     if read_files:
         read_block = "\n".join(read_files)
@@ -76,7 +83,7 @@ def format_file_operations(read_files: list[str], modified_files: list[str]) -> 
     return f"\n\n{'\n\n'.join(sections)}"
 
 
-def serialize_conversation(messages: list[MessageValue]) -> str:
+def serializeConversation(messages: list[MessageValue]) -> str:
     parts: list[str] = []
 
     for message in messages:
@@ -117,7 +124,7 @@ def serialize_conversation(messages: list[MessageValue]) -> str:
         if role == "toolResult":
             content = _serialize_tool_result_content(read_field(message, "content"))
             if content:
-                parts.append(f"[Tool result]: {_truncate_for_summary(content, _TOOL_RESULT_MAX_CHARS)}")
+                parts.append(f"[Tool result]: {truncateForSummary(content, _TOOL_RESULT_MAX_CHARS)}")
 
     return "\n\n".join(parts)
 
@@ -148,7 +155,7 @@ def _serialize_tool_result_content(content: Any) -> str:
     return "".join(parts)
 
 
-def _truncate_for_summary(text: str, max_chars: int) -> str:
+def truncateForSummary(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     truncated_chars = len(text) - max_chars
@@ -167,25 +174,15 @@ def _safe_json_stringify(value: Any) -> str:
     return serialized if serialized is not None else "undefined"
 
 
-computeFileLists = compute_file_lists
-createFileOps = create_file_ops
-extractFileOpsFromMessage = extract_file_ops_from_message
-formatFileOperations = format_file_operations
-serializeConversation = serialize_conversation
 
 __all__ = [
     "SUMMARIZATION_SYSTEM_PROMPT",
     "FileOperations",
     "computeFileLists",
-    "compute_file_lists",
     "createFileOps",
-    "create_file_ops",
     "extractFileOpsFromMessage",
-    "extract_file_ops_from_message",
     "formatFileOperations",
-    "format_file_operations",
     "serializeConversation",
-    "serialize_conversation",
 ]
 
 

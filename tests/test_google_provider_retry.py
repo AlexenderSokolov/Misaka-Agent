@@ -1,6 +1,6 @@
 """Gemini and Vertex retry a transient failure the way every other provider does.
 
-The SDK makes a single attempt unless told otherwise, so the outer ``retry_google_request``
+The SDK makes a single attempt unless told otherwise, so the outer ``retryGoogleRequest``
 owns retrying -- but the stream call was once never wrapped in it, so a 503 failed the turn
 at once and ``retry.provider.maxRetries`` was ignored for Google.
 """
@@ -10,13 +10,12 @@ from types import SimpleNamespace
 import pytest
 from google.genai import errors
 
-from misaka.ai.models import get_model
-from misaka.ai.providers.google import stream_google
-from misaka.ai.providers.google_vertex import stream_google_vertex
+from misaka.ai.api import google_generative_ai, google_vertex
+from misaka.ai.compat import getModel
 from misaka.ai.types import Context
-from misaka.ai.utils.abort import AbortController
+from misaka.utils.js import AbortController
 
-PROVIDERS = [(stream_google, "google"), (stream_google_vertex, "google-vertex")]
+PROVIDERS = [(google_generative_ai.stream, "google"), (google_vertex.stream, "google-vertex")]
 
 
 def _chunks():
@@ -48,7 +47,7 @@ def _client(models):
 async def test_a_transient_failure_is_retried_up_to_max_retries(stream, provider):
     models = _Models(failures=2)
     options = {"client": _client(models), "maxRetries": 2, "maxRetryDelayMs": 1}
-    result = await stream(get_model(provider, "gemini-2.5-flash"), Context(messages=[]), options).result()
+    result = await stream(getModel(provider, "gemini-2.5-flash"), Context(messages=[]), options).result()
     assert result.stopReason == "stop", result.errorMessage
     assert models.calls == 3
 
@@ -56,7 +55,7 @@ async def test_a_transient_failure_is_retried_up_to_max_retries(stream, provider
 @pytest.mark.parametrize("stream,provider", PROVIDERS)
 async def test_without_max_retries_the_first_failure_ends_the_turn(stream, provider):
     models = _Models(failures=1)
-    result = await stream(get_model(provider, "gemini-2.5-flash"), Context(messages=[]),
+    result = await stream(getModel(provider, "gemini-2.5-flash"), Context(messages=[]),
                           {"client": _client(models)}).result()
     assert result.stopReason == "error"
     assert models.calls == 1
@@ -65,8 +64,8 @@ async def test_without_max_retries_the_first_failure_ends_the_turn(stream, provi
 @pytest.mark.parametrize("stream,provider", PROVIDERS)
 async def test_abort_while_connecting_ends_the_turn_as_aborted(stream, provider):
     controller = AbortController()
-    options = {"client": _client(_Models(failures=0, hang=True)), "signal": controller}
-    pending = stream(get_model(provider, "gemini-2.5-flash"), Context(messages=[]), options).result()
+    options = {"client": _client(_Models(failures=0, hang=True)), "signal": controller.signal}
+    pending = stream(getModel(provider, "gemini-2.5-flash"), Context(messages=[]), options).result()
     await asyncio.sleep(0.05)
     controller.abort()
     result = await asyncio.wait_for(pending, 5)

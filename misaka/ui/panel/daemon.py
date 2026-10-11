@@ -1640,13 +1640,13 @@ class Daemon:
         seconds after its claim (2026-09-18, B16) -- is answered with ``transcript=None``."""
         from misaka.core.network.sister_runtime import ACTIVE_BOARD_STATUSES
         from misaka.core.platform import tasks as db
-        from misaka.core.session_manager import find_most_recent_session
+        from misaka.core.session_manager import findMostRecentSession
         row = db.get(self._board(), task_id)
         if row is None:
             raise ValueError(f"Card not found: {task_id}")
         if row["status"] in ACTIVE_BOARD_STATUSES:
             raise ValueError(f"Card {task_id} is still {row['status']}; steer its running pane instead.")
-        transcript = find_most_recent_session(session_roots.card_session_dir(row))
+        transcript = findMostRecentSession(session_roots.card_session_dir(row))
         if transcript is None and require_session:
             raise ValueError(f"Card {task_id} has no saved session to reopen.")
         return row, transcript
@@ -2095,7 +2095,7 @@ class Daemon:
             workspace = (db.canonical_workspace(params["workspace"])
                          if params.get("workspace") else None)
             from misaka.core.research import runs
-            from misaka.core.session_manager import find_most_recent_session
+            from misaka.core.session_manager import findMostRecentSession
             contexts = runs.task_contexts(self._board())
             cards = []
             for r in self._board().execute(
@@ -2107,7 +2107,7 @@ class Daemon:
                 sess = session_roots.card_session_dir(r)
                 available = (os.path.isdir(r["workspace"] or "")
                              and os.path.isdir(project or ""))
-                transcript = find_most_recent_session(sess) if available else None
+                transcript = findMostRecentSession(sess) if available else None
                 cards.append({"id": r["id"], "status": r["status"], "title": r["title"],
                               "assignee": r["assignee"], "workspace": r["workspace"], "project": project,
                               "origin_session": r["origin_session"], "research": context,

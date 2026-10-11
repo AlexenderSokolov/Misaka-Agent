@@ -1,11 +1,15 @@
-"""Interactive selector for session-scoped model enablement and ordering."""
+"""Interactive selector for session-scoped model enablement and ordering.
+
+Translated from pi's ``modes/interactive/components/scoped-models-selector.ts``.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from misaka.ai.types import Model
 from misaka.ui.tui import (
@@ -18,12 +22,16 @@ from misaka.ui.tui import (
     getKeybindings,
     matchesKey,
 )
+from misaka.ui.tui.interactive.model_search import ModelSearchItem, getModelSearchText
 from misaka.ui.tui.interactive.theme.theme import theme
 
 from .dynamic_border import DynamicBorder
-from .keybinding_hints import key_text
+from .keybinding_hints import keyDisplayText
 
+# EnabledIds: None = all enabled (no filter), list[str] = explicit ordered list
 type EnabledIds = list[str] | None
+
+_UNSET: object = object()
 
 
 def _invoke_callback(callback_result: object) -> None:
@@ -37,33 +45,39 @@ def _invoke_callback(callback_result: object) -> None:
         loop.create_task(callback_result)
 
 
-def is_enabled(enabledIds: EnabledIds, id: str) -> bool:
+def isEnabled(enabledIds: EnabledIds, id: str) -> bool:
     return enabledIds is None or id in enabledIds
 
 
-def toggle(enabledIds: EnabledIds, id: str) -> EnabledIds:
+def normalizeEnabled(result: list[str], allIds: list[str]) -> EnabledIds:
+    """Collapse an explicit list back to None (= all enabled) when it covers every available model."""
+    return None if len(result) == len(allIds) and all(id in allIds for id in result) else result
+
+
+def toggle(enabledIds: EnabledIds, allIds: list[str], id: str) -> EnabledIds:
     if enabledIds is None:
-        return [id]
+        return [modelId for modelId in allIds if modelId != id]
     if id in enabledIds:
-        return [entry for entry in enabledIds if entry != id]
-    return [*enabledIds, id]
+        index = enabledIds.index(id)
+        return [*enabledIds[:index], *enabledIds[index + 1:]]
+    return normalizeEnabled([*enabledIds, id], allIds)
 
 
-def enable_all(enabledIds: EnabledIds, allIds: list[str], targetIds: list[str] | None = None) -> EnabledIds:
+def enableAll(enabledIds: EnabledIds, allIds: list[str], targetIds: list[str] | None = None) -> EnabledIds:
     if enabledIds is None:
-        return None
-    targets = targetIds or allIds
+        return None  # Already all enabled
+    targets = targetIds if targetIds is not None else allIds
     result = list(enabledIds)
     for id in targets:
         if id not in result:
             result.append(id)
-    return None if len(result) == len(allIds) else result
+    return normalizeEnabled(result, allIds)
 
 
-def clear_all(enabledIds: EnabledIds, allIds: list[str], targetIds: list[str] | None = None) -> EnabledIds:
+def clearAll(enabledIds: EnabledIds, allIds: list[str], targetIds: list[str] | None = None) -> EnabledIds:
     if enabledIds is None:
-        return [id for id in allIds if id not in set(targetIds or [])] if targetIds else []
-    targets = set(targetIds or enabledIds)
+        return [id for id in allIds if id not in targetIds] if targetIds is not None else []
+    targets = set(targetIds if targetIds is not None else enabledIds)
     return [id for id in enabledIds if id not in targets]
 
 
@@ -71,28 +85,28 @@ def move(enabledIds: EnabledIds, id: str, delta: int) -> EnabledIds:
     if enabledIds is None:
         return None
     current = list(enabledIds)
-    try:
-        index = current.index(id)
-    except ValueError:
+    if id not in current:
         return current
+    index = current.index(id)
     newIndex = index + delta
     if newIndex < 0 or newIndex >= len(current):
         return current
-    current[index], current[newIndex] = current[newIndex], current[index]
-    return current
+    result = list(current)
+    result[index], result[newIndex] = result[newIndex], result[index]
+    return result
 
 
-def get_sorted_ids(enabledIds: EnabledIds, allIds: list[str]) -> list[str]:
+def getSortedIds(enabledIds: EnabledIds, allIds: list[str]) -> list[str]:
     if enabledIds is None:
         return list(allIds)
-    enabled = set(enabledIds)
-    return [*enabledIds, *[id for id in allIds if id not in enabled]]
+    enabledSet = set(enabledIds)
+    return [*enabledIds, *[id for id in allIds if id not in enabledSet]]
 
 
 @dataclass(slots=True)
 class ModelItem:
     fullId: str
-    model: Model
+    model: Model | None
     enabled: bool
 
 
@@ -100,56 +114,73 @@ class ModelItem:
 class ModelsConfig:
     allModels: list[Model]
     enabledModelIds: list[str] | None
+    refreshStatus: str | None = None
 
 
 @dataclass(slots=True)
 class ModelsCallbacks:
+    # Called whenever the enabled model set or order changes (session-only, no persist)
     onChange: Callable[[list[str] | None], object]
+    # Called when user wants to persist current selection to settings
     onPersist: Callable[[list[str] | None], object]
     onCancel: Callable[[], None]
 
 
 class ScopedModelsSelectorComponent(Container):
+    """Component for enabling/disabling models for Ctrl+P cycling.
+    Changes are session-only until explicitly persisted with Ctrl+S.
+    """
+
     def __init__(self, config: ModelsConfig, callbacks: ModelsCallbacks) -> None:
         super().__init__()
-        self._focused = False
-        self.callbacks = callbacks
         self.modelsById: dict[str, Model] = {}
         self.allIds: list[str] = []
-        self.enabledIds: EnabledIds = None if config.enabledModelIds is None else list(config.enabledModelIds)
+        self.enabledIds: EnabledIds = None
         self.filteredItems: list[ModelItem] = []
         self.selectedIndex = 0
+        # Focusable implementation - propagate to searchInput for IME cursor positioning
+        self._focused = False
+        self.callbacks = callbacks
         self.maxVisible = 8
         self.isDirty = False
+        self.refreshStatusText: Text | None = None
 
         for model in config.allModels:
             fullId = f"{model.provider}/{model.id}"
             self.modelsById[fullId] = model
             self.allIds.append(fullId)
 
+        self.enabledIds = None if config.enabledModelIds is None else list(config.enabledModelIds)
+        self.filteredItems = self.buildItems()
+
+        # Header
         self.addChild(DynamicBorder())
         self.addChild(Spacer(1))
         self.addChild(Text(theme.fg("accent", theme.bold("Model Configuration")), 0, 0))
         self.addChild(
-            Text(theme.fg("muted", f"Session-only. {key_text('app.models.save')} to save to settings."), 0, 0)
+            Text(theme.fg("muted", f"Session-only. {keyDisplayText('app.models.save')} to save to settings."), 0, 0)
         )
         self.addChild(Spacer(1))
 
+        # Search input
         self.searchInput = Input()
         self.addChild(self.searchInput)
         self.addChild(Spacer(1))
 
+        # List container
         self.listContainer = Container()
         self.addChild(self.listContainer)
+
+        # Footer hint
         self.addChild(Spacer(1))
-
-        self.footerText = Text("", 0, 0)
+        if config.refreshStatus:
+            self.refreshStatusText = Text(theme.fg("muted", f"  {config.refreshStatus}"), 0, 0)
+            self.addChild(self.refreshStatusText)
+        self.footerText = Text(self.getFooterText(), 0, 0)
         self.addChild(self.footerText)
-        self.addChild(DynamicBorder())
 
-        self.filteredItems = self.buildItems()
+        self.addChild(DynamicBorder())
         self.updateList()
-        self.footerText.setText(self.getFooterText())
 
     @property
     def focused(self) -> bool:
@@ -160,40 +191,86 @@ class ScopedModelsSelectorComponent(Container):
         self._focused = value
         self.searchInput.focused = value
 
+    def updateModels(self, models: Sequence[Model], enabledModelIds: list[str] | None | object = _UNSET) -> None:
+        selectedId = (
+            self.filteredItems[self.selectedIndex].fullId if self.selectedIndex < len(self.filteredItems) else None
+        )
+        if enabledModelIds is not _UNSET:
+            self.enabledIds = None if enabledModelIds is None else list(enabledModelIds)  # type: ignore[call-overload]
+        self.modelsById.clear()
+        self.allIds = []
+        for model in models:
+            fullId = f"{model.provider}/{model.id}"
+            self.modelsById[fullId] = model
+            self.allIds.append(fullId)
+        self.refresh()
+        refreshedIndex = (
+            next((index for index, item in enumerate(self.filteredItems) if item.fullId == selectedId), -1)
+            if selectedId
+            else -1
+        )
+        if refreshedIndex >= 0:
+            self.selectedIndex = refreshedIndex
+            self.updateList()
+
+    def setRefreshStatus(self, message: str, kind: Literal["muted", "success", "warning"]) -> None:
+        if self.refreshStatusText is not None:
+            self.refreshStatusText.setText(theme.fg(kind, f"  {message}"))
+
     def buildItems(self) -> list[ModelItem]:
         return [
-            ModelItem(fullId=id, model=self.modelsById[id], enabled=is_enabled(self.enabledIds, id))
-            for id in get_sorted_ids(self.enabledIds, self.allIds)
-            if id in self.modelsById
+            ModelItem(fullId=id, model=self.modelsById.get(id), enabled=isEnabled(self.enabledIds, id))
+            for id in getSortedIds(self.enabledIds, self.allIds)
         ]
 
     def getFooterText(self) -> str:
-        enabledCount = len(self.enabledIds) if self.enabledIds is not None else len(self.allIds)
+        enabledCount = (
+            len([id for id in self.enabledIds if id in self.modelsById])
+            if self.enabledIds is not None
+            else len(self.allIds)
+        )
+        unavailableCount = (
+            len([id for id in self.enabledIds if id not in self.modelsById]) if self.enabledIds is not None else 0
+        )
         allEnabled = self.enabledIds is None
-        countText = "all enabled" if allEnabled else f"{enabledCount}/{len(self.allIds)} enabled"
+        countText = (
+            "all enabled"
+            if allEnabled
+            else f"{enabledCount}/{len(self.allIds)} enabled"
+            + (f" · {unavailableCount} unavailable" if unavailableCount else "")
+        )
         parts = [
-            f"{key_text('tui.select.confirm')} toggle",
-            f"{key_text('app.models.enableAll')} all",
-            f"{key_text('app.models.clearAll')} clear",
-            f"{key_text('app.models.toggleProvider')} provider",
-            f"{key_text('app.models.reorderUp')}/{key_text('app.models.reorderDown')} reorder",
-            f"{key_text('app.models.save')} save",
+            f"{keyDisplayText('tui.select.confirm')} toggle",
+            f"{keyDisplayText('app.models.enableAll')} all",
+            f"{keyDisplayText('app.models.clearAll')} clear",
+            f"{keyDisplayText('app.models.toggleProvider')} provider",
+            f"{keyDisplayText('app.models.reorderUp')}/{keyDisplayText('app.models.reorderDown')} reorder",
+            f"{keyDisplayText('app.models.save')} save",
             countText,
         ]
-        base = theme.fg("dim", f"  {' · '.join(parts)}")
-        return base + theme.fg("warning", " (unsaved)") if self.isDirty else base
+        return (
+            theme.fg("dim", f"  {' · '.join(parts)} ") + theme.fg("warning", "(unsaved)")
+            if self.isDirty
+            else theme.fg("dim", f"  {' · '.join(parts)}")
+        )
 
     def refresh(self) -> None:
         query = self.searchInput.getValue()
         items = self.buildItems()
         self.filteredItems = (
-            fuzzyFilter(items, query, lambda item: f"{item.model.id} {item.model.provider}")
+            fuzzyFilter(
+                items,
+                query,
+                lambda item: getModelSearchText(
+                    ModelSearchItem(id=item.model.id, provider=item.model.provider, name=item.model.name)
+                )
+                if item.model is not None
+                else item.fullId,
+            )
             if query
             else items
         )
-        # Lower bound included on purpose: a negative index is a legal Python subscript,
-        # so `filteredItems[-1]` would silently hand the last row to the toggle path.
-        self.selectedIndex = max(0, min(self.selectedIndex, len(self.filteredItems) - 1))
+        self.selectedIndex = min(self.selectedIndex, max(0, len(self.filteredItems) - 1))
         self.updateList()
         self.footerText.setText(self.getFooterText())
 
@@ -202,6 +279,7 @@ class ScopedModelsSelectorComponent(Container):
 
     def updateList(self) -> None:
         self.listContainer.clear()
+
         if not self.filteredItems:
             self.listContainer.addChild(Text(theme.fg("muted", "  No matching models"), 0, 0))
             return
@@ -211,29 +289,41 @@ class ScopedModelsSelectorComponent(Container):
             min(self.selectedIndex - (self.maxVisible // 2), len(self.filteredItems) - self.maxVisible),
         )
         endIndex = min(startIndex + self.maxVisible, len(self.filteredItems))
-        allEnabled = self.enabledIds is None
-
         for index in range(startIndex, endIndex):
             item = self.filteredItems[index]
             isSelected = index == self.selectedIndex
             prefix = theme.fg("accent", "→ ") if isSelected else "  "
-            modelText = theme.fg("accent", item.model.id) if isSelected else item.model.id
-            providerBadge = theme.fg("muted", f" [{item.model.provider}]")
-            status = "" if allEnabled else (theme.fg("success", " ✓") if item.enabled else theme.fg("dim", " ✗"))
-            self.listContainer.addChild(Text(f"{prefix}{modelText}{providerBadge}{status}", 0, 0))
+            id = item.model.id if item.model is not None else item.fullId
+            styledId = id if item.model is not None else theme.strikethrough(id)
+            modelText = theme.fg("accent", styledId) if isSelected else styledId
+            providerBadge = theme.fg("muted", f" [{item.model.provider}]" if item.model is not None else " [unavailable]")
+            status = theme.fg("accent", "✓ ") if item.model is not None and item.enabled else "  "
+            self.listContainer.addChild(Text(f"{prefix}{status}{modelText}{providerBadge}", 0, 0))
 
+        # Add scroll indicator if needed
         if startIndex > 0 or endIndex < len(self.filteredItems):
             self.listContainer.addChild(
                 Text(theme.fg("muted", f"  ({self.selectedIndex + 1}/{len(self.filteredItems)})"), 0, 0)
             )
 
-        selected = self.filteredItems[self.selectedIndex]
-        self.listContainer.addChild(Spacer(1))
-        self.listContainer.addChild(Text(theme.fg("muted", f"  Model Name: {selected.model.name}"), 0, 0))
+        if self.filteredItems:
+            selected = self.filteredItems[self.selectedIndex]
+            self.listContainer.addChild(Spacer(1))
+            self.listContainer.addChild(
+                Text(
+                    theme.fg(
+                        "muted",
+                        f"  {f'Model Name: {selected.model.name}' if selected.model is not None else 'Model unavailable'}",
+                    ),
+                    0,
+                    0,
+                )
+            )
 
     def handleInput(self, data: str) -> None:
         kb = getKeybindings()
 
+        # Navigation
         if kb.matches(data, "tui.select.up"):
             if not self.filteredItems:
                 return
@@ -247,83 +337,87 @@ class ScopedModelsSelectorComponent(Container):
             self.updateList()
             return
 
+        # Reorder enabled models
         reorderUp = kb.matches(data, "app.models.reorderUp")
         reorderDown = kb.matches(data, "app.models.reorderDown")
         if reorderUp or reorderDown:
-            if self.enabledIds is None or not self.filteredItems:
+            if self.enabledIds is None:
                 return
-            item = self.filteredItems[self.selectedIndex]
-            if is_enabled(self.enabledIds, item.fullId):
+            item = self.filteredItems[self.selectedIndex] if self.selectedIndex < len(self.filteredItems) else None
+            if item is not None and isEnabled(self.enabledIds, item.fullId):
                 delta = -1 if reorderUp else 1
                 currentIndex = self.enabledIds.index(item.fullId)
                 newIndex = currentIndex + delta
+                # Only move if within bounds
                 if 0 <= newIndex < len(self.enabledIds):
                     self.enabledIds = move(self.enabledIds, item.fullId, delta)
                     self.isDirty = True
+                    self.selectedIndex += delta
                     self.refresh()
-                    # `selectedIndex` indexes the filtered view while the reorder moved the
-                    # model in the *global* order, so the two only agree without a search
-                    # query. Re-find the row that was just moved instead of stepping by delta.
+                    # MISAKA fork: `selectedIndex` indexes the filtered view while the move is in
+                    # the global order; the two only agree without a search query, so the moved
+                    # row is found again rather than stepped to by delta.
                     self.selectedIndex = next(
-                        (
-                            index
-                            for index, candidate in enumerate(self.filteredItems)
-                            if candidate.fullId == item.fullId
-                        ),
+                        (index for index, candidate in enumerate(self.filteredItems) if candidate.fullId == item.fullId),
                         self.selectedIndex,
                     )
                     self.updateList()
                     self.notifyChange()
             return
 
+        # Toggle on Enter
         if kb.matches(data, "tui.select.confirm"):
-            if not self.filteredItems:
-                return
-            item = self.filteredItems[self.selectedIndex]
-            self.enabledIds = toggle(self.enabledIds, item.fullId)
-            self.isDirty = True
-            self.refresh()
-            self.notifyChange()
+            item = self.filteredItems[self.selectedIndex] if self.selectedIndex < len(self.filteredItems) else None
+            if item is not None:
+                self.enabledIds = toggle(self.enabledIds, self.allIds, item.fullId)
+                self.isDirty = True
+                self.refresh()
+                self.notifyChange()
             return
 
+        # Enable all (filtered if search active, otherwise all)
         if kb.matches(data, "app.models.enableAll"):
             targetIds = [item.fullId for item in self.filteredItems] if self.searchInput.getValue() else None
-            self.enabledIds = enable_all(self.enabledIds, self.allIds, targetIds)
+            self.enabledIds = enableAll(self.enabledIds, self.allIds, targetIds)
             self.isDirty = True
             self.refresh()
             self.notifyChange()
             return
 
+        # Clear all (filtered if search active, otherwise all)
         if kb.matches(data, "app.models.clearAll"):
             targetIds = [item.fullId for item in self.filteredItems] if self.searchInput.getValue() else None
-            self.enabledIds = clear_all(self.enabledIds, self.allIds, targetIds)
+            self.enabledIds = clearAll(self.enabledIds, self.allIds, targetIds)
             self.isDirty = True
             self.refresh()
             self.notifyChange()
             return
 
+        # Toggle provider of current item
         if kb.matches(data, "app.models.toggleProvider"):
-            if not self.filteredItems:
-                return
-            item = self.filteredItems[self.selectedIndex]
-            providerIds = [id for id in self.allIds if self.modelsById[id].provider == item.model.provider]
-            allProviderEnabled = all(is_enabled(self.enabledIds, id) for id in providerIds)
-            self.enabledIds = (
-                clear_all(self.enabledIds, self.allIds, providerIds)
-                if allProviderEnabled
-                else enable_all(self.enabledIds, self.allIds, providerIds)
-            )
-            self.isDirty = True
-            self.refresh()
-            self.notifyChange()
+            item = self.filteredItems[self.selectedIndex] if self.selectedIndex < len(self.filteredItems) else None
+            if item is not None and item.model is not None:
+                provider = item.model.provider
+                providerIds = [id for id in self.allIds if self.modelsById[id].provider == provider]
+                allEnabled = all(isEnabled(self.enabledIds, id) for id in providerIds)
+                self.enabledIds = (
+                    clearAll(self.enabledIds, self.allIds, providerIds)
+                    if allEnabled
+                    else enableAll(self.enabledIds, self.allIds, providerIds)
+                )
+                self.isDirty = True
+                self.refresh()
+                self.notifyChange()
             return
 
+        # Save/persist to settings
         if kb.matches(data, "app.models.save"):
             _invoke_callback(self.callbacks.onPersist(None if self.enabledIds is None else list(self.enabledIds)))
             self.isDirty = False
             self.footerText.setText(self.getFooterText())
             return
 
+        # Ctrl+C - clear search or cancel if empty
         if matchesKey(data, Key.ctrl("c")):
             if self.searchInput.getValue():
                 self.searchInput.setValue("")
@@ -331,10 +425,13 @@ class ScopedModelsSelectorComponent(Container):
             else:
                 self.callbacks.onCancel()
             return
+
+        # Escape - cancel
         if matchesKey(data, Key.escape):
             self.callbacks.onCancel()
             return
 
+        # Pass everything else to search input
         self.searchInput.handleInput(data)
         self.refresh()
 

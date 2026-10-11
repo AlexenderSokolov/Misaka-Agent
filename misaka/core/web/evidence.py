@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from misaka.core.documents.index import under
-from misaka.core.tools.path_utils import DOWNLOAD_DIR_NAME, resolve_to_cwd
+from misaka.core.tools.path_utils import DOWNLOAD_DIR_NAME, resolveToCwd
 
 # Where the complete extracted text of a fetched page is left, under the workspace.
 # Beside download_file's own output rather than in a directory of its own: both are
@@ -184,7 +184,7 @@ def save_page(cwd: str | None, provenance: dict[str, Any], text: str) -> str | N
     except UnicodeError:
         return None
     relative = f"{_PAGE_DIR}/{stem}.md"
-    path = resolve_to_cwd(relative, cwd)
+    path = resolveToCwd(relative, cwd)
     if not under(path, cwd):
         return None
     return relative if _write_document(path, document, mode=0o644) else None

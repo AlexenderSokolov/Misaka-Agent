@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
-import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
+from misaka.ai.api._sdk import EXTRAS
 from misaka.ai.auth.resolve import AuthResolutionOverrides
 from misaka.ai.auth.types import (
     ApiKeyCredential,
@@ -18,17 +18,12 @@ from misaka.ai.auth.types import (
     AuthResult,
     OAuthCredential,
 )
-from misaka.ai.models_store import InMemoryModelsStore
-from misaka.ai.providers.sdk import EXTRAS
+from misaka.ai.models import ModelsRefreshOptions
 from misaka.ai.types import Model
-from misaka.config import get_agent_dir, get_auth_path
-from misaka.core.auth_storage import (
-    AuthStorage,
-    AuthStorageBackend,
-    AuthStorageCredentialStore,
-    FileAuthStorageBackend,
-)
-from misaka.core.model_registry import ModelRegistry
+from misaka.config import get_auth_path
+from misaka.core.auth_storage import AuthStorage, ReadOnlyAuthStorage
+from misaka.core.model_runtime import ModelRuntime
+from misaka.core.models_store import InMemoryCodingAgentModelsStore
 
 type AuthCommandKind = Literal["check", "api_key", "bearer_token"]
 
@@ -37,7 +32,7 @@ _PRINT_TIMEOUT_SECONDS = 15
 
 # Which vendor SDK each wire protocol needs, as ``api -> (module, PyPI package)``. The
 # provider modules import these behind ``try/except ImportError`` and only fail at the first
-# request, through ``misaka.ai.providers.sdk.require`` -- so a credential alone proves
+# request, through ``misaka.ai.api._sdk.require`` -- so a credential alone proves
 # nothing about whether the provider can serve a call. An api absent from this table
 # (``pi-messages``, ``openai-codex-responses``, ``mistral-conversations``) speaks its
 # protocol over httpx and needs no extra. ``EXTRAS`` turns the package into the extra name
@@ -67,7 +62,7 @@ def _sdk_installed(module: str) -> bool:
         return False
 
 
-def _missing_sdk_extras(registry: ModelRegistry, provider: str) -> list[str]:
+def _missing_sdk_extras(runtime: ModelRuntime, provider: str) -> list[str]:
     """The extras to install before ``provider`` can serve any request, or ``[]``.
 
     A provider that offers several wire protocols (github-copilot, opencode) is usable as
@@ -75,7 +70,7 @@ def _missing_sdk_extras(registry: ModelRegistry, provider: str) -> list[str]:
     """
     requirements = {
         _API_SDK_REQUIREMENTS.get(model.api)
-        for model in registry.getAll()
+        for model in runtime.getModels()
         if model.provider == provider
     }
     if not requirements or None in requirements:
@@ -152,9 +147,8 @@ class AuthCheckResult:
 
 @dataclass(slots=True)
 class _AuthRuntime:
-    storage: AuthStorage
-    credentials: AuthStorageCredentialStore
-    registry: ModelRegistry
+    credentials: AuthStorage | ReadOnlyAuthStorage
+    runtime: ModelRuntime
 
 
 @dataclass(slots=True)
@@ -164,33 +158,6 @@ class _AuthTarget:
     check: AuthCheck | None = None
 
 
-class _ReadOnlyAuthStorageBackend(AuthStorageBackend):
-    """One-shot safe auth.json snapshot; every mutation fails closed."""
-
-    def __init__(self, auth_path: str) -> None:
-        self._reader = FileAuthStorageBackend(auth_path)
-        self._loaded = False
-        self._content: str | None = None
-
-    def _load(self) -> str | None:
-        if self._loaded:
-            return self._content
-        try:
-            self._content, _revision = self._reader._read_file()
-        except FileNotFoundError:
-            self._content = None
-        self._loaded = True
-        return self._content
-
-    def withLock(self, fn):
-        outcome = fn(self._load())
-        if outcome.next is not None or outcome.publish is not None:
-            raise RuntimeError("Read-only credential storage cannot modify auth.json")
-        return outcome.result
-
-    async def withLockAsync(self, fn, options=None):
-        del fn, options
-        raise RuntimeError("Read-only credential storage cannot modify auth.json")
 
 
 def _parse_duration(value: str) -> int:
@@ -358,25 +325,36 @@ def get_auth_credential(auth: AuthResult | None) -> str | None:
     return None
 
 
-def _create_runtime(*, read_only: bool) -> _AuthRuntime:
-    storage = (
-        AuthStorage.fromStorage(_ReadOnlyAuthStorageBackend(get_auth_path()))
-        if read_only
-        else AuthStorage.create()
-    )
-    registry = ModelRegistry(
-        storage,
-        os.path.join(get_agent_dir(), "models.json"),
-        InMemoryModelsStore(),
-    )
-    return _AuthRuntime(
-        storage=storage,
-        credentials=AuthStorageCredentialStore(storage),
-        registry=registry,
+async def create_auth_check_model_runtime(credentials: AuthStorage | ReadOnlyAuthStorage) -> ModelRuntime:
+    """pi's ``createAuthCheckModelRuntime``: no catalog network, no refresh on create."""
+    return await ModelRuntime.create(
+        credentials=credentials,
+        modelsStore=InMemoryCodingAgentModelsStore(),
+        allowModelNetwork=False,
+        refreshOnCreate=False,
     )
 
 
-def _validate_storage(storage: AuthStorage) -> None:
+async def _create_runtime(*, read_only: bool, refresh: bool = False) -> _AuthRuntime:
+    """``refresh`` fills the availability snapshot the status overviews read."""
+    credentials = ReadOnlyAuthStorage(get_auth_path()) if read_only else AuthStorage.create()
+    runtime = await create_auth_check_model_runtime(credentials)
+    if refresh:
+        await runtime.refresh(ModelsRefreshOptions(allowNetwork=False))
+    return _AuthRuntime(credentials=credentials, runtime=runtime)
+
+
+def _stored_data(credentials: AuthStorage | ReadOnlyAuthStorage) -> Any:
+    """What auth.json holds, as the store read it. A read-only store reads the file now and raises for one it cannot
+    use, as its ``read`` would."""
+    if isinstance(credentials, ReadOnlyAuthStorage):
+        return credentials._load()
+    if credentials.loadError is not None:
+        raise credentials.loadError
+    return credentials.data
+
+
+def _validate_storage(data: Any) -> None:
     """Raises ``AuthCommandError`` so the reason survives.
 
     ``_check_auth`` folds anything raised here into a structured ``invalid`` result, but
@@ -388,11 +366,9 @@ def _validate_storage(storage: AuthStorage) -> None:
     # auth.json, and `print-api-key` prints an AuthCommandError verbatim. Same for the
     # pydantic validations below. Only the messages this function writes itself -- which
     # name a provider and nothing else -- are safe to surface.
-    if storage.loadError is not None:
-        raise storage.loadError
-    if not isinstance(storage.data, dict):
+    if not isinstance(data, dict):
         raise AuthCommandError("Invalid auth.json: expected an object", 1)
-    for provider, value in storage.data.items():
+    for provider, value in data.items():
         if not isinstance(provider, str) or not isinstance(value, dict):
             raise AuthCommandError(f'Invalid auth.json credential for provider "{provider}"', 1)
         if value.get("type") == "api_key":
@@ -409,12 +385,12 @@ def _validate_storage(storage: AuthStorage) -> None:
 
 
 def _model_candidates(
-    registry: ModelRegistry, model_reference: str
+    runtime: ModelRuntime, model_reference: str
 ) -> list[_AuthTarget]:
     reference = model_reference.lower()
     seen: set[tuple[str, str]] = set()
     matches: list[_AuthTarget] = []
-    for model in registry.getAll():
+    for model in runtime.getModels():
         key = model.provider.lower(), model.id.lower()
         if key in seen:
             continue
@@ -435,11 +411,11 @@ def _is_canonical_model(target: _AuthTarget, model_reference: str) -> bool:
 
 
 def _provider_model_candidates(
-    registry: ModelRegistry, provider: str, model_reference: str
+    runtime: ModelRuntime, provider: str, model_reference: str
 ) -> list[_AuthTarget]:
     candidates = [
         target
-        for target in _model_candidates(registry, model_reference)
+        for target in _model_candidates(runtime, model_reference)
         if target.provider == provider
     ]
     canonical = [
@@ -448,9 +424,9 @@ def _provider_model_candidates(
     return canonical or candidates
 
 
-def _canonical_provider(registry: ModelRegistry, provider: str) -> str | None:
-    provider_ids = {model.provider for model in registry.getAll()} | {
-        item.id for item in registry.getNativeProviders()
+def _canonical_provider(runtime: ModelRuntime, provider: str) -> str | None:
+    provider_ids = {model.provider for model in runtime.getModels()} | {
+        item.id for item in runtime.getProviders()
     }
     lowered = provider.lower()
     return next(
@@ -459,9 +435,9 @@ def _canonical_provider(registry: ModelRegistry, provider: str) -> str | None:
 
 
 def _resolve_explicit_target(
-    registry: ModelRegistry, provider: str, model_reference: str | None
+    runtime: ModelRuntime, provider: str, model_reference: str | None
 ) -> _AuthTarget:
-    canonical_provider = _canonical_provider(registry, provider)
+    canonical_provider = _canonical_provider(runtime, provider)
     if canonical_provider is None:
         if model_reference is None:
             return _AuthTarget(provider=provider)
@@ -471,7 +447,7 @@ def _resolve_explicit_target(
         )
     if model_reference is None:
         return _AuthTarget(provider=canonical_provider)
-    matches = _provider_model_candidates(registry, canonical_provider, model_reference)
+    matches = _provider_model_candidates(runtime, canonical_provider, model_reference)
     if len(matches) != 1:
         raise AuthCommandError(
             f'Model "{model_reference}" not found for provider "{canonical_provider}". '
@@ -482,11 +458,11 @@ def _resolve_explicit_target(
 
 
 async def _resolve_check_target(
-    command: AuthCommand, registry: ModelRegistry
+    command: AuthCommand, runtime: ModelRuntime
 ) -> _AuthTarget:
     if command.provider is not None:
-        return _resolve_explicit_target(registry, command.provider, command.model)
-    candidates = _model_candidates(registry, command.model or "")
+        return _resolve_explicit_target(runtime, command.provider, command.model)
+    candidates = _model_candidates(runtime, command.model or "")
     if not candidates:
         raise AuthCommandError(
             f'Model "{command.model}" not found. Use --list-models to see available models.',
@@ -506,7 +482,7 @@ async def _resolve_check_target(
             2,
         )
     if canonical:
-        check = await registry.checkProviderAuth(canonical[0].provider)
+        check = await runtime.checkAuth(canonical[0].provider)
         if check is not None:
             canonical[0].check = check
             return canonical[0]
@@ -514,7 +490,7 @@ async def _resolve_check_target(
         for target in candidates:
             if target is canonical[0]:
                 continue
-            check = await registry.checkProviderAuth(target.provider)
+            check = await runtime.checkAuth(target.provider)
             if check is not None:
                 target.check = check
                 configured_raw.append(target)
@@ -522,7 +498,7 @@ async def _resolve_check_target(
 
     configured: list[_AuthTarget] = []
     for target in candidates:
-        check = await registry.checkProviderAuth(target.provider)
+        check = await runtime.checkAuth(target.provider)
         if check is not None:
             target.check = check
             configured.append(target)
@@ -541,8 +517,8 @@ async def _resolve_auth(
     overrides: AuthResolutionOverrides | None = None,
 ) -> AuthResult | None:
     if target.model is not None:
-        return await runtime.registry.getAuth(target.model, overrides)
-    return await runtime.registry.getProviderAuth(target.provider, overrides)
+        return await runtime.runtime.getAuth(target.model, overrides)
+    return await runtime.runtime.getAuth(target.provider, overrides)
 
 
 def _invalid_result(
@@ -558,21 +534,19 @@ def _invalid_result(
 async def _check_auth(command: AuthCommand) -> AuthCheckResult:
     target: _AuthTarget | None = None
     try:
-        runtime = _create_runtime(read_only=command.no_refresh)
-        _validate_storage(runtime.storage)
-        if runtime.registry.getError() is not None:
+        runtime = await _create_runtime(read_only=command.no_refresh)
+        _validate_storage(_stored_data(runtime.credentials))
+        if runtime.runtime.getError() is not None:
             return _invalid_result(command)
-        target = await _resolve_check_target(command, runtime.registry)
-        if not runtime.registry.hasProvider(target.provider):
+        target = await _resolve_check_target(command, runtime.runtime)
+        if runtime.runtime.getProvider(target.provider) is None:
             return AuthCheckResult(
                 status="not_ready",
                 provider=target.provider,
                 reason="provider_not_found",
             )
 
-        check = target.check or await runtime.registry.checkProviderAuth(
-            target.provider
-        )
+        check = target.check or await runtime.runtime.checkAuth(target.provider)
         if check is None:
             return AuthCheckResult(
                 status="not_ready",
@@ -583,7 +557,7 @@ async def _check_auth(command: AuthCommand) -> AuthCheckResult:
         # A resolvable credential is only half of "ready": on a plain wheel install the
         # provider's SDK is an extra that nothing has pulled in, and reporting ready here is
         # what sends the user off to debug a request that was never going to be made.
-        missing_extras = _missing_sdk_extras(runtime.registry, target.provider)
+        missing_extras = _missing_sdk_extras(runtime.runtime, target.provider)
         if missing_extras:
             return AuthCheckResult(
                 status="not_ready",
@@ -595,7 +569,7 @@ async def _check_auth(command: AuthCommand) -> AuthCheckResult:
 
         auth: AuthResult | None = None
         if not command.no_refresh:
-            auth = await runtime.registry.getProviderAuth(target.provider)
+            auth = await runtime.runtime.getAuth(target.provider)
             if auth is None:
                 return AuthCheckResult(
                     status="not_ready",
@@ -611,7 +585,7 @@ async def _check_auth(command: AuthCommand) -> AuthCheckResult:
                     stored.access if isinstance(stored, OAuthCredential) else None
                 )
             else:
-                auth = auth or await runtime.registry.getProviderAuth(target.provider)
+                auth = auth or await runtime.runtime.getAuth(target.provider)
                 credential = get_auth_credential(auth)
             if not credential:
                 return AuthCheckResult(
@@ -631,19 +605,19 @@ async def _check_auth(command: AuthCommand) -> AuthCheckResult:
 
 
 async def _print_credential(command: AuthCommand) -> str:
-    runtime = _create_runtime(read_only=False)
-    _validate_storage(runtime.storage)
-    if runtime.registry.getError() is not None:
-        raise AuthCommandError(runtime.registry.getError() or "Invalid model state", 1)
+    runtime = await _create_runtime(read_only=False)
+    _validate_storage(_stored_data(runtime.credentials))
+    if runtime.runtime.getError() is not None:
+        raise AuthCommandError(runtime.runtime.getError() or "Invalid model state", 1)
 
     credential_types = {
         info.providerId: info.type for info in await runtime.credentials.list()
     }
     if command.provider is not None:
         target = _resolve_explicit_target(
-            runtime.registry, command.provider, command.model
+            runtime.runtime, command.provider, command.model
         )
-        if not runtime.registry.hasProvider(target.provider):
+        if runtime.runtime.getProvider(target.provider) is None:
             raise AuthCommandError(
                 f'Unknown provider "{command.provider}". Use --list-models to see available providers.',
                 1,
@@ -653,7 +627,7 @@ async def _print_credential(command: AuthCommand) -> str:
         targets: list[_AuthTarget] = []
         for provider in credential_types:
             matches = _provider_model_candidates(
-                runtime.registry, provider, command.model or ""
+                runtime.runtime, provider, command.model or ""
             )
             if len(matches) > 1:
                 raise AuthCommandError(
@@ -721,9 +695,9 @@ async def _print_credential(command: AuthCommand) -> str:
 
 
 def _run_legacy_check(provider: str | None, *, show: bool) -> int:
-    runtime = _create_runtime(read_only=False)
-    known = {model.provider for model in runtime.registry.getAvailable()} | set(
-        runtime.storage.getAll()
+    runtime = asyncio.run(_create_runtime(read_only=False, refresh=True))
+    known = {model.provider for model in runtime.runtime.getAvailableSnapshot()} | set(
+        _stored_data(runtime.credentials)
     )
     targets = [provider] if provider else sorted(known)
     if not targets:
@@ -731,11 +705,11 @@ def _run_legacy_check(provider: str | None, *, show: bool) -> int:
         return 1
     bad = 0
     for target in targets:
-        status = runtime.registry.getProviderAuthStatus(target)
+        status = runtime.runtime.getProviderAuthStatus(target)
         ready = bool(status.configured or status.source)
         # "!" rather than "✗": the credential is fine, the install is not. Both count as not
         # ready, so the exit code still refuses to call this provider usable.
-        missing = _missing_sdk_extras(runtime.registry, target) if ready else []
+        missing = _missing_sdk_extras(runtime.runtime, target) if ready else []
         mark = "!" if missing else "✓" if ready else "✗"
         detail = status.source or "not configured"
         if status.label:
@@ -744,12 +718,20 @@ def _run_legacy_check(provider: str | None, *, show: bool) -> int:
             detail += f"; SDK not installed -- {_install_hint(missing)}"
         line = f"{mark} {target}  {detail}"
         if show and ready:
-            key = asyncio.run(runtime.registry.getApiKeyForProvider(target))
+            key = asyncio.run(_api_key_for_provider(runtime.runtime, target))
             line += f"  {key}" if key else " (credential could not be resolved)"
         print(line)
         if not ready or missing:
             bad += 1
     return 1 if bad else 0
+
+
+async def _api_key_for_provider(runtime: ModelRuntime, provider: str) -> str | None:
+    try:
+        resolution = await runtime.getAuth(provider)
+    except Exception:  # noqa: BLE001 - an unresolvable provider has no key to show
+        return None
+    return get_auth_credential(resolution)
 
 
 def _write_auth_check(result: AuthCheckResult, *, json_output: bool) -> int:

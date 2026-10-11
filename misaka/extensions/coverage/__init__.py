@@ -23,7 +23,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 
-from misaka.ai.utils.user_agent import get_misaka_user_agent
+from misaka.ai.utils.pi_user_agent import getPiUserAgent
 
 SESSION_KINDS = {"foreground", "dm", "card", "bare"}
 API = "https://api.openalex.org"
@@ -74,7 +74,7 @@ def _get(path, **params):
         params["api_key"] = os.environ[KEY_ENV]
     url = f"{API}{path}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(
-        url, headers={"User-Agent": f"{get_misaka_user_agent()} coverage-scan"})
+        url, headers={"User-Agent": f"{getPiUserAgent()} coverage-scan"})
     try:
         with urllib.request.urlopen(request, timeout=25) as response:
             return json.load(response)

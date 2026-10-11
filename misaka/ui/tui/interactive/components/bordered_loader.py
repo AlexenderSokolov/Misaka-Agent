@@ -1,70 +1,87 @@
-"""Loader wrapped in bordered interactive chrome."""
+"""Translated from pi's ``modes/interactive/components/bordered-loader.ts`` (v1.1.0)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
 from misaka.ui.tui import CancellableLoader, Container, Loader, Spacer, Text
-from misaka.ui.tui.components import AbortController
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.components.keybinding_hints import key_hint
+from misaka.utils.js import AbortController, AbortSignal
+
+from .dynamic_border import DynamicBorder
+from .keybinding_hints import keyHint
+
+if TYPE_CHECKING:
+    from misaka.ui.tui.interactive.theme.theme import Theme
+
+
+class BorderedLoaderOptions(TypedDict, total=False):
+    """MISAKA fork: a name for the inline type of ``options``."""
+
+    cancellable: bool
 
 
 class BorderedLoader(Container):
-    def __init__(self, tui, theme, message: str, options: dict[str, bool] | None = None) -> None:
+    """Loader wrapped with borders for extension UI"""
+
+    def __init__(self, tui: Any, theme: Theme, message: str, options: BorderedLoaderOptions | None = None) -> None:
         super().__init__()
-        self.cancellable = bool((options or {}).get("cancellable", True))
-        def border_color(text: str) -> str:
-            return theme.fg("border", text)
-        self.addChild(DynamicBorder(border_color))
+        cancellable = options.get("cancellable") if options is not None else None
+        self.cancellable: bool = True if cancellable is None else cancellable
         self.signalController: AbortController | None = None
+
+        def borderColor(s: str) -> str:
+            return theme.fg("border", s)
+
+        self.addChild(DynamicBorder(borderColor))
         if self.cancellable:
             self.loader: CancellableLoader | Loader = CancellableLoader(
                 tui,
-                lambda text: theme.fg("accent", text),
-                lambda text: theme.fg("muted", text),
+                lambda s: theme.fg("accent", s),
+                lambda s: theme.fg("muted", s),
                 message,
             )
         else:
             self.signalController = AbortController()
             self.loader = Loader(
                 tui,
-                lambda text: theme.fg("accent", text),
-                lambda text: theme.fg("muted", text),
+                lambda s: theme.fg("accent", s),
+                lambda s: theme.fg("muted", s),
                 message,
             )
         self.addChild(self.loader)
         if self.cancellable:
             self.addChild(Spacer(1))
-            self.addChild(Text(key_hint("tui.select.cancel", "cancel"), 1, 0))
+            self.addChild(Text(keyHint("tui.select.cancel", "cancel"), 1, 0))
         self.addChild(Spacer(1))
-        self.addChild(DynamicBorder(border_color))
+        self.addChild(DynamicBorder(borderColor))
 
     @property
-    def signal(self):
+    def signal(self) -> AbortSignal:
         if self.cancellable:
-            return self.loader.signal
+            return cast(CancellableLoader, self.loader).signal
         return self.signalController.signal if self.signalController is not None else AbortController().signal
 
     @property
-    def onAbort(self):
-        return getattr(self.loader, "onAbort", None)
+    def onAbort(self) -> Callable[[], None] | None:
+        """MISAKA fork: a Python property needs a getter."""
+        return cast(CancellableLoader, self.loader).onAbort if self.cancellable else None
 
     @onAbort.setter
-    def onAbort(self, fn) -> None:
+    def onAbort(self, fn: Callable[[], None] | None) -> None:
         if self.cancellable:
-            self.loader.onAbort = fn
+            cast(CancellableLoader, self.loader).onAbort = fn
 
     def handleInput(self, data: str) -> None:
         if self.cancellable:
-            self.loader.handleInput(data)
+            cast(CancellableLoader, self.loader).handleInput(data)
 
     def dispose(self) -> None:
         dispose = getattr(self.loader, "dispose", None)
         if callable(dispose):
             dispose()
-            return
-        stop = getattr(self.loader, "stop", None)
-        if callable(stop):
-            stop()
+        else:
+            stop = getattr(self.loader, "stop", None)
+            if callable(stop):
+                stop()
 
-
-__all__ = ["BorderedLoader"]

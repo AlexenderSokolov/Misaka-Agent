@@ -32,7 +32,7 @@ from misaka.core.skills.manage import (
     prepare_arguments,
 )
 from misaka.core.skills.vendor import commands as hermes_commands
-from misaka.core.tools.path_utils import resolve_to_cwd
+from misaka.core.tools.path_utils import resolveToCwd
 from misaka.utils.async_lifecycle import run_in_thread, settle
 
 _SKILL_INVOCATION_PREFIX = "[IMPORTANT: The user has invoked the "
@@ -249,7 +249,7 @@ class SkillsPart:
             if tool in ("write", "edit"):
                 # Resolved as write and edit resolve it (a leading @, file://, Unicode spaces): a
                 # target read any other way let `@PROJECT.md` past this check onto PROJECT.md.
-                target = os.path.realpath(resolve_to_cwd(str(args.get("path") or ""), workspace))
+                target = os.path.realpath(resolveToCwd(str(args.get("path") or ""), workspace))
                 folded = home.folded(target)
                 if any(folded == root or root in folded.parents for root in map(home.folded, live_roots)):
                     return "path"
@@ -572,7 +572,7 @@ class SkillsPart:
                     reserved.update(c.name for c in getattr(part, "commands", ()))
             runner = getattr(self.session, "extensionRunner", None)
             if runner:
-                reserved.update(c.name for c in runner.get_registered_commands())
+                reserved.update(c.name for c in runner.getRegisteredCommands())
             loader = getattr(self.session, "resourceLoader", None)
             if loader and hasattr(loader, "getPrompts"):
                 reserved.update(p.name for p in loader.getPrompts().get("prompts", []))
@@ -657,7 +657,7 @@ class SkillsPart:
         from misaka.core.skills.runtime import using_runtime
         loop = asyncio.get_running_loop()
         if _ctx is None and getattr(self.session, "extensionRunner", None) is not None:
-            _ctx = self.session.extensionRunner.create_context()
+            _ctx = self.session.extensionRunner.createContext()
         captures = set()
         async def capture_owned(name, prompt):
             from misaka.core.skills.secret_input import capture_secret
@@ -810,7 +810,7 @@ class SkillsPart:
     def attach(self, session):
         self.session = session
         self.scope.model = getattr(session, "model", None)
-        self.scope.model_registry = getattr(session, "modelRegistry", None)
+        self.scope.model_runtime = getattr(session, "modelRuntime", None)
         manager = getattr(session, "sessionManager", None)
         if manager is not None:
             manager._skill_runtime = self.runtime

@@ -145,7 +145,7 @@ class CardContextTests(unittest.TestCase):
 
     def test_durable_child_base_and_research_mode_on_fresh_and_resumed_starts(self):
         from misaka.config.identity import COMMON_CHARTER, SISTER_ROLE
-        from misaka.core.system_prompt import build_system_prompt
+        from misaka.core.system_prompt import buildSystemPrompt
         from misaka.core.tools.office import office_tool_system_prompt_contribution
         manager = object.__new__(sister_runtime._SisterManager)
         for persona in ("Persisted old persona", f"Current persona\n\n{COMMON_CHARTER}\n\n{SISTER_ROLE}"):
@@ -160,7 +160,7 @@ class CardContextTests(unittest.TestCase):
                 self.assertEqual(task.definition.prompt, persona)
                 sections = [persona] + [flags[i + 1] for i, value in enumerate(flags)
                                         if value == "--append-system-prompt" and i]
-                prompt = build_system_prompt({"cwd": "/fixture", "appendSystemPrompt": "\n\n".join(sections),
+                prompt = buildSystemPrompt({"cwd": "/fixture", "appendSystemPrompt": "\n\n".join(sections),
                                               "selectedTools": ["office"],
                                               "toolSnippets": {"office": "Office"},
                                               "promptGuidelines": office_tool_system_prompt_contribution["guidelines"]})

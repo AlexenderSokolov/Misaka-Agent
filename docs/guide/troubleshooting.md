@@ -235,6 +235,6 @@ log file it names.
    | `misaka.log` | warnings and errors from MISAKA and the panel |
    | `panel-crash.log` | the last lines of panes that closed, and panel crashes |
    | `misaka-crash.log` | crashes of the chat window itself |
-   | `mcp/` | what each MCP server printed |
+   | `mcp/mcp.log` | the messages MCP servers log |
 
 3. Note what you typed, what you expected and what happened, and include `misaka --version`.

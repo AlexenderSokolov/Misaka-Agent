@@ -8,9 +8,9 @@ import math
 from dataclasses import dataclass
 from io import BytesIO
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps
 
-from misaka.ai.types import ImageContent
+from misaka.utils.js import jsRound
 
 DEFAULT_MAX_BYTES = int(4.5 * 1024 * 1024)
 
@@ -103,12 +103,13 @@ def _resize_image_bytes_sync(
             image = normalized.copy()
             if normalized is not opened:
                 normalized.close()
-    except (UnidentifiedImageError, OSError, ValueError):
+    except Exception:  # noqa: BLE001 - pi's catch-all: an image that cannot be decoded is not resized
         return None
 
     try:
         original_width, original_height = image.size
-        format_suffix = (mime_type.split("/", 1)[1] if mime_type else (image.format or "png")).lower()
+        format_parts = mime_type.split("/")
+        format_suffix = format_parts[1] if len(format_parts) > 1 else "png"
 
         if (
             original_width <= resolved.maxWidth
@@ -132,15 +133,15 @@ def _resize_image_bytes_sync(
         target_width = original_width
         target_height = original_height
         if target_width > resolved.maxWidth:
-            target_height = round((target_height * resolved.maxWidth) / target_width)
+            target_height = jsRound((target_height * resolved.maxWidth) / target_width)
             target_width = resolved.maxWidth
         if target_height > resolved.maxHeight:
-            target_width = round((target_width * resolved.maxHeight) / target_height)
+            target_width = jsRound((target_width * resolved.maxHeight) / target_height)
             target_height = resolved.maxHeight
 
         quality_steps = list(dict.fromkeys([resolved.jpegQuality, 85, 70, 55, 40]))
-        current_width = max(1, target_width)
-        current_height = max(1, target_height)
+        current_width = target_width
+        current_height = target_height
 
         while True:
             resized = image.resize((current_width, current_height), Image.Resampling.LANCZOS)
@@ -174,47 +175,28 @@ def _resize_image_bytes_sync(
             current_height = next_height
 
         return None
+    except Exception:  # noqa: BLE001 - pi's catch-all: a failed resize or encode gives no image
+        return None
     finally:
         image.close()
 
 
-def _resize_image_content_sync(
-    img: ImageContent,
-    options: ImageResizeOptions | None,
-) -> ResizedImage | None:
-    try:
-        input_buffer = base64.b64decode(img.data)
-    except ValueError:
-        return None
-    return _resize_image_bytes_sync(
-        input_buffer,
-        img.mimeType,
-        options,
-        original_base64=img.data,
-        input_base64_size=len(img.data.encode("utf-8")),
-    )
-
-
-async def resize_image_bytes(
-    input_buffer: bytes,
-    mime_type: str,
+async def resizeImage(
+    inputBytes: bytes,
+    mimeType: str,
     options: ImageResizeOptions | None = None,
 ) -> ResizedImage | None:
-    """Resize raw image bytes, encoding base64 only for the returned attachment."""
+    """Resize raw image bytes, encoding base64 only for the returned attachment. MISAKA fork: a worker thread stands in
+    for pi's resize worker, so the event loop is not blocked."""
     return await asyncio.to_thread(
         _resize_image_bytes_sync,
-        input_buffer,
-        mime_type,
+        inputBytes,
+        mimeType,
         options,
     )
 
 
-async def resize_image(img: ImageContent, options: ImageResizeOptions | None = None) -> ResizedImage | None:
-    """Compatibility entry point for callers that already hold base64 image content."""
-    return await asyncio.to_thread(_resize_image_content_sync, img, options)
-
-
-def format_dimension_note(result: ResizedImage) -> str | None:
+def formatDimensionNote(result: ResizedImage) -> str | None:
     if not result.wasResized:
         return None
     scale = result.originalWidth / result.width
@@ -225,8 +207,6 @@ def format_dimension_note(result: ResizedImage) -> str | None:
     )
 
 
-formatDimensionNote = format_dimension_note
-resizeImage = resize_image
 
 __all__ = [
     "DEFAULT_MAX_BYTES",
@@ -234,5 +214,4 @@ __all__ = [
     "ResizedImage",
     "formatDimensionNote",
     "resizeImage",
-    "resize_image_bytes",
 ]

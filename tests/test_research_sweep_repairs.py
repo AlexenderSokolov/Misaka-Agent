@@ -184,7 +184,7 @@ def test_research_registration_does_not_relabel_post_submission_bytes(state, mut
 async def test_live_skill_guard_covers_office_writer(tmp_path, monkeypatch, tool):
     from misaka.core.extensions import startup_sections
     from misaka.core.skills.wiring.skills import SkillsPart
-    from misaka.core.tools.office import create_office_tool_definition
+    from misaka.core.tools.office import createOfficeToolDefinition
 
     live = tmp_path / "profile" / "skills" / "fixture"
     live.mkdir(parents=True)
@@ -205,7 +205,7 @@ async def test_live_skill_guard_covers_office_writer(tmp_path, monkeypatch, tool
     params = {"path": str(path), "content": "after", "overwrite": True}
     decision = await part.tool_call({"toolName": tool, "input": params}, None)
     if not decision and tool == "office":
-        await create_office_tool_definition(str(tmp_path)).execute(
+        await createOfficeToolDefinition(str(tmp_path)).execute(
             "fixture", params, None, None, None
         )
     assert path.read_text(encoding="utf-8") == "before", (
@@ -216,7 +216,7 @@ async def test_live_skill_guard_covers_office_writer(tmp_path, monkeypatch, tool
 
 @pytest.mark.parametrize("added", [True, False])
 async def test_responses_fallback_call_is_in_final_message(added):
-    from misaka.ai.providers.openai_responses_shared import process_responses_stream
+    from misaka.ai.api.openai_responses_shared import processResponsesStream
     from misaka.ai.types import AssistantMessage, Model, Usage, UsageCost
 
     output = AssistantMessage(
@@ -265,14 +265,14 @@ async def test_responses_fallback_call_is_in_final_message(added):
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
     seen = []
-    await process_responses_stream(
+    await processResponsesStream(
         events(), output, SimpleNamespace(push=seen.append), model
     )
     assert any(e.type == "toolcall_end" for e in seen)
     assert len(output.content) == 1, (
         "toolcall_end was emitted but final message silently dropped the recovered call"
     )
-    from misaka.agent.agent_loop import execute_tool_calls
+    from misaka.agent.agent_loop import _executeToolCalls
     from misaka.agent.types import (
         AgentContext,
         AgentLoopConfig,
@@ -299,7 +299,7 @@ async def test_responses_fallback_call_is_in_final_message(added):
         parameters={"type": "object", "properties": {}},
         execute=execute,
     )
-    result = await execute_tool_calls(
+    result = await _executeToolCalls(
         AgentContext(messages=[], tools=[tool]),
         restored,
         AgentLoopConfig(model=None, convertToLlm=lambda m: m),
@@ -802,7 +802,7 @@ async def test_office_executes_the_approved_ops_not_later_file_bytes(
 
     from misaka.core.extensions import startup_sections
     from misaka.core.skills.wiring.skills import SkillsPart
-    from misaka.core.tools.office import create_office_tool_definition
+    from misaka.core.tools.office import createOfficeToolDefinition
 
     live = tmp_path / "skills"
     live.mkdir()
@@ -826,7 +826,7 @@ async def test_office_executes_the_approved_ops_not_later_file_bytes(
         {"toolName": "office", "input": {"path": "output.md", "ops": "@ops.json"}}, None
     )
     ops.write_text(json.dumps([{"export_pdf": {"out": str(protected)}}]), encoding="utf-8")
-    await create_office_tool_definition(str(tmp_path)).execute(
+    await createOfficeToolDefinition(str(tmp_path)).execute(
         "fixture", decision["updatedInput"], None, None, None
     )
     assert (tmp_path / "output.md").read_text(encoding="utf-8") == "approved"

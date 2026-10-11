@@ -25,7 +25,8 @@ reach all of it):
   `CLAUDE.md` in the project or a folder above it -- which a Sister or a sub-agent does not
   change (Last Order and you can);
 - `~/.misaka` itself, which an unattended session (a card, a sub-agent) does not write into;
-- API keys, which an MCP server does not inherit: it gets only the variables it is configured with.
+- API keys, which an MCP server does not inherit: it gets a small part of the environment (paths,
+  locale, proxy and certificate settings) and the variables it is configured with.
 
 What MISAKA itself passes to a model from outside -- fetched pages, document pages, findings, a
 Sister's output, the materials listed in a card -- is fenced as data, not instructions. What a

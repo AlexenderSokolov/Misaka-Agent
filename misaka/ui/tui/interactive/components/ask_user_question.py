@@ -6,6 +6,7 @@ import asyncio
 import base64
 import os
 import re
+import sys
 import unicodedata
 from collections.abc import Callable
 from itertools import zip_longest
@@ -23,13 +24,14 @@ from misaka.ui.tui import (
     visibleWidth,
     wrapTextWithAnsi,
 )
-from misaka.ui.tui.interactive.components.extension_editor import edit_text_external
+from misaka.ui.tui.interactive.external_editor import editInExternalEditor
 from misaka.ui.tui.interactive.theme.theme import (
-    get_editor_theme,
-    get_markdown_theme,
+    ThemeColor,
+    getEditorTheme,
+    getMarkdownTheme,
     theme,
 )
-from misaka.utils.clipboard_image import read_clipboard_image
+from misaka.utils.clipboard_image import readClipboardImage
 
 # question / header / label / description / preview all come from the model, and Text,
 # Markdown and theme.fg pass escape sequences straight through to the terminal (and
@@ -98,7 +100,7 @@ class AskUserQuestionComponent:
 
         self.editor = Editor(
             self.tui,
-            get_editor_theme(),
+            getEditorTheme(),
             EditorOptions(paddingX=0, autocompleteMaxVisible=3),
         )
         self.editor.onChange = lambda _text: self._input_changed()
@@ -309,13 +311,27 @@ class AskUserQuestionComponent:
         task.add_done_callback(self._tasks.discard)
 
     async def _open_external_editor(self) -> None:
-        value = await edit_text_external(self.tui, self._editor_value())
-        if value is not None and self.inputMode is not None:
-            self.editor.setText(value)
+        # The same hand-over as pi's ExtensionEditorComponent.handleOpenExternalEditor.
+        command = (
+            os.environ.get("VISUAL") or os.environ.get("EDITOR") or ("notepad" if sys.platform == "win32" else "nano")
+        )
+        content = self._editor_value()
+        stop = getattr(self.tui, "stop", None)
+        if callable(stop):
+            stop()
+        try:
+            result = await editInExternalEditor({"command": command, "content": content})
+            if result["status"] == "complete" and self.inputMode is not None:
+                self.editor.setText(result["content"])
+        finally:
+            start = getattr(self.tui, "start", None)
+            if callable(start):
+                start()
+            self.tui.requestRender(True)
 
     async def _paste_image(self) -> None:
         try:
-            image = await read_clipboard_image()
+            image = await readClipboardImage()
         except Exception:  # noqa: BLE001 - no clipboard image
             image = None
         if image is None or self.inputMode != "other":
@@ -360,7 +376,7 @@ class AskUserQuestionComponent:
         if self._matches_app(data, "app.clipboard.pasteImage") and self.inputMode == "other":
             self._spawn(self._paste_image())
             return
-        if self._matches_app(data, "app.editor.external") and (os.environ.get("VISUAL") or os.environ.get("EDITOR")):
+        if self._matches_app(data, "app.editor.external"):
             self._spawn(self._open_external_editor())
             return
         if self._handle_image_selection(data):
@@ -541,11 +557,11 @@ class AskUserQuestionComponent:
             check = "☑ " if self._is_multi(question) and label in selected_multi else "☐ " if self._is_multi(question) else ""
             pointer = theme.fg("accent", "→") if selected else " "
             body = f"{pointer} {index + 1}. {check}{label}{' ✓' if answered and compact else ''}"
-            color = "success" if answered else "accent" if selected else "text"
+            color: ThemeColor = "success" if answered else "accent" if selected else "text"
             lines.append(theme.fg(color, body))
             description = str(_get(option, "description", "") or "")
             if description and not compact:
-                description_color = "success" if answered else "muted"
+                description_color: ThemeColor = "success" if answered else "muted"
                 lines.extend(
                     theme.fg(description_color, "     " + part)
                     for part in wrapTextWithAnsi(description, max(1, width - 7))
@@ -577,7 +593,7 @@ class AskUserQuestionComponent:
     def _preview_box(self, content: str, width: int, max_lines: int) -> list[str]:
         width = max(12, width)
         inner = max(1, width - 4)
-        rendered = Markdown(content or "No preview available", 0, 0, get_markdown_theme()).render(inner)
+        rendered = Markdown(content or "No preview available", 0, 0, getMarkdownTheme()).render(inner)
         hidden = max(0, len(rendered) - max_lines)
         rendered = rendered[:max_lines]
         border = theme.fg("borderMuted", "─" * (width - 2))
@@ -648,7 +664,7 @@ class AskUserQuestionComponent:
             hint += " · Tab/Shift+Tab questions"
         if self._has_preview(question):
             hint += " · n notes"
-        if self.inputMode is not None and (os.environ.get("VISUAL") or os.environ.get("EDITOR")):
+        if self.inputMode is not None:
             hint += " · Ctrl+G external editor"
         lines += ["", theme.fg("muted", hint + " · Esc cancel")]
         return lines

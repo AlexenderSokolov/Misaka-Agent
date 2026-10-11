@@ -1,8 +1,8 @@
 """Role profile layout: ~/.misaka/profiles/<role>/.
 
 A role directory is a partial overlay of the home: ``SOUL.md`` (voice), ``settings.json``
-(what she holds of her own: her pinned model, her MCP servers, her web overrides -- see
-``settings_manager.ROLE_KEYS``), ``skills/`` and ``subagents/``. Nothing lives in the source
+(what she holds of her own: her pinned model, her web overrides -- see
+``settings_manager.ROLE_KEYS``), ``mcp.json`` (her MCP servers), ``skills/`` and ``subagents/``. Nothing lives in the source
 tree. Built-in subagent types ship with the package (misaka/core/subagent/agents/).
 
 ``<role>`` is a path relative to profiles/, e.g. ``last_order`` or ``sisters/10032``.
@@ -70,16 +70,16 @@ def pinned_model(profile_dir, *, strict=False):
     return f"{provider}/{model}" if provider else ""
 
 
-def resolve_model_reference(reference, registry, *, fallback_provider=None):
+def resolve_model_reference(reference, runtime, *, fallback_provider=None):
     """Resolve a role pin to provider/id without borrowing another role's endpoint.
 
     An explicit legacy provider may disambiguate a bare ID. Canonical references
-    always win; raw model IDs containing slashes remain valid registry IDs.
+    always win; raw model IDs containing slashes remain valid catalog IDs.
     """
     from misaka.core.model_resolver import findExactModelReferenceMatch
 
     reference = str(reference or "").strip()
-    models = list(registry.getAll())
+    models = list(runtime.getModels())
     model = findExactModelReferenceMatch(reference, models)
     if model is None and fallback_provider:
         model = next((m for m in models if m.provider == fallback_provider and m.id == reference), None)

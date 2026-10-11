@@ -7,7 +7,7 @@ import dataclasses
 import io
 import os
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, TextIO
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,32 +17,29 @@ from misaka.ai.types import Api, ImageContent, Model, TextContent
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.tools._common import (
     _ignore_background_task_result,
-    _string_arg,
     abort_race,
     regular_file,
     whole_file_bytes,
 )
-from misaka.core.tools.path_utils import resolve_read_path_async, resolve_to_cwd
-from misaka.core.tools.render_utils import (
-    get_text_output,
-    render_tool_path,
-    replace_tabs,
-)
-from misaka.core.tools.tool_definition_wrapper import wrap_tool_definition
+from misaka.core.tools.path_utils import resolveReadPathAsync
+from misaka.core.tools.renderers.read import readRenderers
+from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
 from misaka.core.tools.truncate import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,
     TruncationResult,
-    format_size,
-    truncate_head,
+    formatSize,
+    truncateHead,
 )
-from misaka.ui.tui import Text
-from misaka.ui.tui.interactive.theme.theme import get_language_from_path, highlight_code
-from misaka.utils.image_process import ProcessImageOptions, process_image
+from misaka.utils.image_process import ProcessImageOptions, processImage
 from misaka.utils.image_resize import ImageResizeOptions
-from misaka.utils.mime import detect_supported_image_mime_type_from_file
-from misaka.utils.paths import format_path_relative_to_cwd_or_absolute
+from misaka.utils.mime import detectSupportedImageMimeTypeFromFile
 from misaka.utils.values import read_field, signal_aborted
+
+readToolSystemPromptContribution = {
+    "snippet": "Read file contents",
+    "guidelines": ["Use read to examine files instead of cat or sed."],
+}
 
 
 class ReadToolInput(BaseModel):
@@ -60,18 +57,33 @@ class ReadToolInput(BaseModel):
     )
 
 
+# Result for programmatic callers such as codemode scripts: the text for text files, and an image
+# block for images that codemode's `image()` accepts. `note` is the text that goes with the image,
+# such as resize hints. Property descriptions are left out so the type stays on one line in tool
+# descriptions.
+readOutputSchema: dict[str, Any] = {
+    "anyOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "required": ["type", "data", "mimeType", "note"],
+            "properties": {
+                "type": {"const": "image", "type": "string"},
+                "data": {"type": "string"},
+                "mimeType": {"type": "string"},
+                "note": {"type": "string"},
+            },
+        },
+    ]
+}
+
+# MISAKA fork: `Static<typeof readOutputSchema>` is the text, or a mapping of the image block.
+type ReadToolOutput = str | dict[str, str]
+
+
 @dataclass(slots=True)
 class ReadToolDetails:
     truncation: TruncationResult | None = None
-
-
-@dataclass(slots=True)
-class _CompactReadClassification:
-    kind: str
-    label: str
-
-
-COMPACT_RESOURCE_FILE_NAMES = {"AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"}
 
 
 class ReadOperations(Protocol):
@@ -97,7 +109,7 @@ class _DefaultReadOperations:
         await asyncio.to_thread(regular_file, absolute_path)
 
     async def detectImageMimeType(self, absolute_path: str) -> str | None:
-        return await detect_supported_image_mime_type_from_file(absolute_path)
+        return await detectSupportedImageMimeTypeFromFile(absolute_path)
 
     def openText(self, absolute_path: str) -> TextIO:
         # MISAKA fork: pi reads the whole file and splits it. Text is streamed instead (see
@@ -187,127 +199,17 @@ def _coerce_options(options: ReadToolOptions | Mapping[str, Any] | None) -> Read
     )
 
 
-def _format_read_line_range(args: Mapping[str, Any] | None, theme_obj: Any) -> str:
-    if read_field(args, "offset") is None and read_field(args, "limit") is None:
-        return ""
-    start_line = read_field(args, "offset") or 1
-    limit = read_field(args, "limit")
-    end_line = start_line + limit - 1 if limit is not None else ""
-    return theme_obj.fg("warning", f":{start_line}{f'-{end_line}' if end_line else ''}")
+def toReadOutput(content: list[Any]) -> ReadToolOutput:
+    """The image block and its note, or the text for text files and images that could not be processed."""
+    text = next((block.text for block in content if read_field(block, "type") == "text"), "")
+    image = next((block for block in content if read_field(block, "type") == "image"), None)
+    return {"type": "image", "data": image.data, "mimeType": image.mimeType, "note": text} if image else text
 
 
-def _format_read_call(args: Mapping[str, Any] | None, theme_obj: Any, cwd: str) -> str:
-    raw_path = _string_arg(read_field(args, "file_path", read_field(args, "path")))
-    return (
-        f"{theme_obj.fg('toolTitle', theme_obj.bold('read'))} "
-        f"{render_tool_path(raw_path, theme_obj, cwd)}{_format_read_line_range(args, theme_obj)}"
-    )
-
-
-def _trim_trailing_empty_lines(lines: list[str]) -> list[str]:
-    end = len(lines)
-    while end > 0 and lines[end - 1] == "":
-        end -= 1
-    return lines[:end]
-
-
-def _get_non_vision_image_note(model: Model[Api] | None) -> str | None:
+def getNonVisionImageNote(model: Model[Api] | None) -> str | None:
     if model is None or "image" in model.input:
         return None
     return "[Current model does not support images. The image will be omitted from this request.]"
-
-
-def _to_posix_path(file_path: str) -> str:
-    return file_path.replace(os.sep, "/")
-
-
-def _get_compact_read_classification(args: Mapping[str, Any] | None, cwd: str) -> _CompactReadClassification | None:
-    raw_path = _string_arg(read_field(args, "file_path", read_field(args, "path")))
-    if not raw_path:
-        return None
-
-    absolute_path = resolve_to_cwd(raw_path, cwd)
-    file_name = os.path.basename(absolute_path)
-    if file_name == "SKILL.md":
-        return _CompactReadClassification(kind="skill", label=os.path.basename(os.path.dirname(absolute_path)) or file_name)
-
-    if file_name in COMPACT_RESOURCE_FILE_NAMES:
-        return _CompactReadClassification(
-            kind="resource",
-            label=format_path_relative_to_cwd_or_absolute(absolute_path, cwd),
-        )
-    return None
-
-
-def _format_compact_read_call(
-    classification: _CompactReadClassification,
-    args: Mapping[str, Any] | None,
-    theme_obj: Any,
-) -> str:
-    from misaka.ui.tui.interactive.components.keybinding_hints import key_text
-
-    expand_hint = theme_obj.fg("dim", f" ({key_text('app.tools.expand')} to expand)")
-    if classification.kind == "skill":
-        return (
-            theme_obj.fg("customMessageLabel", "\x1b[1m[skill]\x1b[22m ")
-            + theme_obj.fg("customMessageText", classification.label)
-            + _format_read_line_range(args, theme_obj)
-            + expand_hint
-        )
-
-    return (
-        theme_obj.fg("toolTitle", theme_obj.bold(f"read {classification.kind}"))
-        + " "
-        + theme_obj.fg("accent", classification.label)
-        + _format_read_line_range(args, theme_obj)
-        + expand_hint
-    )
-
-
-def _format_read_result(
-    args: Mapping[str, Any] | None,
-    result: AgentToolResult | Mapping[str, Any],
-    options: Any,
-    theme_obj: Any,
-    show_images: bool,
-    cwd: str,
-    is_error: bool,
-) -> str:
-    from misaka.ui.tui.interactive.components.keybinding_hints import key_hint
-
-    if not bool(read_field(options, "expanded")) and not is_error and _get_compact_read_classification(args, cwd):
-        return ""
-
-    raw_path = _string_arg(read_field(args, "file_path", read_field(args, "path")))
-    output = get_text_output(result, show_images)
-    lang = get_language_from_path(raw_path) if raw_path else None
-    rendered_lines = highlight_code(replace_tabs(output), lang) if lang else output.split("\n")
-    lines = _trim_trailing_empty_lines(rendered_lines)
-    max_lines = len(lines) if bool(read_field(options, "expanded")) else 10
-    display_lines = lines[:max_lines]
-    remaining = len(lines) - max_lines
-    text = "\n" + "\n".join(replace_tabs(line) if lang else theme_obj.fg("toolOutput", replace_tabs(line)) for line in display_lines)
-    if remaining > 0:
-        more_lines_text = theme_obj.fg("muted", f"\n... ({remaining} more lines,")
-        text += f"{more_lines_text} {key_hint('app.tools.expand', 'to expand')})"
-
-    details = read_field(result, "details")
-    truncation = read_field(details, "truncation")
-    if bool(read_field(truncation, "truncated")):
-        if read_field(truncation, "firstLineExceedsLimit"):
-            warning = f"[First line exceeds {format_size(read_field(truncation, 'maxBytes') or DEFAULT_MAX_BYTES)} limit]"
-        elif read_field(truncation, "truncatedBy") == "lines":
-            warning = (
-                f"[Truncated: showing {read_field(truncation, 'outputLines')} of {read_field(truncation, 'totalLines')} lines "
-                f"({read_field(truncation, 'maxLines') or DEFAULT_MAX_LINES} line limit)]"
-            )
-        else:
-            warning = (
-                f"[Truncated: {read_field(truncation, 'outputLines')} lines shown "
-                f"({format_size(read_field(truncation, 'maxBytes') or DEFAULT_MAX_BYTES)} limit)]"
-            )
-        text += "\n" + theme_obj.fg("warning", warning)
-    return text
 
 
 def _office_format(absolute_path: str) -> str | None:
@@ -334,8 +236,8 @@ async def _render_office(absolute_path: str, cell_range: str | None, workspace: 
 
     size = (await asyncio.to_thread(os.stat, absolute_path)).st_size
     if size > MAX_OFFICE_READ_BYTES:
-        raise RuntimeError(f"{absolute_path} is {format_size(size)}; read renders Office files up to "
-                           f"{format_size(MAX_OFFICE_READ_BYTES)}. Use doc_read or bash for a file this large.")
+        raise RuntimeError(f"{absolute_path} is {formatSize(size)}; read renders Office files up to "
+                           f"{formatSize(MAX_OFFICE_READ_BYTES)}. Use doc_read or bash for a file this large.")
     if cell_range:
         return await asyncio.to_thread(office.render, absolute_path, cell_range=cell_range)
     return await asyncio.to_thread(
@@ -353,7 +255,7 @@ def _model_resize_options(model: Any) -> ImageResizeOptions | None:
     )
 
 
-def create_read_tool_definition(
+def createReadToolDefinition(
     cwd: str,
     options: ReadToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[ReadToolInput | dict[str, Any], ReadToolDetails | None]:
@@ -375,7 +277,7 @@ def create_read_tool_definition(
             raise RuntimeError("Operation aborted")
 
         async def worker() -> AgentToolResult:
-            absolute_path = await resolve_read_path_async(parsed.path, cwd)
+            absolute_path = await resolveReadPathAsync(parsed.path, read_field(ctx, "cwd") or cwd)
             if signal_aborted(signal):
                 return AgentToolResult(content=[], details=None)
             await operations.access(absolute_path)
@@ -386,11 +288,11 @@ def create_read_tool_definition(
             mime_type = await detect_mime(absolute_path) if callable(detect_mime) else None
             content: list[TextContent | ImageContent]
             details: ReadToolDetails | None = None
-            non_vision_image_note = _get_non_vision_image_note(getattr(ctx, "model", None))
+            non_vision_image_note = getNonVisionImageNote(getattr(ctx, "model", None))
 
             if mime_type:
                 buffer = await operations.readFile(absolute_path)
-                processed = await process_image(
+                processed = await processImage(
                     buffer,
                     mime_type,
                     ProcessImageOptions(
@@ -424,7 +326,7 @@ def create_read_tool_definition(
                 start_line = max(0, parsed.offset - 1) if parsed.offset else 0
                 open_text = getattr(operations, "openText", None)
                 if _office_format(absolute_path) is not None:
-                    text_stream: Any = io.StringIO(await _render_office(absolute_path, parsed.cell_range, cwd))
+                    text_stream: Any = io.StringIO(await _render_office(absolute_path, parsed.cell_range, read_field(ctx, "cwd") or cwd))
                 elif parsed.cell_range:
                     raise RuntimeError(
                         "cell_range names a sheet and a range, and this is not a spreadsheet. "
@@ -453,11 +355,11 @@ def create_read_tool_definition(
                 # a selection ending in "\n" has no last line, an empty one has no lines).
                 counted_lines = end_line - start_line - (scan.last_char == "\n") if scan.selected_bytes else 0
                 truncation = dataclasses.replace(
-                    truncate_head(scan.window), totalLines=counted_lines, totalBytes=scan.selected_bytes)
+                    truncateHead(scan.window), totalLines=counted_lines, totalBytes=scan.selected_bytes)
                 if truncation.firstLineExceedsLimit:
-                    first_line_size = format_size(scan.first_line_bytes)
+                    first_line_size = formatSize(scan.first_line_bytes)
                     output_text = (
-                        f"[Line {start_line_display} is {first_line_size}, exceeds {format_size(DEFAULT_MAX_BYTES)} limit. "
+                        f"[Line {start_line_display} is {first_line_size}, exceeds {formatSize(DEFAULT_MAX_BYTES)} limit. "
                         f"Use bash: sed -n '{start_line_display}p' {parsed.path} | head -c {DEFAULT_MAX_BYTES}]"
                     )
                     details = ReadToolDetails(truncation=truncation)
@@ -473,7 +375,7 @@ def create_read_tool_definition(
                     else:
                         output_text += (
                             f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_file_lines} "
-                            f"({format_size(DEFAULT_MAX_BYTES)} limit). Use offset={next_offset} to continue.]"
+                            f"({formatSize(DEFAULT_MAX_BYTES)} limit). Use offset={next_offset} to continue.]"
                         )
                     details = ReadToolDetails(truncation=truncation)
                 elif user_limited_lines is not None and start_line + user_limited_lines < total_file_lines:
@@ -506,30 +408,16 @@ def create_read_tool_definition(
                 raise RuntimeError("Operation aborted")
             return result
 
-    def render_call(args: Mapping[str, Any] | None, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        classification = _get_compact_read_classification(args, context.cwd) if not context.expanded else None
-        text.setText(
-            _format_compact_read_call(classification, args, theme_obj)
-            if classification is not None
-            else _format_read_call(args, theme_obj, context.cwd)
-        )
-        return text
-
-    def render_result(result: Any, options_obj: Any, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        text.setText(
-            _format_read_result(
-                context.args,
-                result,
-                options_obj,
-                theme_obj,
-                bool(context.showImages),
-                context.cwd,
-                bool(context.isError),
-            )
-        )
-        return text
+    async def execute_with_output(
+        tool_call_id: str,
+        params: ReadToolInput | dict[str, Any],
+        signal: Any | None = None,
+        on_update: Callable[[AgentToolResult], None] | None = None,
+        ctx: Any = None,
+    ) -> AgentToolResult:
+        # Every result carries `structuredContent` for programmatic callers (upstream's `.then()` on execute).
+        result = await execute(tool_call_id, params, signal, on_update, ctx)
+        return replace(result, structuredContent=toReadOutput(result.content))
 
     return ToolDefinition(
         name="read",
@@ -546,22 +434,20 @@ def create_read_tool_definition(
             "document keeps its headings, lists, tables in body order and its footnotes; a "
             "deck is rendered slide by slide with chart values and connector flow."
         ),
-        promptSnippet="Read file contents",
-        promptGuidelines=["Use read to examine files instead of cat or sed."],
+        promptSnippet=readToolSystemPromptContribution["snippet"],
+        promptGuidelines=[*readToolSystemPromptContribution["guidelines"]],
         parameters=ReadToolInput,
+        outputSchema=readOutputSchema,
         constrainedSampling={"type": "json_schema", "strict": "prefer"},
-        execute=execute,
-        renderCall=render_call,
-        renderResult=render_result,
+        execute=execute_with_output,
+        **readRenderers,
     )
 
 
-def create_read_tool(cwd: str, options: ReadToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
-    return wrap_tool_definition(create_read_tool_definition(cwd, options))
+def createReadTool(cwd: str, options: ReadToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
+    return wrapToolDefinition(createReadToolDefinition(cwd, options))
 
 
-createReadTool = create_read_tool
-createReadToolDefinition = create_read_tool_definition
 
 __all__ = [
     "ReadOperations",
@@ -570,4 +456,5 @@ __all__ = [
     "ReadToolOptions",
     "createReadTool",
     "createReadToolDefinition",
+    "readToolSystemPromptContribution",
 ]

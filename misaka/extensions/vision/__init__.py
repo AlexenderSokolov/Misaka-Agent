@@ -49,8 +49,8 @@ def _omitted_note():
     """The line Pi's read tool appends to its text for a model without vision -- "the image will be
     omitted" -- which this extension makes untrue. Asked of the tool rather than copied."""
     try:
-        from misaka.core.tools.read import _get_non_vision_image_note
-        return _get_non_vision_image_note(SimpleNamespace(input=["text"]))
+        from misaka.core.tools.read import getNonVisionImageNote
+        return getNonVisionImageNote(SimpleNamespace(input=["text"]))
     except Exception:  # noqa: BLE001 - only a courtesy: the note is left in place
         return None
 

@@ -1,14 +1,20 @@
-"""Native llama.cpp provider, including Pi timeline item 66 autoload semantics."""
+"""Native llama.cpp provider.
+
+Translated from pi's ``coding-agent/src/extensions/llama/provider.ts``.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Literal, TypeGuard
 
+from misaka.ai.api.llama_cpp_classify_lazy import llamaCppClassifyApi
+from misaka.ai.api.typesafe_system_one_lazy import typesafeSystemOneApi
 from misaka.ai.auth.types import (
     ApiKeyAuth,
     ApiKeyCredential,
@@ -19,10 +25,17 @@ from misaka.ai.auth.types import (
     SecretPrompt,
     TextPrompt,
 )
-from misaka.ai.models_runtime import ModelsPublication, RefreshModelsContext
+from misaka.ai.compat import stream, streamSimple
+from misaka.ai.models import ModelsPublication, RefreshModelsContext, isModelType
 from misaka.ai.models_store import ModelsStoreEntry
-from misaka.ai.stream import stream, stream_simple
-from misaka.ai.types import Model, ModelCost, OpenAICompletionsCompat
+from misaka.ai.types import (
+    AnyModel,
+    ClassifierModel,
+    Model,
+    ModelCost,
+    OpenAICompletionsCompat,
+)
+from misaka.utils.js import jsIsSafeInteger, jsNumber, jsTrim
 from misaka.utils.values import signal_aborted
 
 from .client import (
@@ -37,39 +50,30 @@ LLAMA_PROVIDER_ID = "llama.cpp"
 DEFAULT_LLAMA_SERVER_URL = "http://127.0.0.1:8080"
 
 
-def _credential_server_url(credential: ApiKeyCredential | None) -> str | None:
-    value = (
-        (credential.env or {}).get("LLAMA_BASE_URL") if credential is not None else None
-    )
-    return (
-        normalizeLlamaServerUrl(value)
-        if isinstance(value, str) and value.strip()
-        else None
-    )
+def credentialServerUrl(credential: ApiKeyCredential | None) -> str | None:
+    value = (credential.env or {}).get("LLAMA_BASE_URL") if credential is not None else None
+    return normalizeLlamaServerUrl(value) if isinstance(value, str) and jsTrim(value) else None
 
 
-async def _resolve_server_url(
-    ctx: Any, credential: ApiKeyCredential | None
-) -> str | None:
-    configured = _credential_server_url(credential)
+async def resolveServerUrl(ctx: Any, credential: ApiKeyCredential | None) -> str | None:
+    configured = credentialServerUrl(credential)
     if configured is None:
         ambient = await ctx.env("LLAMA_BASE_URL")
-        configured = ambient.strip() if isinstance(ambient, str) else None
+        configured = jsTrim(ambient) if ambient is not None else None
     return normalizeLlamaServerUrl(configured) if configured else None
 
 
 def modelIsSelectable(model: LlamaModelInfo, routerAutoload: bool) -> bool:
-    if model.status.value in {"loaded", "sleeping"}:
+    if model.status.value == "loaded":
         return True
-    return (
-        routerAutoload
-        and model.status.value == "unloaded"
-        and not model.status.failed
-        and model.source == "preset"
-    )
+    # llama.cpp reports idle-slept models as "sleeping"; requests wake them automatically.
+    if model.status.value == "sleeping":
+        return True
+    # Unloaded presets are routable only when llama.cpp router autoload can load them on first use.
+    return routerAutoload and model.status.value == "unloaded" and not model.status.failed and model.source == "preset"
 
 
-async def _router_autoload_enabled(
+async def routerAutoloadEnabled(
     client: LlamaClient, catalog: Sequence[LlamaModelInfo], signal: Any
 ) -> bool:
     if not any(
@@ -87,37 +91,79 @@ def configuredContextWindow(model: LlamaModelInfo) -> int | None:
     args = model.status.args or []
     for index in range(len(args) - 1):
         flag = args[index]
-        if flag not in {"--ctx-size", "-c", "-ctx"}:
+        if flag != "--ctx-size" and flag != "-c" and flag != "-ctx":
             continue
-        try:
-            context_window = int(args[index + 1])
-        except ValueError:
-            continue
-        if context_window > 0:
-            return context_window
+        contextWindow = jsNumber(args[index + 1])
+        if jsIsSafeInteger(contextWindow) and contextWindow > 0:
+            return int(contextWindow)
     return None
 
 
 def contextWindowOf(model: LlamaModelInfo, cachedContextWindow: int | None = None) -> int:
-    runtime_context_window = model.meta.n_ctx if model.meta is not None else None
-    if runtime_context_window and runtime_context_window > 0:
-        return runtime_context_window
-    configured_context = configuredContextWindow(model)
-    if configured_context:
-        return configured_context
+    runtimeContextWindow = model.meta.n_ctx if model.meta is not None else None
+    if runtimeContextWindow and runtimeContextWindow > 0:
+        return runtimeContextWindow
+    configuredContext = configuredContextWindow(model)
+    if configuredContext:
+        return configuredContext
     if cachedContextWindow and cachedContextWindow > 0:
         return cachedContextWindow
-    training_context_window = model.meta.n_ctx_train if model.meta is not None else None
-    return training_context_window if training_context_window and training_context_window > 0 else 128_000
+    trainingContextWindow = model.meta.n_ctx_train if model.meta is not None else None
+    return trainingContextWindow if trainingContextWindow and trainingContextWindow > 0 else 128000
 
 
-def _to_model(
+type LlamaClassifierApi = Literal["llama-cpp-classify", "typesafe-system-one"]
+
+
+def isDecisionModel(model: LlamaModelInfo) -> bool:
+    """Whether llama.cpp reports a native decision model. Since llama.cpp 0.6.0, ``GET /models`` lists
+    ``decisions`` in ``architecture.output_modalities`` for these models, including unloaded and sleeping ones.
+    Older servers report ``["text"]`` or omit ``architecture``, so their models are treated as chat models."""
+    modalities = model.architecture.output_modalities if model.architecture is not None else None
+    return modalities is not None and "decisions" in modalities
+
+
+def isChatModel(model: LlamaModelInfo) -> bool:
+    """Decision-only models cannot generate text and are not listed for chat."""
+    modalities = model.architecture.output_modalities if model.architecture is not None else None
+    return not isDecisionModel(model) or (modalities is not None and "text" in modalities)
+
+
+def toPiClassifierModel(
+    model: LlamaModelInfo,
+    serverUrl: str,
+    cachedContextWindow: int | None = None,
+) -> ClassifierModel:
+    """A llama.cpp model used as a classifier. Decision models answer natively through llama.cpp's
+    System One endpoint (``/v1/systemone``). Chat models fall back to ``llama-cpp-classify``, which reads
+    answers from next-token label probabilities."""
+    decision = isDecisionModel(model)
+    return ClassifierModel(
+        type="classifier",
+        id=model.id,
+        name=model.id,
+        api="typesafe-system-one" if decision else "llama-cpp-classify",
+        provider=LLAMA_PROVIDER_ID,
+        baseUrl=llamaInferenceUrl(serverUrl) if decision else serverUrl,
+        input=["text"],
+        cost=ModelCost(input=0, output=0, cacheRead=0, cacheWrite=0),
+        contextWindow=contextWindowOf(model, cachedContextWindow),
+    )
+
+
+def isLlamaClassifierModel(model: AnyModel) -> TypeGuard[ClassifierModel]:
+    return isModelType(model, "classifier") and (
+        model.api == "llama-cpp-classify" or model.api == "typesafe-system-one"
+    )
+
+
+def toPiModel(
     model: LlamaModelInfo,
     serverUrl: str,
     props: LlamaServerProps | None = None,
     cachedContextWindow: int | None = None,
 ) -> Model:
-    context_window = contextWindowOf(model, cachedContextWindow)
+    contextWindow = contextWindowOf(model, cachedContextWindow)
     reasoning = props is not None and props.chat_template is not None and "enable_thinking" in props.chat_template
     modalities = model.architecture.input_modalities if model.architecture else None
     return Model(
@@ -134,8 +180,8 @@ def _to_model(
         ),
         input=["text", "image"] if modalities and "image" in modalities else ["text"],
         cost=ModelCost(input=0, output=0, cacheRead=0, cacheWrite=0),
-        contextWindow=context_window,
-        maxTokens=context_window,
+        contextWindow=contextWindow,
+        maxTokens=contextWindow,
         compat=OpenAICompletionsCompat(
             supportsStore=False,
             supportsDeveloperRole=False,
@@ -148,107 +194,79 @@ def _to_model(
     )
 
 
-class _LlamaProvider:
-    id = LLAMA_PROVIDER_ID
-    name = "llama.cpp"
-    baseUrl = llamaInferenceUrl(DEFAULT_LLAMA_SERVER_URL)
+@dataclass(slots=True)
+class LlamaProviderController:
+    provider: Any
+    setCatalog: Callable[..., None]
+    """``setCatalog(models, serverUrl, options={"routerAutoload"?})``."""
 
-    def __init__(self) -> None:
-        self._models: list[Model] = []
 
-        async def login(interaction: Any) -> ApiKeyCredential:
-            entered_url = await interaction.prompt(
-                TextPrompt(
-                    message="llama.cpp server URL",
-                    placeholder=os.environ.get(
-                        "LLAMA_BASE_URL", DEFAULT_LLAMA_SERVER_URL
-                    ),
-                )
-            )
-            server_url = normalizeLlamaServerUrl(
-                entered_url.strip()
-                or os.environ.get("LLAMA_BASE_URL")
-                or DEFAULT_LLAMA_SERVER_URL
-            )
-            api_key = (
-                await interaction.prompt(SecretPrompt(message="API key (optional)"))
-            ).strip()
-            await LlamaClient(server_url, api_key or None).list(
-                signal=interaction.signal
-            )
-            return ApiKeyCredential(
-                key=api_key or None, env={"LLAMA_BASE_URL": server_url}
-            )
+def createLlamaProvider() -> LlamaProviderController:
+    models: list[Model] = []
+    classifiers: list[ClassifierModel] = []
+    fallbackClassifier = llamaCppClassifyApi()
+    decisionClassifier = typesafeSystemOneApi()
 
-        async def check(
-            *, ctx: Any, credential: ApiKeyCredential | None, signal: Any
-        ) -> AuthCheck | None:
-            server_url = await _resolve_server_url(ctx, credential)
-            if not server_url:
-                return None
-            return AuthCheck(
-                type="api_key",
-                source="stored credential" if credential else "LLAMA_BASE_URL",
-            )
+    def setCatalog(catalog: Sequence[LlamaModelInfo], serverUrl: str, options: dict[str, Any] | None = None) -> None:
+        nonlocal models, classifiers
+        options = options if options is not None else {}
+        selectable = [model for model in catalog if modelIsSelectable(model, options.get("routerAutoload") is True)]
+        models = [toPiModel(model, serverUrl) for model in selectable if isChatModel(model)]
+        classifiers = [toPiClassifierModel(model, serverUrl) for model in selectable]
 
-        async def resolve(
-            *, ctx: Any, credential: ApiKeyCredential | None, signal: Any
-        ) -> AuthResult | None:
-            server_url = await _resolve_server_url(ctx, credential)
-            if not server_url:
-                return None
-            api_key = credential.key if credential is not None else None
-            if api_key is None:
-                api_key = await ctx.env("LLAMA_API_KEY")
-            if api_key is None:
-                api_key = "local"
-            return AuthResult(
-                auth=ModelAuth(apiKey=api_key, baseUrl=llamaInferenceUrl(server_url)),
-                env={
-                    **((credential.env or {}) if credential is not None else {}),
-                    "LLAMA_BASE_URL": server_url,
-                },
-                source="stored credential" if credential else "LLAMA_BASE_URL",
-            )
-
-        self.auth = ProviderAuth(
-            apiKey=ApiKeyAuth(
-                name="llama.cpp server", login=login, check=check, resolve=resolve
+    async def login(interaction: Any) -> ApiKeyCredential:
+        enteredUrl = await interaction.prompt(
+            TextPrompt(
+                message="llama.cpp server URL",
+                placeholder=os.environ.get("LLAMA_BASE_URL", DEFAULT_LLAMA_SERVER_URL),
             )
         )
+        serverUrl = normalizeLlamaServerUrl(
+            jsTrim(enteredUrl) or os.environ.get("LLAMA_BASE_URL") or DEFAULT_LLAMA_SERVER_URL
+        )
+        apiKey = jsTrim(await interaction.prompt(SecretPrompt(message="API key (optional)")))
+        await LlamaClient(serverUrl, apiKey or None).list(signal=interaction.signal)
+        return ApiKeyCredential(key=apiKey or None, env={"LLAMA_BASE_URL": serverUrl})
 
-    def getModels(self) -> list[Model]:
-        return list(self._models)
+    async def check(*, ctx: Any, credential: ApiKeyCredential | None = None, signal: Any = None) -> AuthCheck | None:
+        serverUrl = await resolveServerUrl(ctx, credential)
+        return (
+            AuthCheck(type="api_key", source="stored credential" if credential else "LLAMA_BASE_URL")
+            if serverUrl
+            else None
+        )
 
-    def setCatalog(
-        self,
-        catalog: Sequence[LlamaModelInfo],
-        serverUrl: str,
-        *,
-        routerAutoload: bool = False,
-    ) -> None:
-        self._models = [
-            _to_model(model, serverUrl)
-            for model in catalog
-            if modelIsSelectable(model, routerAutoload)
-        ]
+    async def resolve(*, ctx: Any, credential: ApiKeyCredential | None = None, signal: Any = None) -> AuthResult | None:
+        serverUrl = await resolveServerUrl(ctx, credential)
+        if not serverUrl:
+            return None
+        apiKey = credential.key if credential is not None else None
+        if apiKey is None:
+            apiKey = await ctx.env("LLAMA_API_KEY")
+        if apiKey is None:
+            apiKey = "local"
+        return AuthResult(
+            auth=ModelAuth(apiKey=apiKey, baseUrl=llamaInferenceUrl(serverUrl)),
+            env={**((credential.env or {}) if credential is not None else {}), "LLAMA_BASE_URL": serverUrl},
+            source="stored credential" if credential else "LLAMA_BASE_URL",
+        )
 
-    async def refreshModels(self, context: RefreshModelsContext) -> None:
-        cached_context_windows: dict[str, int] = {}
-        if context.stored is not None:
-            restored = [
-                model
-                for model in context.stored.models
-                if model.provider == LLAMA_PROVIDER_ID
-                and model.api == "openai-completions"
-            ]
-            for model in restored:
-                cached_context_windows[model.id] = model.contextWindow
+    async def refreshModels(context: RefreshModelsContext) -> None:
+        nonlocal models, classifiers
+        cachedContextWindows: dict[str, int] = {}
+        if context.stored:
+            stored = [model for model in context.stored.models if model.provider == LLAMA_PROVIDER_ID]
+            restored = [model for model in stored if isModelType(model, "chat") and model.api == "openai-completions"]
+            restoredClassifiers = [model for model in stored if isLlamaClassifierModel(model)]
+            for model in [*restored, *restoredClassifiers]:
+                cachedContextWindows[model.id] = model.contextWindow
 
-            def apply_restored() -> None:
-                self._models = restored
+            def update() -> None:
+                nonlocal models, classifiers
+                models = restored
+                classifiers = restoredClassifiers
 
-            if not await context.publish(ModelsPublication(update=apply_restored)):
+            if not (await context.publish(ModelsPublication(update=update))):
                 return
 
         if (
@@ -257,70 +275,69 @@ class _LlamaProvider:
             or not isinstance(context.credential, ApiKeyCredential)
         ):
             return
-        server_url = _credential_server_url(context.credential)
-        if server_url is None:
+        serverUrl = credentialServerUrl(context.credential)
+        if not serverUrl:
             return
-        client = LlamaClient(server_url, context.credential.key)
+        client = LlamaClient(serverUrl, context.credential.key)
         catalog = await client.list(signal=context.signal)
         if signal_aborted(context.signal):
             return
-        router_autoload = await _router_autoload_enabled(
-            client, catalog, context.signal
-        )
+        routerAutoload = await routerAutoloadEnabled(client, catalog, context.signal)
         if signal_aborted(context.signal):
             return
-        selectable = [model for model in catalog if modelIsSelectable(model, router_autoload)]
+        selectable = [model for model in catalog if modelIsSelectable(model, routerAutoload)]
 
-        async def to_model(model: LlamaModelInfo) -> Model:
-            cached_context_window = cached_context_windows.get(model.id)
-            # Only loaded models expose their template without side effects. Unloaded autoload presets
-            # would need to be loaded, while querying sleeping models may wake them. Those models remain
-            # unclassified until they are loaded or woken and a later catalog refresh discovers them.
+        # Only loaded models expose their chat template without side effects. Unloaded autoload presets would
+        # need to be loaded, while querying sleeping models may wake them. Those models remain without thinking
+        # support until they are loaded and a later catalog refresh discovers it. Decision models need no
+        # template, and llama.cpp reports them in the catalog regardless of their status.
+        async def refresh(model: LlamaModelInfo) -> Model:
+            cachedContextWindow = cachedContextWindows.get(model.id)
             if model.status.value != "loaded":
-                return _to_model(model, server_url, None, cached_context_window)
+                return toPiModel(model, serverUrl, None, cachedContextWindow)
             props = await client.props(model=model.id, signal=context.signal)
-            return _to_model(model, server_url, props, cached_context_window)
+            return toPiModel(model, serverUrl, props, cachedContextWindow)
 
-        refreshed = list(await asyncio.gather(*(to_model(model) for model in selectable)))
+        refreshed = list(await asyncio.gather(*(refresh(model) for model in selectable if isChatModel(model))))
+        refreshedClassifiers = [
+            toPiClassifierModel(model, serverUrl, cachedContextWindows.get(model.id)) for model in selectable
+        ]
         if signal_aborted(context.signal):
             return
 
-        def apply_refreshed() -> None:
-            self._models = refreshed
+        def update() -> None:
+            nonlocal models, classifiers
+            models = refreshed
+            classifiers = refreshedClassifiers
 
         await context.publish(
             ModelsPublication(
-                persist=ModelsStoreEntry(
-                    models=refreshed, checkedAt=int(time.time() * 1000)
-                ),
+                persist=ModelsStoreEntry(models=[*refreshed, *refreshedClassifiers], checkedAt=int(time.time() * 1000)),
                 persist_is_set=True,
-                update=apply_refreshed,
+                update=update,
             )
         )
 
-    def stream(self, model: Model, context: Any, options: Any = None):
-        return stream(model, context, options)
+    async def classify(model: ClassifierModel, context: Any, options: Any = None) -> Any:
+        return await (decisionClassifier if model.api == "typesafe-system-one" else fallbackClassifier).classify(
+            model, context, options
+        )
 
-    def streamSimple(self, model: Model, context: Any, options: Any = None):
-        return stream_simple(model, context, options)
+    # MISAKA fork: `Provider` is a Protocol; the provider is a namespace of upstream's members.
+    provider = SimpleNamespace(
+        id=LLAMA_PROVIDER_ID,
+        name="llama.cpp",
+        baseUrl=llamaInferenceUrl(DEFAULT_LLAMA_SERVER_URL),
+        auth=ProviderAuth(apiKey=ApiKeyAuth(name="llama.cpp server", login=login, check=check, resolve=resolve)),
+        getModels=lambda: models,
+        getAllModels=lambda: [*models, *classifiers],
+        refreshModels=refreshModels,
+        stream=lambda model, context, options=None: stream(model, context, options),
+        streamSimple=lambda model, context, options=None: streamSimple(model, context, options),
+        classify=classify,
+    )
 
-
-@dataclass(slots=True)
-class LlamaProviderController:
-    provider: _LlamaProvider
-
-    def setCatalog(
-        self,
-        models: Sequence[LlamaModelInfo],
-        serverUrl: str,
-        *,
-        routerAutoload: bool = False,
-    ) -> None:
-        self.provider.setCatalog(models, serverUrl, routerAutoload=routerAutoload)
-
-
-def createLlamaProvider() -> LlamaProviderController:
-    return LlamaProviderController(provider=_LlamaProvider())
+    return LlamaProviderController(provider=provider, setCatalog=setCatalog)
 
 
 __all__ = [

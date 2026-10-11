@@ -22,12 +22,16 @@ def catalog(tmp_path, monkeypatch):
     models = [NS(provider="openai-codex", id="shared", name="Shared"),
               NS(provider="custom", id="vendor/model", name="Custom"),
               NS(provider="unconfigured", id="hidden", name="Hidden")]
-    registry = NS(getAll=lambda: models, getOAuthProviders=list,
-                  hasConfiguredAuth=lambda model: model.provider != "unconfigured")
+    runtime = NS(getModels=lambda: models, getProviders=list,
+                 hasConfiguredAuth=lambda provider: provider != "unconfigured")
+
+    async def create_runtime(**_kwargs):
+        return NS(runtime=runtime, credentials=None)
+
     monkeypatch.setattr(config, "current_config", lambda: cfg.copy())
-    monkeypatch.setattr(auth, "_create_runtime", lambda **kwargs: NS(registry=registry, storage=None))
+    monkeypatch.setattr(auth, "_create_runtime", create_runtime)
     monkeypatch.setattr(auth, "_missing_sdk_extras", lambda *args: [])
-    monkeypatch.setattr(setup.Wizard, "_provider_labels", staticmethod(lambda registry, providers, oauth: providers))
+    monkeypatch.setattr(setup.Wizard, "_provider_labels", staticmethod(lambda runtime, providers, oauth: providers))
     monkeypatch.setattr(setup.Wizard, "_credential", lambda *args: None)
     return cfg, models
 
@@ -85,7 +89,7 @@ def test_setup_role_preselects_its_own_provider_and_model(catalog, monkeypatch):
         seen.append(choices[default])
         return default
 
-    def pick_model(self, registry, provider, selected_cfg):
+    def pick_model(self, runtime, provider, selected_cfg):
         assert provider == selected_cfg["provider"] == "custom"
         assert selected_cfg["default_model"] == "vendor/model"
         return selected_cfg["default_model"]
@@ -139,17 +143,33 @@ def test_model_alias_folding_does_not_cross_providers():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("persist", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
-async def test_model_selector_has_one_save_path(persist, failure):
+async def test_model_selector_has_one_save_path(persist, failure, monkeypatch):
+    from misaka.ui.tui.interactive import interactive_mode
     from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
 
-    calls, statuses, errors = [], [], []
+    calls, statuses, errors, tasks, selectors = [], [], [], [], []
+
+    class FakeModelSelector:
+        def __init__(self, *args):
+            self.onSelect, self.onSelectAsDefault = args[4], args[7]
+            selectors.append(self)
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(interactive_mode, "ModelSelectorComponent", FakeModelSelector)
     model = NS(provider="custom", id="vendor/model")
-    mode = NS(session=NS(setModel=AsyncMock(side_effect=OSError("fixture write failed") if failure else None)),
+    mode = NS(session=NS(setModel=AsyncMock(side_effect=OSError("fixture write failed") if failure else None),
+                         model=None, modelRuntime=None, scopedModels=[]),
+              settingsManager=NS(getDefaultProvider=lambda: None, getDefaultModel=lambda: None), ui=None,
               updateAvailableProviderCount=lambda: None, footer=NS(invalidate=lambda: None),
               updateEditorBorderColor=lambda: None, showStatus=statuses.append, showError=errors.append,
-              _schedule_task=lambda task: None, maybeWarnAboutAnthropicSubscriptionAuth=lambda model: None)
-    await InteractiveMode._handle_model_select(mode, model, lambda: calls.append("done"), persist=persist)
-    mode.session.setModel.assert_awaited_once_with(model, persist=persist)
+              _schedule_task=tasks.append, maybeWarnAboutAnthropicSubscriptionAuth=lambda model: None,
+              showSelector=lambda create: create(lambda: calls.append("done")))
+    InteractiveMode.showModelSelector(mode)
+    (selectors[0].onSelectAsDefault if persist else selectors[0].onSelect)(model)
+    await tasks.pop(0)
+    mode.session.setModel.assert_awaited_once_with(model, {"persist": persist})
     assert calls == ["done"]
     if failure:
         assert errors == ["fixture write failed"]
@@ -166,15 +186,15 @@ async def test_login_adoption_has_one_save_path(failure):
 
     model = NS(provider="custom", id="vendor/model")
     statuses, errors = [], []
-    registry = NS(refresh=AsyncMock(), getAvailable=lambda: [model])
-    mode = NS(session=NS(modelRegistry=registry,
+    runtime = NS(refresh=AsyncMock(return_value=NS(aborted=False, errors={})), getAvailableSnapshot=lambda: [model])
+    mode = NS(session=NS(modelRuntime=runtime, model=None,
                         setModel=AsyncMock(side_effect=OSError("fixture write failed") if failure else None)),
               updateAvailableProviderCount=lambda: None, footer=NS(invalidate=lambda: None),
               updateEditorBorderColor=lambda: None, showStatus=statuses.append,
-              showError=errors.append, _schedule_task=lambda task: None,
-              maybeWarnAboutAnthropicSubscriptionAuth=lambda model: None)
-    await InteractiveMode.completeProviderAuthentication(mode, "custom", "Custom", "api-key")
-    mode.session.setModel.assert_awaited_once_with(model, persist=True)
+              showError=errors.append, _schedule_task=lambda task: getattr(task, "close", lambda: None)(),
+              maybeWarnAboutAnthropicSubscriptionAuth=lambda model=None: None)
+    await InteractiveMode.completeProviderAuthentication(mode, "custom", "Custom", "api_key", None)
+    mode.session.setModel.assert_awaited_once_with(model, {"persist": True})
     if failure:
         assert "fixture write failed" in errors[-1]
         assert all("Selected" not in message for message in statuses)

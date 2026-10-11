@@ -1,53 +1,59 @@
-"""Environment-based credential discovery for provider auth (pi ``env-api-keys.ts``)."""
+"""Translated from pi's ``packages/ai/src/env-api-keys.ts`` (v1.1.0).
+
+Upstream's Node/browser loader plumbing (``_existsSync``, ``dynamicImport``, the ``node:*`` specifiers and the
+"modules have not loaded yet" branch of ``hasVertexAdcCredentials``) keeps ``node:fs`` out of browser builds; Python
+always has ``pathlib``.
+
+MISAKA fork: ``envMap`` is the module-level ``_envMap``, because ``misaka/core/skills/runtime.py`` keeps every provider
+key variable out of skill environments.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from misaka.ai.auth.types import ProviderEnv
-from misaka.ai.utils.provider_env import get_provider_env_value
+from misaka.ai.types import ProviderEnv
+from misaka.ai.utils.provider_env import getProviderEnvValue
 
 ANTHROPIC_AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN"
 ANTHROPIC_OAUTH_TOKEN_ENV = "ANTHROPIC_OAUTH_TOKEN"
 ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+ANTHROPIC_FEDERATION_RULE_ID_ENV = "ANTHROPIC_FEDERATION_RULE_ID"
+ANTHROPIC_ORGANIZATION_ID_ENV = "ANTHROPIC_ORGANIZATION_ID"
+ANTHROPIC_SERVICE_ACCOUNT_ID_ENV = "ANTHROPIC_SERVICE_ACCOUNT_ID"
+ANTHROPIC_IDENTITY_TOKEN_FILE_ENV = "ANTHROPIC_IDENTITY_TOKEN_FILE"
+ANTHROPIC_WORKSPACE_ID_ENV = "ANTHROPIC_WORKSPACE_ID"
 
-_cached_vertex_adc_credentials_exists: bool | None = None
+_cachedVertexAdcCredentialsExists: bool | None = None
 
 
-def _has_vertex_adc_credentials(env: ProviderEnv | None = None) -> bool:
-    global _cached_vertex_adc_credentials_exists
+def _hasVertexAdcCredentials(env: ProviderEnv | None = None) -> bool:
+    global _cachedVertexAdcCredentialsExists
 
-    explicit_credentials_path = env.get("GOOGLE_APPLICATION_CREDENTIALS") if env else None
-    if explicit_credentials_path:
-        return Path(explicit_credentials_path).exists()
+    explicitCredentialsPath = env.get("GOOGLE_APPLICATION_CREDENTIALS") if env else None
+    if explicitCredentialsPath:
+        return Path(explicitCredentialsPath).exists()
 
-    if _cached_vertex_adc_credentials_exists is None:
+    if _cachedVertexAdcCredentialsExists is None:
         # Check GOOGLE_APPLICATION_CREDENTIALS env var first (standard way)
-        gac_path = get_provider_env_value("GOOGLE_APPLICATION_CREDENTIALS", env)
-        if gac_path:
-            _cached_vertex_adc_credentials_exists = Path(gac_path).exists()
+        gacPath = getProviderEnvValue("GOOGLE_APPLICATION_CREDENTIALS", env)
+        if gacPath:
+            _cachedVertexAdcCredentialsExists = Path(gacPath).exists()
         else:
             # Fall back to default ADC path (lazy evaluation)
-            _cached_vertex_adc_credentials_exists = Path.home().joinpath(
+            _cachedVertexAdcCredentialsExists = Path.home().joinpath(
                 ".config", "gcloud", "application_default_credentials.json"
             ).exists()
-    return _cached_vertex_adc_credentials_exists
+    return _cachedVertexAdcCredentialsExists
 
 
-def _clear_has_vertex_adc_credentials_cache() -> None:
-    global _cached_vertex_adc_credentials_exists
-    _cached_vertex_adc_credentials_exists = None
-
-
-_has_vertex_adc_credentials.cache_clear = _clear_has_vertex_adc_credentials_cache  # type: ignore[attr-defined]
-
-_ENV_MAP: dict[str, str] = {
+_envMap: dict[str, str] = {
     "ant-ling": "ANT_LING_API_KEY",
     "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
     "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
     "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
     "openai": "OPENAI_API_KEY",
-    "azure-openai-responses": "AZURE_OPENAI_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
     "nvidia": "NVIDIA_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "google": "GEMINI_API_KEY",
@@ -83,59 +89,57 @@ _ENV_MAP: dict[str, str] = {
 }
 
 
-def _get_api_key_env_vars(provider: str) -> tuple[str, ...] | None:
+def _getApiKeyEnvVars(provider: str) -> list[str] | None:
     if provider == "github-copilot":
-        return ("COPILOT_GITHUB_TOKEN",)
+        return ["COPILOT_GITHUB_TOKEN"]
 
     # ANTHROPIC_AUTH_TOKEN participates in env discovery/status, but
-    # get_env_api_key() skips it because requests must pass it as Authorization: Bearer.
+    # getEnvApiKey() skips it because requests must pass it as Authorization: Bearer.
     if provider == "anthropic":
-        return (ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV)
+        return [ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV]
 
-    env_var = _ENV_MAP.get(provider)
-    return (env_var,) if env_var else None
+    envVar = _envMap.get(provider)
+    return [envVar] if envVar else None
 
 
-def find_env_keys(provider: str, env: ProviderEnv | None = None) -> list[str] | None:
+def findEnvKeys(provider: str, env: ProviderEnv | None = None) -> list[str] | None:
     """Find configured environment variables that can provide an API key for a provider.
 
     This only reports actual API key variables. It intentionally excludes ambient
     credential sources such as AWS profiles, AWS IAM credentials, and Google
     Application Default Credentials.
     """
-    env_vars = _get_api_key_env_vars(provider)
-    if not env_vars:
+    envVars = _getApiKeyEnvVars(provider)
+    if not envVars:
         return None
 
-    found = [env_var for env_var in env_vars if get_provider_env_value(env_var, env)]
-    return found or None
+    found = [envVar for envVar in envVars if getProviderEnvValue(envVar, env)]
+    return found if len(found) > 0 else None
 
 
-def get_env_api_key(provider: str, env: ProviderEnv | None = None) -> str | None:
+def getEnvApiKey(provider: str, env: ProviderEnv | None = None) -> str | None:
     """Get API key for provider from known environment variables, e.g. OPENAI_API_KEY.
 
     Will not return API keys for providers that require OAuth tokens.
     """
-    env_keys = find_env_keys(provider, env)
-    if env_keys:
-        api_key_env = (
-            next((key for key in env_keys if key != ANTHROPIC_AUTH_TOKEN_ENV), None)
+    envKeys = findEnvKeys(provider, env)
+    if envKeys and envKeys[0]:
+        apiKeyEnv = (
+            next((key for key in envKeys if key != ANTHROPIC_AUTH_TOKEN_ENV), None)
             if provider == "anthropic"
-            else env_keys[0]
+            else envKeys[0]
         )
-        if api_key_env:
-            return get_provider_env_value(api_key_env, env)
+        if apiKeyEnv:
+            return getProviderEnvValue(apiKeyEnv, env)
 
     # Vertex AI supports either an explicit API key or Application Default Credentials.
     # Auth is configured via `gcloud auth application-default login`.
     if provider == "google-vertex":
-        has_credentials = _has_vertex_adc_credentials(env)
-        has_project = bool(
-            get_provider_env_value("GOOGLE_CLOUD_PROJECT", env) or get_provider_env_value("GCLOUD_PROJECT", env)
-        )
-        has_location = bool(get_provider_env_value("GOOGLE_CLOUD_LOCATION", env))
+        hasCredentials = _hasVertexAdcCredentials(env)
+        hasProject = bool(getProviderEnvValue("GOOGLE_CLOUD_PROJECT", env) or getProviderEnvValue("GCLOUD_PROJECT", env))
+        hasLocation = bool(getProviderEnvValue("GOOGLE_CLOUD_LOCATION", env))
 
-        if has_credentials and has_project and has_location:
+        if hasCredentials and hasProject and hasLocation:
             return "<authenticated>"
 
     if provider == "amazon-bedrock" and (
@@ -146,12 +150,12 @@ def get_env_api_key(provider: str, env: ProviderEnv | None = None) -> str | None
         # 4. AWS_CONTAINER_CREDENTIALS_RELATIVE_URI - ECS task roles
         # 5. AWS_CONTAINER_CREDENTIALS_FULL_URI - ECS task roles (full URI)
         # 6. AWS_WEB_IDENTITY_TOKEN_FILE - IRSA (IAM Roles for Service Accounts)
-        get_provider_env_value("AWS_PROFILE", env)
-        or (get_provider_env_value("AWS_ACCESS_KEY_ID", env) and get_provider_env_value("AWS_SECRET_ACCESS_KEY", env))
-        or get_provider_env_value("AWS_BEARER_TOKEN_BEDROCK", env)
-        or get_provider_env_value("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", env)
-        or get_provider_env_value("AWS_CONTAINER_CREDENTIALS_FULL_URI", env)
-        or get_provider_env_value("AWS_WEB_IDENTITY_TOKEN_FILE", env)
+        getProviderEnvValue("AWS_PROFILE", env)
+        or (getProviderEnvValue("AWS_ACCESS_KEY_ID", env) and getProviderEnvValue("AWS_SECRET_ACCESS_KEY", env))
+        or getProviderEnvValue("AWS_BEARER_TOKEN_BEDROCK", env)
+        or getProviderEnvValue("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", env)
+        or getProviderEnvValue("AWS_CONTAINER_CREDENTIALS_FULL_URI", env)
+        or getProviderEnvValue("AWS_WEB_IDENTITY_TOKEN_FILE", env)
     ):
         return "<authenticated>"
 
@@ -161,7 +165,12 @@ def get_env_api_key(provider: str, env: ProviderEnv | None = None) -> str | None
 __all__ = [
     "ANTHROPIC_API_KEY_ENV",
     "ANTHROPIC_AUTH_TOKEN_ENV",
+    "ANTHROPIC_FEDERATION_RULE_ID_ENV",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE_ENV",
     "ANTHROPIC_OAUTH_TOKEN_ENV",
-    "find_env_keys",
-    "get_env_api_key",
+    "ANTHROPIC_ORGANIZATION_ID_ENV",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID_ENV",
+    "ANTHROPIC_WORKSPACE_ID_ENV",
+    "findEnvKeys",
+    "getEnvApiKey",
 ]

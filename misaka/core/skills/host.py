@@ -3,7 +3,7 @@
 import os
 import subprocess
 
-from misaka.utils.shell import get_shell_env
+from misaka.utils.shell import getShellEnv
 
 IS_WINDOWS = os.name == "nt"
 
@@ -23,4 +23,4 @@ def delegated_child_subprocess_env():
     # Use the same child environment as MISAKA's shell, never mutate os.environ.
     from .runtime import _active
     runtime = _active.get()
-    return runtime.execution_env(get_shell_env(), scrub=True) if runtime else get_shell_env()
+    return runtime.execution_env(getShellEnv(), scrub=True) if runtime else getShellEnv()

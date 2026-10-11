@@ -109,7 +109,8 @@ def register(harn: Any) -> None:
                 done,
                 tui=tui,
                 keybindings=keybindings,
-            )
+            ),
+            {"blocked": {"kind": "question", "message": params.questions[0].question}},
         )
         if not isinstance(result, dict):
             raise RuntimeError("AskUserQuestion dialog closed without a result")  # noqa: TRY004 - callers treat bad input as ValueError

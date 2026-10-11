@@ -1,63 +1,75 @@
-"""Generic bordered input used by interactive extension dialogs."""
+"""Translated from pi's ``modes/interactive/components/extension-input.ts`` (v1.1.0).
+
+Simple text input component for extensions.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypedDict
 
 from misaka.ui.tui import Container, Input, Spacer, Text, getKeybindings
 from misaka.ui.tui.interactive.theme.theme import theme
 
 from .countdown_timer import CountdownTimer
 from .dynamic_border import DynamicBorder
-from .keybinding_hints import key_hint
+from .keybinding_hints import keyHint
+
+
+class ExtensionInputOptions(TypedDict, total=False):
+    tui: Any
+    timeout: float | None
+    initialValue: str | None
+    description: str | None
 
 
 class ExtensionInputComponent(Container):
     def __init__(
         self,
         title: str,
-        placeholder: str | None,
+        _placeholder: str | None,
         onSubmit: Callable[[str], None],
         onCancel: Callable[[], None],
-        opts: dict[str, Any] | None = None,
+        opts: ExtensionInputOptions | None = None,
     ) -> None:
         super().__init__()
+        self.countdown: CountdownTimer | None = None
+        # Focusable implementation - propagate to input for IME cursor positioning
         self._focused = False
+
         self.onSubmitCallback = onSubmit
         self.onCancelCallback = onCancel
         self.baseTitle = title
-        self.countdown: CountdownTimer | None = None
 
         self.addChild(DynamicBorder())
         self.addChild(Spacer(1))
 
         self.titleText = Text(theme.fg("accent", title), 1, 0)
         self.addChild(self.titleText)
+        description = opts.get("description") if opts else None
+        if description:
+            self.addChild(Spacer(1))
+            self.addChild(Text(theme.fg("text", description), 1, 0))
         self.addChild(Spacer(1))
 
-        timeout = (opts or {}).get("timeout")
-        tui = (opts or {}).get("tui")
-        # Extensions send milliseconds through JSON, so a float (or a bool, which is an
-        # `int` subclass) reaches us as often as a plain int; `CountdownTimer` wants an int.
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0 and tui is not None:
-            self.countdown = CountdownTimer(
-                int(timeout),
-                tui,
-                lambda seconds: self.titleText.setText(theme.fg("accent", f"{self.baseTitle} ({seconds}s)")),
-                self.onCancelCallback,
-            )
+        timeout = opts.get("timeout") if opts else None
+        tui = opts.get("tui") if opts else None
+        # MISAKA fork: extensions send the timeout through JSON, so a bool (an `int` subclass) or a string can arrive
+        # where a number belongs; only a real number starts the countdown.
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0 and tui:
+
+            def onTick(s: int) -> None:
+                self.titleText.setText(theme.fg("accent", f"{self.baseTitle} ({s}s)"))
+
+            self.countdown = CountdownTimer(timeout, tui, onTick, lambda: self.onCancelCallback())
 
         self.input = Input()
+        initialValue = opts.get("initialValue") if opts else None
+        if initialValue:
+            self.input.setValue(initialValue)
         self.addChild(self.input)
         self.addChild(Spacer(1))
-        self.addChild(
-            Text(
-                f"{key_hint('tui.select.confirm', 'submit')}  {key_hint('tui.select.cancel', 'cancel')}",
-                1,
-                0,
-            )
-        )
+        self.addChild(Text(f"{keyHint('tui.select.confirm', 'submit')}  {keyHint('tui.select.cancel', 'cancel')}", 1, 0))
         self.addChild(Spacer(1))
         self.addChild(DynamicBorder())
 
@@ -70,18 +82,18 @@ class ExtensionInputComponent(Container):
         self._focused = value
         self.input.focused = value
 
-    def handleInput(self, data: str) -> None:
+    def handleInput(self, keyData: str) -> None:
         kb = getKeybindings()
-        if kb.matches(data, "tui.select.confirm") or data == "\n":
+        if kb.matches(keyData, "tui.select.confirm") or keyData == "\n":
             self.onSubmitCallback(self.input.getValue())
-        elif kb.matches(data, "tui.select.cancel"):
+        elif kb.matches(keyData, "tui.select.cancel"):
             self.onCancelCallback()
         else:
-            self.input.handleInput(data)
+            self.input.handleInput(keyData)
 
     def dispose(self) -> None:
         if self.countdown is not None:
             self.countdown.dispose()
 
 
-__all__ = ["ExtensionInputComponent"]
+__all__ = ["ExtensionInputComponent", "ExtensionInputOptions"]

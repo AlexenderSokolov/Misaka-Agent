@@ -1,6 +1,7 @@
-"""Shared conversation rendering for interactive chat and read-only session views.
+"""MISAKA fork: the transcript replay of the read-only/attach session viewer (``misaka chat --read-only/--attach``).
 
-Only builds components. It owns no agent, session file, tools or dispatch loop.
+The message and entry rendering of pi's interactive mode (``addMessageToChat``, ``renderSessionItems``,
+``addCustomEntryToChat``), for a screen with no agent, session file, tools or dispatch loop.
 """
 
 from __future__ import annotations
@@ -9,8 +10,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from misaka.core.agent_session import parse_skill_block
+from misaka.core.agent_session import parseSkillBlock
 from misaka.core.session_manager import session_entry_to_display_messages
+from misaka.core.tools.truncate import TruncationResult
 from misaka.ui.tui import Container, Spacer
 from misaka.utils.values import read_field
 
@@ -23,6 +25,23 @@ from .custom_message import CustomMessageComponent
 from .skill_invocation_message import SkillInvocationMessageComponent
 from .tool_execution import ToolExecutionComponent
 from .user_message import UserMessageComponent
+
+
+def _truncated(content: str) -> TruncationResult:
+    """pi's ``{ truncated: true } as TruncationResult``."""
+    return TruncationResult(
+        content=content,
+        truncated=True,
+        truncatedBy="bytes",
+        totalLines=0,
+        totalBytes=0,
+        outputLines=0,
+        outputBytes=0,
+        lastLinePartial=False,
+        firstLineExceedsLimit=False,
+        maxLines=0,
+        maxBytes=0,
+    )
 
 
 def user_text(message: Any) -> str:
@@ -56,14 +75,15 @@ class TranscriptRenderer:
     def customEntry(self, entry: Any) -> CustomEntryComponent | None:
         if self.extensionRunner is None:
             return None
-        renderer = self.extensionRunner.get_entry_renderer(str(read_field(entry, "customType", "")))
+        renderer = self.extensionRunner.getEntryRenderer(str(read_field(entry, "customType", "")))
         if renderer is None:
             return None
-        component = CustomEntryComponent(entry, renderer)
+        component = CustomEntryComponent(entry, renderer, self.outputPad)
         component.setExpanded(self.expanded)
         return component if component.hasContent() else None
 
     def addMessage(self, container: Container, message: Any) -> None:
+        component: Any
         role = read_field(message, "role")
         if role == "system":
             # Prompt and tool state ride the transcript as system messages; nothing to show.
@@ -74,12 +94,14 @@ class TranscriptRenderer:
                 return
             if container.children:
                 container.addChild(Spacer(1))
-            skill = parse_skill_block(text)
+            skill = parseSkillBlock(text)
             if skill is not None:
-                component = SkillInvocationMessageComponent(skill, self.markdownTheme)
+                component = SkillInvocationMessageComponent(skill, self.markdownTheme, self.outputPad)
                 component.setExpanded(self.expanded)
                 container.addChild(component)
                 text = read_field(skill, "userMessage")
+                if text:
+                    container.addChild(Spacer(1))
             if text:
                 container.addChild(UserMessageComponent(
                     str(text), self.markdownTheme, self.outputPad, self.markdownTransformers,
@@ -95,25 +117,27 @@ class TranscriptRenderer:
             component = BashExecutionComponent(
                 str(read_field(message, "command", "")), self.ui,
                 bool(read_field(message, "excludeFromContext", False)),
+                self.outputPad,
             )
             output = str(read_field(message, "output", ""))
             if output:
                 component.appendOutput(output)
             component.setComplete(
                 read_field(message, "exitCode"), bool(read_field(message, "cancelled", False)),
-                None, read_field(message, "fullOutputPath"),
+                _truncated(output) if read_field(message, "truncated") else None, read_field(message, "fullOutputPath"),
             )
+            container.addChild(component)
+            return
         elif role == "custom":
             if not read_field(message, "display", False):
                 return
-            get_renderer = (getattr(self.extensionRunner, "get_message_renderer", None)
-                            or getattr(self.extensionRunner, "getMessageRenderer", None))
+            get_renderer = getattr(self.extensionRunner, "getMessageRenderer", None)
             renderer = get_renderer(str(read_field(message, "customType", ""))) if get_renderer else None
             component = CustomMessageComponent(message, renderer, self.markdownTheme, self.outputPad)
         elif role in {"branchSummary", "compactionSummary"}:
             container.addChild(Spacer(1))
             cls = BranchSummaryMessageComponent if role == "branchSummary" else CompactionSummaryMessageComponent
-            component = cls(message, self.markdownTheme)
+            component = cls(message, self.markdownTheme, self.outputPad)
         else:
             return
         component.setExpanded(self.expanded)
@@ -121,6 +145,7 @@ class TranscriptRenderer:
 
     def appendItem(self, container: Container, message: Any, pending: dict[str, ToolExecutionComponent]) -> None:
         """Replay one item; a result updates its call instead of appearing a second time."""
+        component: Any
         role = read_field(message, "role")
         if read_field(message, "type") == "custom" and role is None:
             component = self.customEntry(message)
@@ -141,10 +166,9 @@ class TranscriptRenderer:
             name, call_id = str(read_field(call, "name", "")), str(read_field(call, "id", ""))
             component = ToolExecutionComponent(
                 name, call_id, read_field(call, "arguments", {}),
-                {"showImages": self.showImages, "imageWidthCells": self.imageWidthCells},
+                {"showImages": self.showImages, "imageWidthCells": self.imageWidthCells, "outputPad": self.outputPad},
                 self.toolDefinition(name) if self.toolDefinition else None, self.ui, self.cwd,
             )
-            component.setArgsComplete()
             component.setExpanded(self.expanded)
             container.addChild(component)
             stop = read_field(message, "stopReason")

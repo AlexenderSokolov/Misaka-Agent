@@ -36,8 +36,8 @@ except ImportError:  # pragma: no cover - exercised only off POSIX
 def abort_wait_task(signal: Any | None) -> asyncio.Task[None] | None:
     """A task that finishes when the caller aborts, or None if this signal cannot say.
 
-    ``misaka.agent.agent.AbortSignal`` is the only signal in the project and it wraps an
-    ``asyncio.Event``, so awaiting it is free. A signal that cannot be awaited gets None
+    The agent's signal (``misaka.utils.js.AbortSignal``) wraps an ``asyncio.Event``, so
+    awaiting it is free. A signal that cannot be awaited gets None
     and the caller runs unraced, rather than polling a flag at 100Hz for the length of
     the tool call -- which is what the ported fallback did.
     """

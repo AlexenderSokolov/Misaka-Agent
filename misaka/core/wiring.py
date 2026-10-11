@@ -113,7 +113,6 @@ class ToolCollector:
 PART_MODULES: tuple[str, ...] = (
     "misaka.core.session_catalog",
     "misaka.core.moa",
-    "misaka.core.mcp",
     "misaka.core.web",
     "misaka.core.network.wiring.messages",
     "misaka.core.network.wiring.roster",
@@ -133,29 +132,17 @@ PART_MODULES: tuple[str, ...] = (
 )
 
 
-# Core modules that are providers (``provider_config(configured, find) -> (name, config) | None``,
-# with the registry's own credential check and model lookup): part of every model registry,
-# recomputed on each reload, as pi's built-in providers are.
+# Core modules that are providers (``provider_config(runtime) -> (name, config)``): part of every
+# model runtime, registered when it is created, as pi's built-in providers are. A config's
+# ``refreshModels`` keeps what it publishes in step with the credentials of the moment.
 PROVIDER_MODULES: tuple[str, ...] = (
     "misaka.core.moa",
 )
 
 
-def core_providers(
-    configured: Callable[[str], bool],
-    find: Callable[[str, str], Any] | None = None,
-) -> list[tuple[str, dict[str, Any]]]:
-    """``(name, config)`` for each core provider that has something to publish right now.
-
-    ``configured`` is the registry's credential check and ``find`` its model lookup; a
-    provider that composes other models needs the second to size itself.
-    """
-    out: list[tuple[str, dict[str, Any]]] = []
-    for path in PROVIDER_MODULES:
-        entry = importlib.import_module(path).provider_config(configured, find)
-        if entry is not None:
-            out.append(entry)
-    return out
+def core_providers(runtime: Any) -> list[tuple[str, dict[str, Any]]]:
+    """``(name, config)`` for each core provider, bound to the runtime it serves."""
+    return [importlib.import_module(path).provider_config(runtime) for path in PROVIDER_MODULES]
 
 
 def _qualifies(mod: Any, role: str, kind: str) -> bool:
@@ -296,10 +283,16 @@ def assemble(spec: SessionSpec) -> Assembly:
 
 
 def inline(
-    name: str, factory: Callable[[Any], Any], *, hidden: bool = False
+    name: str,
+    factory: Callable[[Any], Any],
+    *,
+    hidden: bool = False,
+    replaceable: bool = False,
+    builtin: bool = False,
 ) -> dict[str, Any]:
-    """Build the named inline-extension descriptor used by Pi's resource loader."""
-    return {"name": name, "factory": factory, "hidden": hidden}
+    """Build the named inline-extension descriptor used by Pi's resource loader. ``builtin``
+    makes it the code of the ``builtin:<name>`` extension resource (see ``InlineExtension``)."""
+    return {"name": name, "factory": factory, "hidden": hidden, "replaceable": replaceable, "builtin": builtin}
 
 
 def delegates(spec: SessionSpec) -> bool:

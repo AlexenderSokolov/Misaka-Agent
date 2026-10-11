@@ -1,67 +1,68 @@
-"""Reusable countdown timer for interactive dialogs."""
+"""Translated from pi's ``modes/interactive/components/countdown-timer.ts`` (v1.1.0).
+
+Reusable countdown timer for dialog components.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import math
 import threading
+from collections.abc import Callable
 from typing import Any
 
 
 class CountdownTimer:
     def __init__(
         self,
-        timeoutMs: int,
+        timeoutMs: float,
         tui: Any | None,
-        onTick: Any,
-        onExpire: Any,
+        onTick: Callable[[int], None],
+        onExpire: Callable[[], None],
     ) -> None:
-        self._tui = tui
-        self._onTick = onTick
-        self._onExpire = onExpire
-        # The ticks run on a bare thread, but the callbacks end up resolving asyncio
-        # futures (extension dialog timeouts). `Future.set_result` off the loop thread only
-        # queues the wakeup without writing the self-pipe, so a loop parked in select() --
-        # exactly the "user walked away" case a timeout exists for -- would not wake until
-        # the next keypress. Hand the callbacks back to the loop, like terminal._on_loop.
-        try:
-            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop = None
-        self._remainingSeconds = math.ceil(timeoutMs / 1000)
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        # MISAKA fork: `setInterval` is a timer that re-arms itself (see `_scheduleTick`), so this holds the pending
+        # one; `_intervalToken` drops a tick already under way when `dispose` runs.
+        self.intervalId: asyncio.TimerHandle | threading.Timer | None = None
+        self._intervalToken = 0
+        self.tui = tui
+        self.onTick = onTick
+        self.onExpire = onExpire
+        self.remainingSeconds = math.ceil(timeoutMs / 1000)
+        self.onTick(self.remainingSeconds)
 
-        self._onTick(self._remainingSeconds)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._scheduleTick(self._intervalToken)
 
-    def _dispatch(self, callback: Any, *args: Any) -> None:
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            callback(*args)
-            return
-        try:
-            loop.call_soon_threadsafe(callback, *args)
-        except RuntimeError:  # loop shut down between the check and the call
-            callback(*args)
+    def _scheduleTick(self, token: int) -> None:
+        """MISAKA fork: ``setInterval`` as a timer on the running event loop that re-arms itself (a daemon
+        ``threading.Timer`` when no loop runs). The callbacks resolve asyncio futures (extension dialog timeouts),
+        which must happen on the loop's thread to wake a loop parked in select()."""
 
-    def _run(self) -> None:
-        while not self._stop.wait(1.0):
-            self._remainingSeconds -= 1
-            self._dispatch(self._onTick, self._remainingSeconds)
-            if self._tui is not None:
-                request_render = getattr(self._tui, "requestRender", None)
-                if callable(request_render):
-                    request_render()
-            if self._remainingSeconds <= 0:
-                self.dispose()
-                self._dispatch(self._onExpire)
+        def tick() -> None:
+            if token != self._intervalToken:
                 return
+            self.remainingSeconds -= 1
+            self.onTick(self.remainingSeconds)
+            if self.tui is not None:
+                self.tui.requestRender()
+
+            if self.remainingSeconds <= 0:
+                self.dispose()
+                self.onExpire()
+                return
+            self._scheduleTick(token)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            timer = threading.Timer(1.0, tick)
+            timer.daemon = True
+            self.intervalId = timer
+            timer.start()
+            return
+        self.intervalId = loop.call_later(1.0, tick)
 
     def dispose(self) -> None:
-        self._stop.set()
-        self._thread = None
-
-
-__all__ = ["CountdownTimer"]
+        if self.intervalId:
+            self._intervalToken += 1
+            self.intervalId.cancel()
+            self.intervalId = None

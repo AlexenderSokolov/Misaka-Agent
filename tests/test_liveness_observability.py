@@ -56,8 +56,19 @@ def test_self_drift_is_reported_once(caplog, monkeypatch):
     processes._REPORTED.clear()
 
 
+_boards: list = []
+
+
+@pytest.fixture(autouse=True)
+def _closeBoards():
+    yield
+    while _boards:
+        _boards.pop().close()
+
+
 def _branch(tmp_path):
     con = tasks.connect(str(tmp_path / "board.db"))
+    _boards.append(con)
     runs.init(con)
     run = runs.create(con, workspace=str(tmp_path), question="why does it drift?",
                       limits={"max_depth": 1, "parallel": 1}, token_start=0, origin_session=None)

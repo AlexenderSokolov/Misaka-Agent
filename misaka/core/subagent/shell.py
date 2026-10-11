@@ -14,13 +14,13 @@ from dataclasses import dataclass, field
 from typing import Any
 from xml.sax.saxutils import escape
 
-from misaka.ai.utils.abort import AbortController
 from misaka.core.prompt_templates import _ECMASCRIPT_WHITESPACE
 from misaka.core.tools.bash import BashOperations, BashSpawnContext
 from misaka.core.tools.output_accumulator import (
     OutputAccumulator,
     OutputAccumulatorOptions,
 )
+from misaka.utils._abort_signal import AbortController
 from misaka.utils.async_lifecycle import settle
 
 # CCB LocalShellTask.tsx: looksLikePrompt / startStallWatchdog.
@@ -95,9 +95,9 @@ class ShellTask:
         process. Completion wins a simultaneous background request; suppress its
         redundant notification as runShellCommand/markTaskNotified do upstream.
         """
-        from misaka.ai.utils.abort import wait_for_abort
         from misaka.core.subagent._shell_parser import is_autobackgrounding_allowed
         from misaka.core.subagent.background import default_bash_timeout_seconds
+        from misaka.utils._abort_signal import wait_for_abort
         from misaka.utils.values import signal_aborted
 
         if auto_background and timeout is None:

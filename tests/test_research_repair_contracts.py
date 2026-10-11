@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from misaka.agent.agent_loop import execute_tool_calls
+from misaka.agent.agent_loop import _executeToolCalls
 from misaka.agent.types import AgentContext, AgentLoopConfig, AgentTool, AgentToolResult
 from misaka.ai.types import (
     AssistantMessage,
@@ -22,9 +22,10 @@ from misaka.ai.types import (
     Usage,
     UsageCost,
 )
-from misaka.ai.utils.json_parse import StreamingArgs
+from misaka.ai.utils._streaming_args import StreamingArgs
 from misaka.core.platform import tasks
 from misaka.core.research import bundle, commands, runs, workflow
+from tests.anthropic_sse import patchRawResponse
 
 
 @pytest.fixture
@@ -130,7 +131,7 @@ async def test_invalid_call_gets_receipt_without_blocking_valid_sibling(executio
     StreamingArgs("not-json").finish_into(bad)
     StreamingArgs("{}").finish_into(good)
     msg = AssistantMessage.model_validate_json(message([bad, good]).model_dump_json())
-    result = await execute_tool_calls(
+    result = await _executeToolCalls(
         AgentContext(messages=[], tools=[tool]),
         msg,
         AgentLoopConfig(model=None, convertToLlm=lambda m: m, toolExecution=execution),
@@ -157,7 +158,7 @@ async def test_invalid_call_gets_receipt_without_blocking_valid_sibling(executio
 async def test_anthropic_finalization_on_real_stream_path(
     monkeypatch, raw, inline, stop_block
 ):
-    from misaka.ai.providers import anthropic
+    from misaka.ai.api import anthropic_messages as anthropic
 
     events = [
         {
@@ -187,10 +188,9 @@ async def test_anthropic_finalization_on_real_stream_path(
         for event in events:
             yield event
 
-    monkeypatch.setattr(
-        anthropic, "_create_raw_response", AsyncMock(return_value=incoming())
+    patchRawResponse(monkeypatch, incoming()
     )
-    stream = anthropic.stream_anthropic(
+    stream = anthropic.stream(
         model(), Context(messages=[]), {"client": object()}
     )
     seen = [event async for event in stream]
@@ -206,15 +206,16 @@ async def test_anthropic_finalization_on_real_stream_path(
 @pytest.mark.parametrize("bridge", ["proxy", "pi-messages"])
 @pytest.mark.parametrize("send_end", [True, False])
 def test_transport_preserves_raw_parse_failure(bridge, send_end):
-    from misaka.agent.proxy import _process_proxy_event
-    from misaka.ai.providers.pi_messages import _EventConverter
+    from misaka.agent.proxy import _processProxyEvent
+    from misaka.ai.api.pi_messages import _createEventConverter
 
-    converter = _EventConverter(model())
+    convertEvent = _createEventConverter(model())
     partial, buffers = message(), {}
+    events: list = []
     convert = (
-        converter.convert
+        (lambda e: events.append(convertEvent(e)))
         if bridge == "pi-messages"
-        else lambda e: _process_proxy_event(e, partial, buffers)
+        else lambda e: _processProxyEvent(e, partial, buffers)
     )
     convert(
         {
@@ -241,14 +242,14 @@ def test_transport_preserves_raw_parse_failure(bridge, send_end):
     convert(
         {"type": "done", "reason": "toolUse", "usage": message().usage.model_dump()}
     )
-    result = converter.partial if bridge == "pi-messages" else partial
+    result = events[-1].message if bridge == "pi-messages" else partial
     assert result.content[0].argumentsError
 
 
 @pytest.mark.parametrize("raw", ["not-json", "{}"])
 @pytest.mark.parametrize("start", [False, True])
 async def test_responses_final_item_has_same_validation(raw, start):
-    from misaka.ai.providers.openai_responses_shared import process_responses_stream
+    from misaka.ai.api.openai_responses_shared import processResponsesStream
 
     item = {
         "type": "function_call",
@@ -270,7 +271,7 @@ async def test_responses_final_item_has_same_validation(raw, start):
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
     output, seen = message(), []
-    await process_responses_stream(
+    await processResponsesStream(
         incoming(), output, SimpleNamespace(push=seen.append), model("openai-responses")
     )
     call = next(e.toolCall for e in seen if e.type == "toolcall_end")
@@ -721,14 +722,14 @@ def test_the_refusal_names_the_bare_variable_it_refuses(tmp_path):
 @pytest.mark.parametrize("bridge", ["proxy", "pi-messages"])
 def test_native_argument_error_is_persisted_but_not_sent_on_wire(bridge):
     from misaka.agent import proxy
-    from misaka.ai.providers import pi_messages
+    from misaka.ai.api import pi_messages
     from misaka.ai.types import UserMessage
 
     call = ToolCall(id="bad", name="probe", arguments={}, argumentsError="fixture")
     context = Context(
         messages=[UserMessage(content="hello", timestamp=0), message([call])]
     )
-    serialize = (proxy if bridge == "proxy" else pi_messages)._serialize_context
+    serialize = proxy._serializeContext if bridge == "proxy" else pi_messages._serializeContext
     wire = serialize(context)
     assert wire["messages"][0]["content"] == "hello"
     assert "argumentsError" not in wire["messages"][1]["content"][0]
@@ -887,28 +888,26 @@ def test_derived_index_ignores_io_failure_but_not_stop(state, monkeypatch, failu
 @pytest.mark.parametrize("stop_block", [False, True])
 @pytest.mark.parametrize("raw", ["not-json", "{}"])
 def test_bedrock_validates_closed_and_unclosed_blocks(stop_block, raw):
-    from misaka.ai.providers import amazon_bedrock as bedrock
+    from misaka.ai.api import bedrock_converse_stream as bedrock
 
     output = message([ToolCall(id="call", name="probe", arguments={})])
-    buffers = {0: StreamingArgs(raw)}
+    blocks = bedrock._Blocks(output)
+    blocks.scratch[0] = bedrock._BlockScratch(index=0, partialJson=StreamingArgs(raw))
     if stop_block:
-        bedrock.handle_content_block_stop(
-            {"contentBlockIndex": 0},
-            {0: 0},
-            buffers,
-            output,
-            SimpleNamespace(push=lambda e: None),
-        )
+        bedrock._handleContentBlockStop({"contentBlockIndex": 0}, blocks, output, SimpleNamespace(push=lambda e: None))
     else:
-        bedrock.finish_open_tool_arguments(buffers, output)
+        bedrock._finalizeStreamingBlock(blocks, 0)
     assert bool(output.content[0].argumentsError) == (raw != "{}")
-    assert not buffers
+    assert blocks.scratch[0].partialJson is None
 
 
 @pytest.mark.parametrize("provider", ["mistral", "openai-completions"])
 @pytest.mark.parametrize("raw", ["not-json", "{}"])
 async def test_chat_completion_finalization(provider, raw, monkeypatch):
-    from misaka.ai.providers import mistral, openai_completions
+    import httpx
+
+    from misaka.ai.api import _openai_sdk, openai_completions
+    from misaka.ai.api import mistral_conversations as mistral
 
     async def incoming():
         yield {
@@ -935,20 +934,21 @@ async def test_chat_completion_finalization(provider, raw, monkeypatch):
                 yield {"data": chunk}
 
         output = message()
-        await mistral.consume_chat_stream(
+        await mistral._consumeChatStream(
             model("mistral-conversations"),
             output,
             SimpleNamespace(push=lambda e: None),
             events(),
+            None,
         )
     else:
         monkeypatch.setattr(
-            openai_completions,
-            "_create_completion_stream",
-            AsyncMock(return_value=incoming()),
+            _openai_sdk,
+            "_create_with_response",
+            AsyncMock(return_value=_openai_sdk._WithResponse(incoming(), httpx.Response(200))),
         )
-        stream = openai_completions.stream_openai_completions(
-            model(provider), Context(messages=[]), {"client": object()}
+        stream = openai_completions.stream(
+            model(provider), Context(messages=[]), {"apiKey": "test"}
         )
         async for _event in stream:
             pass

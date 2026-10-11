@@ -325,8 +325,8 @@ def renew_request(con, lease, ttl_seconds=LEASE_TTL_SECONDS):
 
 
 # Characters of the sha256 kept for the URL or query one external call was made
-# against. Same 16 as the repo's other privacy digests (core/mcp.py, the task
-# fingerprints in platform/tasks.py): enough that two different pages never collide in
+# against. Same 16 as the repo's other privacy digests (the task fingerprints in
+# platform/tasks.py): enough that two different pages never collide in
 # one run's ledger, short enough that the row stays readable.
 _SUBJECT_DIGEST_CHARS = 16
 

@@ -78,7 +78,7 @@ def test_last_order_and_ordinary_files_are_untouched(tmp_path, kind, path):
 
 def test_the_file_tools_do_not_read_misakas_credentials(tmp_path, monkeypatch):
     from misaka.config import home
-    from misaka.core.tools.grep import create_grep_tool
+    from misaka.core.tools.grep import createGrepTool
     from misaka.core.web.evidence import CREDENTIALS_REFUSED, check_material_read
     monkeypatch.setenv(home.ENV_HOME, str(tmp_path / "home"))
     auth = home.path("auth")
@@ -90,7 +90,7 @@ def test_the_file_tools_do_not_read_misakas_credentials(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="not read through file tools"):
             check_material_read(str(path))
     check_material_read(str(tmp_path / "home" / "notes.md"))
-    grep = create_grep_tool(str(tmp_path))
+    grep = createGrepTool(str(tmp_path))
     found = asyncio.run(grep.execute("g", {"pattern": "secret-value", "path": str(tmp_path / "home")}, None, None))
     text = found.content[0].text
     assert "notes.md" in text and "sk-secret" not in text and "exa-secret" not in text

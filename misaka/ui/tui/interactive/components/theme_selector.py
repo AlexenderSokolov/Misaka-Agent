@@ -1,20 +1,23 @@
-"""Bordered theme selector for interactive theme switching."""
+"""Translated from pi's ``modes/interactive/components/theme-selector.ts`` (v1.1.0)."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
 from misaka.ui.tui import Container, SelectItem, SelectList, SelectListLayoutOptions
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.theme.theme import (
-    get_available_themes,
-    get_select_list_theme,
-)
+from misaka.ui.tui.interactive.theme.theme import getAvailableThemes, getSelectListTheme
 
-THEME_SELECT_LIST_LAYOUT = SelectListLayoutOptions(minPrimaryColumnWidth=12, maxPrimaryColumnWidth=32)
+from .dynamic_border import DynamicBorder
+
+THEME_SELECT_LIST_LAYOUT = SelectListLayoutOptions(
+    minPrimaryColumnWidth=12,
+    maxPrimaryColumnWidth=32,
+)
 
 
 class ThemeSelectorComponent(Container):
+    """Component that renders a theme selector"""
+
     def __init__(
         self,
         currentTheme: str,
@@ -23,29 +26,45 @@ class ThemeSelectorComponent(Container):
         onPreview: Callable[[str], None],
     ) -> None:
         super().__init__()
-        themes = get_available_themes()
-        items = [
-            SelectItem(
-                value=name,
-                label=name,
-                description="(current)" if name == currentTheme else None,
-            )
+        self.onPreview = onPreview
+
+        # Get available themes and create select items
+        themes = getAvailableThemes()
+        themeItems = [
+            SelectItem(value=name, label=name, description="(current)" if name == currentTheme else None)
             for name in themes
         ]
 
-        self.addChild(DynamicBorder())
-        self.selectList = SelectList(items, 10, get_select_list_theme(), THEME_SELECT_LIST_LAYOUT)
-        current_index = themes.index(currentTheme) if currentTheme in themes else -1
-        if current_index >= 0:
-            self.selectList.setSelectedIndex(current_index)
-        self.selectList.onSelect = lambda item: onSelect(item.value)
-        self.selectList.onCancel = onCancel
-        self.selectList.onSelectionChange = lambda item: onPreview(item.value)
-        self.addChild(self.selectList)
+        # Add top border
         self.addChild(DynamicBorder())
 
-    def handleInput(self, data: str) -> None:
-        self.selectList.handleInput(data)
+        # Create selector
+        self.selectList = SelectList(themeItems, 10, getSelectListTheme(), THEME_SELECT_LIST_LAYOUT)
+
+        # Preselect current theme
+        currentIndex = themes.index(currentTheme) if currentTheme in themes else -1
+        if currentIndex != -1:
+            self.selectList.setSelectedIndex(currentIndex)
+
+        def select(item: SelectItem) -> None:
+            onSelect(item.value)
+
+        self.selectList.onSelect = select
+
+        def cancel() -> None:
+            onCancel()
+
+        self.selectList.onCancel = cancel
+
+        def selectionChange(item: SelectItem) -> None:
+            self.onPreview(item.value)
+
+        self.selectList.onSelectionChange = selectionChange
+
+        self.addChild(self.selectList)
+
+        # Add bottom border
+        self.addChild(DynamicBorder())
 
     def getSelectList(self) -> SelectList:
         return self.selectList

@@ -27,7 +27,7 @@ from misaka.core.network import worker
 from misaka.core.platform import admission, budget, notifications
 from misaka.core.platform import processes as process_tree
 from misaka.core.platform import tasks as db
-from misaka.core.session_manager import find_most_recent_session
+from misaka.core.session_manager import findMostRecentSession
 from misaka.core.skills import sandbox as skill_sandbox
 from misaka.core.subagent.agents import AgentDefinition
 from misaka.core.subagent.runtime import (
@@ -182,7 +182,7 @@ def _adoptable_transcript(task) -> str | None:
     """Return the card's most recent session transcript if it can be cleaned for resumption, else None.
 
     ``task`` is the board row: its storage directory does not follow a moving worktree."""
-    found = find_most_recent_session(session_roots.card_session_dir(task))
+    found = findMostRecentSession(session_roots.card_session_dir(task))
     if not found:
         return None
     try:
@@ -259,17 +259,17 @@ class _SisterManager(SubagentManager):
             resolve_model_spec,
         )
 
-        registry = session.modelRegistry
-        models = registry.getAll()
+        runtime = session.modelRuntime
+        models = runtime.getModels()
         override = profiles.explicit_model_override(self.profile_dir, row["model"])
         normalized = normalize_model_for_api(override or "")
         explicit = findExactModelReferenceMatch(normalized, models)
         self.thinking_override = None
         if override and explicit is None:
-            from misaka.cli.args import is_valid_thinking_level
+            from misaka.cli.args import isValidThinkingLevel
 
             prefix, separator, level = override.rpartition(":")
-            if separator and is_valid_thinking_level(level):
+            if separator and isValidThinkingLevel(level):
                 # Keep native :level overrides separate from registry model IDs.
                 override, self.thinking_override = prefix, level
                 normalized = normalize_model_for_api(override)
@@ -283,7 +283,7 @@ class _SisterManager(SubagentManager):
             if not reference or reference == "inherit":
                 reference = f"{cfg['provider']}/{cfg['default_model']}"
             canonical = profiles.resolve_model_reference(
-                reference, registry,
+                reference, runtime,
                 fallback_provider=cfg["provider"] if reference == cfg["default_model"] else None,
             )
             provider, model_id = canonical.split("/", 1)
@@ -292,10 +292,10 @@ class _SisterManager(SubagentManager):
         # inherit from this Sister's pair rather than Last Order's model.
         provider, model_id = resolve_model_spec({}, override, None, parent, models)
         self.model = f"{provider}/{model_id}"
-        selected = registry.find(provider, normalize_model_for_api(model_id))
+        selected = runtime.getModel(provider, normalize_model_for_api(model_id))
         if selected is None:
             raise ValueError(f"Unknown Sister model: {self.model}")
-        if not registry.hasConfiguredAuth(selected):
+        if not runtime.hasConfiguredAuth(selected.provider):
             # The generic runtime resolves against authenticated providers. An
             # absent provider there must not turn this pin into a bare LO ID.
             raise ValueError(f"No configured authentication for Sister model: {self.model}")
@@ -341,9 +341,9 @@ class _SisterManager(SubagentManager):
             raise ValueError(f"Sister card cannot change identity to {requested!r}")
         # Identity comes first, followed by mandatory role instructions.
         from misaka.config import identity
-        from misaka.core.resource_loader import resolve_prompt_input
+        from misaka.core.resource_loader import resolvePromptInput
         soul = "\n\n".join(
-            resolve_prompt_input(source, "role system prompt")
+            resolvePromptInput(source, "role system prompt")
             for source in identity.base_prompt_sources(self.profile_dir,
                                                         profiles.role_of(self.profile_dir)))
         # The same stack a card in a pane sees (project, role, shared), as read-only copies.
@@ -1370,7 +1370,7 @@ class SisterRuntime:
             return None, f"Card not found: {task_id}"
         session_file = row["session_file"]
         if not (session_file and os.path.isfile(session_file)):
-            session_file = find_most_recent_session(session_roots.card_session_dir(row))
+            session_file = findMostRecentSession(session_roots.card_session_dir(row))
         if not session_file:
             return None, f"Card {task_id} has no session yet."
         text = transcript_tail(session_file, limit)

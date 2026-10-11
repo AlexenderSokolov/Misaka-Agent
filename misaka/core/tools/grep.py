@@ -17,24 +17,18 @@ from misaka.agent.types import AgentTool, AgentToolResult
 from misaka.ai.types import TextContent
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.tools._common import abort_race
-from misaka.core.tools.path_utils import resolve_to_cwd
-from misaka.core.tools.render_utils import (
-    get_text_output,
-    invalid_arg_text,
-    shorten_path,
-    str_value,
-)
-from misaka.core.tools.tool_definition_wrapper import wrap_tool_definition
+from misaka.core.tools.path_utils import resolveToCwd
+from misaka.core.tools.renderers.grep import grepRenderers
+from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
 from misaka.core.tools.truncate import (
     DEFAULT_MAX_BYTES,
     GREP_MAX_LINE_LENGTH,
     TruncationOptions,
     TruncationResult,
-    format_size,
-    truncate_head,
-    truncate_line,
+    formatSize,
+    truncateHead,
+    truncateLine,
 )
-from misaka.ui.tui import Text
 from misaka.utils.streams import STREAM_LIMIT
 from misaka.utils.tools_manager import find_tool, missing_tool_message
 from misaka.utils.values import maybe_await, read_field, signal_aborted
@@ -63,11 +57,10 @@ class GrepToolInput(BaseModel):
     limit: int | None = Field(default=None, description="Maximum number of matches to return (default: 100)")
 
 
-grep_tool_system_prompt_contribution = {
+grepToolSystemPromptContribution = {
     "snippet": "Search file contents for patterns (respects .gitignore)",
     "guidelines": [],
 }
-grepToolSystemPromptContribution = grep_tool_system_prompt_contribution
 
 
 DEFAULT_LIMIT = 100
@@ -117,62 +110,6 @@ def _coerce_options(options: GrepToolOptions | Mapping[str, Any] | None) -> Grep
     return GrepToolOptions(operations=options.get("operations"))
 
 
-def _format_grep_call(args: Mapping[str, Any] | None, theme_obj: Any) -> str:
-    pattern = str_value(read_field(args, "pattern"))
-    raw_path = str_value(read_field(args, "path"))
-    path_value = shorten_path(raw_path or ".") if raw_path is not None else None
-    glob_value = str_value(read_field(args, "glob"))
-    limit = read_field(args, "limit")
-    invalid_arg = invalid_arg_text(theme_obj)
-
-    text = (
-        theme_obj.fg("toolTitle", theme_obj.bold("grep"))
-        + " "
-        + (invalid_arg if pattern is None else theme_obj.fg("accent", f"/{pattern or ''}/"))
-        + theme_obj.fg("toolOutput", f" in {invalid_arg if path_value is None else path_value}")
-    )
-    if glob_value:
-        text += theme_obj.fg("toolOutput", f" ({glob_value})")
-    if limit is not None:
-        text += theme_obj.fg("toolOutput", f" limit {limit}")
-    return text
-
-
-def _format_grep_result(result: Any, options: Any, theme_obj: Any, show_images: bool) -> str:
-    from misaka.ui.tui.interactive.components.keybinding_hints import key_hint
-
-    output = get_text_output(result, show_images).strip()
-    text = ""
-    if output:
-        lines = output.split("\n")
-        max_lines = len(lines) if bool(read_field(options, "expanded")) else 15
-        display_lines = lines[:max_lines]
-        remaining = len(lines) - max_lines
-        text += "\n" + "\n".join(theme_obj.fg("toolOutput", line) for line in display_lines)
-        if remaining > 0:
-            more_lines_text = theme_obj.fg("muted", f"\n... ({remaining} more lines,")
-            text += f"{more_lines_text} {key_hint('app.tools.expand', 'to expand')})"
-
-    details = read_field(result, "details")
-    match_limit = read_field(details, "matchLimitReached")
-    truncation = read_field(details, "truncation")
-    lines_truncated = read_field(details, "linesTruncated")
-    stopped_early = read_field(details, "searchStoppedEarly")
-    if match_limit or bool(read_field(truncation, "truncated")) or lines_truncated or stopped_early:
-        warnings: list[str] = []
-        if match_limit:
-            warnings.append(f"{match_limit} matches limit")
-        if bool(read_field(truncation, "truncated")):
-            warnings.append(f"{format_size(read_field(truncation, 'maxBytes') or DEFAULT_MAX_BYTES)} limit")
-        if lines_truncated:
-            warnings.append("some lines truncated")
-        if stopped_early:
-            warnings.append("search stopped at an overlong line")
-        warning_text = f"[Truncated: {', '.join(warnings)}]"
-        text += "\n" + theme_obj.fg("warning", warning_text)
-    return text
-
-
 def _format_match_path(file_path: str, search_path: str, is_directory: bool) -> str:
     if is_directory:
         relative = os.path.relpath(file_path, search_path)
@@ -199,7 +136,7 @@ async def _read_stderr(stream: asyncio.StreamReader | None) -> str:
     return "".join(chunks)
 
 
-def create_grep_tool_definition(
+def createGrepToolDefinition(
     cwd: str,
     options: GrepToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[GrepToolInput | dict[str, Any], GrepToolDetails | None]:
@@ -215,7 +152,7 @@ def create_grep_tool_definition(
         params: GrepToolInput | dict[str, Any],
         signal: Any | None = None,
         _on_update: Callable[[AgentToolResult], None] | None = None,
-        _ctx: Any = None,
+        ctx: Any = None,
     ) -> AgentToolResult:
         if signal_aborted(signal):
             raise RuntimeError("Operation aborted")
@@ -225,7 +162,8 @@ def create_grep_tool_definition(
         if not rg_path:
             raise RuntimeError(missing_tool_message("rg"))
 
-        search_path = resolve_to_cwd(parsed.path or ".", cwd)
+        search_path = resolveToCwd(parsed.path or ".", read_field(ctx, "cwd") or cwd)
+        # MISAKA fork: MISAKA's credentials and the web evidence vault are out of the tools' reach.
         from misaka.core.web.evidence import check_material_read, is_credential_store
         check_material_read(search_path)
         try:
@@ -360,7 +298,7 @@ def create_grep_tool_definition(
             raise RuntimeError(stderr_text or f"ripgrep exited with code {return_code}")
 
         long_line_notice = (
-            f"Search stopped early: a file has a line longer than {format_size(STREAM_LIMIT)} "
+            f"Search stopped early: a file has a line longer than {formatSize(STREAM_LIMIT)} "
             "(minified or single-line dump); anything after it was not searched"
             if long_line_skipped
             else None
@@ -377,7 +315,7 @@ def create_grep_tool_definition(
             if context_value == 0 and line_text is not None:
                 relative_path = format_path(file_path)
                 sanitized = line_text.replace("\r\n", "\n").replace("\r", "").removesuffix("\n")
-                truncated = truncate_line(sanitized)
+                truncated = truncateLine(sanitized)
                 lines_truncated = lines_truncated or bool(truncated["wasTruncated"])
                 output_lines.append(f"{relative_path}:{line_number}: {truncated['text']}")
                 continue
@@ -392,7 +330,7 @@ def create_grep_tool_definition(
             for current in range(start, end + 1):
                 line_text_value = lines[current - 1] if current - 1 < len(lines) else ""
                 sanitized = line_text_value.replace("\r", "")
-                truncated = truncate_line(sanitized)
+                truncated = truncateLine(sanitized)
                 lines_truncated = lines_truncated or bool(truncated["wasTruncated"])
                 if current == line_number:
                     output_lines.append(f"{relative_path}:{current}: {truncated['text']}")
@@ -400,7 +338,7 @@ def create_grep_tool_definition(
                     output_lines.append(f"{relative_path}-{current}- {truncated['text']}")
 
         raw_output = "\n".join(output_lines)
-        truncation = truncate_head(raw_output, TruncationOptions(maxLines=2**31 - 1))
+        truncation = truncateHead(raw_output, TruncationOptions(maxLines=2**31 - 1))
         output = truncation.content
         details = GrepToolDetails()
         notices: list[str] = []
@@ -413,7 +351,7 @@ def create_grep_tool_definition(
             )
             details.matchLimitReached = effective_limit
         if truncation.truncated:
-            notices.append(f"{format_size(DEFAULT_MAX_BYTES)} limit reached")
+            notices.append(f"{formatSize(DEFAULT_MAX_BYTES)} limit reached")
             details.truncation = truncation
         if lines_truncated:
             notices.append(f"Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines")
@@ -426,16 +364,6 @@ def create_grep_tool_definition(
             details=_details_or_none(details),
         )
 
-    def render_call(args: Mapping[str, Any] | None, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        text.setText(_format_grep_call(args, theme_obj))
-        return text
-
-    def render_result(result: Any, options_obj: Any, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        text.setText(_format_grep_result(result, options_obj, theme_obj, bool(context.showImages)))
-        return text
-
     return ToolDefinition(
         name="grep",
         label="grep",
@@ -444,20 +372,17 @@ def create_grep_tool_definition(
             "Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). "
             f"Long lines are truncated to {GREP_MAX_LINE_LENGTH} chars."
         ),
-        promptSnippet=grep_tool_system_prompt_contribution["snippet"],
+        promptSnippet=grepToolSystemPromptContribution["snippet"],
         parameters=GrepToolInput,
         execute=execute,
-        renderCall=render_call,
-        renderResult=render_result,
+        **grepRenderers,
     )
 
 
-def create_grep_tool(cwd: str, options: GrepToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
-    return wrap_tool_definition(create_grep_tool_definition(cwd, options))
+def createGrepTool(cwd: str, options: GrepToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
+    return wrapToolDefinition(createGrepToolDefinition(cwd, options))
 
 
-createGrepTool = create_grep_tool
-createGrepToolDefinition = create_grep_tool_definition
 
 __all__ = [
     "GrepOperations",

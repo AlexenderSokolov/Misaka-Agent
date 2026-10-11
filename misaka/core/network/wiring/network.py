@@ -56,12 +56,12 @@ def _session_line(ctx, limit=10):
     current = getattr(getattr(ctx, "sessionManager", None), "sessionFile", None)
     if not current:
         return ids
-    from misaka.core.session_manager import read_session_header
+    from misaka.core.session_manager import readSessionHeader
     for _ in range(limit):
-        current = (read_session_header(current) or {}).get("parentSession")
+        current = (readSessionHeader(current) or {}).get("parentSession")
         if not current:
             break
-        parent_id = (read_session_header(current) or {}).get("id")
+        parent_id = (readSessionHeader(current) or {}).get("id")
         if parent_id and parent_id not in ids:
             ids.append(parent_id)
     return ids
@@ -722,8 +722,8 @@ def _install(harn, runtime):
         row = db.get(_con(), params.task_id)
         if row is not None and not row["session_file"]:
             from misaka.config import sessions as session_roots
-            from misaka.core.session_manager import find_most_recent_session
-            if find_most_recent_session(session_roots.card_session_dir(row)) is None:
+            from misaka.core.session_manager import findMostRecentSession
+            if findMostRecentSession(session_roots.card_session_dir(row)) is None:
                 return _text(f"Card {params.task_id} never ran: it was stopped before its first turn, so "
                              "there is no session to show. misaka_sister_message (confirmed=true) starts "
                              "its first attempt with your note; misaka_card_requeue puts it back in the "

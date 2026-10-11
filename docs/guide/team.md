@@ -43,27 +43,35 @@ each Sister.
 |---|---|
 | `DESCRIBE.md` | Her specialty. Last Order reads it to decide who gets what. |
 | `SOUL.md` | Her personality and voice, optional. It shapes how she talks and thinks; her duties stay the same. |
-| `settings.json` | What is hers alone: her model (`defaultProvider` / `defaultModel`), `defaultThinkingLevel`, her MCP servers (`mcpServers`) and `web` overrides. |
+| `settings.json` | What is hers alone: her model (`defaultProvider` / `defaultModel`), `defaultThinkingLevel` and `web` overrides. |
+| `mcp.json` | Her MCP servers. The home's `~/.misaka/mcp.json` is Last Order's and does not reach her. |
+| `credentials/mcp-auth.json` | Her MCP sign-ins (`/mcp` in her window). Last Order's are in the home's `credentials/`. |
 | `.env` | Keys that are hers, laid over the home's `.env`. |
 | `skills/` | Skills only she sees. |
 | `skill-bundles/` | Named sets of skills saved for her (`misaka bundles save`). |
 | `subagents/` | Sub-agent types only she can start. |
 
-MCP servers are set per role, in that role's own `settings.json`, in the shape Hermes uses:
+MCP servers are set in `mcp.json` files, in the `mcpServers` shape other MCP clients use. Each role
+has her own: Last Order's are in the home's `~/.misaka/mcp.json` (and her
+`profiles/last_order/mcp.json`), a Sister's in `profiles/sisters/<number>/mcp.json`, and one role never
+connects another's servers:
 
 ```json
-"mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}
+{"mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}}
 ```
 
-`/mcp` in her window lists the servers and their tools.
+`misaka mcp add camofox -- npx -y camofox-mcp` writes the home's file and `misaka mcp list` checks
+that the home's and the project's servers connect. `/mcp` in her window lists hers too, signs in to
+one, reconnects it, or turns it off. The [configuration reference](../reference/configuration.md#skills-and-mcp) lists every key.
 
 A server starts with a small part of MISAKA's environment: `PATH`, `HOME`, the locale, the proxy
 and certificate variables, the settings of npm, uv and pip (a registry mirror reaches `npx` and
 `uvx`) and the like, never an API key or a registry's token. A key it needs goes in its `env`, where
-`${NAME}` takes the value from the environment (or the home's `.env`):
+`${NAME}` takes the value from the environment (or the home's `.env`); a server whose variable is not
+set does not start, and its error names the variable:
 
 ```json
-"mcpServers": {"github": {"command": "npx", "args": ["-y", "github-mcp"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}
+{"mcpServers": {"github": {"command": "npx", "args": ["-y", "github-mcp"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}}
 ```
 
 What every role shares lives in the home: `~/.misaka/MISAKA.md` (the shared identity),

@@ -398,7 +398,7 @@ def _output_snapshot(task, root):
     output_dir = task.get("output_dir")
     if not output_dir:
         return {}
-    from misaka.utils.paths import get_file_revision
+    from misaka.utils.paths import getFileRevision
 
     output = Path(output_dir).resolve()
     output.relative_to(root)
@@ -407,7 +407,7 @@ def _output_snapshot(task, root):
     snapshot = {}
     for value in _output_files(str(output), str(root)):
         relative = _artifact(root, value)
-        revision = get_file_revision(str(root / relative)) if relative else None
+        revision = getFileRevision(str(root / relative)) if relative else None
         if revision is not None:
             snapshot[relative] = list(revision)
     return snapshot
@@ -571,6 +571,9 @@ def card_session_setup(task, workspace, profile_dir, provider, default_model):
             flags += ["-t", ",".join(MANAGEMENT_TOOLS)]
         else:
             flags += ["-nt"]
+        # A `-t` list without `mcp__` entries keeps MCP tools registered (pi 1.0.4); a wrap-up turn
+        # starts no MCP servers at all.
+        flags.append("--no-mcp")
     else:
         # Regular cards run against read-only copies of the role's skill stack: skills are
         # read-only at run time (constitution), and a card never sees the live tree.

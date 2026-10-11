@@ -244,9 +244,9 @@ def _api(path: str) -> tuple[dict | None, str | None]:
     import urllib.error
     import urllib.request
 
-    from misaka.ai.utils.user_agent import get_misaka_user_agent
+    from misaka.ai.utils.pi_user_agent import getPiUserAgent
     token, _source = github_token()
-    headers = {"User-Agent": get_misaka_user_agent(), "Accept": "application/vnd.github+json"}
+    headers = {"User-Agent": getPiUserAgent(), "Accept": "application/vnd.github+json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(f"{API}{path}", headers=headers)

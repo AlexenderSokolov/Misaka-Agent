@@ -138,7 +138,7 @@ async def test_native_saved_default_isolated_and_reused(local_models):
     before = [path.read_bytes() for path in paths]
     async with opened(root, "sisters/10032", "foreground") as (_, session):
         target = session.modelRegistry.find("fixture-lo", "shared")
-        await session.setModel(target, persist=True)
+        await session.setModel(target, {"persist": True})
         await session.settingsManager.flush()
         assert session.settingsManager.getDefaultModelPair() == ("fixture-lo", "shared")
         await prompt(session, "SAVED_MARKER")
@@ -178,7 +178,7 @@ async def test_native_child_default_guard_preserves_parent_and_global(local_mode
         assert session.settingsManager.getModelProfile() is None
         target = session.modelRegistry.find("fixture-b", "different")
         with pytest.raises(ValueError, match="/agents"):
-            await session.setModel(target, persist=True)
+            await session.setModel(target, {"persist": True})
         assert (session.model.provider, session.model.id) == ("fixture-a", "shared")
         await session.setModel(target)
         await prompt(session, "CHILD_MARKER")

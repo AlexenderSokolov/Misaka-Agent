@@ -22,7 +22,7 @@ from misaka.core.documents import index as corpus
 from misaka.core.platform import prompt_guard
 from misaka.core.platform import tasks as task_store
 from misaka.core.research import bundle, commands, graph, planner, runs
-from misaka.core.session_manager import find_most_recent_session
+from misaka.core.session_manager import findMostRecentSession
 from misaka.utils import atomic
 
 _LOG = logging.getLogger(__name__)
@@ -264,9 +264,8 @@ def _stage(con, run, cfg, worker, prompt, *, key, model, reply, extra_tools=(), 
     action, _text = planner.commanded(
         worker, cfg, prompt, command=tool, name=REPORT_TOOL, what=f"{REPORT_TOOL} for {key}",
         recorded=lambda: runs.action(con, run["id"], root["id"], key),
-        cwd=run["workspace"], session_dir=session_dir, tools=FINAL_TOOLS,
-        raw=True, task_id=run["id"], con=con, session_file=run["root_session"],
-        continue_session=bool(find_most_recent_session(session_dir)), extra_tools=tuple(extra_tools))
+        cwd=run["workspace"], session_dir=session_dir, raw=True, task_id=run["id"], con=con, session_file=run["root_session"],
+        continue_session=bool(findMostRecentSession(session_dir)), extra_tools=tuple(extra_tools))
     if check_active:
         check_active()
     return action["payload"]

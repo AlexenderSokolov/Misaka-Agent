@@ -57,6 +57,8 @@ def discover(spec) -> list[dict[str, Any]]:
                         getattr(mod, "EXTENSION_NAME", mod.__name__.rsplit(".", 1)[-1]),
                         register,
                         hidden=bool(getattr(mod, "HIDDEN", False)),
+                        replaceable=bool(getattr(mod, "REPLACEABLE", False)),
+                        builtin=bool(getattr(mod, "BUILTIN", False)),
                     )
                 )
     return out

@@ -1,6 +1,7 @@
 {
   "$schema": "./theme-schema.json",
   "name": "dark",
+  "appearance": "dark",
   "vars": {
     "rose": "#cb3862",
     "roseLite": "#e8698c",

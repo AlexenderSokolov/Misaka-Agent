@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 from misaka.config import current_config
+from misaka.utils._abort_signal import AnyAbortSignal
 from misaka.utils.async_lifecycle import run_in_thread
 from misaka.utils.values import read_field
 
@@ -47,6 +48,14 @@ def runtime(ctx):
         _REGISTRY.reset(registry_token)
 
 
+def _stored(registry, provider):
+    """The provider's stored credential record as the registry's auth.json store last loaded it, without I/O: the
+    synchronous paths here cannot await the store's ``read``."""
+    from misaka.core.auth_storage import _coerce_storage_object
+
+    return _coerce_storage_object(registry.authStorage.data).get(provider)
+
+
 def usage_dict(usage) -> dict:
     """Preserve the host's separate input, output and cache counters."""
     inp, out, read, write = (int(read_field(usage, key, 0) or 0)
@@ -59,14 +68,14 @@ def usage_dict(usage) -> dict:
 
 def get_provider(name):
     """Native provider identity for Hermes' provider-plus-endpoint rule."""
-    from misaka.ai.models import get_providers
+    from misaka.ai.compat import getProviders
 
     registry = _REGISTRY.get()
     from .profiles import get_provider_profile
     profile = get_provider_profile(name)
     if profile is not None and profile.auth_type == 'external_process':
         return profile.name
-    names = {item.provider for item in registry.getAll()} if registry is not None else get_providers()
+    names = {item.provider for item in registry.getAll()} if registry is not None else getProviders()
     if registry is not None:
         from .profiles import native_provider
         name = native_provider(name, registry)
@@ -86,11 +95,11 @@ def _unwrap_moa_provider(provider, model):
 
 
 def _model_route(model, registry):
-    from misaka.ai.models import get_providers
+    from misaka.ai.compat import getProviders
 
     from ..vendor.model_routing import parse_lcm_model_override
 
-    custom = {item.provider for item in registry.getAll()} - set(get_providers())
+    custom = {item.provider for item in registry.getAll()} - set(getProviders())
     return parse_lcm_model_override(model, provider_resolver=lambda name: name == "cerebras" or name in custom)
 
 
@@ -147,7 +156,7 @@ def resolve_model(provider, model, registry):
         if candidate is None:
             raise RuntimeError(f'No native model registered for {provider}')
         return candidate
-    resolved = resolveCliModel({'cliProvider': provider, 'cliModel': model, 'modelRegistry': registry})
+    resolved = resolveCliModel({'cliProvider': provider, 'cliModel': model, 'modelRuntime': registry.modelRuntime})
     if resolved.model is None:
         raise RuntimeError(resolved.error or f'Unknown auxiliary model: {provider}/{model}')
     return resolved.model
@@ -161,21 +170,18 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
                     main_runtime, base_url, api_key, api_mode, route_info, latency_info, started,
                     extra_body=None, reasoning_config=None, extra_headers=None, recovery=True):
     from misaka.ai.auth.resolve import AuthResolutionOverrides
-    from misaka.ai.session_resources import cleanup_session_resources
+    from misaka.ai.session_resources import cleanupSessionResources
     from misaka.ai.types import Context, SimpleStreamOptions, UserMessage
-    from misaka.ai.utils.abort import (
-        AbortController,
-        combine_abort_signals,
-        wait_for_abort,
-    )
-    from misaka.core.auth_storage import AuthStorage
     from misaka.core.model_registry import ModelRegistry
+    from misaka.core.model_runtime import ModelRuntime
+    from misaka.utils._abort_signal import wait_for_abort
+    from misaka.utils.js import AbortController
 
     from ..native import auxiliary_options, auxiliary_policy
     from . import routing
 
     execution.check_cancelled()
-    registry = _REGISTRY.get() or ModelRegistry.create(AuthStorage.create())
+    registry = _REGISTRY.get() or ModelRegistry(await ModelRuntime.create())
     system, turns = [], []
     for message in messages or []:
         role = message.get("role", "user")
@@ -273,7 +279,7 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
         if not base_url or base_url == main_runtime.get("base_url"):
             api_key = api_key or main_runtime.get("api_key")
     controller = AbortController()
-    signal = combine_abort_signals(controller, execution.current_signal())
+    signal = AnyAbortSignal(controller.signal, execution.current_signal())
     request = asyncio.current_task()
 
     async def abort_request():
@@ -291,7 +297,7 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
         pooled_entry = None
 
         def issuing_credential():
-            stored = (registry.authStorage.get(pooled_entry.id if pooled_entry else selected.provider)
+            stored = (_stored(registry, pooled_entry.id if pooled_entry else selected.provider)
                       if not api_key and hasattr(registry, 'authStorage') else None)
             # The wire key is authoritative, even when a default login exists.
             return {**(stored or {}), 'access': auth.get('apiKey') or (stored or {}).get('access', '')}
@@ -351,7 +357,7 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
                     return await complete(messages=messages, model=selected.id, timeout=budget,
                         cwd=_CWD.get(), signal=signal, temperature=temperature, max_tokens=max_tokens)
             attempt = AbortController()
-            attempt_signal = combine_abort_signals(attempt, signal)
+            attempt_signal = AnyAbortSignal(attempt.signal, signal)
             request_id = str(uuid.uuid4())
             failed = False
             stream = None
@@ -411,7 +417,7 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
                     )
                     if latency_info is not None:
                         latency_info.setdefault("provider_dispatch_ms", _elapsed_ms(started))
-                    stream = registry.streamSimple(wire_model, context, options)
+                    stream = _provider_stream(registry, wire_model, context, options)
                     if streamed:
                         # Only substantive native deltas re-arm the idle window.
                         # Metadata/keepalives count for timing, never for liveness.
@@ -465,7 +471,7 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
                         if stream is not None and hasattr(stream, 'settled'):
                             await stream.settled()
                     finally:
-                        cleanup_session_resources(request_id)
+                        cleanupSessionResources(request_id)
                 except Exception:
                     if not failed:
                         raise
@@ -482,7 +488,7 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
                 # An explicit key must not refresh an unrelated saved OAuth login.
                 if external or api_key or not hasattr(registry, 'authStorage') or not registry.isUsingOAuth(selected):
                     return False
-                if not registry.authStorage.get(selected.provider):
+                if not _stored(registry, selected.provider):
                     return False
                 owner = Pool(registry, selected.provider, [selected.provider], 'fill_first')
                 entry = SimpleNamespace(id=selected.provider)
@@ -571,6 +577,24 @@ async def _complete(messages, model, provider, temperature, max_tokens, timeout,
         if aborting is not None:
             aborting.cancel()
             await asyncio.gather(aborting, return_exceptions=True)
+
+
+def _provider_stream(registry, model, context, options):
+    """Stream through the model's own provider with the auth resolved above. The runtime's
+    ``streamSimple`` would resolve it again, and put back the key, headers and endpoint this
+    module deliberately chose (a pooled account, header-only Bearer auth, the /v1 rewrite).
+
+    A task's ``api_mode`` can put the model on an API its provider does not serve (a Z.AI
+    model on its Anthropic endpoint): that one goes by the API it names, as before the runtime.
+    """
+    from misaka.ai.compat import streamSimple
+    from misaka.ai.utils.transcript import normalizeContext
+
+    provider = registry.getProvider(model.provider)
+    catalog = registry.find(model.provider, model.id)
+    if provider is None or (catalog is not None and catalog.api != model.api):
+        return streamSimple(model, context, options)
+    return provider.streamSimple(model, normalizeContext(context), options)
 
 
 def _elapsed_ms(started):

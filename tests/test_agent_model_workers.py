@@ -13,7 +13,9 @@ from misaka.core.subagent.model import resolve_model_spec
 from misaka.core.subagent.runtime import RoleContext
 
 
-class Registry:
+class Runtime:
+    """The model runtime, as much of it as a Sister's model selection reads."""
+
     def __init__(self):
         self.unauthenticated = set()
         self.models = [SimpleNamespace(provider=provider, id=model) for provider, model in (
@@ -23,17 +25,17 @@ class Registry:
             ("sister-provider", "family/model"),
         )]
 
-    def getAll(self):
-        return list(self.models)
+    def getModels(self, providerId=None):
+        return [model for model in self.models if providerId is None or model.provider == providerId]
 
-    def getAvailable(self):
-        return [model for model in self.models if self.hasConfiguredAuth(model)]
+    def getAvailableSnapshot(self):
+        return [model for model in self.models if self.hasConfiguredAuth(model.provider)]
 
-    def find(self, provider, model_id):
+    def getModel(self, provider, model_id):
         return next((model for model in self.models if model.provider == provider and model.id == model_id), None)
 
-    def hasConfiguredAuth(self, model):
-        return model.provider not in self.unauthenticated
+    def hasConfiguredAuth(self, provider):
+        return provider not in self.unauthenticated
 
 
 class WorkerModelTests(unittest.TestCase):
@@ -43,10 +45,10 @@ class WorkerModelTests(unittest.TestCase):
         self.root = Path(temp.name)
         self.profile = self.root / "profiles" / "10032"
         self.profile.mkdir(parents=True)
-        self.registry = Registry()
+        self.runtime = Runtime()
         self.session = SimpleNamespace(
             model=SimpleNamespace(provider="lo-provider", id="lo-model"),
-            modelRegistry=self.registry,
+            modelRuntime=self.runtime,
         )
         self.cfg = {"profiles_root": str(self.profile.parent), "provider": "other-provider",
                     "default_model": "other-model", "db": str(self.root / "board.db")}
@@ -131,7 +133,7 @@ class WorkerModelTests(unittest.TestCase):
 
     def test_missing_auth_fails_before_parent_provider_can_capture_pin(self):
         self.pin("sister-provider/sister-model")
-        self.registry.unauthenticated.add("sister-provider")
+        self.runtime.unauthenticated.add("sister-provider")
         with self.assertRaisesRegex(ValueError, "authentication.*sister-provider/sister-model"):
             self.manager()
         self.assertEqual(self.manager("other-provider/other-model").model, "other-provider/other-model")
@@ -171,7 +173,7 @@ class WorkerModelTests(unittest.TestCase):
         self.assertIsNone(context.model_override)
         self.assertEqual(resolve_model_spec({}, None, "other-provider/other-model",
                                             {"provider": "sister-provider", "id": "sister-model"},
-                                            self.registry.getAvailable()),
+                                            self.runtime.getAvailableSnapshot()),
                          ("other-provider", "other-model"))
 
 
@@ -181,8 +183,8 @@ class MoADefaultModelTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, \
                 patch.dict(os.environ, {"MISAKA_HOME": directory}), \
-                patch("misaka.ai.models.get_providers", return_value=["builtin-provider", "global-provider"]), \
-                patch("misaka.core.model_registry.ModelRegistry", side_effect=AssertionError("recursive registry")):
+                patch("misaka.ai.compat.getProviders", return_value=["builtin-provider", "global-provider"]), \
+                patch("misaka.core.model_runtime.ModelRuntime.create", side_effect=AssertionError("recursive runtime")):
             home.path("models").parent.mkdir(parents=True, exist_ok=True)
             home.path("models").write_text(json.dumps({"providers": {"custom-provider": {}}}), encoding="utf-8")
             for reference, expected in (
@@ -204,7 +206,7 @@ class MoADefaultModelTests(unittest.TestCase):
         cfg = {"provider": "global-provider", "default_model": "builtin-provider/raw-model",
                "lo_model": "builtin-provider/raw-model"}
         with patch.object(moa, "current_config", return_value=cfg), \
-                patch("misaka.ai.models.get_providers", return_value=["builtin-provider"]):
+                patch("misaka.ai.compat.getProviders", return_value=["builtin-provider"]):
             refs, aggregator = moa._default_slots()
         expected = {"provider": "global-provider", "model": "builtin-provider/raw-model"}
         self.assertEqual(refs, [expected, expected])

@@ -1212,15 +1212,13 @@ class SubagentManager:
 
         specific = [spec for spec in definition.mcp_servers if isinstance(spec, str)]
         specific.extend(name for name, _ in agent_roster.inline_mcp_entries(definition.mcp_servers))
-        from misaka.core import mcp
-
-        configured = list(mcp.servers_for(self.role_context.profile_dir))
+        available = agent_roster.available_mcp_servers(self.session)
         missing_config = [
             pattern
             for pattern in required
             if not any(
-                pattern.casefold() in server.casefold()
-                for server in [*configured, *specific]
+                agent_roster.mcp_server_matches(pattern, server)
+                for server in [*available, *specific]
             )
         ]
         if missing_config:
@@ -2784,7 +2782,7 @@ class SubagentManager:
         this session belongs to). Hermes raises its hook of the same name in the parent when it
         starts a subagent. The core names no extension: without one, nothing is added."""
         runner = getattr(self.session, "extensionRunner", None)
-        if runner is None or not runner.has_handlers("subagent_start"):
+        if runner is None or not runner.hasHandlers("subagent_start"):
             return
         await runner.emit({"type": "subagent_start", "subagentId": task.id, "cwd": task.cwd, "env": env})
 
@@ -2799,17 +2797,15 @@ class SubagentManager:
     def _agent_mcp_config(self, task: AgentTask) -> str | None:
         if not task.definition.mcp_servers:
             return None
-        from misaka.core import mcp
-
-        available = mcp.servers_for(self.role_context.profile_dir)
-        # Everything available, then whatever the definition spells out inline. A
-        # definition's `mcpServers` can only add: the child's own `mcp.servers_for()`
-        # unions the injected file with its profile's `mcp_servers`, so a name left out
-        # here still reaches the child through its profile. Naming an available server by
-        # its string is therefore a no-op -- it is in `selected` already -- and only the
-        # inline `{name: {...}}` form carries a server this side did not have.
-        selected: dict[str, Any] = dict(available)
-        selected.update(agent_roster.inline_mcp_entries(task.definition.mcp_servers, on_invalid=_log_warning))
+        # Only what the definition spells out inline. The child loads the global, role and project
+        # `mcp.json` itself (the MCP extension), so a definition's `mcpServers` can only add: naming
+        # a configured server by its string is a no-op, and only the inline `{name: {...}}` form
+        # carries a server the child would not have.
+        selected: dict[str, Any] = dict(
+            agent_roster.inline_mcp_entries(task.definition.mcp_servers, on_invalid=_log_warning)
+        )
+        if not selected:
+            return None
         path = task.metadata_path.parent / ".mcp" / f"{task.id}.json"
         _atomic_json(path, {"mcpServers": selected})
         return str(path)
@@ -3060,7 +3056,7 @@ class SubagentManager:
         # Readers observe the published result, not cleanup or a metadata write.
         # Only send_message (continuation) waits for the _settled fence.
         if block and task.status not in TERMINAL_STATUSES and timeout_ms > 0:
-            from misaka.ai.utils.abort import wait_for_abort
+            from misaka.utils._abort_signal import wait_for_abort
             from misaka.utils.values import signal_aborted
 
             if signal_aborted(signal):

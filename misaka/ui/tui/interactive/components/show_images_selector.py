@@ -1,34 +1,54 @@
-"""Bordered selector for the interactive show-images setting."""
+"""Translated from pi's ``modes/interactive/components/show-images-selector.ts`` (v1.1.0)."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
 from misaka.ui.tui import Container, SelectItem, SelectList, SelectListLayoutOptions
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.theme.theme import get_select_list_theme
+from misaka.ui.tui.interactive.theme.theme import getSelectListTheme
 
-SHOW_IMAGES_SELECT_LIST_LAYOUT = SelectListLayoutOptions(minPrimaryColumnWidth=12, maxPrimaryColumnWidth=32)
+from .dynamic_border import DynamicBorder
+
+SHOW_IMAGES_SELECT_LIST_LAYOUT = SelectListLayoutOptions(
+    minPrimaryColumnWidth=12,
+    maxPrimaryColumnWidth=32,
+)
 
 
 class ShowImagesSelectorComponent(Container):
+    """Component that renders a show images selector with borders"""
+
     def __init__(self, currentValue: bool, onSelect: Callable[[bool], None], onCancel: Callable[[], None]) -> None:
         super().__init__()
+
         items = [
             SelectItem(value="yes", label="Yes", description="Show images inline in terminal"),
             SelectItem(value="no", label="No", description="Show text placeholder instead"),
         ]
 
-        self.addChild(DynamicBorder())
-        self.selectList = SelectList(items, 5, get_select_list_theme(), SHOW_IMAGES_SELECT_LIST_LAYOUT)
-        self.selectList.setSelectedIndex(0 if currentValue else 1)
-        self.selectList.onSelect = lambda item: onSelect(item.value == "yes")
-        self.selectList.onCancel = onCancel
-        self.addChild(self.selectList)
+        # Add top border
         self.addChild(DynamicBorder())
 
-    def handleInput(self, data: str) -> None:
-        self.selectList.handleInput(data)
+        # Create selector
+        self.selectList = SelectList(items, 5, getSelectListTheme(), SHOW_IMAGES_SELECT_LIST_LAYOUT)
+
+        # Preselect current value
+        self.selectList.setSelectedIndex(0 if currentValue else 1)
+
+        def select(item: SelectItem) -> None:
+            onSelect(item.value == "yes")
+
+        self.selectList.onSelect = select
+
+        def cancel() -> None:
+            onCancel()
+
+        self.selectList.onCancel = cancel
+
+        self.addChild(self.selectList)
+
+        # Add bottom border
+        self.addChild(DynamicBorder())
 
     def getSelectList(self) -> SelectList:
         return self.selectList

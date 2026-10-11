@@ -534,7 +534,7 @@ def test_research_restores_the_recall_rules_without_repeating_them(tmp_path):
     dropped them, and repeats none under the default prompt -- this long multi-paragraph one too."""
     from misaka.core.agent_session import AgentSession
     from misaka.core.research.prompting import system_context
-    from misaka.core.system_prompt import build_system_prompt
+    from misaka.core.system_prompt import buildSystemPrompt
     from misaka.core.wiring import ToolCollector
     from misaka.extensions.misaka_lcm.host import tools
 
@@ -545,8 +545,8 @@ def test_research_restores_the_recall_rules_without_repeating_them(tmp_path):
                              getAgentsFiles=lambda: {"agentsFiles": []})
     host = SimpleNamespace(_cwd=str(tmp_path), _resourceLoader=loader,
                            _toolRegistry=definitions, _toolDefinitions=definitions)
-    AgentSession._rebuild_system_prompt(host, list(definitions))
-    prompt = build_system_prompt(host._baseSystemPromptOptions)
+    AgentSession._rebuildSystemPrompt(host, list(definitions))
+    prompt = buildSystemPrompt(host._baseSystemPromptOptions)
     session = SimpleNamespace(getToolDefinition=definitions.get)
     rule = tools.recall_guideline()
     assert rule in prompt and rule not in system_context(session, list(definitions), prompt)

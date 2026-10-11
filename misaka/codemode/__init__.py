@@ -1,0 +1,84 @@
+"""pi's ``packages/codemode``: a sandbox that runs model-written JavaScript against the session's
+tools, and the TypeScript declarations scripts are shown.
+
+Translated from pi's ``packages/codemode/src/index.ts``. MISAKA fork: no ``loadQuickJSWasm`` and no
+``CodemodeWasmModule``; the engine is V8 through ``mini-racer`` (``runtime/engine.py``).
+"""
+
+from misaka.codemode.declarations import (
+    DEFAULT_INPUT_SCHEMA_MAX_CHARS,
+    MCP_TYPESCRIPT_PREAMBLE,
+    RenderDeclarationsOptions,
+    mcpStructuredContentSchema,
+    renderDeclarations,
+    renderToolOutputType,
+    renderToolSample,
+    renderToolSignature,
+    schemaToType,
+)
+from misaka.codemode.identifier import toCodemodeIdentifier
+from misaka.codemode.runtime.host import CodemodeSandbox
+from misaka.codemode.runtime.prelude_source import (
+    MAX_OUTPUT_CHARS,
+    MAX_OUTPUT_ITEMS,
+    MAX_STORE_TOTAL_CHARS,
+    MAX_STORE_VALUE_CHARS,
+)
+from misaka.codemode.source import (
+    CODEMODE_OPTIONS_PREFIX,
+    CODEMODE_SOURCE_GRAMMAR,
+    CodemodeSourceError,
+    CodemodeSourceOptions,
+    ParsedCodemodeSource,
+    parseCodemodeSource,
+)
+from misaka.codemode.types import (
+    CodemodeCall,
+    CodemodeCallStatus,
+    CodemodeError,
+    CodemodeErrorKind,
+    CodemodeExecuteOptions,
+    CodemodeJsonSchema,
+    CodemodeOutputItem,
+    CodemodeResult,
+    CodemodeSandboxOptions,
+    CodemodeStoreWrites,
+    CodemodeTool,
+    CodemodeToolContext,
+)
+
+__all__ = [
+    "CODEMODE_OPTIONS_PREFIX",
+    "CODEMODE_SOURCE_GRAMMAR",
+    "DEFAULT_INPUT_SCHEMA_MAX_CHARS",
+    "MAX_OUTPUT_CHARS",
+    "MAX_OUTPUT_ITEMS",
+    "MAX_STORE_TOTAL_CHARS",
+    "MAX_STORE_VALUE_CHARS",
+    "MCP_TYPESCRIPT_PREAMBLE",
+    "CodemodeCall",
+    "CodemodeCallStatus",
+    "CodemodeError",
+    "CodemodeErrorKind",
+    "CodemodeExecuteOptions",
+    "CodemodeJsonSchema",
+    "CodemodeOutputItem",
+    "CodemodeResult",
+    "CodemodeSandbox",
+    "CodemodeSandboxOptions",
+    "CodemodeSourceError",
+    "CodemodeSourceOptions",
+    "CodemodeStoreWrites",
+    "CodemodeTool",
+    "CodemodeToolContext",
+    "ParsedCodemodeSource",
+    "RenderDeclarationsOptions",
+    "mcpStructuredContentSchema",
+    "parseCodemodeSource",
+    "renderDeclarations",
+    "renderToolOutputType",
+    "renderToolSample",
+    "renderToolSignature",
+    "schemaToType",
+    "toCodemodeIdentifier",
+]

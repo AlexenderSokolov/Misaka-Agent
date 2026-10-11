@@ -15,27 +15,28 @@ from misaka.agent.types import AgentTool, AgentToolResult
 from misaka.ai.types import TextContent
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.tools._common import _ignore_background_task_result, abort_race
-from misaka.core.tools.path_utils import resolve_to_cwd
-from misaka.core.tools.render_utils import (
-    get_text_output,
-    render_tool_path,
-    str_value,
-)
-from misaka.core.tools.tool_definition_wrapper import wrap_tool_definition
+from misaka.core.tools.path_utils import resolveToCwd
+from misaka.core.tools.renderers.ls import lsRenderers
+from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
 from misaka.core.tools.truncate import (
     DEFAULT_MAX_BYTES,
     TruncationOptions,
     TruncationResult,
-    format_size,
-    truncate_head,
+    formatSize,
+    truncateHead,
 )
-from misaka.ui.tui import Text
 from misaka.utils.values import maybe_await, read_field, signal_aborted
 
 T = TypeVar("T")
 
 
 DEFAULT_LIMIT = 500
+
+
+lsToolSystemPromptContribution = {
+    "snippet": "List directory contents",
+    "guidelines": [],
+}
 
 
 class LsToolInput(BaseModel):
@@ -82,47 +83,6 @@ def _coerce_options(options: LsToolOptions | Mapping[str, Any] | None) -> LsTool
     return LsToolOptions(operations=options.get("operations"))
 
 
-def _format_ls_call(args: Mapping[str, Any] | None, theme_obj: Any, cwd: str) -> str:
-    raw_path = str_value(read_field(args, "path"))
-    limit = read_field(args, "limit")
-    text = (
-        f"{theme_obj.fg('toolTitle', theme_obj.bold('ls'))} "
-        f"{render_tool_path(raw_path, theme_obj, cwd, {'emptyFallback': '.'})}"
-    )
-    if limit is not None:
-        text += theme_obj.fg("toolOutput", f" (limit {limit})")
-    return text
-
-
-def _format_ls_result(result: Any, options: Any, theme_obj: Any, show_images: bool) -> str:
-    from misaka.ui.tui.interactive.components.keybinding_hints import key_hint
-
-    output = get_text_output(result, show_images).strip()
-    text = ""
-    if output:
-        lines = output.split("\n")
-        max_lines = len(lines) if bool(read_field(options, "expanded")) else 20
-        display_lines = lines[:max_lines]
-        remaining = len(lines) - max_lines
-        text += "\n" + "\n".join(theme_obj.fg("toolOutput", line) for line in display_lines)
-        if remaining > 0:
-            more_lines_text = theme_obj.fg("muted", f"\n... ({remaining} more lines,")
-            text += f"{more_lines_text} {key_hint('app.tools.expand', 'to expand')})"
-
-    details = read_field(result, "details")
-    entry_limit = read_field(details, "entryLimitReached")
-    truncation = read_field(details, "truncation")
-    if entry_limit or bool(read_field(truncation, "truncated")):
-        warnings: list[str] = []
-        if entry_limit:
-            warnings.append(f"{entry_limit} entries limit")
-        if bool(read_field(truncation, "truncated")):
-            warnings.append(f"{format_size(read_field(truncation, 'maxBytes') or DEFAULT_MAX_BYTES)} limit")
-        warning_text = f"[Truncated: {', '.join(warnings)}]"
-        text += "\n" + theme_obj.fg("warning", warning_text)
-    return text
-
-
 def _is_directory(stat_result: Any) -> bool:
     if hasattr(stat_result, "is_dir"):
         return bool(stat_result.is_dir())
@@ -140,7 +100,7 @@ def _details_or_none(details: LsToolDetails) -> LsToolDetails | None:
     return None
 
 
-def create_ls_tool_definition(
+def createLsToolDefinition(
     cwd: str,
     options: LsToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[LsToolInput | dict[str, Any], LsToolDetails | None]:
@@ -151,13 +111,13 @@ def create_ls_tool_definition(
         params: LsToolInput | dict[str, Any],
         signal: Any | None = None,
         _on_update: Callable[[AgentToolResult], None] | None = None,
-        _ctx: Any = None,
+        ctx: Any = None,
     ) -> AgentToolResult:
         if signal_aborted(signal):
             raise RuntimeError("Operation aborted")
 
         parsed = LsToolInput.model_validate(params)
-        dir_path = resolve_to_cwd(parsed.path or ".", cwd)
+        dir_path = resolveToCwd(parsed.path or ".", read_field(ctx, "cwd") or cwd)
         effective_limit = parsed.limit if parsed.limit is not None else DEFAULT_LIMIT
 
         async def worker() -> AgentToolResult:
@@ -191,7 +151,7 @@ def create_ls_tool_definition(
                 return AgentToolResult(content=[TextContent(text="(empty directory)")], details=None)
 
             raw_output = "\n".join(results)
-            truncation = truncate_head(raw_output, TruncationOptions(maxLines=2**31 - 1))
+            truncation = truncateHead(raw_output, TruncationOptions(maxLines=2**31 - 1))
             output = truncation.content
             details = LsToolDetails()
             notices: list[str] = []
@@ -199,7 +159,7 @@ def create_ls_tool_definition(
                 notices.append(f"{effective_limit} entries limit reached. Use limit={effective_limit * 2} for more")
                 details.entryLimitReached = effective_limit
             if truncation.truncated:
-                notices.append(f"{format_size(DEFAULT_MAX_BYTES)} limit reached")
+                notices.append(f"{formatSize(DEFAULT_MAX_BYTES)} limit reached")
                 details.truncation = truncation
             if notices:
                 output += f"\n\n[{'. '.join(notices)}]"
@@ -220,16 +180,6 @@ def create_ls_tool_definition(
                 raise RuntimeError("Operation aborted")
             return await worker_task
 
-    def render_call(args: Mapping[str, Any] | None, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        text.setText(_format_ls_call(args, theme_obj, context.cwd))
-        return text
-
-    def render_result(result: Any, options_obj: Any, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        text.setText(_format_ls_result(result, options_obj, theme_obj, bool(context.showImages)))
-        return text
-
     return ToolDefinition(
         name="ls",
         label="ls",
@@ -237,20 +187,17 @@ def create_ls_tool_definition(
             "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. "
             "Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first)."
         ),
-        promptSnippet="List directory contents",
+        promptSnippet=lsToolSystemPromptContribution["snippet"],
         parameters=LsToolInput,
         execute=execute,
-        renderCall=render_call,
-        renderResult=render_result,
+        **lsRenderers,
     )
 
 
-def create_ls_tool(cwd: str, options: LsToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
-    return wrap_tool_definition(create_ls_tool_definition(cwd, options))
+def createLsTool(cwd: str, options: LsToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
+    return wrapToolDefinition(createLsToolDefinition(cwd, options))
 
 
-createLsTool = create_ls_tool
-createLsToolDefinition = create_ls_tool_definition
 
 __all__ = [
     "LsOperations",
@@ -259,4 +206,5 @@ __all__ = [
     "LsToolOptions",
     "createLsTool",
     "createLsToolDefinition",
+    "lsToolSystemPromptContribution",
 ]

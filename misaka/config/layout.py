@@ -34,7 +34,8 @@ define, it shares with every other role.
     last_order/        Last Order, the coordinator
       SOUL.md          her voice -- OPTIONAL; shared duties and role charter are kept
       settings.json    what she holds of her own: "defaultProvider"/"defaultModel" (the model
-                       she starts on; /model Ctrl+S writes it), "mcpServers", "web"
+                       she starts on; /model Ctrl+S writes it), "web"
+      mcp.json         MCP servers only she connects, on top of the home's mcp.json
       skills/          skills only she sees
       subagents/       sub-agent types only she sees
     sisters/<id>/      one per Sister, same layout (`misaka create <id>` builds it)
@@ -46,9 +47,9 @@ In the home, shared by every role:
     ../skills/         skills every role sees
     ../subagents/      sub-agent types every role sees
 
-An MCP server entry has the shape Hermes uses:
+An mcp.json has the shape other MCP clients use:
 
-    "mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}
+    {"mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}}
 
 Skills resolve project -> role -> shared -> external, first match winning. The project
 layer is a `skills/` folder in whatever directory MISAKA runs in.

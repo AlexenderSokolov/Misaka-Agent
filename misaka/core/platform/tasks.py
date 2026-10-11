@@ -1243,7 +1243,7 @@ _FAILURE_KINDS = (
     # Quota means an exhausted allowance, not a rate limit that mentions one: Gemini's 429
     # reads "Resource has been exhausted (e.g. check quota)" and must stay retryable. The last
     # line holds the words pi's own retry refuses to retry (ai/utils/retry.py
-    # NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN, casefolded; a test keeps the two in step --
+    # _NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN, casefolded; a test keeps the two in step --
     # importing it here would load the provider layer into every board process). Permission is
     # only the providers' error codes: a filesystem "Permission denied" is not a credential.
     ("auth_or_quota", re.compile(
@@ -1253,14 +1253,16 @@ _FAILURE_KINDS = (
         r"|(?:error code|status(?: code)?)[: ]+40[13]\b|\(40[13]\)"
         r"|exceeded your (?:current )?quota|payment required|credit balance|insufficient[ _-]?credit"
         r"|gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance"
-        r"|insufficient[ _-]?quota|out of budget|quota exceeded|billing|token_cap reached")),
+        r"|insufficient[ _-]?quota|out of budget|quota exceeded|billing|token_cap reached"
+        r"|subscription_sharing_usage_limit_exceeded")),
     ("rate_limit", re.compile(r"rate[ _-]?limit|too many requests|\b429\b")),
     ("context_overflow", re.compile(
         r"context[ _-]?(?:length|window)|maximum context|too many tokens|prompt is too long"
         r"|input is too long|exceeds? the (?:context|token)")),
     ("timeout", re.compile(r"time(?:d[ -]?| )?out|deadline exceeded")),
     ("server_error", re.compile(
-        r"overloaded|internal server error|service unavailable|bad gateway|\b(?:500|502|503|529)\b")),
+        r"overloaded|server_busy|servers are currently busy|model is at capacity"
+        r"|internal server error|service unavailable|bad gateway|\b(?:500|502|503|529)\b")),
     ("protocol_violation", re.compile(r"without settling|unparsable|bad schema")),
     ("crash", re.compile(r"reclaim|crash|supervisor|exited with code|killed by signal|segfault")),
 )

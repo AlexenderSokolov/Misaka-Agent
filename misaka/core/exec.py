@@ -70,7 +70,7 @@ def _normalize_exit_code(code: int | None, *, killed: bool, failed: bool) -> int
     return code
 
 
-async def exec_command(
+async def execCommand(
     command: str,
     args: list[str],
     cwd: str,

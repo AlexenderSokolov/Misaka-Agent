@@ -1,4 +1,4 @@
-"""User-message renderer for interactive chat transcripts."""
+"""Translated from pi's ``modes/interactive/components/user-message.ts`` (v1.1.0)."""
 
 from __future__ import annotations
 
@@ -6,28 +6,39 @@ from collections.abc import Sequence
 from dataclasses import replace
 
 from misaka.core.extensions.types import MarkdownTransformer
-from misaka.ui.tui import Box, Container, DefaultTextStyle, Markdown, MarkdownTheme
-from misaka.ui.tui.interactive.components.markdown_transform import (
-    create_markdown_transform,
+from misaka.ui.tui import (
+    Container,
+    DefaultTextStyle,
+    Markdown,
+    MarkdownOptions,
+    MarkdownTheme,
 )
-from misaka.ui.tui.interactive.theme.theme import get_markdown_theme, theme
+from misaka.ui.tui.interactive.theme.theme import getMarkdownTheme, theme
 
-
-def _bubble_markdown_theme(base: MarkdownTheme) -> MarkdownTheme:
-    """The user-message bubble is filled with the accent colour, so the markdown theme's
-    rose/accent headings, inline code and list bullets are the same colour as the background
-    and vanish into it. Render them in the bubble's own text colour instead -- bold, so they
-    still stand out from the body -- rather than putting a coloured box behind them."""
-    body = lambda content: theme.fg("userMessageText", content)
-    strong = lambda content: theme.bold(theme.fg("userMessageText", content))
-    return replace(base, heading=strong, code=strong, listBullet=body)
+from .markdown_transform import createMarkdownTransform
 
 OSC133_ZONE_START = "\x1b]133;A\x07"
 OSC133_ZONE_END = "\x1b]133;B\x07"
 OSC133_ZONE_FINAL = "\x1b]133;C\x07"
 
 
+def _bubbleMarkdownTheme(base: MarkdownTheme) -> MarkdownTheme:
+    """MISAKA fork: the user-message bubble is filled with the accent colour, so the markdown theme's rose/accent
+    headings, inline code and list bullets are the same colour as the background and vanish into it. Render them in
+    the bubble's own text colour instead -- bold, so they still stand out from the body."""
+
+    def body(content: str) -> str:
+        return theme.fg("userMessageText", content)
+
+    def strong(content: str) -> str:
+        return theme.bold(theme.fg("userMessageText", content))
+
+    return replace(base, heading=strong, code=strong, listBullet=body)
+
+
 class UserMessageComponent(Container):
+    """Component that renders a user message"""
+
     def __init__(
         self,
         text: str,
@@ -37,9 +48,9 @@ class UserMessageComponent(Container):
     ) -> None:
         super().__init__()
         self.text = text
-        self.markdownTheme = markdownTheme or get_markdown_theme()
+        self.markdownTheme = markdownTheme if markdownTheme is not None else getMarkdownTheme()
         self.outputPad = outputPad
-        self.markdownTransformers = tuple(markdownTransformers)
+        self.markdownTransformers = markdownTransformers
         self.rebuild()
 
     def setOutputPad(self, padding: int) -> None:
@@ -48,26 +59,32 @@ class UserMessageComponent(Container):
 
     def rebuild(self) -> None:
         self.clear()
-        self.contentBox = Box(self.outputPad, 1, lambda content: theme.bg("userMessageBg", content))
-        self.contentBox.addChild(
+        # The Markdown pads and colors its own background: a Box around it would keep a second full-width copy of every
+        # line, with identical output.
+        self.addChild(
             Markdown(
                 self.text,
-                0,
-                0,
-                _bubble_markdown_theme(self.markdownTheme),
-                DefaultTextStyle(color=lambda content: theme.fg("userMessageText", content)),
-                transform=create_markdown_transform("user", lambda: False, self.markdownTransformers),
+                self.outputPad,
+                1,
+                # MISAKA fork: the bubble theme (see `_bubbleMarkdownTheme`).
+                _bubbleMarkdownTheme(self.markdownTheme),
+                DefaultTextStyle(
+                    color=lambda content: theme.fg("userMessageText", content),
+                    bgColor=lambda content: theme.bg("userMessageBg", content),
+                ),
+                MarkdownOptions(
+                    preserveOrderedListMarkers=True,
+                    preserveBackslashEscapes=True,
+                    transform=createMarkdownTransform("user", False, self.markdownTransformers),
+                ),
             )
         )
-        self.addChild(self.contentBox)
 
     def render(self, width: int) -> list[str]:
-        lines = list(super().render(width))
-        if not lines:
+        lines = super().render(width)
+        if len(lines) == 0:
             return lines
+
         lines[0] = OSC133_ZONE_START + lines[0]
-        lines[-1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[-1]
+        lines[len(lines) - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[len(lines) - 1]
         return lines
-
-
-__all__ = ["UserMessageComponent"]

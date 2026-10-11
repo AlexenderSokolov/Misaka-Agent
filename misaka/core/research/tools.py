@@ -15,7 +15,7 @@ from misaka.core.extensions.types import ToolDefinition
 from misaka.core.platform import tasks as task_store
 from misaka.core.platform.prompt_guard import untrusted
 from misaka.core.research import graph, ledger, runs
-from misaka.core.tools.truncate import TruncationOptions, format_size, truncate_head
+from misaka.core.tools.truncate import TruncationOptions, formatSize, truncateHead
 
 # One tool result is one prompt turn for the smallest window in play (272k); the whole index of a
 # mature project renders to megabytes (2026-09-24: 1.85 MB, 25k lines, a Sister at 1.19M tokens).
@@ -68,11 +68,11 @@ def register(harn):
         if params.view == "workspace":
             tree = workspace_index.outline(con, workspace=workspace, run_id=run["id"], research_store=runs)
             stamp = datetime.now(UTC).isoformat(timespec="seconds")
-            truncation = truncate_head(workspace_index.render(tree),
+            truncation = truncateHead(workspace_index.render(tree),
                                        TruncationOptions(maxLines=2**31 - 1, maxBytes=WORKSPACE_VIEW_MAX_BYTES))
             text = truncation.content
             if truncation.truncated:
-                text += (f"\n\n[{format_size(WORKSPACE_VIEW_MAX_BYTES)} limit reached: {truncation.outputLines} of "
+                text += (f"\n\n[{formatSize(WORKSPACE_VIEW_MAX_BYTES)} limit reached: {truncation.outputLines} of "
                          f"{truncation.totalLines} index lines shown. Narrow the question instead of re-reading: "
                          "doc_list / doc_find for materials, find / grep under a card's folder for its outputs; "
                          "the run, issues and findings views stay small.]")

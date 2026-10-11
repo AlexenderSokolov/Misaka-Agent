@@ -564,11 +564,7 @@ class SubagentPart:
 
                 await asyncio.to_thread(_log_warning, f"Agent definition {path}: {error}")
             self._catalog_diagnostics = diagnostics
-        get_tools = getattr(self.session, "getAllTools", None)
-        tools = get_tools() if get_tools is not None else []
-        from misaka.core import mcp
-
-        available_servers = [server for tool in tools if (server := mcp.server_of(tool.name))]
+        available_servers = agent_roster.available_mcp_servers(self.session)
         from misaka.core.subagent.configuration import denied_agent_types
 
         denied_agents = denied_agent_types(self.session, cwd=cwd, include_project=trusted)

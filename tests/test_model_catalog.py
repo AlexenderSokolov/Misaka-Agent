@@ -9,9 +9,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from misaka.ai import models
-from misaka.ai.model_catalog import flatten_chat_model_catalog
-from misaka.ai.models_generated import MODEL_DATA_MANIFEST, MODELS
+from misaka.ai.compat import getModel
+from misaka.ai.model_catalog import _flattenModelCatalog
+from misaka.ai.models_generated import CLASSIFIER_MODELS, IMAGE_MODELS, MODELS
+from misaka.ai.providers.all import _modelDataManifest as MODEL_DATA_MANIFEST
+from misaka.ai.providers.all import getBuiltinModelDataGeneratedAt
 from misaka.ai.types import Model
 from misaka.core.model_resolver import defaultModelPerProvider
 
@@ -38,31 +40,39 @@ def test_the_data_is_pi_s_as_published():
         assert hashlib.sha256((DATA / name).read_bytes()).hexdigest() == digest, name
 
 
-def test_the_provider_list_is_what_the_script_writes():
+def test_the_catalog_modules_are_what_the_script_writes():
     script = _script()
-    assert (ROOT / "misaka" / "ai" / "models_generated.py").read_text(encoding="utf-8") == script.render(MODEL_DATA_MANIFEST)
+    rendered = script.render(MODEL_DATA_MANIFEST)
+    for path, text in rendered.items():
+        assert path.read_text(encoding="utf-8") == text, path.name
+    assert set(script.generated_modules()) == set(rendered) - {script.TARGET}
 
 
-def test_every_chat_model_is_loaded_exactly_as_pi_ships_it():
+@pytest.mark.parametrize(("table", "type"), [(MODELS, "chat"), (IMAGE_MODELS, "image"), (CLASSIFIER_MODELS, "classifier")])
+def test_every_model_of_every_type_is_loaded_exactly_as_pi_ships_it(table, type):
+    # Every provider is listed for every type, as pi's tables are (typesafe has no chat model).
     for path in _provider_files():
-        chat = flatten_chat_model_catalog(path.stem, json.loads(path.read_text(encoding="utf-8")))
-        if not chat:
-            assert path.stem not in MODELS  # classifier-only providers (pi 0.99 "typesafe") stay out
-            continue
-        assert list(MODELS[path.stem]) == list(chat), path.stem  # pi's file order
-        for model_id, raw in chat.items():
-            assert MODELS[path.stem][model_id].model_dump(mode="json", exclude_none=True) == raw
+        raw_models = _flattenModelCatalog(json.loads(path.read_text(encoding="utf-8")), type)
+        assert list(table[path.stem]) == list(raw_models), path.stem  # pi's file order
+        for model_id, raw in raw_models.items():
+            assert table[path.stem][model_id].model_dump(mode="json", exclude_none=True) == raw
+
+
+def test_an_id_that_is_both_a_chat_and_an_image_model_stays_two_models():
+    assert "google/gemini-3-pro-image" in MODELS["openrouter"]
+    assert "google/gemini-3-pro-image" in IMAGE_MODELS["openrouter"]
+    assert MODELS["typesafe"] == {} and list(CLASSIFIER_MODELS["typesafe"]) == ["jev-latest"]
 
 
 def test_every_default_model_is_in_the_catalog():
     """pi drops models between releases; a default that went with them fails every sign-in."""
     missing = {provider: model_id for provider, model_id in defaultModelPerProvider.items()
-               if models.get_model(provider, model_id) is None}
+               if getModel(provider, model_id) is None}
     assert missing == {}
 
 
 def test_the_generation_stamp_comes_from_the_manifest():
-    assert models.get_builtin_model_data_generated_at() is not None
+    assert getBuiltinModelDataGeneratedAt() is not None
 
 
 def test_a_model_s_type_is_chat_or_unset():

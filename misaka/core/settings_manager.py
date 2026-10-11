@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import os
+import sys
 import time
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -22,19 +25,29 @@ from misaka.core.http_dispatcher import (
     parseHttpIdleTimeoutMs,
 )
 from misaka.utils import atomic
-from misaka.utils.paths import normalize_path, resolve_path
+from misaka.utils.js import UNDEFINED, jsString, jsTrim
+from misaka.utils.paths import normalizePath, resolvePath
 
 DEFAULT_COMPACTION_TOKEN_SETTINGS = {
     "reserveTokens": 16384,
     "keepRecentTokens": 20000,
 }
+type MermaidRenderingMode = Literal["off", "final", "streaming"]
+
 # Cache-warming profile. "idle" also warms between agent runs.
 CACHE_WARMING_MODES = ("off", "streaming", "idle")
+type CacheWarmingMode = Literal["off", "streaming", "idle"]
 _MAX_SAFE_INTEGER = 2**53 - 1
 
 
 def _is_non_negative_safe_integer(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_SAFE_INTEGER
+    """`typeof value === "number" && Number.isSafeInteger(value) && value >= 0`: an integral float such as 4096.0
+    is a safe integer too."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
+        return False
+    return 0 <= value <= _MAX_SAFE_INTEGER
 
 type CompactionSettings = dict[str, Any]
 type BranchSummarySettings = dict[str, Any]
@@ -50,16 +63,33 @@ type SettingsScope = Literal["global", "role", "project"]
 # The keys a role may hold a value of its own for. A role session that sets one of these writes
 # its own scope; every other key is the user's, shared by every role, and stays global. This
 # table is what keeps Last Order's and a Sister's configuration apart -- not per-key special cases.
-ROLE_KEYS = frozenset({"defaultProvider", "defaultModel", "defaultThinkingLevel", "mcpServers", "web"})
+ROLE_KEYS = frozenset({"defaultProvider", "defaultModel", "defaultThinkingLevel", "web"})
 type TransportSetting = Transport
+# How the codemode tool presents tools while it is active.
+# - `on`: declared tools that scripts can call get a note on calling them from scripts appended to
+#   their description; the codemode description lists only the tools without `direct` exposure.
+# - `only`: the codemode description lists every tool scripts can call, and active `direct` tools are
+#   not declared to the model.
+type CodemodeMode = Literal["on", "only"]
+
+
+class CodemodeSettings(TypedDict, total=False):
+    # Default: `on`.
+    mode: CodemodeMode
+    # Estimated tokens (characters / 4) the codemode description may spend on tool declarations. Default: 3000.
+    inlineBudget: float
+
+
 type DefaultProjectTrust = Literal["ask", "always", "never"]
+# true hides all startup output, "header" keeps only the startup header.
+type QuietStartup = bool | Literal["header"]
 
 
 class SettingsManagerOptions(TypedDict, total=False):
     projectTrusted: bool
 
 
-def _deep_merge_objects(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+def deepMergeObjects(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     """Overrides take precedence, nested objects merge recursively.
     (pi 97f0ccd #7572: previously everything below the first level was replaced wholesale,
     dropping sibling keys from base.)"""
@@ -67,7 +97,7 @@ def _deep_merge_objects(base: dict[str, Any], overrides: dict[str, Any]) -> dict
     for key, override_value in overrides.items():
         base_value = base.get(key)
         result[key] = (
-            _deep_merge_objects(base_value, override_value)
+            deepMergeObjects(base_value, override_value)
             if isinstance(base_value, dict) and isinstance(override_value, dict)
             else override_value
         )
@@ -79,42 +109,78 @@ def _deep_merge_objects(base: dict[str, Any], overrides: dict[str, Any]) -> dict
 DEFAULT_TOOL_NAMES: tuple[str, ...] = ("read", "bash", "edit", "write", "office", "grep", "find", "ls")
 
 
-def _is_tool_modifier(entry: Any) -> bool:
+def isToolModifier(entry: Any) -> bool:
+    """Whether a tool selection entry is a `+name` or `-name` modifier."""
     return isinstance(entry, str) and entry.startswith(("+", "-"))
 
 
-def _merge_default_tools(base: Any, overrides: Any) -> Any:
+def getToolListError(entries: Sequence[str]) -> str | None:
+    """Validate a tool list from `--tools` or the SDK `tools` option. It is either an allowlist of plain
+    names and patterns or a list of only `+name`/`-name` entries with exact names. Returns the
+    problem, or None when the list is valid."""
+    modifiers = [entry for entry in entries if isToolModifier(entry)]
+    if len(modifiers) == 0:
+        return None
+    if len(modifiers) < len(entries):
+        return "tool names cannot be mixed with +name or -name entries"
+    pattern = next((entry for entry in modifiers if "*" in entry), None)
+    if pattern:
+        return f"+name and -name entries take exact tool names, not patterns: {pattern}"
+    return None
+
+
+def applyToolModifiers(base: Sequence[str], entries: Sequence[str]) -> list[str]:
+    """Apply the `+name` and `-name` entries of `entries` to `base` in order: `+name` adds a tool and
+    `-name` removes one. Other entries are ignored."""
+    tools = [*base]
+    for entry in entries:
+        if not isToolModifier(entry):
+            continue
+        name = entry[1:]
+        index = tools.index(name) if name in tools else -1
+        if entry.startswith("+") and index == -1 and name:
+            tools.append(name)
+        elif entry.startswith("-") and index != -1:
+            del tools[index]
+    return tools
+
+
+def mergeDefaultTools(base: Any, overrides: Any) -> Any:
     """Merge `defaultTools` of two settings layers. A list with plain tool names replaces the inherited
     one; a list of only `+name`/`-name` entries is appended, so it modifies the inherited selection."""
     if overrides is None:
         return base
     # Settings files are not validated; a malformed value replaces instead of throwing here.
-    if not isinstance(base, list) or not isinstance(overrides, list) or not all(map(_is_tool_modifier, overrides)):
+    if not isinstance(base, list) or not isinstance(overrides, list) or not all(map(isToolModifier, overrides)):
         return overrides
     return [*base, *overrides]
 
 
-def _resolve_default_tools(entries: list[str]) -> list[str]:
+def resolveDefaultTools(entries: list[str]) -> list[str]:
     """Resolve a merged `defaultTools` list: plain names replace `DEFAULT_TOOL_NAMES`, then `+name` adds
     and `-name` removes a tool, in list order."""
-    plain = [entry for entry in entries if not _is_tool_modifier(entry)]
-    tools = plain if plain or not entries else list(DEFAULT_TOOL_NAMES)
-    for entry in entries:
-        if not _is_tool_modifier(entry):
-            continue
-        name = entry[1:]
-        if entry.startswith("+") and name not in tools and name:
-            tools.append(name)
-        elif entry.startswith("-") and name in tools:
-            tools.remove(name)
-    return tools
+    plain = [entry for entry in entries if not isToolModifier(entry)]
+    return applyToolModifiers(plain if len(plain) > 0 or len(entries) == 0 else DEFAULT_TOOL_NAMES, entries)
 
 
-def deep_merge_settings(base: Settings, overrides: Settings) -> Settings:
+def deepMergeSettings(base: Settings, overrides: Settings) -> Settings:
     """Deep merge settings: project/overrides take precedence, nested objects merge recursively."""
-    merged = _deep_merge_objects(base, overrides)
-    default_tools = _merge_default_tools(base.get("defaultTools"), overrides.get("defaultTools"))
+    merged = deepMergeObjects(base, overrides)
+    default_tools = mergeDefaultTools(base.get("defaultTools"), overrides.get("defaultTools"))
     return merged if default_tools is None else {**merged, "defaultTools": default_tools}
+
+
+# An absent setting; JSON's null is a value, and an invalid one.
+_UNDEFINED = object()
+
+
+def parseTimeoutSetting(value: Any, settingName: str) -> int | None:
+    timeoutMs = parseHttpIdleTimeoutMs(None if value is _UNDEFINED else value)
+    if timeoutMs is not None:
+        return timeoutMs
+    if value is not _UNDEFINED:
+        raise ValueError(f"Invalid {settingName} setting: {value}")
+    return None
 
 
 @dataclass(slots=True)
@@ -124,7 +190,7 @@ class SettingsError:
     path: str | None = None
 
 
-def _to_settings_error(
+def toSettingsError(
     scope: SettingsScope,
     error: Exception | BaseException,
     path: str | None = None,
@@ -165,8 +231,8 @@ class SettingsStorage:
 
 class FileSettingsStorage(SettingsStorage):
     def __init__(self, cwd: str, agent_dir: str):
-        resolved_cwd = resolve_path(cwd)
-        resolved_agent_dir = resolve_path(agent_dir)
+        resolved_cwd = resolvePath(cwd)
+        resolved_agent_dir = resolvePath(agent_dir)
         self.globalSettingsPath = str(Path(resolved_agent_dir) / "settings.json")
         # None when ``cwd`` has no project scope of its own: its config directory is the home.
         project_dir = home.project_dir(resolved_cwd)
@@ -270,13 +336,13 @@ class SettingsManager:
         self.writeQueue: asyncio.Future[None] | None = None
         # A role's own settings live in its directory (``ROLE_KEYS``); credentials and every
         # other setting keep their scopes. The role is bound explicitly, never read from env.
-        self._modelProfileRegistry: Any = None
+        self._modelProfileRuntime: Any = None
         self._modelDefaultsReadOnly = False
 
     def _merged(self) -> Settings:
         """global <- project <- role: the role is the most specific owner of what it holds."""
-        merged = deep_merge_settings(self.globalSettings, self.projectSettings)
-        return deep_merge_settings(merged, self.roleSettings) if self.roleSettings else merged
+        merged = deepMergeSettings(self.globalSettings, self.projectSettings)
+        return deepMergeSettings(merged, self.roleSettings) if self.roleSettings else merged
 
     @classmethod
     def create(
@@ -326,13 +392,13 @@ class SettingsManager:
         initial_errors: list[SettingsError] = []
         if global_load["error"] is not None:
             initial_errors.append(
-                _to_settings_error(
+                toSettingsError(
                     "global", global_load["error"], settings_paths.get("global")
                 )
             )
         if project_load["error"] is not None:
             initial_errors.append(
-                _to_settings_error(
+                toSettingsError(
                     "project", project_load["error"], settings_paths.get("project")
                 )
             )
@@ -463,7 +529,7 @@ class SettingsManager:
         self.settings = self._merged()
 
     def applyOverrides(self, overrides: Settings) -> None:
-        self.settings = deep_merge_settings(self.settings, overrides)
+        self.settings = deepMergeSettings(self.settings, overrides)
 
     def markModified(self, field: str, nestedKey: str | None = None) -> None:
         self.modifiedFields.add(field)
@@ -477,7 +543,7 @@ class SettingsManager:
 
     def recordError(self, scope: SettingsScope, error: Exception | BaseException) -> None:
         self.errors.append(
-            _to_settings_error(scope, error, self.settingsPaths.get(scope))
+            toSettingsError(scope, error, self.settingsPaths.get(scope))
         )
 
     def clearModifiedScope(self, scope: SettingsScope) -> None:
@@ -490,7 +556,7 @@ class SettingsManager:
         self.modifiedProjectNestedFields.clear()
 
     @staticmethod
-    def _clone_modified_nested_fields(source: dict[str, set[str]]) -> dict[str, set[str]]:
+    def cloneModifiedNestedFields(source: dict[str, set[str]]) -> dict[str, set[str]]:
         return {key: set(value) for key, value in source.items()}
 
     def _persistScopedSettings(
@@ -560,7 +626,7 @@ class SettingsManager:
 
         snapshot_global_settings = copy.deepcopy(self.globalSettings)
         modified_fields = set(self.modifiedFields)
-        modified_nested_fields = self._clone_modified_nested_fields(self.modifiedNestedFields)
+        modified_nested_fields = self.cloneModifiedNestedFields(self.modifiedNestedFields)
         self.enqueueWrite(
             "global",
             lambda: self._persistScopedSettings("global", snapshot_global_settings, modified_fields, modified_nested_fields),
@@ -575,7 +641,7 @@ class SettingsManager:
 
         snapshot_project_settings = copy.deepcopy(self.projectSettings)
         modified_fields = set(self.modifiedProjectFields)
-        modified_nested_fields = self._clone_modified_nested_fields(self.modifiedProjectNestedFields)
+        modified_nested_fields = self.cloneModifiedNestedFields(self.modifiedProjectNestedFields)
         self.enqueueWrite(
             "project",
             lambda: self._persistScopedSettings("project", snapshot_project_settings, modified_fields, modified_nested_fields),
@@ -749,7 +815,7 @@ class SettingsManager:
 
     def getSessionDir(self) -> str | None:
         session_dir = self.settings.get("sessionDir")
-        return normalize_path(session_dir) if session_dir else session_dir
+        return normalizePath(session_dir) if session_dir else session_dir
 
     def bindRole(self, profile_dir: str | None) -> None:
         """Serve ``profile_dir`` as this session's role: its settings.json is read now and is
@@ -762,9 +828,9 @@ class SettingsManager:
         self._load_role()
         self.settings = self._merged()
 
-    def bindModelProfile(self, profile_dir: str, model_registry: Any) -> None:
+    def bindModelProfile(self, profile_dir: str, model_runtime: Any) -> None:
         self.bindRole(profile_dir)
-        self._modelProfileRegistry = model_registry
+        self._modelProfileRuntime = model_runtime
 
     def getModelProfile(self) -> str | None:
         return self._role_dir()
@@ -786,11 +852,11 @@ class SettingsManager:
             return None
         if not (isinstance(provider, str) and provider and isinstance(model, str) and model):
             raise ValueError(f"{self.settingsPaths.get('role')}: defaultProvider and defaultModel go together")
-        if self._modelProfileRegistry is not None:
+        if self._modelProfileRuntime is not None:
             from misaka.config import profiles
 
             provider, model = profiles.resolve_model_reference(
-                f"{provider}/{model}", self._modelProfileRegistry).split("/", 1)
+                f"{provider}/{model}", self._modelProfileRuntime).split("/", 1)
         return provider, model
 
     def hasPinnedModelDefault(self) -> bool:
@@ -800,7 +866,7 @@ class SettingsManager:
         pin = self._role_pin()
         if pin is not None:
             return pin
-        merged = deep_merge_settings(self.globalSettings, self.projectSettings)
+        merged = deepMergeSettings(self.globalSettings, self.projectSettings)
         return merged.get("defaultProvider"), merged.get("defaultModel")
 
     def getDefaultProvider(self) -> str | None:
@@ -821,11 +887,11 @@ class SettingsManager:
         if self.roleSettings is not None:
             if not provider or not modelId:
                 raise ValueError("Both provider and model are required")
-            if self._modelProfileRegistry is not None:
+            if self._modelProfileRuntime is not None:
                 from misaka.config import profiles
 
                 provider, modelId = profiles.resolve_model_reference(
-                    f"{provider}/{modelId}", self._modelProfileRegistry).split("/", 1)
+                    f"{provider}/{modelId}", self._modelProfileRuntime).split("/", 1)
 
             def apply(data: dict[str, Any]) -> None:
                 data["defaultProvider"], data["defaultModel"] = provider, modelId
@@ -855,12 +921,19 @@ class SettingsManager:
         tools = self.settings.get("defaultTools")
         if tools is None:
             return None
-        return _resolve_default_tools(
+        return resolveDefaultTools(
             [tool for tool in tools if isinstance(tool, str)] if isinstance(tools, list) else []
         )
 
+    def getThemeSetting(self) -> str | None:
+        value = self.settings.get("theme")
+        if isinstance(value, str):
+            return value
+        return None
+
     def getTheme(self) -> str | None:
-        return self.settings.get("theme")
+        theme = self.getThemeSetting()
+        return None if theme is not None and "/" in theme else theme
 
     def setTheme(self, theme: str) -> None:
         self._set_global_value("theme", theme)
@@ -889,6 +962,18 @@ class SettingsManager:
 
     def setDefaultProjectTrust(self, defaultProjectTrust: DefaultProjectTrust) -> None:
         self._set_global_value("defaultProjectTrust", defaultProjectTrust)
+
+    def getOrCreateDeviceId(self) -> str:
+        """Stable ID of this installation, e.g. sent to OpenAI as its agent host ID.
+
+        Created on first use. Project settings are ignored so a committed project settings
+        file cannot give every clone the same ID.
+        """
+        if not self.globalSettings.get("deviceId"):
+            self.globalSettings["deviceId"] = str(uuid.uuid4())
+            self.markModified("deviceId")
+            self.save()
+        return self.globalSettings["deviceId"]
 
     def getModelThinkingLevel(self, provider: str, modelId: str) -> ModelThinkingLevel | None:
         levels = self.settings.get("modelThinkingLevels")
@@ -934,31 +1019,32 @@ class SettingsManager:
 
     def getCompactionTokenSetting(self, field: str, model: Model | None = None) -> int:
         compaction = self._settings_object("compaction")
-        ordinary = compaction.get(field)
-        if ordinary is not None and not _is_non_negative_safe_integer(ordinary):
+        # A JSON null is a value here, as it is to pi (`!== undefined`): only an absent field is unset.
+        ordinary = compaction.get(field, UNDEFINED)
+        if ordinary is not UNDEFINED and not _is_non_negative_safe_integer(ordinary):
             raise ValueError(
-                f"Invalid compaction.{field} setting: {ordinary}. Expected a non-negative safe integer."
+                f"Invalid compaction.{field} setting: {jsString(ordinary)}. Expected a non-negative safe integer."
             )
         model_key = f"{model.provider}/{model.id}" if model is not None else None
         model_overrides = compaction.get("modelOverrides")
         entry = (
-            model_overrides.get(model_key)
+            model_overrides.get(model_key, UNDEFINED)
             if model_key is not None and isinstance(model_overrides, dict)
-            else None
+            else UNDEFINED
         )
-        if entry is not None and not isinstance(entry, dict):
+        if entry is not UNDEFINED and not isinstance(entry, dict):
             raise ValueError(
-                f'Invalid compaction.modelOverrides["{model_key}"] setting: {entry}. Expected an object.'
+                f'Invalid compaction.modelOverrides["{model_key}"] setting: {jsString(entry)}. Expected an object.'
             )
-        override = entry.get(field) if entry is not None else None
-        if override is not None and not _is_non_negative_safe_integer(override):
+        override = entry.get(field, UNDEFINED) if isinstance(entry, dict) else UNDEFINED
+        if override is not UNDEFINED and not _is_non_negative_safe_integer(override):
             raise ValueError(
-                f'Invalid compaction.modelOverrides["{model_key}"].{field} setting: {override}. '
+                f'Invalid compaction.modelOverrides["{model_key}"].{field} setting: {jsString(override)}. '
                 "Expected a non-negative safe integer."
             )
-        if override is not None:
+        if override is not UNDEFINED:
             return override
-        if ordinary is not None:
+        if ordinary is not UNDEFINED:
             return ordinary
         return DEFAULT_COMPACTION_TOKEN_SETTINGS[field]
 
@@ -1005,13 +1091,8 @@ class SettingsManager:
         }
 
     def getHttpIdleTimeoutMs(self) -> int:
-        if "httpIdleTimeoutMs" not in self.settings:
-            return DEFAULT_HTTP_IDLE_TIMEOUT_MS
-        value = self.settings["httpIdleTimeoutMs"]
-        timeout_ms = parseHttpIdleTimeoutMs(value)
-        if timeout_ms is None:
-            raise ValueError(f"Invalid httpIdleTimeoutMs setting: {value}")
-        return timeout_ms
+        timeout_ms = parseTimeoutSetting(self.settings.get("httpIdleTimeoutMs", _UNDEFINED), "httpIdleTimeoutMs")
+        return DEFAULT_HTTP_IDLE_TIMEOUT_MS if timeout_ms is None else timeout_ms
 
     def setHttpIdleTimeoutMs(self, timeoutMs: float) -> None:
         if isinstance(timeoutMs, bool) or not isinstance(timeoutMs, int | float):
@@ -1021,12 +1102,12 @@ class SettingsManager:
             raise ValueError(f"Invalid httpIdleTimeoutMs setting: {timeoutMs}")
         self._set_global_value("httpIdleTimeoutMs", timeout_ms)
 
-    def getCacheWarmingMode(self) -> str:
+    def getCacheWarmingMode(self) -> CacheWarmingMode:
         """Read from global settings only because warming costs money."""
         mode = self.globalSettings.get("cacheWarming")
         return mode if mode is not None and mode in CACHE_WARMING_MODES else "streaming"
 
-    def setCacheWarmingMode(self, mode: str) -> None:
+    def setCacheWarmingMode(self, mode: CacheWarmingMode) -> None:
         self._set_global_value("cacheWarming", mode)
 
     def getProviderRetrySettings(self) -> dict[str, Any]:
@@ -1038,11 +1119,29 @@ class SettingsManager:
             "maxRetryDelayMs": self._nullish(provider_settings.get("maxRetryDelayMs"), 60000),
         }
 
+    def getWebSocketConnectTimeoutMs(self) -> int | None:
+        return parseTimeoutSetting(self.settings.get("websocketConnectTimeoutMs", _UNDEFINED), "websocketConnectTimeoutMs")
+
     def getHideThinkingBlock(self) -> bool:
         return self._nullish(self.settings.get("hideThinkingBlock"), False)
 
+    def getShowCacheMissNotices(self) -> bool:
+        return self._nullish(self.settings.get("showCacheMissNotices"), False)
+
+    def getExternalEditorCommand(self) -> str:
+        configuredEditor = self.settings.get("externalEditor")
+        if isinstance(configuredEditor, str) and jsTrim(configuredEditor) != "":
+            return configuredEditor
+        environmentEditor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if environmentEditor:
+            return environmentEditor
+        return "notepad" if sys.platform == "win32" else "nano"
+
     def setHideThinkingBlock(self, hide: bool) -> None:
         self._set_global_value("hideThinkingBlock", hide)
+
+    def setShowCacheMissNotices(self, show: bool) -> None:
+        self._set_global_value("showCacheMissNotices", show)
 
     def getShellPath(self) -> str | None:
         return self.settings.get("shellPath")
@@ -1050,10 +1149,11 @@ class SettingsManager:
     def setShellPath(self, path: str | None) -> None:
         self._set_global_value("shellPath", path)
 
-    def getQuietStartup(self) -> bool:
-        return self._nullish(self.settings.get("quietStartup"), False)
+    def getQuietStartup(self) -> QuietStartup:
+        value = self.settings.get("quietStartup")
+        return value if value is True or value == "header" else False
 
-    def setQuietStartup(self, quiet: bool) -> None:
+    def setQuietStartup(self, quiet: QuietStartup) -> None:
         self._set_global_value("quietStartup", quiet)
 
     def getEnableInstallTelemetry(self) -> bool:
@@ -1246,6 +1346,16 @@ class SettingsManager:
     def getCodeBlockIndent(self) -> str:
         return self._nullish(self._settings_object("markdown").get("codeBlockIndent"), "  ")
 
+    def getMermaidRenderingMode(self) -> MermaidRenderingMode:
+        mode = self._settings_object("markdown").get("mermaid")
+        return mode if mode == "off" or mode == "final" else "streaming"
+
+    def setMermaidRenderingMode(self, mode: MermaidRenderingMode) -> None:
+        markdown = self._ensure_global_nested("markdown")
+        markdown["mermaid"] = mode
+        self.markModified("markdown", "mermaid")
+        self.save()
+
     def getWarnings(self) -> dict[str, Any]:
         return dict(self._settings_object("warnings"))
 
@@ -1253,7 +1363,10 @@ class SettingsManager:
         self._set_global_value("warnings", {**warnings})
 
 __all__ = [
+    "DEFAULT_TOOL_NAMES",
     "BranchSummarySettings",
+    "CodemodeMode",
+    "CodemodeSettings",
     "CompactionSettings",
     "DefaultProjectTrust",
     "FileSettingsStorage",
@@ -1261,6 +1374,7 @@ __all__ = [
     "InMemorySettingsStorage",
     "MarkdownSettings",
     "ProviderRetrySettings",
+    "QuietStartup",
     "RetrySettings",
     "Settings",
     "SettingsError",
@@ -1272,4 +1386,7 @@ __all__ = [
     "ThinkingBudgetsSettings",
     "TransportSetting",
     "WarningSettings",
+    "applyToolModifiers",
+    "getToolListError",
+    "isToolModifier",
 ]

@@ -8,9 +8,9 @@ import sys
 from dataclasses import dataclass
 
 from misaka.ai.types import ImageContent
-from misaka.core.tools.path_utils import resolve_read_path
-from misaka.utils.image_process import ProcessImageOptions, process_image
-from misaka.utils.mime import detect_supported_image_mime_type_from_file
+from misaka.core.tools.path_utils import resolveReadPath
+from misaka.utils.image_process import ProcessImageOptions, processImage
+from misaka.utils.mime import detectSupportedImageMimeTypeFromFile
 
 
 @dataclass(slots=True)
@@ -24,14 +24,14 @@ class ProcessFileOptions:
     autoResizeImages: bool | None = None
 
 
-async def process_file_arguments(
+async def processFileArguments(
     file_args: list[str],
     options: ProcessFileOptions | None = None,
 ) -> ProcessedFiles:
-    return await _process_file_arguments(file_args, options=options)
+    return await _processFileArguments(file_args, options=options)
 
 
-async def _process_file_arguments(
+async def _processFileArguments(
     file_args: list[str],
     options: ProcessFileOptions | None = None,
     *,
@@ -43,7 +43,7 @@ async def _process_file_arguments(
     images: list[ImageContent] = []
 
     for file_arg in file_args:
-        absolute_path = os.path.abspath(resolve_read_path(file_arg, resolved_cwd))
+        absolute_path = os.path.abspath(resolveReadPath(file_arg, resolved_cwd))
         if not os.path.exists(absolute_path):
             sys.stderr.write(f"Error: File not found: {absolute_path}\n")
             raise SystemExit(1)
@@ -52,10 +52,10 @@ async def _process_file_arguments(
         if stats.st_size == 0:
             continue
 
-        mime_type = await detect_supported_image_mime_type_from_file(absolute_path)
+        mime_type = await detectSupportedImageMimeTypeFromFile(absolute_path)
         if mime_type:
             content = await asyncio.to_thread(_read_bytes, absolute_path)
-            processed = await process_image(
+            processed = await processImage(
                 content,
                 mime_type,
                 ProcessImageOptions(autoResizeImages=auto_resize_images),
@@ -98,4 +98,4 @@ def _read_text(path: str) -> str:
         return handle.read()
 
 
-__all__ = ["ProcessFileOptions", "ProcessedFiles", "process_file_arguments"]
+__all__ = ["ProcessFileOptions", "ProcessedFiles", "processFileArguments"]

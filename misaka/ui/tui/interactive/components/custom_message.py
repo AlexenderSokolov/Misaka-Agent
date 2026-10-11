@@ -1,34 +1,56 @@
-"""Renderer for extension-defined custom messages."""
+"""Translated from pi's ``modes/interactive/components/custom-message.ts`` (v1.1.0).
+
+MISAKA fork: the message is read with ``read_field``. A custom message reaches the default renderer in either shape:
+the ``CustomMessage`` the type promises, or the plain dict an extension handed to ``sendMessage`` (see
+``misaka/core/network/messages.py``'s agent-messages payload).
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from misaka.core.extensions.types import MessageRenderer
 from misaka.core.messages import CustomMessage
-from misaka.ui.tui import Box, Container, DefaultTextStyle, Markdown, Spacer, Text
-from misaka.ui.tui.interactive.theme.theme import get_markdown_theme, theme
+from misaka.ui.tui import (
+    Box,
+    Component,
+    Container,
+    DefaultTextStyle,
+    Markdown,
+    MarkdownTheme,
+    Spacer,
+    Text,
+)
+from misaka.ui.tui.interactive.theme.theme import getMarkdownTheme, theme
 from misaka.utils.values import read_field
 
 
 class CustomMessageComponent(Container):
+    """Component that renders a custom message entry from extensions.
+    Uses distinct styling to differentiate from user messages.
+    """
+
     def __init__(
         self,
         message: CustomMessage[object] | Mapping[str, Any],
         customRenderer: MessageRenderer[Any] | None = None,
-        markdownTheme=None,
+        markdownTheme: MarkdownTheme | None = None,
         outputPad: int = 1,
     ) -> None:
         super().__init__()
+        self.customComponent: Component | None = None
+        self._expanded = False
         self.message = message
         self.customRenderer = customRenderer
-        self.markdownTheme = get_markdown_theme() if markdownTheme is None else markdownTheme
+        self.markdownTheme = markdownTheme if markdownTheme is not None else getMarkdownTheme()
         self.outputPad = outputPad
-        self.customComponent: Any | None = None
-        self._expanded = False
+
         self.addChild(Spacer(1))
-        self.box = Box(1, 1, lambda content: theme.bg("customMessageBg", content))
+
+        # Create box with purple background (used for default rendering)
+        self.box = Box(1, 1, lambda t: theme.bg("customMessageBg", t))
+
         self.rebuild()
 
     def setExpanded(self, expanded: bool) -> None:
@@ -46,56 +68,51 @@ class CustomMessageComponent(Container):
         self.rebuild()
 
     def rebuild(self) -> None:
+        # Remove previous content component
         if self.customComponent is not None:
             self.removeChild(self.customComponent)
             self.customComponent = None
         self.removeChild(self.box)
 
+        # Try custom renderer first - it handles its own styling
         if self.customRenderer is not None:
             try:
                 component = self.customRenderer(
-                    self.message,
+                    cast("CustomMessage[Any]", self.message),
                     {"expanded": self._expanded, "outputPad": self.outputPad},
                     theme,
                 )
-            except Exception:  # noqa: BLE001 - a failing custom renderer falls back to the default
-                component = None
-            if component is not None:
-                self.customComponent = component
-                self.addChild(component)
-                return
+                if component is not None:
+                    # Custom renderer provides its own styled component
+                    self.customComponent = component
+                    self.addChild(component)
+                    return
+            except Exception:  # noqa: BLE001, S110 - fall through to default rendering
+                pass
 
+        # Default rendering uses our box
         self.addChild(self.box)
         self.box.clear()
-        # A custom message reaches the default renderer in either shape: the CustomMessage the
-        # type hint promises, or the plain dict an extension handed to ``sendMessage`` (see
-        # misaka/core/network/messages.py's agent-messages payload). Every other reader of this
-        # message -- interactive_mode's dispatch immediately above this component -- already
-        # uses read_field for exactly that reason; attribute access here raised a bare
-        # AttributeError that the pane surfaced to the user verbatim.
-        custom_type = str(read_field(self.message, "customType", ""))
-        label = theme.fg("customMessageLabel", f"\x1b[1m[{custom_type}]\x1b[22m")
+        self.box.setPaddingX(self.outputPad)
+
+        # Default rendering: label + content
+        label = theme.fg("customMessageLabel", f"\x1b[1m[{read_field(self.message, 'customType')}]\x1b[22m")
         self.box.addChild(Text(label, 0, 0))
         self.box.addChild(Spacer(1))
 
-        content = read_field(self.message, "content", "")
+        # Extract text content
+        content = read_field(self.message, "content")
         if isinstance(content, str):
             text = content
         else:
-            text = "\n".join(
-                str(read_field(block, "text", ""))
-                for block in content
-                if read_field(block, "type") == "text"
-            )
+            text = "\n".join(read_field(c, "text") for c in content if read_field(c, "type") == "text")
+
         self.box.addChild(
             Markdown(
                 text,
                 0,
                 0,
                 self.markdownTheme,
-                DefaultTextStyle(color=lambda content: theme.fg("customMessageText", content)),
+                DefaultTextStyle(color=lambda text: theme.fg("customMessageText", text)),
             )
         )
-
-
-__all__ = ["CustomMessageComponent"]

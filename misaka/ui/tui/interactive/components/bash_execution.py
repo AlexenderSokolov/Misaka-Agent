@@ -1,75 +1,77 @@
-"""Streaming bash-execution renderer for interactive mode."""
+"""Translated from pi's ``modes/interactive/components/bash-execution.ts`` (v1.1.0).
+
+Component for displaying bash command execution with streaming output.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from misaka.core.tools.truncate import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,
     TruncationOptions,
     TruncationResult,
-    truncate_tail,
+    truncateTail,
 )
 from misaka.ui.tui import Container, Loader, Spacer, Text
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.components.keybinding_hints import key_hint, key_text
-from misaka.ui.tui.interactive.components.visual_truncate import (
-    truncate_to_visual_lines,
-)
 from misaka.ui.tui.interactive.theme.theme import theme
-from misaka.utils.ansi import strip_ansi
+from misaka.utils.ansi import stripAnsi
 
+from .dynamic_border import DynamicBorder
+from .keybinding_hints import keyHint, keyText
+from .visual_truncate import truncateToVisualLines
+
+# Preview line limit when not expanded (matches tool execution behavior)
 PREVIEW_LINES = 20
 
 
-@dataclass(slots=True)
-class _CachedVisualLines:
-    renderer: Any
-    cachedWidth: int | None = None
-    cachedLines: list[str] | None = None
-
-    def invalidate(self) -> None:
-        self.cachedWidth = None
-        self.cachedLines = None
-
-    def render(self, width: int) -> list[str]:
-        if self.cachedLines is None or self.cachedWidth != width:
-            self.cachedLines = list(self.renderer(width))
-            self.cachedWidth = width
-        return self.cachedLines
-
-
 class BashExecutionComponent(Container):
-    def __init__(self, command: str, ui: Any, excludeFromContext: bool = False) -> None:
+    def __init__(self, command: str, ui: Any, excludeFromContext: bool = False, outputPad: int = 1) -> None:
         super().__init__()
-        self.command = command
         self.outputLines: list[str] = []
-        self.status: str = "running"
+        self.status: Literal["running", "complete", "cancelled", "error"] = "running"
         self.exitCode: int | None = None
         self.truncationResult: TruncationResult | None = None
         self.fullOutputPath: str | None = None
         self.expanded = False
-        self.ui = ui
-        self.colorKey = "dim" if excludeFromContext else "bashMode"
-        self.borderColor = lambda text: theme.fg(self.colorKey, text)
+        self.command = command
+        # `dim` marks `!!` commands, whose output is excluded from the model context.
+        self.colorKey: Literal["dim", "bashMode"] = "dim" if excludeFromContext else "bashMode"
+        self.outputPad = outputPad
 
+        def borderColor(str: str) -> str:
+            return theme.fg(self.colorKey, str)
+
+        # Add spacer
         self.addChild(Spacer(1))
-        self.addChild(DynamicBorder(self.borderColor))
+
+        # Top border
+        self.addChild(DynamicBorder(borderColor))
+
+        # Content container (holds dynamic content between borders)
         self.contentContainer = Container()
         self.addChild(self.contentContainer)
+
         self.loader = Loader(
             ui,
             lambda spinner: theme.fg(self.colorKey, spinner),
             lambda text: theme.fg("muted", text),
-            f"Running... ({key_text('tui.select.cancel')} to cancel)",
+            f"Running... ({keyText('tui.select.cancel')} to cancel)",  # Plain text for loader
         )
-        self.addChild(DynamicBorder(self.borderColor))
+
+        # Bottom border
+        self.addChild(DynamicBorder(borderColor))
+
         self.updateDisplay()
 
     def setExpanded(self, expanded: bool) -> None:
+        """Set whether the output is expanded (shows full output) or collapsed (preview only)."""
         self.expanded = expanded
+        self.updateDisplay()
+
+    def setOutputPad(self, outputPad: int) -> None:
+        self.outputPad = outputPad
         self.updateDisplay()
 
     def invalidate(self) -> None:
@@ -77,13 +79,19 @@ class BashExecutionComponent(Container):
         self.updateDisplay()
 
     def appendOutput(self, chunk: str) -> None:
-        clean = strip_ansi(chunk).replace("\r\n", "\n").replace("\r", "\n")
-        new_lines = clean.split("\n")
-        if self.outputLines and new_lines:
-            self.outputLines[-1] += new_lines[0]
-            self.outputLines.extend(new_lines[1:])
+        # Strip ANSI codes and normalize line endings
+        # Note: binary data is already sanitized in tui-renderer.ts executeBashCommand
+        clean = stripAnsi(chunk).replace("\r\n", "\n").replace("\r", "\n")
+
+        # Append to output lines
+        newLines = clean.split("\n")
+        if len(self.outputLines) > 0 and len(newLines) > 0:
+            # Append first chunk to last line (incomplete line continuation)
+            self.outputLines[len(self.outputLines) - 1] += newLines[0]
+            self.outputLines.extend(newLines[1:])
         else:
-            self.outputLines.extend(new_lines)
+            self.outputLines.extend(newLines)
+
         self.updateDisplay()
 
     def setComplete(
@@ -94,70 +102,106 @@ class BashExecutionComponent(Container):
         fullOutputPath: str | None = None,
     ) -> None:
         self.exitCode = exitCode
-        self.status = "cancelled" if cancelled else "error" if exitCode not in {0, None} else "complete"
+        self.status = "cancelled" if cancelled else "error" if exitCode != 0 and exitCode is not None else "complete"
         self.truncationResult = truncationResult
         self.fullOutputPath = fullOutputPath
+
+        # Stop loader
         self.loader.stop()
+
         self.updateDisplay()
 
+    def updateDisplay(self) -> None:
+        # Apply truncation for LLM context limits (same limits as bash tool)
+        fullOutput = "\n".join(self.outputLines)
+        contextTruncation = truncateTail(
+            fullOutput,
+            TruncationOptions(maxLines=DEFAULT_MAX_LINES, maxBytes=DEFAULT_MAX_BYTES),
+        )
+
+        # Get the lines to potentially display (after context truncation)
+        availableLines = contextTruncation.content.split("\n") if contextTruncation.content else []
+
+        # Apply preview truncation based on expanded state
+        previewLogicalLines = availableLines[-PREVIEW_LINES:]
+        hiddenLineCount = len(availableLines) - len(previewLogicalLines)
+
+        # Rebuild content container
+        self.contentContainer.clear()
+
+        # Command header
+        header = Text(theme.fg(self.colorKey, theme.bold(f"$ {self.command}")), self.outputPad, 0)
+        self.contentContainer.addChild(header)
+
+        # Output
+        if len(availableLines) > 0:
+            if self.expanded:
+                # Show all lines
+                displayText = "\n".join(theme.fg("muted", line) for line in availableLines)
+                self.contentContainer.addChild(Text(f"\n{displayText}", self.outputPad, 0))
+            else:
+                # Use shared visual truncation utility with width-aware caching
+                styledOutput = "\n".join(theme.fg("muted", line) for line in previewLogicalLines)
+                styledInput = f"\n{styledOutput}"
+                component = self
+
+                class _Preview:
+                    """MISAKA fork: a class for the inline ``{ render, invalidate }`` object."""
+
+                    cachedWidth: int | None = None
+                    cachedLines: list[str] | None = None
+
+                    def render(preview, width: int) -> list[str]:
+                        if preview.cachedLines is None or preview.cachedWidth != width:
+                            result = truncateToVisualLines(styledInput, PREVIEW_LINES, width, component.outputPad)
+                            preview.cachedLines = result.visualLines
+                            preview.cachedWidth = width
+                        return preview.cachedLines if preview.cachedLines is not None else []
+
+                    def invalidate(preview) -> None:
+                        preview.cachedWidth = None
+                        preview.cachedLines = None
+
+                self.contentContainer.addChild(_Preview())
+
+        # Loader or status
+        if self.status == "running":
+            self.contentContainer.addChild(self.loader)
+        else:
+            statusParts: list[str] = []
+
+            # Show how many lines are hidden (collapsed preview)
+            if hiddenLineCount > 0:
+                if self.expanded:
+                    statusParts.append(
+                        f"{theme.fg('muted', '(')}{keyHint('app.tools.expand', 'to collapse')}{theme.fg('muted', ')')}",
+                    )
+                else:
+                    statusParts.append(
+                        f"{theme.fg('muted', f'... {hiddenLineCount} more lines (')}"
+                        f"{keyHint('app.tools.expand', 'to expand')}{theme.fg('muted', ')')}",
+                    )
+
+            if self.status == "cancelled":
+                statusParts.append(theme.fg("warning", "(cancelled)"))
+            elif self.status == "error":
+                statusParts.append(theme.fg("error", f"(exit {self.exitCode})"))
+
+            # Add truncation warning (context truncation, not preview truncation)
+            wasTruncated = (self.truncationResult is not None and self.truncationResult.truncated) or (
+                contextTruncation.truncated
+            )
+            if wasTruncated and self.fullOutputPath:
+                statusParts.append(theme.fg("warning", f"Output truncated. Full output: {self.fullOutputPath}"))
+
+            if len(statusParts) > 0:
+                joined = "\n".join(statusParts)
+                self.contentContainer.addChild(Text(f"\n{joined}", self.outputPad, 0))
+
     def getOutput(self) -> str:
+        """Get the raw output for creating BashExecutionMessage."""
         return "\n".join(self.outputLines)
 
     def getCommand(self) -> str:
+        """Get the command that was executed."""
         return self.command
-
-    def updateDisplay(self) -> None:
-        full_output = self.getOutput()
-        context_truncation = truncate_tail(
-            full_output,
-            TruncationOptions(maxLines=DEFAULT_MAX_LINES, maxBytes=DEFAULT_MAX_BYTES),
-        )
-        available_lines = context_truncation.content.split("\n") if context_truncation.content else []
-        preview_logical_lines = available_lines[-PREVIEW_LINES:]
-        hidden_line_count = len(available_lines) - len(preview_logical_lines)
-
-        self.contentContainer.clear()
-        self.contentContainer.addChild(Text(theme.fg("bashMode", theme.bold(f"$ {self.command}")), 1, 0))
-
-        if available_lines:
-            if self.expanded:
-                display_text = "\n".join(theme.fg("muted", line) for line in available_lines)
-                self.contentContainer.addChild(Text(f"\n{display_text}", 1, 0))
-            else:
-                styled_output = "\n".join(theme.fg("muted", line) for line in preview_logical_lines)
-                styled_input = f"\n{styled_output}"
-                self.contentContainer.addChild(
-                    _CachedVisualLines(
-                        lambda width: truncate_to_visual_lines(styled_input, PREVIEW_LINES, width, 1).visualLines
-                    )
-                )
-
-        if self.status == "running":
-            self.contentContainer.addChild(self.loader)
-            return
-
-        status_parts: list[str] = []
-        if hidden_line_count > 0:
-            if self.expanded:
-                status_parts.append(f"({key_hint('app.tools.expand', 'to collapse')})")
-            else:
-                status_parts.append(
-                    f"{theme.fg('muted', f'... {hidden_line_count} more lines')} "
-                    f"({key_hint('app.tools.expand', 'to expand')})"
-                )
-        if self.status == "cancelled":
-            status_parts.append(theme.fg("warning", "(cancelled)"))
-        elif self.status == "error":
-            status_parts.append(theme.fg("error", f"(exit {self.exitCode})"))
-
-        was_truncated = bool(
-            (self.truncationResult and self.truncationResult.truncated) or context_truncation.truncated
-        )
-        if was_truncated and self.fullOutputPath:
-            status_parts.append(theme.fg("warning", f"Output truncated. Full output: {self.fullOutputPath}"))
-
-        if status_parts:
-            self.contentContainer.addChild(Text(f"\n{'\n'.join(status_parts)}", 1, 0))
-
-
-__all__ = ["BashExecutionComponent"]

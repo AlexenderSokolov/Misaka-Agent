@@ -1,4 +1,4 @@
-"""Project-trust decision selector."""
+"""Translated from pi's ``modes/interactive/components/trust-selector.ts`` (v1.1.0)."""
 
 from __future__ import annotations
 
@@ -13,13 +13,16 @@ from misaka.core.project_trust import (
 )
 from misaka.ui.tui import Container, Spacer, Text, getKeybindings
 from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.utils.js import jsIndex
 
 from .dynamic_border import DynamicBorder
-from .keybinding_hints import key_hint, raw_key_hint
+from .keybinding_hints import keyHint, rawKeyHint
 
 
 @dataclass(frozen=True, slots=True)
 class TrustSelection:
+    """``Pick<ProjectTrustOption, "trusted" | "updates">``."""
+
     trusted: bool
     updates: list[ProjectTrustUpdate]
 
@@ -33,14 +36,11 @@ class TrustSelectorOptions:
     onCancel: Callable[[], None]
 
 
-def _format_decision(
-    trust_path: str | None,
-    decision: ProjectTrustStoreEntry | None,
-) -> str:
+def formatDecision(trustPath: str | None, decision: ProjectTrustStoreEntry | None) -> str:
     if decision is None:
         return "none"
     label = "trusted" if decision.decision else "untrusted"
-    if trust_path is not None and decision.path != trust_path:
+    if trustPath is not None and decision.path != trustPath:
         return f"{label} (inherited from {decision.path})"
     return f"{label} ({decision.path})"
 
@@ -48,18 +48,12 @@ def _format_decision(
 class TrustSelectorComponent(Container):
     def __init__(self, options: TrustSelectorOptions) -> None:
         super().__init__()
+
         self.savedDecision = options.savedDecision
-        self.trustOptions = get_project_trust_options(options.cwd)
+        self.trustOptions: list[ProjectTrustOption] = get_project_trust_options(options.cwd)
         self.selectedIndex = max(
             0,
-            next(
-                (
-                    index
-                    for index, option in enumerate(self.trustOptions)
-                    if self._is_saved_option(option)
-                ),
-                -1,
-            ),
+            next((index for index, option in enumerate(self.trustOptions) if self.isSavedOption(option)), -1),
         )
         self.onSelectCallback = options.onSelect
         self.onCancelCallback = options.onCancel
@@ -69,19 +63,20 @@ class TrustSelectorComponent(Container):
         self.addChild(Text(theme.fg("accent", theme.bold("Project trust")), 1, 0))
         self.addChild(Text(theme.fg("muted", options.cwd), 1, 0))
         self.addChild(Spacer(1))
-        trust_path = self.trustOptions[0].savedPath if self.trustOptions else None
+        firstOption = jsIndex(self.trustOptions, 0)
         self.addChild(
             Text(
                 theme.fg(
                     "muted",
-                    f"Saved decision: {_format_decision(trust_path, options.savedDecision)}",
+                    f"Saved decision: {formatDecision(firstOption.savedPath if firstOption else None, options.savedDecision)}",
                 ),
                 1,
                 0,
             )
         )
-        current = "trusted" if options.projectTrusted else "untrusted"
-        self.addChild(Text(theme.fg("muted", f"Current session: {current}"), 1, 0))
+        self.addChild(
+            Text(theme.fg("muted", f"Current session: {'trusted' if options.projectTrusted else 'untrusted'}"), 1, 0)
+        )
         self.addChild(Spacer(1))
 
         self.listContainer = Container()
@@ -89,20 +84,21 @@ class TrustSelectorComponent(Container):
         self.addChild(Spacer(1))
         self.addChild(
             Text(
-                raw_key_hint("↑↓", "navigate")
+                rawKeyHint("↑↓", "navigate")
                 + "  "
-                + key_hint("tui.select.confirm", "save")
+                + keyHint("tui.select.confirm", "save")
                 + "  "
-                + key_hint("tui.select.cancel", "cancel"),
+                + keyHint("tui.select.cancel", "cancel"),
                 1,
                 0,
             )
         )
         self.addChild(Spacer(1))
         self.addChild(DynamicBorder())
-        self._update_list()
 
-    def _is_saved_option(self, option: ProjectTrustOption) -> bool:
+        self.updateList()
+
+    def isSavedOption(self, option: ProjectTrustOption) -> bool:
         return (
             option.savedPath is not None
             and self.savedDecision is not None
@@ -110,37 +106,32 @@ class TrustSelectorComponent(Container):
             and self.savedDecision.path == option.savedPath
         )
 
-    def _update_list(self) -> None:
+    def updateList(self) -> None:
         self.listContainer.clear()
-        for index, option in enumerate(self.trustOptions):
-            selected = index == self.selectedIndex
-            current = self._is_saved_option(option)
-            checkmark = theme.fg("success", " ✓") if current else ""
-            prefix = theme.fg("accent", "→ ") if selected else "  "
-            label = (
-                theme.fg("accent", option.label)
-                if selected
-                else theme.fg("text", option.label)
-            )
-            self.listContainer.addChild(Text(f"{prefix}{label}{checkmark}", 1, 0))
+        for i in range(len(self.trustOptions)):
+            option = self.trustOptions[i]
+            if not option:
+                continue
+
+            isSelected = i == self.selectedIndex
+            isCurrent = self.isSavedOption(option)
+            currentMarker = theme.fg("accent", "✓ ") if isCurrent else "  "
+            prefix = theme.fg("accent", "→ ") if isSelected else "  "
+            label = theme.fg("accent", option.label) if isSelected else theme.fg("text", option.label)
+            self.listContainer.addChild(Text(f"{prefix}{currentMarker}{label}", 1, 0))
 
     def handleInput(self, keyData: str) -> None:
         kb = getKeybindings()
         if kb.matches(keyData, "tui.select.up") or keyData == "k":
             self.selectedIndex = max(0, self.selectedIndex - 1)
-            self._update_list()
+            self.updateList()
         elif kb.matches(keyData, "tui.select.down") or keyData == "j":
             self.selectedIndex = min(len(self.trustOptions) - 1, self.selectedIndex + 1)
-            self._update_list()
+            self.updateList()
         elif kb.matches(keyData, "tui.select.confirm") or keyData == "\n":
-            if 0 <= self.selectedIndex < len(self.trustOptions):
-                selected = self.trustOptions[self.selectedIndex]
-                self.onSelectCallback(
-                    TrustSelection(
-                        trusted=selected.trusted,
-                        updates=list(selected.updates),
-                    )
-                )
+            selected = jsIndex(self.trustOptions, self.selectedIndex)
+            if selected:
+                self.onSelectCallback(TrustSelection(trusted=selected.trusted, updates=list(selected.updates)))
         elif kb.matches(keyData, "tui.select.cancel"):
             self.onCancelCallback()
 

@@ -28,8 +28,7 @@ def _parse_json_number(_value: str) -> object:
     return _JSON_NUMBER
 
 
-def read_pi_manifest(package_json_path: str) -> PiManifest | None:
-    """Python equivalent of Pi's ``readPiManifest``."""
+def readPiManifest(package_json_path: str) -> PiManifest | None:
     try:
         content = Path(package_json_path).read_bytes().decode("utf-8", errors="replace")
         package: object = json.loads(
@@ -57,6 +56,4 @@ def read_pi_manifest(package_json_path: str) -> PiManifest | None:
     return cast(PiManifest, manifest)
 
 
-readPiManifest = read_pi_manifest
-
-__all__ = ["PiManifest", "readPiManifest", "read_pi_manifest"]
+__all__ = ["PiManifest", "readPiManifest"]

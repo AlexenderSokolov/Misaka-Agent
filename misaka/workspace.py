@@ -91,10 +91,10 @@ def _project_file(workspace):
 
 def _session_node(node_id, title, path):
     """One conversation of a run: its LCM session id (the session file's header id) and file."""
-    from misaka.core.session_manager import read_session_header
+    from misaka.core.session_manager import readSessionHeader
     if not path:
         return None
-    sid = str(read_session_header(path).get("id") or "")
+    sid = str(readSessionHeader(path).get("id") or "")
     return {"node_id": node_id, "title": title, "summary": f"session_id {sid}" if sid else "session id unknown",
             "path": path}
 

@@ -62,8 +62,8 @@ def parse_skill_markdown(content):
         return frontmatter, body
     # Keep the already-supported Pi fence spellings readable. Hermes handles
     # all normal input; only the host's older fence grammar is normalized here.
-    from misaka.utils.frontmatter import _extract_frontmatter
-    yaml_text, legacy_body = _extract_frontmatter(content)
+    from misaka.utils.frontmatter import extractFrontmatter
+    yaml_text, legacy_body = extractFrontmatter(content)
     if yaml_text is not None:
         return parse_frontmatter("---\n" + yaml_text + "\n---\n" + legacy_body)
     return frontmatter, body

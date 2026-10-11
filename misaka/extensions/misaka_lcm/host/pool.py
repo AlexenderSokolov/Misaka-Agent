@@ -15,13 +15,12 @@ import time
 import httpx
 
 from misaka.ai.auth.types import AuthOperationOptions, OAuthCredential
-from misaka.ai.utils.abort import race_with_abort_signal
 from misaka.core.auth_storage import (
-    AuthStorageCredentialStore,
     LockResult,
     _coerce_storage_object,
     _with_lock_async,
 )
+from misaka.utils.abort import raceWithAbortSignal
 from misaka.utils.async_lifecycle import settle
 from misaka.utils.values import signal_aborted
 
@@ -103,7 +102,7 @@ async def _quota_restored(registry, token, base_url, signal):
     result = None
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-            response = await race_with_abort_signal(client.get(url, headers=headers), signal)
+            response = await raceWithAbortSignal(client.get(url, headers=headers), signal)
         if response.status_code == 200:
             limit = (response.json() or {}).get('rate_limit') or {}
             used = [(limit.get(window) or {}).get('used_percent') for window in ('primary_window', 'secondary_window')]
@@ -163,7 +162,7 @@ class Pool:
     def __init__(self, registry, provider, refs, strategy):
         self.registry, self.provider, self.refs, self.strategy = registry, provider, refs, strategy
         self.storage = registry.authStorage
-        self.credentials = AuthStorageCredentialStore(self.storage)
+        self.credentials = self.storage
         self.current = None
         self._unmatched_rotation_streak = 0
 
@@ -217,6 +216,9 @@ class Pool:
                     runtime_keys[ref] = (credential.access if credential.expires <= time.time() * 1000 + 300_000
                                         else runtime_key(await self._oauth().toAuth(credential)))
                 else:
+                    if credential.key is None:
+                        # The store reads a key it cannot resolve as no key (pi's auth-storage).
+                        raise ValueError('Stored API key could not be resolved')
                     runtime_keys[ref] = credential.key
             except Exception as candidate_error:
                 execution.check_cancelled()
@@ -241,7 +243,7 @@ class Pool:
                         restored.add(ref)
 
         async def mutate(raw):
-            data = _coerce_storage_object(self.storage._parse_storage_data(raw))
+            data = _coerce_storage_object(self.storage.parseStorageData(raw))
             if any(data.get(ref) != snapshot.get(ref) for ref in self.refs):
                 return LockResult(result=_RETRY_SELECTION)
             states = dict(data.get(STATE_KEY, {}))

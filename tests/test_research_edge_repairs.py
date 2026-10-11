@@ -372,7 +372,7 @@ async def test_queued_followup_error_does_not_invalidate_phase_answer(
         agent=SimpleNamespace(streamFn=None),
         moments=SimpleNamespace(parts=[SisterCapabilitiesPart(str(tmp_path), [])]),
         subscribe=lambda fn: observers.append(fn) or (lambda: observers.remove(fn)),
-        toolScope=lambda names: nullcontext(),
+        toolScope=lambda names, callable=(): nullcontext(),
         registerCustomTools=lambda tools: None,
         unregisterCustomTools=lambda tools: None,
         getActiveToolNames=list,
@@ -381,7 +381,7 @@ async def test_queued_followup_error_does_not_invalidate_phase_answer(
     bridge = window.WindowLO(session, lambda: None, describe=dict)
     try:
         _obj, text, error = await bridge._execute_turn(
-            "phase fixture", {"session_dir": str(tmp_path), "tools": []}
+            "phase fixture", {"session_dir": str(tmp_path)}
         )
         assert text == "phase answer"
         assert error is None, error

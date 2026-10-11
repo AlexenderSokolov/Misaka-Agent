@@ -6,6 +6,7 @@ engine, and none of that work may run on the event loop -- see ``_off_loop``.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from functools import partial
@@ -67,6 +68,9 @@ def register(harn, *, kind: str, workspace: str):
     async def context_prepare(event, ctx):
         transcript = context_engine.snapshot(ctx)
         frozen = context_engine.freeze_context(ctx, transcript)
+        # The model this request goes to: under a virtual selection ctx.model has no window.
+        if read_field(event, "model") is not None:
+            frozen.model = copy.deepcopy(read_field(event, "model"))
         prepared = await execution.off_loop(
             partial(context_engine.prepare, transcript=transcript), event, frozen,
             ctx=frozen, signal=read_field(event, "signal"))

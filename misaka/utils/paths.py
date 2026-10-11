@@ -13,7 +13,7 @@ UNICODE_SPACES = re.compile(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]")
 _WINDOWS_SHELL_DRIVE = re.compile(r"^/(?:mnt/|cygdrive/)?([a-zA-Z])(?:/(.*))?$")
 
 
-def canonicalize_path(path: str) -> str:
+def canonicalizePath(path: str) -> str:
     # `strict=` has existed since 3.10 and this package requires >=3.12, so there is no
     # interpreter that answers this call with TypeError; the only failure is the OSError
     # a missing or unresolvable path raises, and that answer is the path unchanged.
@@ -23,7 +23,7 @@ def canonicalize_path(path: str) -> str:
         return path
 
 
-def get_file_revision(path: str) -> tuple[int, int, int, int, int] | None:
+def getFileRevision(path: str) -> tuple[int, int, int, int, int] | None:
     """Identity of the bytes currently at ``path`` (pi paths.ts:36-42).
 
     ``os.stat`` follows symlinks and imposes no shape filters, on purpose. An earlier
@@ -42,7 +42,7 @@ def get_file_revision(path: str) -> tuple[int, int, int, int, int] | None:
 
 
 def file_revision_from_stat(stats: os.stat_result) -> tuple[int, int, int, int, int]:
-    """The revision ``get_file_revision`` reads, from a ``stat`` or an ``fstat`` alike.
+    """The revision ``getFileRevision`` reads, from a ``stat`` or an ``fstat`` alike.
 
     On Windows CPython (3.12+) fills ``st_ctime`` with the creation time from ``os.stat`` but
     with the last metadata change from ``os.fstat``, so once a file has been renamed into place
@@ -52,12 +52,13 @@ def file_revision_from_stat(stats: os.stat_result) -> tuple[int, int, int, int, 
     return stats.st_dev, stats.st_ino, stats.st_size, stats.st_mtime_ns, changed
 
 
-def is_local_path(value: str) -> bool:
+def isLocalPath(value: str) -> bool:
+    """Whether a source names a local file, not a package, URL, or ``builtin:`` extension."""
     trimmed = value.strip()
-    return not trimmed.startswith(("npm:", "git:", "github:", "http:", "https:", "ssh:"))
+    return not trimmed.startswith(("npm:", "git:", "github:", "http:", "https:", "ssh:", "builtin:"))
 
 
-def normalize_windows_shell_path(file_path: str) -> str:
+def normalizeWindowsShellPath(file_path: str) -> str:
     """Git Bash, MSYS, Cygwin and WSL drive paths in the form native Windows APIs accept (pi paths.ts:66-73)."""
     if not file_path.startswith("/") or file_path.startswith("//") or "\\" in file_path:
         return file_path
@@ -68,7 +69,7 @@ def normalize_windows_shell_path(file_path: str) -> str:
     return f"{match[1].upper()}:\\{suffix}"
 
 
-def normalize_path(
+def normalizePath(
     value: str,
     *,
     trim: bool = False,
@@ -83,7 +84,7 @@ def normalize_path(
     if strip_at_prefix and normalized.startswith("@"):
         normalized = normalized[1:]
     if os.name == "nt":                       # on POSIX /mnt/c and /c are real directories
-        normalized = normalize_windows_shell_path(normalized)
+        normalized = normalizeWindowsShellPath(normalized)
 
     if expand_tilde:
         home = home_dir or str(Path.home())
@@ -99,17 +100,17 @@ def normalize_path(
     return normalized
 
 
-def resolve_path(value: str, base_dir: str | None = None, **options: object) -> str:
-    normalized = normalize_path(value, **options)
-    normalized_base_dir = normalize_path(base_dir or os.getcwd())
+def resolvePath(value: str, base_dir: str | None = None, **options: object) -> str:
+    normalized = normalizePath(value, **options)
+    normalized_base_dir = normalizePath(base_dir or os.getcwd())
     if os.path.isabs(normalized):
         return os.path.abspath(normalized)
     return os.path.abspath(os.path.join(normalized_base_dir, normalized))
 
 
-def get_cwd_relative_path(file_path: str, cwd: str) -> str | None:
-    resolved_cwd = resolve_path(cwd)
-    resolved_path = resolve_path(file_path, resolved_cwd)
+def getCwdRelativePath(file_path: str, cwd: str) -> str | None:
+    resolved_cwd = resolvePath(cwd)
+    resolved_path = resolvePath(file_path, resolved_cwd)
     try:
         relative_path = os.path.relpath(resolved_path, resolved_cwd)
     except ValueError:
@@ -123,13 +124,13 @@ def get_cwd_relative_path(file_path: str, cwd: str) -> str | None:
     return relative_path if is_inside_cwd else None
 
 
-def format_path_relative_to_cwd_or_absolute(file_path: str, cwd: str) -> str:
-    absolute_path = resolve_path(file_path, cwd)
-    display = get_cwd_relative_path(absolute_path, cwd) or absolute_path
+def formatPathRelativeToCwdOrAbsolute(file_path: str, cwd: str) -> str:
+    absolute_path = resolvePath(file_path, cwd)
+    display = getCwdRelativePath(absolute_path, cwd) or absolute_path
     return display.replace(os.sep, "/")
 
 
-def mark_path_ignored_by_cloud_sync(path: str) -> None:
+def markPathIgnoredByCloudSync(path: str) -> None:
     if sys_platform() == "darwin":
         attrs = ["com.dropbox.ignored", "com.apple.fileprovider.ignore#P"]
         for attr in attrs:
@@ -158,20 +159,13 @@ def posix_relpath(path: str | os.PathLike[str], start: str | os.PathLike[str]) -
     return os.path.relpath(path, start).replace(os.sep, "/")
 
 
-canonicalizePath = canonicalize_path
-isLocalPath = is_local_path
-normalizePath = normalize_path
-resolvePath = resolve_path
-getCwdRelativePath = get_cwd_relative_path
-formatPathRelativeToCwdOrAbsolute = format_path_relative_to_cwd_or_absolute
-markPathIgnoredByCloudSync = mark_path_ignored_by_cloud_sync
 
 __all__ = [
     "canonicalizePath",
     "file_revision_from_stat",
     "formatPathRelativeToCwdOrAbsolute",
     "getCwdRelativePath",
-    "get_file_revision",
+    "getFileRevision",
     "isLocalPath",
     "markPathIgnoredByCloudSync",
     "normalizePath",

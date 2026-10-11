@@ -10,13 +10,18 @@ import os
 import re
 from pathlib import Path
 
-from misaka.ai.utils.overflow import hit_output_limit
+from misaka.ai.utils._output_limit import hit_output_limit
 from misaka.config import home
+from misaka.core.mcp_servers import (
+    LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+    LIST_MCP_RESOURCES_TOOL,
+    READ_MCP_RESOURCE_TOOL,
+)
 from misaka.core.network.card_contract import format_deliverable, split_deliverable
 from misaka.core.platform import prompt_guard
 from misaka.core.platform import tasks as task_store
 from misaka.core.research import commands, ledger, runs
-from misaka.core.session_manager import find_most_recent_session, read_session_header
+from misaka.core.session_manager import findMostRecentSession, readSessionHeader
 from misaka.utils import atomic
 
 ROOT_CONTRACT = """# Research plan — design only
@@ -127,12 +132,31 @@ You are one researcher on a research graph that Last Order coordinates. How to w
 """
 
 
+def _registered_tools(worker):
+    """Names of every tool the session has registered, active or not (none for a session that cannot say)."""
+    getAllTools = getattr(getattr(worker, "session", None), "getAllTools", None)
+    return [tool.name for tool in getAllTools()] if getAllTools is not None else []
+
+
 def session_tools(worker, tools=RESEARCH_TOOLS):
-    """Inherit enabled tools in session order; new registrations join the next phase."""
+    """Inherit enabled tools in session order; new registrations join the next phase. With MCP servers
+    connected, `codemode` and `tool_search` come along: MCP tools reach the model through scripts
+    (user decision, 2026-10-03)."""
     from misaka.core.research.tool_policy import research_tools
 
     session = getattr(worker, "session", None)
-    return research_tools(session.getActiveToolNames() if session is not None else tools)
+    if session is None:
+        return research_tools(tools)
+    names = list(session.getActiveToolNames())
+    registered = _registered_tools(worker)
+    if any(name.startswith("mcp__") for name in registered):
+        names.extend(name for name in ("codemode", "tool_search") if name in registered and name not in names)
+    return research_tools(names)
+
+
+# What a research scope lets codemode scripts call without declaring it: every MCP server tool and the
+# resource tools, also those of servers that connect after the phase starts.
+MCP_CALLABLE = ("mcp__*", LIST_MCP_RESOURCES_TOOL, LIST_MCP_RESOURCE_TEMPLATES_TOOL, READ_MCP_RESOURCE_TOOL)
 
 SOURCES_FOOTER = """
 End with a `## Sources` section listing every source this text rests on, one per line: the file's path inside the
@@ -560,10 +584,10 @@ def _catalog_text(items):
 
 
 def _call(worker, cfg, prompt, *, cwd, session_dir, continue_session=False,
-          profile="last_order", tools=RESEARCH_TOOLS, raw=False, task_id=None,
+          profile="last_order", raw=False, task_id=None,
           model=None, extra_tools=(), con=None, session_file=None, sister_catalog=None):
     kwargs = {
-        "cwd": cwd, "tools": list(session_tools(worker, tools)),
+        "cwd": cwd,
         "timeout": None, "research_context": True,
         "raw": raw, "usage_db": cfg.get("db"), "usage_task_id": task_id,
         "usage_generation": 1, "usage_token_cap": cfg.get("token_cap"),
@@ -846,14 +870,14 @@ Read the live workspace view before planning.
         description="Last Order: assign the research plan, record its forks, and choose its red-team Sister",
         model=commands.Plan,
         validate=lambda value: validate_plan(value, roster, decisions_allowed=forks, root=runs.is_root(node)),
-        session_dir=session_dir, tools=RESEARCH_TOOLS, sister_catalog=roster, merge=commands.merge_plan,
+        session_dir=session_dir, sister_catalog=roster, merge=commands.merge_plan,
         reply=lambda payload: "Accepted misaka_research_assign. " + commands.plan_receipt(payload, forks=forks),
     )
     return action["payload"], raw, action["session_file"]
 
 
 def _command(con, run, cfg, worker, node, prompt, *, key, name, description, model, validate,
-             session_dir, tools=RESEARCH_TOOLS, sister_catalog=None, merge=None, reply=None):
+             session_dir, sister_catalog=None, merge=None, reply=None):
     previous = runs.action(con, run["id"], node["id"], key)
     if previous:
         return previous, ""
@@ -864,8 +888,8 @@ def _command(con, run, cfg, worker, node, prompt, *, key, name, description, mod
     return commanded(
         worker, cfg, prompt, command=command, name=name, what=f"{name} for {key}",
         recorded=lambda: runs.action(con, run["id"], node["id"], key),
-        cwd=run["workspace"], session_dir=session_dir, tools=tools, raw=True, sister_catalog=sister_catalog,
-        continue_session=bool(find_most_recent_session(session_dir)), task_id=run["id"], con=con,
+        cwd=run["workspace"], session_dir=session_dir, raw=True, sister_catalog=sister_catalog,
+        continue_session=bool(findMostRecentSession(session_dir)), task_id=run["id"], con=con,
         session_file=session_file)
 
 
@@ -1076,8 +1100,8 @@ def synthesize(con, run, cfg, worker, node, task_rows, *, followup=None, round=1
               + navigation(run["id"]))
     session_dir = _lo_session(run, node)
     _obj, text, err = _call(
-        worker, cfg, prompt, cwd=run["workspace"], session_dir=session_dir, raw=True, tools=RESEARCH_TOOLS,
-        continue_session=bool(find_most_recent_session(session_dir)), task_id=run["id"], con=con,
+        worker, cfg, prompt, cwd=run["workspace"], session_dir=session_dir, raw=True,
+        continue_session=bool(findMostRecentSession(session_dir)), task_id=run["id"], con=con,
         session_file=lo_session_file(run, node),
         extra_tools=tuple(tool for tool in (followup, dissolve, erratum) if tool is not None),
     )
@@ -1354,8 +1378,8 @@ def present_dissolution(con, run, cfg, worker, *, material):
     session_dir = _lo_session(run, root)
     _obj, _text, err = _call(
         worker, cfg, DISSOLUTION_CONTRACT + prompt_guard.untrusted("dissolutions", _catalog_text(material)),
-        cwd=run["workspace"], session_dir=session_dir, tools=RESEARCH_TOOLS, raw=True,
-        continue_session=bool(find_most_recent_session(session_dir)), task_id=run["id"], con=con,
+        cwd=run["workspace"], session_dir=session_dir, raw=True,
+        continue_session=bool(findMostRecentSession(session_dir)), task_id=run["id"], con=con,
         session_file=run["root_session"])
     if err:
         raise RuntimeError(f"Putting the dissolution to the user failed: {err}")
@@ -1376,8 +1400,8 @@ def reconcile(con, run, cfg, worker, *, round, material, validate):
     recorded, _text = commanded(
         worker, cfg, prompt, command=command, name="misaka_research_reconcile",
         recorded=lambda: runs.reconcile(con, run["id"], round),
-        cwd=run["workspace"], session_dir=session_dir, tools=RESEARCH_TOOLS, raw=True,
-        continue_session=bool(find_most_recent_session(session_dir)), task_id=run["id"], con=con,
+        cwd=run["workspace"], session_dir=session_dir, raw=True,
+        continue_session=bool(findMostRecentSession(session_dir)), task_id=run["id"], con=con,
         session_file=run["root_session"])
     return recorded
 
@@ -1410,7 +1434,7 @@ when evidence warrants it and explain why. No separate planning submission, file
     if question:
         larger = (f"\n## the larger question\n{question}\n"
                   "This card is one piece of it; the rationale above says which piece.\n")
-    lo_id = (read_session_header(str(home.from_stored(lo_session))) or {}).get("id") if lo_session else None
+    lo_id = (readSessionHeader(str(home.from_stored(lo_session))) or {}).get("id") if lo_session else None
     if lo_id:
         larger += (f"\nYour node's Last Order is session `{lo_id}`: send `SendMessage` to that id, or to "
                    "`last-order`, which inside the run means her.\n")

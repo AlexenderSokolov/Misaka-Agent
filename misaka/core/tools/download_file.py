@@ -47,7 +47,7 @@ from misaka.core.documents.prompt import (
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.platform.prompt_guard import untrusted
 from misaka.core.tools._common import run_with_abort
-from misaka.core.tools.path_utils import DOWNLOAD_DIR_NAME, resolve_to_cwd
+from misaka.core.tools.path_utils import DOWNLOAD_DIR_NAME, resolveToCwd
 from misaka.core.web.bounded import UnsafeUrlError, open_checked_stream
 from misaka.core.web.evidence import citable_url
 from misaka.core.web.screening import screen_url
@@ -485,7 +485,7 @@ def create_download_file_tool_definition(
             return _result(screened.refusal)
         url = screened.url
 
-        directory = resolve_to_cwd(DOWNLOAD_DIR_NAME, cwd)
+        directory = resolveToCwd(DOWNLOAD_DIR_NAME, cwd)
         try:
             result, aborted = await run_with_abort(
                 _download(url, parsed.path.strip(), directory, signal, cwd), signal

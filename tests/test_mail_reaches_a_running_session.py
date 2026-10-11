@@ -13,14 +13,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from misaka.ai.models import get_models
+from misaka.ai.compat import getModels
 from misaka.ai.types import AssistantMessage, DoneEvent, ToolCall, Usage, UsageCost
 from misaka.ai.utils.event_stream import AssistantMessageEventStream
 from misaka.core.auth_storage import AuthStorage
 from misaka.core.extensions.types import ToolDefinition
+from misaka.core.model_runtime import ModelRuntime
 from misaka.core.network import messages
 from misaka.core.resource_loader import DefaultResourceLoader
-from misaka.core.sdk import create_agent_session
+from misaka.core.sdk import createAgentSession
 from misaka.core.session_manager import SessionManager
 from misaka.core.settings_manager import SettingsManager
 from tests.offline import refuse_network
@@ -63,11 +64,11 @@ async def world(tmp_path, monkeypatch):
     loader = DefaultResourceLoader({"cwd": str(tmp_path), "agentDir": str(tmp_path / "agent"),
                                     "noExtensions": True, "noPromptTemplates": True, "noThemes": True})
     await loader.reload()
-    model = next(m for m in get_models("openai") if "image" in m.input)
-    auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, "fixture")
-    result = await create_agent_session({
-        "cwd": str(tmp_path), "agentDir": str(tmp_path / "agent"), "model": model, "authStorage": auth,
+    model = next(m for m in getModels("openai") if "image" in m.input)
+    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    await runtime.setRuntimeApiKey(model.provider, "fixture")
+    result = await createAgentSession({
+        "cwd": str(tmp_path), "agentDir": str(tmp_path / "agent"), "model": model, "modelRuntime": runtime,
         "resourceLoader": loader,
         "settingsManager": SettingsManager.inMemory({"compaction": {"enabled": False}, "retry": {"enabled": False}}),
         "sessionManager": SessionManager.create(str(tmp_path), str(tmp_path / "sessions")),
@@ -83,7 +84,7 @@ async def world(tmp_path, monkeypatch):
         output.end(message)
         return output
 
-    session.agent.streamFn = stream
+    session.agent.streamFunction = stream
     mail = messages.connect()
 
     def post(body):

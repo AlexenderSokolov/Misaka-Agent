@@ -42,11 +42,11 @@ def _content_type(block: Any) -> str | None:
 
 
 def _serialize_json_line(value: Any) -> str:
-    from misaka.modes.jsonl import to_json_event
-    return json.dumps(to_json_event(value), ensure_ascii=False, separators=(",", ":")) + "\n"
+    from misaka.modes.jsonl import toJsonEvent
+    return json.dumps(toJsonEvent(value), ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
-async def run_print_mode(runtime_host: Any, options: PrintModeOptions | dict[str, Any]) -> int:
+async def runPrintMode(runtime_host: Any, options: PrintModeOptions | dict[str, Any]) -> int:
     resolved = options if isinstance(options, PrintModeOptions) else PrintModeOptions(**dict(options or {}))
     session = runtime_host.session
     unsubscribe = None
@@ -189,6 +189,5 @@ async def run_print_mode(runtime_host: Any, options: PrintModeOptions | dict[str
         await dispose_runtime()
         await flushRawStdout()
 
-runPrintMode = run_print_mode
 
 __all__ = ["PrintModeOptions", "runPrintMode"]

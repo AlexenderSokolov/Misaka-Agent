@@ -6,12 +6,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from misaka.ai.models import get_models
+from misaka.ai.compat import getModels
 from misaka.ai.types import AssistantMessage, DoneEvent
 from misaka.ai.utils.event_stream import AssistantMessageEventStream
 from misaka.core.auth_storage import AuthStorage
+from misaka.core.model_runtime import ModelRuntime
 from misaka.core.resource_loader import DefaultResourceLoader
-from misaka.core.sdk import create_agent_session
+from misaka.core.sdk import createAgentSession
 from misaka.core.session_manager import SessionManager
 from misaka.core.settings_manager import SettingsManager
 from misaka.core.skills.wiring.skills import SkillsPart
@@ -55,17 +56,17 @@ async def host(tmp_path, monkeypatch):
     loader = DefaultResourceLoader({'cwd': str(tmp_path), 'agentDir': str(tmp_path / 'agent'),
         'noExtensions': True, 'noPromptTemplates': True, 'noThemes': True})
     await loader.reload()
-    model = next(m for m in get_models('openai') if 'image' in m.input)
-    auth = AuthStorage.inMemory()
-    auth.setRuntimeApiKey(model.provider, 'fixture')
-    result = await create_agent_session({'cwd': str(tmp_path), 'agentDir': str(tmp_path / 'agent'),
-        'model': model, 'authStorage': auth, 'resourceLoader': loader,
+    model = next(m for m in getModels('openai') if 'image' in m.input)
+    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    await runtime.setRuntimeApiKey(model.provider, 'fixture')
+    result = await createAgentSession({'cwd': str(tmp_path), 'agentDir': str(tmp_path / 'agent'),
+        'model': model, 'modelRuntime': runtime, 'resourceLoader': loader,
         'settingsManager': SettingsManager.inMemory({'compaction': {'enabled': False}, 'retry': {'enabled': False}}),
         'sessionManager': SessionManager.create(str(tmp_path), str(tmp_path / 'sessions')),
         'parts': [part], 'tools': []})
     session = result['session']
     calls, errors, inputs = [], [], []
-    session.extensionRunner.on_error(lambda error: errors.append(error.error))
+    session.extensionRunner.onError(lambda error: errors.append(error.error))
     async def observe_input(event, _ctx):
         inputs.append(event)
     part.input = observe_input
@@ -81,13 +82,13 @@ async def host(tmp_path, monkeypatch):
         output.push(DoneEvent(reason='stop', message=message))
         output.end(message)
         return output
-    session.agent.streamFn = stream
+    session.agent.streamFunction = stream
     try:
         yield SimpleNamespace(session=session, part=part, calls=calls, errors=errors, inputs=inputs, root=root)
     finally:
         session._isAgentRunActive = False
         session._compactionAbortController = None
-        await part.session_shutdown({'reason': 'test'}, session.extensionRunner.create_context())
+        await part.session_shutdown({'reason': 'test'}, session.extensionRunner.createContext())
         session.dispose()
 
 
@@ -154,21 +155,32 @@ async def test_compaction_rejects_before_loading_and_reports_preflight_failure(h
     assert host.calls == []
 
 
+class _UiMode(InteractiveMode):
+    # The session is the fixture's own rather than the runtime host's.
+    session = None
+
+
 def ui_for(session):
-    mode = object.__new__(InteractiveMode)
+    mode = object.__new__(_UiMode)
     mode.session = session
-    mode.editor = SimpleNamespace(addToHistory=Mock())
+    mode.editor = SimpleNamespace(addToHistory=Mock(), setText=Mock(), getText=lambda: "")
+    mode.defaultEditor = SimpleNamespace()
+    mode.ui = SimpleNamespace(requestRender=Mock())
     mode.compactionQueuedMessages = []
-    mode.deferredInputMessages = []
+    mode.pendingUserInputs = []
     mode._backgroundTasks = set()
-    mode._set_editor_text = Mock()
     mode.updatePendingMessagesDisplay = Mock()
     mode.showStatus = Mock()
     mode.showError = Mock()
-    mode._request_render = Mock()
     mode.flushPendingBashComponents = Mock()
     mode.onInputCallback = Mock()
+    mode.setupEditorSubmitHandler()
     return mode
+
+
+async def submit(mode, text):
+    mode.defaultEditor.onSubmit(text)
+    await asyncio.gather(*list(mode._backgroundTasks), return_exceptions=True)
 
 
 @pytest.mark.parametrize('behavior', ['steer', 'followUp'])
@@ -176,9 +188,9 @@ async def test_ui_queues_skill_during_compaction_then_flushes_once(host, behavio
     mode = ui_for(host.session)
     host.session._compactionAbortController = object()
     if behavior == 'steer':
-        await mode.handleSubmittedText('/agent-reach inspect')
+        await submit(mode, '/agent-reach inspect')
     else:
-        mode._get_editor_text = lambda: '/agent-reach inspect'
+        mode.editor.getText = lambda: '/agent-reach inspect'
         await mode.handleFollowUp()
     assert mode.compactionQueuedMessages == [{'text': '/agent-reach inspect', 'mode': behavior}]
     assert host.calls == []
@@ -250,8 +262,7 @@ async def test_streaming_failure_is_visible_and_original_input_stays_in_editor_h
     async def fail(*_args, **_kwargs):
         raise ValueError('fixture unavailable')
     monkeypatch.setattr(host.part, '_run_activation', fail)
-    mode._schedule_task(mode.handleSubmittedText('/agent-reach inspect'))
-    await asyncio.gather(*list(mode._backgroundTasks), return_exceptions=True)
+    await submit(mode, '/agent-reach inspect')
     await asyncio.sleep(0)
     mode.showError.assert_called_once_with('fixture unavailable')
     mode.editor.addToHistory.assert_called_once_with('/agent-reach inspect')
@@ -325,7 +336,7 @@ async def test_skill_does_not_consume_pending_research_question(host, monkeypatc
     part.attach(host.session)
     host.session.moments.parts.append(part)
     notifications = []
-    host.session.extensionRunner.set_ui_context(SimpleNamespace(notify=lambda *args: notifications.append(args)))
+    host.session.extensionRunner.setUIContext(SimpleNamespace(notify=lambda *args: notifications.append(args)))
     try:
         await host.session.prompt('/research 2')
         await host.session.prompt('/agent-reach inspect')
@@ -334,19 +345,19 @@ async def test_skill_does_not_consume_pending_research_question(host, monkeypatc
         assert 'waiting for a question' in notifications[-1][0]
         assert host.errors == []
     finally:
-        await part.session_shutdown({'reason': 'test'}, host.session.extensionRunner.create_context())
+        await part.session_shutdown({'reason': 'test'}, host.session.extensionRunner.createContext())
         connection.close()
 
 
 async def test_non_prompt_core_and_extension_commands_keep_their_dispatch(host):
     from misaka.core.extensions.types import Extension, RegisteredCommand
     from misaka.core.moments import CoreCommand
-    from misaka.core.source_info import create_synthetic_source_info
+    from misaka.core.source_info import createSyntheticSourceInfo
     calls = []
     async def command(args, ctx):
         calls.append((args, type(ctx).__name__))
     host.part._commands.append(CoreCommand('control-fixture', 'fixture', command))
-    extension = Extension(path='fixture', resolvedPath='fixture', sourceInfo=create_synthetic_source_info('fixture', {'source': 'sdk'}))
+    extension = Extension(path='fixture', resolvedPath='fixture', sourceInfo=createSyntheticSourceInfo('fixture', {'source': 'sdk'}))
     extension.commands['extension-fixture'] = RegisteredCommand(name='extension-fixture', sourceInfo=extension.sourceInfo, description='fixture', handler=command)
     host.session.extensionRunner.extensions.append(extension)
     await host.session.prompt('/control-fixture core')
@@ -462,12 +473,12 @@ async def test_cancelled_compaction_flush_drains_preparation_and_restores_input(
 
 
 async def test_compaction_starting_in_preflight_does_not_persist_a_skill_message(host, monkeypatch):
-    prepare = host.session._prepare_agent_start
+    prepare = host.session._emitBeforeAgentStart
     async def compact_during_preflight(*args):
         result = await prepare(*args)
         host.session._compactionAbortController = object()
         return result
-    monkeypatch.setattr(host.session, '_prepare_agent_start', compact_during_preflight)
+    monkeypatch.setattr(host.session, '_emitBeforeAgentStart', compact_during_preflight)
     accepted = []
     with pytest.raises(RuntimeError, match='compaction'):
         await host.session.prompt('/agent-reach inspect', {'preflightResult': accepted.append})
@@ -489,7 +500,7 @@ async def test_core_prompt_result_contract_preserves_empty_text(host, value):
 
 async def test_skill_view_does_not_submit_a_new_turn(host):
     view = next(tool for tool in host.part.tools if tool.name == 'skill_view')
-    result = await view.execute('fixture', {'name': 'agent-reach'}, None, None, host.session.extensionRunner.create_context())
+    result = await view.execute('fixture', {'name': 'agent-reach'}, None, None, host.session.extensionRunner.createContext())
     assert not result.get('isError')
     assert 'Fixture body for agent-reach.' in result['content'][0]['text']
     assert host.calls == []
@@ -525,12 +536,12 @@ async def test_learn_gate_remains_closed_and_failure_is_visible_without_ui(host,
 @pytest.mark.parametrize('will_retry', [False, True])
 async def test_turn_ending_during_queued_skill_preparation_does_not_strand_message(host, monkeypatch, will_retry):
     stream_started, preparing = asyncio.Event(), asyncio.Event()
-    stream = host.session.agent.streamFn
+    stream = host.session.agent.streamFunction
     async def held_stream(*args, **kwargs):
         stream_started.set()
         await preparing.wait()
         return stream(*args, **kwargs)
-    monkeypatch.setattr(host.session.agent, 'streamFn', held_stream)
+    monkeypatch.setattr(host.session.agent, 'streamFunction', held_stream)
     first_turn = asyncio.create_task(host.session.prompt('original turn'))
     await stream_started.wait()
     activate = host.part._run_activation
@@ -551,14 +562,14 @@ async def test_turn_ending_during_queued_skill_preparation_does_not_strand_messa
 @pytest.mark.parametrize('fail_preflight', [False, True])
 async def test_skill_preflight_keeps_unaccepted_next_turn_notifications(host, monkeypatch, fail_preflight):
     await host.session.sendCustomMessage({'customType': 'fixture', 'content': 'before'}, {'deliverAs': 'nextTurn'})
-    prepare = host.session._prepare_agent_start
+    prepare = host.session._emitBeforeAgentStart
     async def notification_during_preflight(*args):
         result = await prepare(*args)
         await host.session.sendCustomMessage({'customType': 'fixture', 'content': 'during'}, {'deliverAs': 'nextTurn'})
         if fail_preflight:
             host.session._compactionAbortController = object()
         return result
-    monkeypatch.setattr(host.session, '_prepare_agent_start', notification_during_preflight)
+    monkeypatch.setattr(host.session, '_emitBeforeAgentStart', notification_during_preflight)
     if fail_preflight:
         with pytest.raises(RuntimeError, match='compaction'):
             await host.session.prompt('/agent-reach inspect')

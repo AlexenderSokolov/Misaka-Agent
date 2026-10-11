@@ -13,15 +13,22 @@ MISAKA 的部分文件移植自其它项目。移植代码所附带的许可证�
 - 上游：https://github.com/earendil-works/pi ，npm 包 `@earendil-works/pi-coding-agent`
 - 许可证：MIT
 - 版权：Copyright (c) 2025 Mario Zechner
-- 许可证全文：`misaka/LICENSE.pi`，取自上游仓库 `v0.87.1` 的 `LICENSE`（npm 包本身不带 LICENSE 文件）
-- 对照件：`@earendil-works/pi-coding-agent` 0.87.1 的 `dist/`
-- 模型目录数据：`misaka/ai/providers/data/` 是 `@earendil-works/pi-ai` 0.99.1 发布包中 `dist/providers/data` 的原样拷贝，
+- 许可证全文：`misaka/LICENSE.pi`，取自上游仓库 `v1.1.0` 的 `LICENSE`（与 `v0.87.1` 一字不差；npm 包本身不带 LICENSE 文件）
+- 对照件：上游仓库 `v1.1.0` 标签的源码（`packages/*/src`）与 `@earendil-works/pi-ai` 1.1.0 发布包
+- 模型目录数据：`misaka/ai/providers/data/` 是 `@earendil-works/pi-ai` 1.1.0 发布包中 `dist/providers/data` 的原样拷贝，
   用 `scripts/refresh_model_catalog.py` 按清单校验后更新
-- 本仓库位置：`misaka/ai/**`、`misaka/agent/**`、`misaka/ui/tui/**`，以及 `misaka/core/`
-  的内核部分。逐目录、逐文件的归属清单是 `misaka/core/PI_ORIGIN.md`。
+- 本仓库位置：`misaka/ai/**`、`misaka/agent/**`、`misaka/ui/tui/**`、`misaka/mcp/**`（Pi 的
+  `packages/mcp`）、`misaka/codemode/**`（Pi 的 `packages/codemode`，运行时换成 V8/mini-racer）、
+  `misaka/extensions/{mcp,codemode,tool_search}/**`，`misaka/{chord,protocol,client,server,durable}/**`
+  （Pi 的同名 packages；`chord/node` 是 Python 分叉）、`misaka/experimental/**` 与 `misaka/cli/experimental/**`
+  （Pi 的 `coding-agent/src/experimental` 与 `src/cli/experimental`，开发专用），以及 `misaka/core/` 的内核
+  部分；这些目录自 2026-10 起对照 Pi 1.1.0。`misaka/core/` 逐目录、逐文件的归属清单是 `misaka/core/PI_ORIGIN.md`。
+  仓库里另有两处 Pi 来源：`tests/` 中移植的上游测试（含 faux provider 与 suite 测试夹具），以及
+  `examples/plugins/pi-example-plugin/`（Pi 的示例插件）。
 - 说明：MISAKA 的内核是 Pi 的 Python 移植，是本仓库最大的单一上游来源。分叉处在代码里
-  以 `# MISAKA fork:` 注释标出并说明理由。Pi 树内自带许可证头的两个文件
-  （`utils/ansi.ts`、`tui/src/stdin-buffer.ts`）另见下面的 ansi-regex 与 OpenTUI 两条。
+  以 `# MISAKA fork:` 注释标出并说明理由。Pi 树内自带第三方许可证头的文件另见下面各条：
+  `utils/ansi.ts`（ansi-regex）、`tui/src/stdin-buffer.ts`（OpenTUI）、`mcp/src/oauth/{types,discovery,flow}.ts`
+  （MCP TypeScript SDK）、`tui/src/oklab.ts`（Oklab）、`core/export-html/vendor/*.min.js`（marked、highlight.js）。
 
 ## ansi-regex / strip-ansi
 
@@ -40,6 +47,101 @@ MISAKA 的部分文件移植自其它项目。移植代码所附带的许可证�
 - 本仓库位置：`misaka/ui/tui/stdin_buffer.py`（完整 MIT 文本在该文件头部）
 - 说明：经由 Pi 的 `packages/tui/src/stdin-buffer.ts` 移植；转义序列的缓冲与切分
   逻辑来自上游，字节层增量解码与定时器回环是本仓库为 Python 运行时所加。
+
+## MCP TypeScript SDK（经 Pi 的 packages/mcp）
+
+- 上游：https://github.com/modelcontextprotocol/typescript-sdk ，v1.29.0 的 `src/client/auth.ts`
+- 许可证：MIT
+- 版权：Copyright (c) 2024 Anthropic, PBC
+- 许可证全文：`LICENSES/modelcontextprotocol-typescript-sdk.txt`（Pi `packages/mcp/LICENSES/` 的原样拷贝）
+- 本仓库位置：`misaka/mcp/oauth/types.py`、`misaka/mcp/oauth/discovery.py`、`misaka/mcp/oauth/flow.py`
+- 说明：Pi 把 SDK 的 OAuth 发现、动态注册与授权码流程改写成无依赖的结构校验版本并保留了
+  上游头部；MISAKA 再从 Pi 的 TypeScript 移植到 Python，三个文件的文档字符串保留 Pi 的头部原文。
+
+## cross-spawn 及其依赖（经 Pi 的 packages/mcp）
+
+- 上游与许可证：cross-spawn 7.0.6（MIT，Copyright (c) 2018 Made With MOXY Lda）、
+  which 2.0.2 与 isexe 2.0.0（ISC，Copyright (c) Isaac Z. Schlueter and Contributors）、
+  path-key 3.1.1 与 shebang-regex 3.0.0（MIT，Copyright (c) Sindre Sorhus）、
+  shebang-command 2.0.0（MIT，Copyright (c) Kevin Mårtensson）
+- 许可证全文：`LICENSES/cross-spawn-and-dependencies.txt`
+- 本仓库位置：`misaka/mcp/transports/_cross_spawn.py`
+- 说明：Pi 的 stdio 传输用 cross-spawn 拉起服务器进程；MISAKA 把它在 Windows 上解析命令、
+  处理 shebang 与 cmd.exe 转义的那部分移植为 Python，转义规则以 node 跑 cross-spawn 7.0.6
+  产出的向量校验（`tests/fixtures/mcp/cross_spawn_vectors.json`）。
+
+## proper-lockfile 与 retry（经 Pi 的 coding-agent 实验服务器）
+
+- 上游与许可证：proper-lockfile 4.1.2（MIT，Copyright (c) 2018 Made With MOXY Lda）、
+  retry 0.12.0（MIT，Copyright (c) 2011 Tim Koschützki、Felix Geisendörfer）
+- 许可证全文：`LICENSES/proper-lockfile-and-retry.txt`
+- 本仓库位置：`misaka/experimental/lockfile.py`
+- 说明：Pi 的实验服务器与 Session worker 用 proper-lockfile 锁目录；MISAKA 把它的
+  `lib/lockfile.js`、`lib/adapter.js`、`lib/mtime-precision.js` 与 retry 的退避参数那一部分
+  逐行改写为 Python（以 `mkdir` 为原子加锁、陈旧锁接管、定时刷新、ELOCKED/ECOMPROMISED/ENOTACQUIRED）。
+
+## jsdiff（经 Pi 的 packages/durable）
+
+- 上游：https://github.com/kpdecker/jsdiff ，npm 包 `diff` 8.0.4
+- 许可证：BSD-3-Clause
+- 版权：Copyright (c) 2009-2015, Kevin Decker
+- 许可证全文：`LICENSES/jsdiff.txt`
+- 本仓库位置：`misaka/utils/jsdiff.py`
+- 说明：Pi 的 durable 编辑工具用 `diffLines` 与补丁生成；MISAKA 移植其中的 Myers 行差异
+  （`diff/base.js`、`diff/line.js`）与 `patch/create.js`，只含工具用到的部分；输出以 node 跑真实的
+  `diff` 8.0.4 录下的用例校验（`tests/fixtures/jsdiff_cases.json`）。
+
+## marked（经 Pi 的 packages/tui）
+
+- 上游：https://github.com/markedjs/marked ，npm 包 `marked` 18.0.11
+- 许可证：MIT
+- 版权：Copyright (c) 2018+, MarkedJS；Copyright (c) 2011-2018, Christopher Jeffrey
+- 许可证全文：`LICENSES/marked.txt`
+- 本仓库位置：`misaka/ui/tui/vendor/marked/`
+- 说明：Pi 的 TUI 用 marked 把 Markdown 切成词元再自己渲染；MISAKA 逐行移植其中的词法部分
+  （`rules`、`helpers`、`Tokenizer`、`Lexer`、`Hooks` 与 `Marked` 的词法接口），不含 HTML 的
+  `Parser`/`Renderer`。正则保留 JavaScript 源码，经 `misaka/utils/js_regexp.py` 按 JavaScript 语义编译；
+  输出以 node 跑真实的 marked 18.0.11 录下的词元校验（`tests/fixtures/marked_18_0_11_tokens.json.gz`）。
+- 另一处：`misaka/core/export_html/vendor/marked.min.js` 是 marked v18.0.5 的压缩构建，取自 Pi 1.1.0 的
+  `core/export-html/vendor/` 原样拷贝，文件头保留上游版权行；HTML 导出页在浏览器里用它渲染 Markdown。
+
+## highlight.js（经 Pi 的 export-html）
+
+- 上游：https://github.com/highlightjs/highlight.js ，v11.9.0
+- 许可证：BSD-3-Clause
+- 版权：Copyright (c) 2006, Ivan Sagalaev 及其他贡献者
+- 许可证全文：`LICENSES/highlight.js.txt`
+- 本仓库位置：`misaka/core/export_html/vendor/highlight.min.js`
+- 说明：Pi 1.1.0 `core/export-html/vendor/` 中压缩构建的原样拷贝，HTML 导出页用它给代码块着色；文件头保留
+  上游的版本与许可证行。
+
+## Oklab（经 Pi 的 packages/tui）
+
+- 上游：https://bottosson.github.io/posts/oklab/ 与 https://bottosson.github.io/posts/colorpicker/ 的参考实现
+- 许可证：MIT
+- 版权：Copyright (c) 2021 Björn Ottosson
+- 本仓库位置：`misaka/ui/tui/colors.py` 的 `rgbToOklab` 一段（许可文本在该段注释里）
+- 说明：经由 Pi 的 `packages/tui/src/oklab.ts` 移植，只取 sRGB 到 Oklab 的换算。
+
+## get-east-asian-width（经 Pi 的 packages/tui）
+
+- 上游：https://github.com/sindresorhus/get-east-asian-width ，npm 包 `get-east-asian-width` 1.6.0
+- 许可证：MIT
+- 版权：Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com)
+- 许可证全文：`LICENSES/get-east-asian-width.txt`
+- 本仓库位置：`misaka/ui/tui/vendor/get_east_asian_width/`
+- 说明：Pi 的 TUI 用它量字符的显示宽度；MISAKA 逐文件移植 `index.js`、`lookup.js`、`lookup-data.js`
+  与 `utilities.js`，取代原先的 wcwidth 依赖。
+
+## Unicode 17 RGI 表情序列（经 Pi 的 packages/tui）
+
+- 上游：https://github.com/node-unicode/unicode-17.0.0 ，npm 包 `@unicode/unicode-17.0.0` 2.0.7
+- 许可证：MIT
+- 版权：Copyright Mathias Bynens <https://mathiasbynens.be/>
+- 许可证全文：`LICENSES/unicode-17.0.0.txt`
+- 本仓库位置：`misaka/ui/tui/vendor/unicode_rgi_emoji.py`
+- 说明：Pi 用 `/^\p{RGI_Emoji}$/v` 判断一个字素是不是表情；Python 的正则没有字符串属性，
+  MISAKA 把该包 `Sequence_Property/RGI_Emoji` 的 3,953 个序列收成一张查找表。
 
 ## hermes-lcm
 
@@ -164,10 +266,6 @@ are not represented as verbatim upstream code.
 - Native ports/adapters: `misaka/core/subagent/`; background Bash host integration in
   `misaka/core/tools/bash.py`, `misaka/core/moments.py`, and `misaka/core/agent_session.py`;
   the source semantic-boolean conversion in `misaka/utils/values.py`.
-- MCP OAuth lifecycle: `misaka/core/subagent/mcp_auth.py` references the pinned
-  `src/services/mcp/auth.ts` and uses the installed official Python MCP SDK for
-  the protocol. Secure storage and cancellation ownership reuse MISAKA helpers;
-  loopback port binding, file-backed metadata and role isolation are native adaptations.
 - Live permission mode: native session/part state plus existing child JSONL IPC,
   using the pinned `packages/builtin-tools/src/tools/AgentTool/runAgent.ts`
   `agentGetAppState` mode-precedence rule.

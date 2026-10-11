@@ -34,7 +34,7 @@ _SMALL_FAST_DEFAULTS: dict[str, tuple[str, ...]] = {
     ),
     "openai": ("gpt-5.4-mini", "gpt-5-mini", "gpt-4.1-mini"),
     "openai-codex": ("gpt-5.4-mini",),
-    "azure-openai-responses": ("gpt-5.4-mini", "gpt-5-mini"),
+    "azure": ("gpt-5.4-mini", "gpt-5-mini"),
     "google": (
         "gemini-flash-latest",
         "gemini-3.5-flash",
@@ -136,7 +136,7 @@ def _small_fast_hook_model(parent: Any, available: list[Any]) -> Any:
         for model in provider_models
     }
 
-    if parent_provider in {"openai", "openai-codex", "azure-openai-responses"}:
+    if parent_provider in {"openai", "openai-codex", "azure"}:
         provider_override = os.environ.get("OPENAI_SMALL_FAST_MODEL")
         keywords = ("mini", "nano", "small", "fast")
     elif parent_provider in {"google", "google-vertex"}:
@@ -694,7 +694,7 @@ async def amain() -> int:
                 },
                 convertToLlm=session.agent.convertToLlm,
                 onPayload=output_format,
-                streamFn=getattr(session.agent, "_subagent_base_stream_fn", session.agent.streamFn),
+                streamFn=getattr(session.agent, "_subagent_base_stream_fn", session.agent.streamFunction),
                 getApiKey=session.agent.getApiKey,
                 beforeToolCall=before_tool if tools else None,
                 finishTurn=finish_turn_from_stop_predicate(should_stop),
@@ -947,7 +947,7 @@ async def amain() -> int:
             }
         )
 
-    from misaka.core import mcp
+    from misaka.core.subagent import agents as agent_roster
 
     def mcp_server_names() -> list[str]:
         try:
@@ -956,7 +956,7 @@ async def amain() -> int:
                 dict.fromkeys(
                     server
                     for tool in registered
-                    if (server := mcp.server_of(read_field(tool, "name", "")))
+                    if read_field(tool, "exposure") != "hidden" and (server := agent_roster.mcp_server_of(tool))
                 )
             )
         except (AttributeError, RuntimeError):
@@ -970,7 +970,7 @@ async def amain() -> int:
         required_mcp = []
     if fork_snapshot is not None:
         required_mcp.extend(
-            server for item in fork_snapshot["tools"] if (server := mcp.server_of(item.get("name")))
+            server for item in fork_snapshot["tools"] if (server := agent_roster.mcp_server_of(item.get("name")))
         )
     from misaka.config.product import setting
 
@@ -978,7 +978,7 @@ async def amain() -> int:
     while required_mcp:
         active_mcp_servers = mcp_server_names()
         if all(
-            any(mcp.server_matches(pattern, name) for name in active_mcp_servers)
+            any(agent_roster.mcp_server_matches(pattern, name) for name in active_mcp_servers)
             for pattern in required_mcp
         ):
             break

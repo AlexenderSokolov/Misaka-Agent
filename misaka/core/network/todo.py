@@ -151,7 +151,7 @@ def _turn_failure(event):
         if stop == "error":
             return "error", str(_field(message, "errorMessage", "") or "request error")
         if stop == "length":
-            from misaka.ai.utils.overflow import output_limit_error
+            from misaka.ai.utils._output_limit import output_limit_error
             return "length", output_limit_error(message)
         return None
     return None

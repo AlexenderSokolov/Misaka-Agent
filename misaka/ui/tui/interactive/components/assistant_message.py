@@ -1,42 +1,51 @@
-"""Assistant-message renderer for interactive chat transcripts."""
+"""Translated from pi's ``modes/interactive/components/assistant-message.ts`` (v1.1.0).
+
+MISAKA forks: a message and its content blocks are read with ``read_field``, since they arrive as models or as dicts;
+D1: a thinking run cannot be clicked to collapse it (``MouseRegion`` and the per-run visibility overrides serve the
+fullscreen renderer's mouse events).
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from collections.abc import Sequence
+from typing import Any
 
 from misaka.core.extensions.types import MarkdownTransformer
 from misaka.ui.tui import (
     Container,
     DefaultTextStyle,
     Markdown,
+    MarkdownOptions,
     MarkdownTheme,
     Spacer,
     Text,
 )
-from misaka.ui.tui.interactive.components.markdown_transform import (
-    create_markdown_transform,
-)
-from misaka.ui.tui.interactive.theme.theme import get_markdown_theme, theme
+from misaka.ui.tui.interactive.theme.theme import getMarkdownTheme, theme
+from misaka.utils.js import jsTrim
 from misaka.utils.values import read_field
+
+from .markdown_transform import createMarkdownTransform
 
 OSC133_ZONE_START = "\x1b]133;A\x07"
 OSC133_ZONE_END = "\x1b]133;B\x07"
 OSC133_ZONE_FINAL = "\x1b]133;C\x07"
 
 
-def _visible_content(block: Any) -> bool:
-    block_type = read_field(block, "type")
-    if block_type == "text":
-        text = read_field(block, "text", "")
-        return bool(text.strip()) if isinstance(text, str) else False
-    if block_type == "thinking":
-        thinking = read_field(block, "thinking", "")
-        return bool(thinking.strip()) if isinstance(thinking, str) else False
-    return False
+def _trimmedField(content: Any, name: str) -> str:
+    """MISAKA fork: ``content.<name>.trim()`` for a model or a dict."""
+    value = read_field(content, name, "")
+    return jsTrim(value) if isinstance(value, str) else ""
+
+
+def _isVisible(c: Any) -> bool:
+    """``(c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim())``"""
+    type = read_field(c, "type")
+    return bool((type == "text" and _trimmedField(c, "text")) or (type == "thinking" and _trimmedField(c, "thinking")))
 
 
 class AssistantMessageComponent(Container):
+    """Component that renders a complete assistant message"""
+
     def __init__(
         self,
         message: Any | None = None,
@@ -47,202 +56,154 @@ class AssistantMessageComponent(Container):
         markdownTransformers: Sequence[MarkdownTransformer] = (),
     ) -> None:
         super().__init__()
-        self.contentContainer = Container()
-        self.hideThinkingBlock = hideThinkingBlock
-        self.markdownTheme = markdownTheme or get_markdown_theme()
-        self.hiddenThinkingLabel = hiddenThinkingLabel
-        self.outputPad = outputPad
-        self.markdownTransformers = tuple(markdownTransformers)
         self.lastMessage: Any | None = None
         self.hasToolCalls = False
         self.isStreaming = False
+
+        self.hideThinkingBlock = hideThinkingBlock
+        self.markdownTheme = markdownTheme if markdownTheme is not None else getMarkdownTheme()
+        self.hiddenThinkingLabel = hiddenThinkingLabel
+        self.outputPad = outputPad
+        self.markdownTransformers = markdownTransformers
+
+        # Container for text/thinking content
+        self.contentContainer = Container()
         self.addChild(self.contentContainer)
-        if message is not None:
+
+        if message:
             self.updateContent(message)
 
     def invalidate(self) -> None:
         super().invalidate()
-        if self.lastMessage is not None:
+        if self.lastMessage:
             self.updateContent(self.lastMessage)
 
     def setHideThinkingBlock(self, hide: bool) -> None:
         self.hideThinkingBlock = hide
-        if self.lastMessage is not None:
+        if self.lastMessage:
             self.updateContent(self.lastMessage)
 
     def setHiddenThinkingLabel(self, label: str) -> None:
         self.hiddenThinkingLabel = label
-        if self.lastMessage is not None:
+        if self.lastMessage:
             self.updateContent(self.lastMessage)
 
     def setOutputPad(self, padding: int) -> None:
         self.outputPad = padding
-        self._fast_markdown = None
-        if self.lastMessage is not None:
+        if self.lastMessage:
             self.updateContent(self.lastMessage)
 
     def render(self, width: int) -> list[str]:
-        lines = list(super().render(width))
-        if self.hasToolCalls or not lines:
+        lines = super().render(width)
+        if self.hasToolCalls or len(lines) == 0:
             return lines
+
         lines[0] = OSC133_ZONE_START + lines[0]
-        lines[-1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[-1]
+        lines[len(lines) - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[len(lines) - 1]
         return lines
 
-    def _markdown_transform(
-        self,
-        message_type: Literal["user", "assistant", "assistant-thinking"],
-    ) -> Callable[[str, int], str]:
-        return create_markdown_transform(
-            message_type,
-            lambda: self.isStreaming,
-            self.markdownTransformers,
-        )
-
     def updateContent(self, message: Any, isStreaming: bool | None = None) -> None:
+        if isStreaming is None:
+            isStreaming = self.isStreaming
         self.lastMessage = message
-        if isStreaming is not None:
-            self.isStreaming = isStreaming
+        self.isStreaming = isStreaming
 
-        content = list(read_field(message, "content", []) or [])
-        stop_reason = read_field(message, "stopReason")
+        # Clear content container
+        self.contentContainer.clear()
 
-        # Fast path: if the content is a single text block (the common
-        # streaming case), update the existing Markdown via setText() instead
-        # of tearing down and rebuilding the component tree.  This avoids a
-        # thread-safety race where the background render timer can observe
-        # the container in a partially-cleared state (between clear() and
-        # addChild()), producing incorrect line counts that corrupt the
-        # differential renderer.  Messages that stopped abnormally must take
-        # the full rebuild so the aborted/error/length notice is rendered.
-        if (
-            len(content) == 1
-            and read_field(content[0], "type") == "text"
-            and not self.hasToolCalls
-            and stop_reason not in ("aborted", "error", "length")
-        ):
-            text_value = read_field(content[0], "text", "")
-            text = text_value.strip() if isinstance(text_value, str) else ""
-            if text:
-                if (
-                    hasattr(self, "_fast_markdown")
-                    and self._fast_markdown is not None
-                ):
-                    # Update existing Markdown in-place (atomic under GIL).
-                    self._fast_markdown.setText(text)
-                    return
-                else:
-                    # First update -- create persistent children.
-                    self.contentContainer.clear()
-                    self._fast_markdown = Markdown(
-                        text,
+        content: list[Any] = list(read_field(message, "content", []) or [])
+        hasVisibleContent = any(_isVisible(c) for c in content)
+
+        if hasVisibleContent:
+            self.contentContainer.addChild(Spacer(1))
+
+        # Render content in order
+        i = 0
+        while i < len(content):
+            c = content[i]
+            if read_field(c, "type") == "text" and _trimmedField(c, "text"):
+                # Assistant text messages with no background - trim the text
+                # Set paddingY=0 to avoid extra spacing before tool executions
+                self.contentContainer.addChild(
+                    Markdown(
+                        _trimmedField(c, "text"),
                         self.outputPad,
                         0,
                         self.markdownTheme,
-                        transform=self._markdown_transform("assistant"),
+                        None,
+                        MarkdownOptions(
+                            transform=createMarkdownTransform("assistant", self.isStreaming, self.markdownTransformers),
+                        ),
                     )
-                    self.contentContainer.addChild(Spacer(1))
-                    self.contentContainer.addChild(self._fast_markdown)
-                    return
-            # Empty text -- fall through to full rebuild.
-
-        # Slow path: full rebuild for complex content (thinking blocks,
-        # multiple text blocks, tool calls, errors, etc.).
-        self._fast_markdown = None
-        self.contentContainer.clear()
-
-        has_visible_content = any(_visible_content(block) for block in content)
-        if has_visible_content:
-            self.contentContainer.addChild(Spacer(1))
-
-        index = 0
-        while index < len(content):
-            block = content[index]
-            block_type = read_field(block, "type")
-            if block_type == "text":
-                text_value = read_field(block, "text", "")
-                text = text_value.strip() if isinstance(text_value, str) else ""
-                if text:
-                    self.contentContainer.addChild(
-                        Markdown(
-                            text,
-                            self.outputPad,
-                            0,
-                            self.markdownTheme,
-                            transform=self._markdown_transform("assistant"),
-                        )
-                    )
-            elif block_type == "thinking":
-                thinking_blocks: list[str] = []
-                while index < len(content) and read_field(content[index], "type") == "thinking":
-                    thinking_value = read_field(content[index], "thinking", "")
-                    thinking = thinking_value.strip() if isinstance(thinking_value, str) else ""
+                )
+            elif read_field(c, "type") == "thinking":
+                thinkingBlocks: list[str] = []
+                while i < len(content):
+                    thinkingContent = content[i]
+                    if read_field(thinkingContent, "type") != "thinking":
+                        break
+                    thinking = _trimmedField(thinkingContent, "thinking")
                     if thinking:
-                        thinking_blocks.append(thinking)
-                    index += 1
-                if not thinking_blocks:
+                        thinkingBlocks.append(thinking)
+                    i += 1
+                i -= 1
+
+                if len(thinkingBlocks) == 0:
+                    i += 1
                     continue
-                has_visible_after = any(_visible_content(item) for item in content[index:])
-                if self.hideThinkingBlock:
-                    self.contentContainer.addChild(
-                        Text(
-                            theme.italic(theme.fg("thinkingText", self.hiddenThinkingLabel)),
-                            self.outputPad,
-                            0,
-                        )
-                    )
-                else:
-                    self.contentContainer.addChild(
-                        Markdown(
-                            "\n\n".join(thinking_blocks),
-                            self.outputPad,
-                            0,
-                            self.markdownTheme,
-                            DefaultTextStyle(
-                                color=lambda value: theme.fg("thinkingText", value),
-                                italic=True,
-                            ),
-                            transform=self._markdown_transform("assistant-thinking"),
-                        )
-                    )
-                if has_visible_after:
-                    self.contentContainer.addChild(Spacer(1))
-                continue
-            index += 1
 
-        self.hasToolCalls = any(read_field(block, "type") == "toolCall" for block in content)
+                # Add spacing only when another visible assistant content block follows.
+                # This avoids a superfluous blank line before separately-rendered tool execution blocks.
+                hasVisibleContentAfter = any(_isVisible(after) for after in content[i + 1 :])
 
-        # Length stops can happen before a tool call is complete, so surface
-        # them even when tool calls are present; for aborted/error the tool
-        # execution components already show the error.
-        error_message = read_field(message, "errorMessage")
-        if stop_reason == "length":
-            self.contentContainer.addChild(Spacer(1))
-            self.contentContainer.addChild(
-                Text(
-                    theme.fg("error", "Response was truncated before completion."),
-                    self.outputPad,
-                    0,
-                )
-            )
-        elif not self.hasToolCalls:
-            if stop_reason == "aborted":
-                abort_message = (
-                    str(error_message)
-                    if isinstance(error_message, str) and error_message and error_message != "Request was aborted"
-                    else "Operation aborted"
-                )
-                self.contentContainer.addChild(Spacer(1))
-                self.contentContainer.addChild(Text(theme.fg("error", abort_message), self.outputPad, 0))
-            elif stop_reason == "error":
-                self.contentContainer.addChild(Spacer(1))
-                self.contentContainer.addChild(
-                    Text(
-                        theme.fg("error", f"Error: {error_message or 'Unknown error'}"),
+                # MISAKA fork: D1, no per-run visibility override.
+                hidden = self.hideThinkingBlock
+                thinkingComponent = (
+                    Text(theme.italic(theme.fg("thinkingText", self.hiddenThinkingLabel)), self.outputPad, 0)
+                    if hidden
+                    else Markdown(
+                        "\n\n".join(thinkingBlocks),
                         self.outputPad,
                         0,
+                        self.markdownTheme,
+                        DefaultTextStyle(
+                            color=lambda text: theme.fg("thinkingText", text),
+                            italic=True,
+                        ),
+                        MarkdownOptions(
+                            transform=createMarkdownTransform(
+                                "assistant-thinking",
+                                self.isStreaming,
+                                self.markdownTransformers,
+                            ),
+                        ),
                     )
                 )
+                self.contentContainer.addChild(thinkingComponent)
+                if hasVisibleContentAfter:
+                    self.contentContainer.addChild(Spacer(1))
+            i += 1
 
-
-__all__ = ["AssistantMessageComponent"]
+        # Check if incomplete/failed - show after partial content.
+        # For aborted/error tool calls, tool execution components show the error.
+        # Length stops can happen before a tool call is complete, so surface them here too.
+        hasToolCalls = any(read_field(c, "type") == "toolCall" for c in content)
+        self.hasToolCalls = hasToolCalls
+        stopReason = read_field(message, "stopReason")
+        errorMessage = read_field(message, "errorMessage")
+        if stopReason == "length":
+            self.contentContainer.addChild(Spacer(1))
+            self.contentContainer.addChild(
+                Text(theme.fg("error", "Response was truncated before completion."), self.outputPad, 0)
+            )
+        elif not hasToolCalls:
+            if stopReason == "aborted":
+                abortMessage = (
+                    errorMessage if errorMessage and errorMessage != "Request was aborted" else "Operation aborted"
+                )
+                self.contentContainer.addChild(Spacer(1))
+                self.contentContainer.addChild(Text(theme.fg("error", abortMessage), self.outputPad, 0))
+            elif stopReason == "error":
+                errorMsg = errorMessage or "Unknown error"
+                self.contentContainer.addChild(Spacer(1))
+                self.contentContainer.addChild(Text(theme.fg("error", f"Error: {errorMsg}"), self.outputPad, 0))

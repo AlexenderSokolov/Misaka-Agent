@@ -94,7 +94,8 @@ def test_a_release_archive_is_updated_by_the_installer(tmp_path, monkeypatch, ca
     assert update.run(apply=True) == 0
     out = capsys.readouterr().out
     assert says in out
-    assert ("install.sh | sh" in out) == (latest == "v0.18.7") and "pip install" not in out
+    installer = "install.ps1 | iex" if os.name == "nt" else "install.sh | sh"
+    assert (installer in out) == (latest == "v0.18.7") and "pip install" not in out
     assert "Tracking the main branch" not in out and "could not be compared" not in out
 
 
@@ -122,12 +123,12 @@ def test_an_archive_homebrew_or_winget_put_in_place_is_theirs_to_update(tmp_path
 def test_the_users_commands_do_not_inherit_the_archives_python_flags(tmp_path, monkeypatch):
     """The launcher sets them for MISAKA's own Python; under PYTHONSAFEPATH a skill's script could
     not import the module beside it."""
-    from misaka.utils.shell import get_shell_env
+    from misaka.utils.shell import getShellEnv
     monkeypatch.setenv("PYTHONSAFEPATH", "1")
     monkeypatch.setenv("PYTHONNOUSERSITE", "1")
-    assert get_shell_env()["PYTHONSAFEPATH"] == "1", "outside an archive the user's own setting stands"
+    assert getShellEnv()["PYTHONSAFEPATH"] == "1", "outside an archive the user's own setting stands"
     monkeypatch.setattr(sys, "prefix", str(_archive(tmp_path) / "python"))
-    env = get_shell_env()
+    env = getShellEnv()
     assert "PYTHONSAFEPATH" not in env and "PYTHONNOUSERSITE" not in env
 
 
@@ -211,10 +212,13 @@ def _seed_home(root: Path) -> None:
 
 def test_an_update_snapshot_holds_settings_credentials_boards_and_roles(fresh_home, monkeypatch):
     _seed_home(fresh_home)
+    home.path("mcp_config").write_text('{"mcpServers": {}}', encoding="utf-8")
+    home.path("mcp_config", home.path("roles_root") / "last_order").write_text('{"mcpServers": {}}', encoding="utf-8")
     shot = backup.snapshot("update")
     assert (shot / "settings.json").read_text(encoding="utf-8") == '{"a": 1}'
     assert (shot / "credentials" / "auth.json").exists()
     assert (shot / "profiles" / "last_order" / "settings.json").exists()
+    assert (shot / "mcp.json").exists() and (shot / "profiles" / "last_order" / "mcp.json").exists()
     with closing(sqlite3.connect(shot / "state" / "board.db")) as con:
         assert con.execute("SELECT x FROM t").fetchone() == (1,)
     assert not (shot / "cache").exists()

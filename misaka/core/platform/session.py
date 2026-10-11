@@ -93,34 +93,33 @@ def run_coro(coro):
 
 async def open_session(flags, cwd, assembly=None):
     """Open and bind a headless session; return ``(runtime, session, error)``."""
-    from misaka.cli.args import parse_args
+    from misaka.cli.args import parseArgs
     from misaka.cli.engine import create_runtime_factory, resolve_cli_paths
     from misaka.config import get_agent_dir
-    from misaka.core.agent_session_runtime import create_agent_session_runtime
-    from misaka.core.auth_storage import AuthStorage
+    from misaka.core.agent_session_runtime import createAgentSessionRuntime
     from misaka.core.session_manager import SessionManager
-    from misaka.utils.paths import normalize_path
+    from misaka.utils.paths import normalizePath
 
     # Every headless MISAKA session runs with the engine's own skill loading off: the skills
     # extension (misaka.core.skills.index) is the one place that decides what a session sees.
-    parsed = parse_args(list(flags))
+    parsed = parseArgs(list(flags))
     errs = [d.message for d in parsed.diagnostics if d.type == "error"]
     if errs:
         return None, None, "; ".join(errs)
-    session_dir = normalize_path(parsed.sessionDir) if parsed.sessionDir else None
+    session_dir = normalizePath(parsed.sessionDir) if parsed.sessionDir else None
     if parsed.noSession:
         sm = SessionManager.inMemory(cwd)
     elif parsed.session:
-        sm = SessionManager.open(normalize_path(parsed.session), session_dir, cwd)
+        sm = SessionManager.open(normalizePath(parsed.session), session_dir, cwd)
     elif parsed.fork:
-        sm = SessionManager.forkFrom(normalize_path(parsed.fork), cwd, session_dir)
+        sm = SessionManager.forkFrom(normalizePath(parsed.fork), cwd, session_dir)
     elif parsed.continue_:
         sm = SessionManager.continueRecent(cwd, session_dir)
     else:
         sm = SessionManager.create(cwd, session_dir)
-    runtime = await create_agent_session_runtime(
+    runtime = await createAgentSessionRuntime(
         create_runtime_factory(
-            parsed, AuthStorage.create(),
+            parsed,
             resolved_extension_paths=resolve_cli_paths(cwd, parsed.extensions),
             resolved_prompt_template_paths=resolve_cli_paths(cwd, parsed.promptTemplates),
             resolved_theme_paths=resolve_cli_paths(cwd, parsed.themes),
@@ -137,7 +136,7 @@ async def open_session(flags, cwd, assembly=None):
         return runtime, None, "; ".join(hard)
     if runtime.session.model is None:
         return runtime, None, "No model is available; check provider, model, and credentials."
-    if not runtime.session.modelRegistry.hasConfiguredAuth(runtime.session.model):
+    if not runtime.session.modelRuntime.hasConfiguredAuth(runtime.session.model.provider):
         model = runtime.session.model
         return runtime, None, f"No configured authentication for {model.provider}/{model.id}; use misaka setup."
     try:
@@ -161,8 +160,8 @@ async def dispose(runtime):
 
 def event_line(ev):
     """Serialize an engine event in the existing JSONL wire format."""
-    from misaka.modes.jsonl import to_json_event
-    return json.dumps(to_json_event(ev), ensure_ascii=False, separators=(",", ":"))
+    from misaka.modes.jsonl import toJsonEvent
+    return json.dumps(toJsonEvent(ev), ensure_ascii=False, separators=(",", ":"))
 
 
 _ENV_LOCK = threading.Lock()
@@ -287,7 +286,7 @@ async def _run_session(flags, prompt, cwd, on_event=None, timeout=600, env=None,
                 # A reply cut at the output cap never reached its tool call; callers that
                 # extract JSON would fail on the truncated text anyway, and the research
                 # driver needs the cause by name to nudge one more turn.
-                from misaka.ai.utils.overflow import output_limit_error
+                from misaka.ai.utils._output_limit import output_limit_error
                 err = (last.get("errorMessage") if isinstance(last, dict)
                        else getattr(last, "errorMessage", None)) or (
                     output_limit_error(last) if stop == "length" else f"request {stop}")

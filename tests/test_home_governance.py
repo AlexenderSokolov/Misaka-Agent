@@ -141,8 +141,8 @@ def test_project_scope_is_absent_when_the_working_directory_is_the_users_home(tm
     monkeypatch.setenv(home.ENV_HOME, str(real))
     monkeypatch.setenv("HOME", str(user))
 
-    assert not project_trust.has_trust_requiring_project_resources(str(user))
-    assert not project_trust.has_trust_requiring_project_resources(str(real / "tasks" / "t_1"))
+    assert not project_trust.hasTrustRequiringProjectResources(str(user))
+    assert not project_trust.hasTrustRequiringProjectResources(str(real / "tasks" / "t_1"))
     assert _project_agent_dirs(real / "tasks") == []
     assert project_settings(str(user)) == {}
     manager = SettingsManager.create(str(user), str(real), {"projectTrusted": True})
@@ -152,7 +152,7 @@ def test_project_scope_is_absent_when_the_working_directory_is_the_users_home(tm
     # An ordinary project beside it still has its scope.
     repo = tmp_path / "repo"
     (repo / home.DIR_NAME / home.SUBAGENTS_DIR).mkdir(parents=True)
-    assert project_trust.has_trust_requiring_project_resources(str(repo))
+    assert project_trust.hasTrustRequiringProjectResources(str(repo))
     assert _project_agent_dirs(repo) == [(repo / home.DIR_NAME / home.SUBAGENTS_DIR).resolve()]
 
 
@@ -349,7 +349,7 @@ def test_a_role_session_writes_its_own_keys_to_its_file_and_everything_else_glob
     other = home.path("profiles_root") / "10036"
     other.mkdir()
     assert SettingsManager.forRole(str(other)).getSection("web") == {"search_backend": "exa", "cache_ttl_minutes": 5}
-    assert {"defaultProvider", "defaultModel", "defaultThinkingLevel", "mcpServers", "web"} == set(ROLE_KEYS)
+    assert {"defaultProvider", "defaultModel", "defaultThinkingLevel", "web"} == set(ROLE_KEYS)
 
 
 def test_the_role_scope_survives_the_manager_and_the_home_alike(tmp_path, monkeypatch):
@@ -363,9 +363,9 @@ def test_the_role_scope_survives_the_manager_and_the_home_alike(tmp_path, monkey
     assert profiles.pinned_model(str(role)) == "anthropic/claude-sonnet-5"
     manager = SettingsManager.forRole(str(role))
     assert manager.getDefaultModelPair() == ("anthropic", "claude-sonnet-5")
-    manager.updateSection("mcpServers", lambda s: s.update({"camofox": {"command": "npx"}}))
+    manager.updateSection("web", lambda s: s.update({"search_backend": "exa"}))
     assert json.loads((role / "settings.json").read_text(encoding="utf-8")) == {
-        "defaultProvider": "anthropic", "defaultModel": "claude-sonnet-5", "mcpServers": {"camofox": {"command": "npx"}}}
+        "defaultProvider": "anthropic", "defaultModel": "claude-sonnet-5", "web": {"search_backend": "exa"}}
 
 
 def test_a_section_write_edits_the_file_as_it_is_now_not_this_managers_stale_copy(tmp_path, monkeypatch):

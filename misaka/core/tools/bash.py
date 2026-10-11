@@ -16,38 +16,58 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from misaka.agent.types import AgentTool, AgentToolResult
 from misaka.ai.types import TextContent
 from misaka.core.extensions.types import ToolDefinition
-from misaka.core.tools._common import _drain_worker, _string_arg, abort_race
+from misaka.core.tools._common import _drain_worker, abort_race
 from misaka.core.tools.output_accumulator import (
     OutputAccumulator,
     OutputAccumulatorOptions,
     OutputSnapshot,
 )
-from misaka.core.tools.render_utils import get_text_output, invalid_arg_text
-from misaka.core.tools.tool_definition_wrapper import wrap_tool_definition
+from misaka.core.tools.renderers.bash import (
+    BASH_UPDATE_THROTTLE_MS,
+    createShellRenderers,
+)
+from misaka.core.tools.renderers.bash import (
+    formatDuration as _format_duration,  # noqa: F401 - misaka/core/subagent imports this name, and that package is not edited
+)
+from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
 from misaka.core.tools.truncate import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,
     TruncationResult,
-    format_size,
+    formatSize,
 )
-from misaka.ui.tui import Container, Text, truncateToWidth
-from misaka.ui.tui.interactive.theme.theme import theme
-from misaka.utils.child_process import spawn_child_process, wait_for_child_process
+from misaka.utils.child_process import spawn_child_process, waitForChildProcess
 from misaka.utils.shell import (
     ShellConfig,
-    get_shell_config,
-    get_shell_env,
-    kill_process_tree,
+    getShellConfig,
+    getShellEnv,
+    killProcessTree,
     normalize_command_for_stdin,
-    track_detached_child_pid,
-    untrack_detached_child_pid,
+    trackDetachedChildPid,
+    untrackDetachedChildPid,
 )
 from misaka.utils.values import read_field, semantic_boolean, signal_aborted
 
-_BASH_PREVIEW_LINES = 5
-_BASH_UPDATE_THROTTLE_SECONDS = 0.1
 _MAX_TIMEOUT_MS = 2_147_483_647
+# Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts
+# receive.
+STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024
 _MAX_TIMEOUT_SECONDS = _MAX_TIMEOUT_MS / 1000
+
+# Result for programmatic callers such as codemode scripts. A non-zero exit code is an error
+# result for the model, but scripts still resolve to this value. `output` is not limited like the
+# model-facing output: callers decide how much of it reaches the model.
+BASH_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "output": {"type": "string", "description": "Combined stdout and stderr, possibly truncated"},
+        "truncated": {"type": "boolean"},
+        "full_output_path": {"type": "string", "description": "Full output, when truncated"},
+        "exit_code": {"type": "number"},
+        "wall_time_seconds": {"type": "number"},
+    },
+    "required": ["output", "truncated", "exit_code", "wall_time_seconds"],
+}
 _SESSION_ENV_KEYS = (
     "PI_SESSION_ID",
     "PI_SESSION_FILE",
@@ -57,7 +77,13 @@ _SESSION_ENV_KEYS = (
 )
 _SESSION_ENV_GUIDELINE = "You can inspect PI_* environment variables for current model and session details."
 
+bashToolSystemPromptContribution = {
+    "snippet": "Execute bash commands (ls, grep, find, etc.)",
+    "guidelines": [_SESSION_ENV_GUIDELINE],
+}
 
+
+# MISAKA fork: pi's resolveTimeoutMs; asyncio counts seconds, so the checked value stays in seconds.
 def _resolve_timeout_seconds(timeout: float | None) -> float | None:
     if timeout is None:
         return None
@@ -77,6 +103,8 @@ class BashToolInput(BaseModel):
     timeout: float | None = Field(default=None, description="Timeout in seconds (optional, no default timeout)")
 
 
+# MISAKA fork: the background-capable input misaka's managed bash uses (CCB's run_in_background/description);
+# pi's schema is BashToolInput alone.
 class BackgroundBashToolInput(BashToolInput):
     # CCB semanticBoolean accepts exactly the two boolean strings, not 0/1/yes.
     timeout: float | None = Field(default=None, description="Foreground wait in seconds; managed commands default to BASH_DEFAULT_TIMEOUT_MS / 1000 (120 seconds if unset). Eligible commands continue in the background at timeout.")
@@ -132,56 +160,8 @@ class ShellToolConfig:
     prompt: str
     promptSnippet: str
     promptGuidelines: tuple[str, ...] = ()
+    # MISAKA fork: a default, where upstream requires the field; output files are named after misaka.
     tempFilePrefix: str = "misaka-shell"
-
-
-@dataclass(slots=True)
-class _BashRenderState:
-    startedAt: float | None = None
-    endedAt: float | None = None
-    interval: asyncio.Task[None] | None = None
-
-
-@dataclass(slots=True)
-class _BashResultRenderState:
-    cachedWidth: int | None = None
-    cachedLines: list[str] | None = None
-
-
-class _BashResultRenderComponent(Container):
-    def __init__(self) -> None:
-        super().__init__()
-        self.state = _BashResultRenderState()
-
-
-class _CollapsedBashPreview:
-    def __init__(self, styled_output: str, state: _BashResultRenderState) -> None:
-        self._styled_output = styled_output
-        self._state = state
-
-    def render(self, width: int) -> list[str]:
-        from misaka.ui.tui.interactive.components.keybinding_hints import key_hint
-        from misaka.ui.tui.interactive.components.visual_truncate import (
-            truncate_to_visual_lines,
-        )
-
-        # Cache the complete output: this renders on every frame for every bash result in the transcript.
-        if self._state.cachedLines is None or self._state.cachedWidth != width:
-            preview = truncate_to_visual_lines(self._styled_output, _BASH_PREVIEW_LINES, width)
-            hint_lines: list[str] = []
-            if preview.skippedCount > 0:
-                hint = (
-                    theme.fg("muted", f"... ({preview.skippedCount} earlier lines,")
-                    + f" {key_hint('app.tools.expand', 'to expand')}{theme.fg('muted', ')')}"
-                )
-                hint_lines.append(truncateToWidth(hint, width, "..."))
-            self._state.cachedLines = ["", *hint_lines, *preview.visualLines]
-            self._state.cachedWidth = width
-        return self._state.cachedLines
-
-    def invalidate(self) -> None:
-        self._state.cachedWidth = None
-        self._state.cachedLines = None
 
 
 @dataclass(slots=True)
@@ -201,7 +181,7 @@ class _LocalShellOperations:
             )
 
         shell_config = self.resolveShellConfig()
-        env = options["env"] if "env" in options else get_shell_env()
+        env = options["env"] if "env" in options else getShellEnv()
         on_data = options["onData"]
         command_from_stdin = shell_config.commandTransport == "stdin"
 
@@ -220,7 +200,7 @@ class _LocalShellOperations:
             on_data=lambda _fd, data: on_data(data),
         )
         if process.pid is not None:
-            track_detached_child_pid(process.pid)
+            trackDetachedChildPid(process.pid)
 
         stdin_error: BaseException | None = None
         if command_from_stdin:
@@ -239,7 +219,7 @@ class _LocalShellOperations:
                     pass
                 except BaseException as error:  # noqa: BLE001 - report writer failures after cleanup
                     stdin_error = error
-        wait_task = asyncio.create_task(wait_for_child_process(process))
+        wait_task = asyncio.create_task(waitForChildProcess(process))
         timeout_task = (
             asyncio.create_task(asyncio.sleep(timeout)) if timeout is not None else None
         )
@@ -259,7 +239,7 @@ class _LocalShellOperations:
                 abort_won = abort_task is not None and abort_task in done
                 abort_requested = abort_won or signal_aborted(signal)
                 if (timed_out or abort_requested) and process.pid is not None:
-                    kill_process_tree(process.pid)
+                    killProcessTree(process.pid)
                 exit_code = await wait_task
 
                 if signal_aborted(signal):
@@ -277,7 +257,7 @@ class _LocalShellOperations:
                 if isinstance(error, asyncio.CancelledError):
                     try:
                         if process.pid is not None:
-                            kill_process_tree(process.pid)
+                            killProcessTree(process.pid)
                     finally:
                         process.close()
                 raise
@@ -296,7 +276,7 @@ class _LocalShellOperations:
                     asyncio.create_task(cleanup())
                 )
                 if process.pid is not None:
-                    untrack_detached_child_pid(process.pid)
+                    untrackDetachedChildPid(process.pid)
                 if primary_error is None:
                     if cancelled_during_cleanup:
                         raise asyncio.CancelledError
@@ -304,7 +284,7 @@ class _LocalShellOperations:
                         raise stdin_error
 
 
-def create_local_shell_operations(
+def createLocalShellOperations(
     shell_name: str,
     resolve_shell_config: Callable[[], ShellConfig],
 ) -> BashOperations:
@@ -314,11 +294,11 @@ def create_local_shell_operations(
     )
 
 
-def create_local_bash_operations(options: Mapping[str, Any] | None = None) -> BashOperations:
+def createLocalBashOperations(options: Mapping[str, Any] | None = None) -> BashOperations:
     shell_path = options.get("shellPath") if options else None
-    return create_local_shell_operations(
+    return createLocalShellOperations(
         "bash",
-        lambda: get_shell_config(shell_path),
+        lambda: getShellConfig(shell_path),
     )
 
 
@@ -341,14 +321,14 @@ def _coerce_options(options: BashToolOptions | Mapping[str, Any] | None) -> Bash
     )
 
 
-def _resolve_spawn_context(
+def resolveSpawnContext(
     command: str,
     cwd: str,
     spawn_hook: BashSpawnHook | None,
     expose_session_environment: bool,
     ctx: Any,
 ) -> BashSpawnContext:
-    env = {**get_shell_env()}
+    env = {**getShellEnv()}
     for key in _SESSION_ENV_KEYS:
         env.pop(key, None)
     if expose_session_environment and ctx is not None:
@@ -364,6 +344,7 @@ def _resolve_spawn_context(
         thinking_level = read_field(ctx, "thinkingLevel")
         if thinking_level:
             env["PI_REASONING_LEVEL"] = thinking_level
+    # MISAKA fork: a skill's runtime (its venv, a remote host) shapes the environment the command runs in.
     runtime = getattr(read_field(ctx, "sessionManager"), "_skill_runtime", None) if ctx is not None else None
     if runtime is not None:
         env = runtime.execution_env(env)
@@ -371,168 +352,11 @@ def _resolve_spawn_context(
     return spawn_hook(base_context) if spawn_hook is not None else base_context
 
 
-def _make_text_result(text: str, details: BashToolDetails | None = None) -> AgentToolResult:
-    return AgentToolResult(content=[TextContent(text=text)], details=details)
-
-
-def _append_status(text: str, status: str) -> str:
+def appendStatus(text: str, status: str) -> str:
     return f"{text}\n\n{status}" if text else status
 
 
-def _now_ms() -> float:
-    return time.time() * 1000
-
-
-def _format_duration(ms: float) -> str:
-    seconds = ms / 1000
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    total_seconds = int(seconds)
-    minutes = total_seconds // 60
-    remainder = total_seconds % 60
-    if minutes < 60:
-        return f"{minutes}m {remainder}s"
-    return f"{minutes // 60}h {minutes % 60}m {remainder}s"
-
-
-def _get_render_state(state: dict[str, Any]) -> _BashRenderState:
-    render_state = state.get("bashRenderState")
-    if isinstance(render_state, _BashRenderState):
-        return render_state
-    render_state = _BashRenderState()
-    state["bashRenderState"] = render_state
-    return render_state
-
-
-def _create_render_interval(invalidate: Callable[[], None]) -> asyncio.Task[None] | None:
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-
-    async def _tick() -> None:
-        try:
-            while True:
-                await asyncio.sleep(1)
-                invalidate()
-        except asyncio.CancelledError:
-            return
-
-    return loop.create_task(_tick())
-
-
-def _format_shell_call(args: dict[str, Any] | None, prompt: str) -> str:
-    command = _string_arg(read_field(args, "command"))
-    timeout = read_field(args, "timeout")
-    timeout_suffix = theme.fg("muted", f" (timeout {timeout}s)") if timeout else ""
-    if command is None:
-        command_display = invalid_arg_text(theme)
-    elif command:
-        command_display = command
-    else:
-        command_display = theme.fg("toolOutput", "...")
-    return theme.fg("toolTitle", theme.bold(f"{prompt} {command_display}")) + timeout_suffix
-
-
-def _rebuild_bash_result_render_component(
-    component: _BashResultRenderComponent,
-    result: AgentToolResult | Mapping[str, Any],
-    options: Mapping[str, Any],
-    show_images: bool,
-    started_at: float | None,
-    ended_at: float | None,
-) -> None:
-    state = component.state
-    component.clear()
-
-    output = get_text_output(result, show_images).strip()
-    details = read_field(result, "details")
-    truncation = read_field(details, "truncation")
-    full_output_path = read_field(details, "fullOutputPath")
-    if (
-        not bool(read_field(options, "isPartial"))
-        and bool(read_field(truncation, "truncated"))
-        and full_output_path
-        and output.endswith("]")
-    ):
-        footer_start = output.rfind("\n\n[")
-        if footer_start != -1 and str(full_output_path) in output[footer_start:]:
-            output = output[:footer_start].rstrip()
-
-    if output:
-        styled_output = "\n".join(theme.fg("toolOutput", line) for line in output.split("\n"))
-        if bool(read_field(options, "expanded")):
-            component.addChild(Text(f"\n{styled_output}", 0, 0))
-        else:
-            component.addChild(_CollapsedBashPreview(styled_output, state))
-
-    if bool(read_field(truncation, "truncated")) or full_output_path:
-        warnings: list[str] = []
-        if full_output_path:
-            warnings.append(f"Full output: {full_output_path}")
-        if bool(read_field(truncation, "truncated")):
-            if read_field(truncation, "truncatedBy") == "lines":
-                warnings.append(
-                    f"Truncated: showing {read_field(truncation, 'outputLines')} of {read_field(truncation, 'totalLines')} lines"
-                )
-            else:
-                warnings.append(
-                    "Truncated: "
-                    f"{read_field(truncation, 'outputLines')} lines shown "
-                    f"({format_size(read_field(truncation, 'maxBytes') or DEFAULT_MAX_BYTES)} limit)"
-                )
-        warning_text = f"[{'. '.join(warnings)}]"
-        component.addChild(Text(f"\n{theme.fg('warning', warning_text)}", 0, 0))
-
-    if started_at is not None:
-        label = "Elapsed" if bool(read_field(options, "isPartial")) else "Took"
-        end_time = ended_at if ended_at is not None else _now_ms()
-        component.addChild(Text(f"\n{theme.fg('muted', f'{label} {_format_duration(end_time - started_at)}')}", 0, 0))
-
-
-def _render_call(args: dict[str, Any] | None, context: Any, prompt: str) -> Text:
-    state = _get_render_state(context.state)
-    if context.executionStarted and state.startedAt is None:
-        state.startedAt = _now_ms()
-        state.endedAt = None
-    text = context.lastComponent if callable(getattr(context.lastComponent, "setText", None)) else Text("", 0, 0)
-    text.setText(_format_shell_call(args, prompt))
-    return text
-
-
-def _render_result(
-    result: AgentToolResult | Mapping[str, Any],
-    options: Mapping[str, Any],
-    context: Any,
-) -> _BashResultRenderComponent:
-    state = _get_render_state(context.state)
-    if state.startedAt is not None and bool(read_field(options, "isPartial")) and state.interval is None:
-        state.interval = _create_render_interval(context.invalidate)
-    if not bool(read_field(options, "isPartial")) or context.isError:
-        if state.endedAt is None:
-            state.endedAt = _now_ms()
-        if state.interval is not None:
-            state.interval.cancel()
-            state.interval = None
-
-    component = (
-        context.lastComponent
-        if isinstance(context.lastComponent, _BashResultRenderComponent)
-        else _BashResultRenderComponent()
-    )
-    _rebuild_bash_result_render_component(
-        component,
-        result,
-        options,
-        context.showImages,
-        state.startedAt,
-        state.endedAt,
-    )
-    component.invalidate()
-    return component
-
-
-def create_shell_tool_definition(
+def createShellToolDefinition(
     cwd: str,
     config: ShellToolConfig,
     options: BashToolOptions | Mapping[str, Any] | None = None,
@@ -545,7 +369,7 @@ def create_shell_tool_definition(
     )
     operations = resolved_options.operations
     if operations is None:
-        operations = create_local_bash_operations(
+        operations = createLocalBashOperations(
             {"shellPath": resolved_options.shellPath}
         )
 
@@ -556,20 +380,21 @@ def create_shell_tool_definition(
         params: dict[str, Any],
         signal: Any | None = None,
         on_update: Callable[[AgentToolResult], None] | None = None,
-        _ctx: Any = None,
+        ctx: Any = None,
     ) -> AgentToolResult:
         parsed = input_model.model_validate(params)
         resolved_command = (
             f"{resolved_options.commandPrefix}\n{parsed.command}" if resolved_options.commandPrefix else parsed.command
         )
-        spawn_context = _resolve_spawn_context(
+        spawn_context = resolveSpawnContext(
             resolved_command,
-            cwd,
+            read_field(ctx, "cwd") or cwd,
             resolved_options.spawnHook,
             expose_session_environment,
-            _ctx,
+            ctx,
         )
-        runtime = getattr(read_field(_ctx, "sessionManager"), "_skill_runtime", None) if _ctx is not None else None
+        # MISAKA fork: a skill whose runtime is remote gets its host ready before the command runs.
+        runtime = getattr(read_field(ctx, "sessionManager"), "_skill_runtime", None) if ctx is not None else None
         if runtime is not None and runtime.remote is not None:
             from misaka.utils.async_lifecycle import run_in_thread
             await run_in_thread(runtime.prepare_remote)
@@ -577,8 +402,10 @@ def create_shell_tool_definition(
             if signal_aborted(signal):
                 raise RuntimeError("Command aborted")
             timeout = _resolve_timeout_seconds(parsed.timeout)
+            # MISAKA fork: a backgrounded command has not finished, so its result carries a task
+            # id rather than the declared `structuredContent`; the output arrives later.
             return resolved_options.startBackground(
-                command=parsed.command, description=parsed.description, context=_ctx,
+                command=parsed.command, description=parsed.description, context=ctx,
                 spawn_context=spawn_context, operations=operations, timeout=timeout,
             )
         output = OutputAccumulator(
@@ -619,7 +446,7 @@ def create_shell_tool_definition(
             if on_update is None:
                 return
             update_dirty = True
-            delay = _BASH_UPDATE_THROTTLE_SECONDS - (loop.time() - last_update_at)
+            delay = BASH_UPDATE_THROTTLE_MS / 1000 - (loop.time() - last_update_at)
             if delay <= 0:
                 clear_update_handle()
                 emit_output_update()
@@ -643,7 +470,7 @@ def create_shell_tool_definition(
             clear_update_handle()
             emit_output_update()
             snapshot = output.snapshot(persistIfTruncated=True)
-            await output.close_temp_file()
+            await output.closeTempFile()
             return snapshot
 
         def format_output(snapshot: OutputSnapshot, empty_text: str = "(no output)") -> tuple[str, BashToolDetails | None]:
@@ -655,9 +482,9 @@ def create_shell_tool_definition(
                 start_line = truncation.totalLines - truncation.outputLines + 1
                 end_line = truncation.totalLines
                 if truncation.lastLinePartial:
-                    last_line_size = format_size(output.get_last_line_bytes())
+                    last_line_size = formatSize(output.getLastLineBytes())
                     text += (
-                        f"\n\n[Showing last {format_size(truncation.outputBytes)} of line {end_line} "
+                        f"\n\n[Showing last {formatSize(truncation.outputBytes)} of line {end_line} "
                         f"(line is {last_line_size}). Full output: {snapshot.fullOutputPath}]"
                     )
                 elif truncation.truncatedBy == "lines":
@@ -668,17 +495,18 @@ def create_shell_tool_definition(
                 else:
                     text += (
                         f"\n\n[Showing lines {start_line}-{end_line} of {truncation.totalLines} "
-                        f"({format_size(DEFAULT_MAX_BYTES)} limit). Full output: {snapshot.fullOutputPath}]"
+                        f"({formatSize(DEFAULT_MAX_BYTES)} limit). Full output: {snapshot.fullOutputPath}]"
                     )
             return text, details
 
         foreground = None
         timeout = parsed.timeout
+        started_at = time.perf_counter()
         if resolved_options.registerForeground is not None:
             if signal_aborted(signal):
                 raise RuntimeError("Command aborted")
             foreground = resolved_options.registerForeground(
-                command=parsed.command, description=read_field(parsed, "description"), context=_ctx,
+                command=parsed.command, description=read_field(parsed, "description"), context=ctx,
                 spawn_context=spawn_context, operations=operations, output=output, on_data=handle_data,
                 timeout=timeout,
             )
@@ -689,6 +517,7 @@ def create_shell_tool_definition(
                     if result is None:
                         from misaka.core.subagent.shell import background_result
                         clear_update_handle()
+                        # MISAKA fork: moved to the background, as above; no `structuredContent` yet.
                         return background_result(foreground, by_user=foreground.backgrounded_by_user)
                 else:
                     result = await operations.exec(
@@ -707,19 +536,40 @@ def create_shell_tool_definition(
                 output_text, _details = format_output(snapshot, "")
                 message = str(error)
                 if message == "aborted":
-                    raise RuntimeError(_append_status(output_text, "Command aborted")) from None
+                    raise RuntimeError(appendStatus(output_text, "Command aborted")) from None
                 if message.startswith("timeout:"):
                     timeout_secs = message.split(":", 1)[1]
-                    raise RuntimeError(_append_status(output_text, f"Command timed out after {timeout_secs} seconds")) from None
+                    raise RuntimeError(appendStatus(output_text, f"Command timed out after {timeout_secs} seconds")) from None
                 raise
 
             snapshot = await finish_output()
             output_text, details = format_output(snapshot)
             if exit_code is None:
-                raise RuntimeError(_append_status(output_text, "Command terminated without an exit code"))
+                raise RuntimeError(appendStatus(output_text, "Command terminated without an exit code"))
+            # `Math.round`: halves round up.
+            wall_time_seconds = math.floor((time.perf_counter() - started_at) * 10 + 0.5) / 10
+            full_output = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES)
+            structured_content: dict[str, Any] = {
+                "output": full_output.content,
+                "truncated": full_output.truncated,
+                **(
+                    {"full_output_path": snapshot.fullOutputPath}
+                    if full_output.truncated and snapshot.fullOutputPath
+                    else {}
+                ),
+                "exit_code": exit_code,
+                "wall_time_seconds": wall_time_seconds,
+            }
             if exit_code != 0:
-                raise RuntimeError(_append_status(output_text, f"Command exited with code {exit_code}"))
-            return _make_text_result(output_text, details)
+                return AgentToolResult(
+                    content=[TextContent(text=appendStatus(output_text, f"Command exited with code {exit_code}"))],
+                    details=details,
+                    structuredContent=structured_content,
+                    isError=True,
+                )
+            return AgentToolResult(
+                content=[TextContent(text=output_text)], details=details, structuredContent=structured_content
+            )
         finally:
             clear_update_handle()
 
@@ -732,21 +582,20 @@ def create_shell_tool_definition(
             f"Output is truncated to last {DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB "
             "(whichever is hit first). If truncated, full output is saved to a temp file. "
             "Optionally provide a timeout in seconds."
+            # MISAKA fork: the background sentence appears only when the session runs managed background commands.
             + (" run_in_background=true returns a task ID immediately; completion arrives automatically. "
                "TaskOutput reads output and TaskStop stops the command. Eligible foreground commands also continue "
                "in the background when the foreground wait times out (default 120 seconds; BASH_DEFAULT_TIMEOUT_MS overrides)." if resolved_options.startBackground is not None else "")
         ),
         promptSnippet=config.promptSnippet,
         promptGuidelines=(
-            list(config.promptGuidelines) if expose_session_environment else []
+            list(config.promptGuidelines) if expose_session_environment else None
         ),
         parameters=input_model,
+        outputSchema=BASH_OUTPUT_SCHEMA,
         constrainedSampling={"type": "json_schema", "strict": "prefer"},
         execute=execute,
-        renderCall=lambda args, _theme, context: _render_call(
-            args, context, config.prompt
-        ),
-        renderResult=lambda result, render_options, _theme, context: _render_result(result, render_options, context),
+        **createShellRenderers(config.prompt),
     )
 
 
@@ -755,22 +604,23 @@ _BASH_TOOL_CONFIG = ShellToolConfig(
     label="bash",
     shellName="bash",
     prompt="$",
-    promptSnippet="Execute bash commands (ls, grep, find, etc.)",
-    promptGuidelines=(_SESSION_ENV_GUIDELINE,),
+    promptSnippet=bashToolSystemPromptContribution["snippet"],
+    promptGuidelines=tuple(bashToolSystemPromptContribution["guidelines"]),
+    # MISAKA fork: output files are named after misaka (upstream: `pi-bash`).
     tempFilePrefix="misaka-bash",
 )
 
 
-def create_bash_tool_definition(
+def createBashToolDefinition(
     cwd: str,
     options: BashToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[dict[str, Any], BashToolDetails | None]:
-    return create_shell_tool_definition(cwd, _BASH_TOOL_CONFIG, options)
+    return createShellToolDefinition(cwd, _BASH_TOOL_CONFIG, options)
 
 
-def create_bash_tool(cwd: str, options: BashToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
-    definition = create_bash_tool_definition(cwd, options)
-    tool = wrap_tool_definition(definition)
+def createBashTool(cwd: str, options: BashToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
+    definition = createBashToolDefinition(cwd, options)
+    tool = wrapToolDefinition(definition)
     # Pi assigns these definition-only fields dynamically so registerTool(createBashTool(...))
     # keeps its system-prompt contribution.
     object.__setattr__(tool, "promptSnippet", definition.promptSnippet)
@@ -778,9 +628,6 @@ def create_bash_tool(cwd: str, options: BashToolOptions | Mapping[str, Any] | No
     return tool
 
 
-createBashTool = create_bash_tool
-createBashToolDefinition = create_bash_tool_definition
-createLocalBashOperations = create_local_bash_operations
 
 __all__ = [
     "BashOperations",
@@ -790,7 +637,12 @@ __all__ = [
     "BashToolInput",
     "BashToolOptions",
     "ShellToolConfig",
+    "bashToolSystemPromptContribution",
     "createBashTool",
     "createBashToolDefinition",
     "createLocalBashOperations",
 ]
+
+# Kept for misaka/core/subagent, which imports these names.
+_resolve_spawn_context = resolveSpawnContext
+create_local_bash_operations = createLocalBashOperations

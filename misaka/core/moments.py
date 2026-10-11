@@ -1,6 +1,6 @@
 """The kernel's direct calls into MISAKA's own subsystems, at the moments Pi's kernel marks.
 
-Pi's kernel does its own work at those moments by direct call -- ``_check_compaction`` is
+Pi's kernel does its own work at those moments by direct call -- ``_checkCompaction`` is
 the pattern -- and offers everything else the extension runner. MISAKA's subsystems used
 to sit on the runner as extensions. Now they are *parts* of the session: assembled by the
 process entry (``core.wiring.assemble``), handed in through ``AgentSessionConfig.parts``,
@@ -25,10 +25,10 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from misaka.ai.utils.transcript import get_current_system_message
+from misaka.ai.utils.transcript import getCurrentSystemMessage
 from misaka.core.system_prompt import (
-    build_system_prompt,
-    normalize_build_system_prompt_options,
+    buildSystemPrompt,
+    normalizeBuildSystemPromptOptions,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ class Moments:
                 attach(session)
 
     def _ctx(self) -> Any:
-        return self.session.extensionRunner.create_context()
+        return self.session.extensionRunner.createContext()
 
     # -- what a part calls between moments (the runtime actions the runner binds, by direct call) --
 
@@ -101,7 +101,7 @@ class Moments:
             except Exception:
                 logger.warning("a core part's message was not delivered", exc_info=True)
 
-        self.session._spawn_extension_message(_run())
+        self.session._spawnExtensionMessage(_run())
 
     def send_user_message(self, content: Any, options: dict[str, Any] | None = None) -> None:
         async def _run() -> None:
@@ -110,7 +110,7 @@ class Moments:
             except Exception:
                 logger.warning("a core part's user message was not delivered", exc_info=True)
 
-        self.session._spawn_extension_message(_run())
+        self.session._spawnExtensionMessage(_run())
 
     # -- commands --
 
@@ -223,7 +223,7 @@ class Moments:
     async def before_agent_start(self, prompt: str, images: Any, options: Any) -> BeforeAgentStart:
         """Runner ``emit_before_agent_start``: each part sees the prompt options as the previous
         one left them, and ``systemPrompt`` renders them on every read."""
-        current_options = normalize_build_system_prompt_options(options)
+        current_options = normalizeBuildSystemPromptOptions(options)
         folded = BeforeAgentStart(system_prompt_options=current_options)
         if not self.parts:
             return folded
@@ -233,7 +233,7 @@ class Moments:
                 "type": "before_agent_start",
                 "prompt": prompt,
                 "images": images,
-                "systemPrompt": build_system_prompt(current_options),
+                "systemPrompt": buildSystemPrompt(current_options),
                 "systemPromptOptions": current_options,
             }, ctx)
             if result is None:
@@ -290,7 +290,7 @@ class Moments:
         return None
 
     async def tool_call(self, event: dict[str, Any]) -> Any:
-        """Runner ``emit_tool_call``: the last answer stands, a block returns at once, a crash is fatal."""
+        """Runner ``emitToolCall``: the last answer stands, a block returns at once, a crash is fatal."""
         if not self.parts:
             return None
         ctx = self._ctx()
@@ -319,7 +319,9 @@ class Moments:
         return result
 
     async def tool_result(self, event: dict[str, Any]) -> Any:
-        """Runner ``emit_tool_result``: parts may replace content, details, isError, usage."""
+        """Runner ``emitToolResult``: parts may replace content, details, structuredContent,
+        isError, usage. Replacing content without returning structuredContent drops it, as the
+        runner does: a part that redacts content must not leave the raw structured result behind."""
         if not self.parts:
             return None
         ctx = self._ctx()
@@ -329,20 +331,22 @@ class Moments:
             result = await self._call(part, "tool_result", current, ctx)
             if result is None:
                 continue
-            for name in ("content", "details", "isError", "usage", "terminate"):
+            for name in ("content", "details", "structuredContent", "isError", "usage", "terminate"):
                 value = _field(result, name, _MISSING)
                 if value is not _MISSING:
                     current[name] = value
                     modified = True
+                    if name == "content" and _field(result, "structuredContent", _MISSING) is _MISSING:
+                        current.pop("structuredContent", None)
         if not modified:
             return None
-        folded = {name: current.get(name) for name in ("content", "details", "isError", "usage")}
+        folded = {name: current.get(name) for name in ("content", "details", "structuredContent", "isError", "usage")}
         if "terminate" in current:
             folded["terminate"] = current["terminate"]
         return folded
 
     async def input(self, text: str, images: Any, source: Any, streaming_behavior: Any) -> dict[str, Any]:
-        """Runner ``emit_input``: the first part to handle the input wins; transforms chain."""
+        """Runner ``emitInput``: the first part to handle the input wins; transforms chain."""
         current_text, current_images = text, images
         if self.parts:
             ctx = self._ctx()
@@ -367,7 +371,7 @@ class Moments:
         return {"action": "continue"}
 
     async def context(self, messages: list[Any]) -> list[Any]:
-        """Runner ``emit_context``: each part rewrites the list the previous one produced.
+        """Runner ``emitContext``: each part rewrites the list the previous one produced.
 
         As for extensions, a part's `context` sees the conversation only; the system messages
         are re-attached after it (an unchanged list keeps them in place, a changed one gets
@@ -401,7 +405,7 @@ def _same_messages(left: list[Any], right: list[Any]) -> bool:
 def _restore_system_messages(current: list[Any], visible: list[Any], returned: list[Any]) -> list[Any]:
     if _same_messages(returned, visible):
         return current
-    head = get_current_system_message(current)
+    head = getCurrentSystemMessage(current)
     return [head, *returned] if head else returned
 
 

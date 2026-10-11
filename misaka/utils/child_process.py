@@ -21,6 +21,9 @@ class _ChildProcessProtocol(asyncio.SubprocessProtocol):
         self._idle_handle: asyncio.TimerHandle | None = None
         self._error: BaseException | None = None
         self._settled = False
+        # Asked when the post-exit grace period ends: true keeps the pipes open another period (a consumer is still
+        # draining what it read).
+        self.is_draining: Callable[[], bool] | None = None
         self.done: asyncio.Future[int | None] = self._loop.create_future()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -35,7 +38,7 @@ class _ChildProcessProtocol(asyncio.SubprocessProtocol):
             except BaseException as error:  # noqa: BLE001 - wait() must report callback failures
                 self._error = error
         if self._exited:
-            self._arm_idle_timer()
+            self.armIdleTimer()
 
     def pipe_connection_lost(self, fd: int, exc: Exception | None) -> None:
         if fd not in self._open_output_pipes:
@@ -51,7 +54,7 @@ class _ChildProcessProtocol(asyncio.SubprocessProtocol):
         if not self._open_output_pipes:
             self._finish()
         else:
-            self._arm_idle_timer()
+            self.armIdleTimer()
 
     def connection_lost(self, exc: Exception | None) -> None:
         if exc is not None and self._error is None:
@@ -59,15 +62,22 @@ class _ChildProcessProtocol(asyncio.SubprocessProtocol):
         if self._exited:
             self._finish()
 
-    def _arm_idle_timer(self) -> None:
+    def armIdleTimer(self) -> None:
         if self._settled:
             return
         if self._idle_handle is not None:
             self._idle_handle.cancel()
         self._idle_handle = self._loop.call_later(
             _EXIT_STDIO_GRACE_SECONDS,
-            self._finish,
+            self._idle_expired,
         )
+
+    def _idle_expired(self) -> None:
+        self._idle_handle = None
+        if self.is_draining is not None and self.is_draining():
+            self.armIdleTimer()
+        else:
+            self._finish()
 
     def _finish(self) -> None:
         if self._settled:
@@ -125,6 +135,22 @@ class ChildProcess:
     def close(self) -> None:
         self._protocol.close()
 
+    def set_draining_check(self, is_draining: Callable[[], bool] | None) -> None:
+        self._protocol.is_draining = is_draining
+
+    def pause_output(self) -> None:
+        """Stop reading stdout and stderr until ``resume_output()``; the child blocks once its pipes fill."""
+        for fd in (1, 2):
+            pipe: Any = self._transport.get_pipe_transport(fd)
+            if pipe is not None and not pipe.is_closing():
+                pipe.pause_reading()
+
+    def resume_output(self) -> None:
+        for fd in (1, 2):
+            pipe: Any = self._transport.get_pipe_transport(fd)
+            if pipe is not None and not pipe.is_closing():
+                pipe.resume_reading()
+
     async def wait(self) -> int | None:
         return await asyncio.shield(self._protocol.done)
 
@@ -156,12 +182,12 @@ async def spawn_child_process(
     return ChildProcess(transport, protocol)
 
 
-async def wait_for_child_process(child: ChildProcess) -> int | None:
+async def waitForChildProcess(child: ChildProcess) -> int | None:
     return await child.wait()
 
 
 __all__ = [
     "ChildProcess",
     "spawn_child_process",
-    "wait_for_child_process",
+    "waitForChildProcess",
 ]

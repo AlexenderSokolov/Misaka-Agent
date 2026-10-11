@@ -124,7 +124,7 @@ def load_config(profile_dir: str | None = None) -> dict:
 
     An unreadable settings file is an error, never a writable empty default.
     """
-    from misaka.core.settings_manager import SettingsManager, deep_merge_settings
+    from misaka.core.settings_manager import SettingsManager, deepMergeSettings
 
     manager = SettingsManager.forRole(profile_dir)
     if manager.globalSettingsLoadError is not None:
@@ -145,7 +145,7 @@ def load_config(profile_dir: str | None = None) -> dict:
                 if isinstance(item, str) and item.strip() else item
                 for item in policy["shared_files"]
             ]
-        result = deep_merge_settings(result, doc)
+        result = deepMergeSettings(result, doc)
     credentials = {**_read_credentials(), **(_read_credentials(profile_dir) if profile_dir else {})}
     if credentials:
         result["env"] = {**(result.get("env") if isinstance(result.get("env"), dict) else {}), **credentials}

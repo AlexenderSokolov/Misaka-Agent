@@ -4,7 +4,7 @@ A tool reaches the model down two channels. The ``tools`` array carries
 ``description`` and the parameter schema, and both are required by the dataclass,
 so a tool that reaches the request is always fully documented there. The system
 prompt's ``Available tools:`` inventory carries ``promptSnippet``, and that field
-is optional: ``build_system_prompt`` filters out every tool without one, and it
+is optional: ``buildSystemPrompt`` filters out every tool without one, and it
 does so silently. A tool can therefore be completely callable and completely
 absent from the inventory the model reads before it decides what to reach for.
 

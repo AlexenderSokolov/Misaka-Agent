@@ -2,7 +2,7 @@
 
 Upstream's contract with its host is one list per turn: *the messages the model is
 actually being sent*, growing as the turn appends and shrinking when compaction
-rewrites it. misaka's equivalent is ``build_session_context(branch).messages`` -- and
+rewrites it. misaka's equivalent is ``buildSessionContext(branch).messages`` -- and
 that includes the compaction-summary message, which is why it is converted here rather
 than dropped. Upstream recognises its own summary scaffold, keeps it out of the durable
 store, and its ingest cursor counts it, so replaying it is what keeps the cursor and the
@@ -24,7 +24,7 @@ from __future__ import annotations
 import dataclasses
 import json
 
-from misaka.agent.harness.messages import convert_to_llm
+from misaka.core.messages import convertToLlm
 from misaka.utils.values import read_field
 
 # Placeholder for a content block that has no useful text: the durable store keeps the
@@ -136,10 +136,10 @@ def to_upstream(message) -> dict:
 
 
 def upstream_messages(messages) -> list[dict]:
-    """A misaka active context (``build_session_context(...).messages``), converted; what its
+    """A misaka active context (``buildSessionContext(...).messages``), converted; what its
     sender marked as not memory is left out, here and only here, so the live view, the
     session's originals and the replay alignment all agree on the same list."""
-    return [to_upstream(message) for message in convert_to_llm([m for m in messages if is_memory(m)])]
+    return [to_upstream(message) for message in convertToLlm([m for m in messages if is_memory(m)])]
 
 
 
@@ -287,7 +287,7 @@ class Replay:
         for message in messages:
             if not is_memory(message):
                 continue                    # the same rule as upstream_messages, or the source ordinals drift
-            converted = convert_to_llm([message])
+            converted = convertToLlm([message])
             if not converted:
                 continue
             for converted_message in converted:
@@ -369,7 +369,7 @@ class Replay:
                     block = {'type': 'image', 'mimeType': header[5:], 'data': data}
                 native_blocks.append(block)
             if role == 'assistant':
-                from misaka.ai.providers._common import _empty_usage
+                from misaka.ai.api._common import _empty_usage
                 for call in replay.get('tool_calls') or []:
                     function = call['function']
                     arguments = function.get('arguments', '{}')
@@ -389,7 +389,7 @@ class Replay:
             payload['content'] = content if role == 'user' and isinstance(content, str) else native_blocks
             if payload['role'] == 'custom':
                 # Custom-message metadata belongs to its native UI wrapper, not the wire.
-                convert_to_llm([payload])
+                convertToLlm([payload])
                 restored.append(payload)
             else:
                 restored.append(validate_message(payload))

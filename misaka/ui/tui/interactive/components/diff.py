@@ -1,140 +1,155 @@
-"""ANSI-styled diff rendering with intra-line highlighting."""
+"""Translated from pi's ``modes/interactive/components/diff.ts`` (v1.1.0)."""
 
 from __future__ import annotations
 
-import difflib
-import re
 from dataclasses import dataclass
 
 from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.utils import js_regexp, jsdiff
+from misaka.utils.js_regexp import RegExp
 
-_DIFF_LINE_RE = re.compile(r"^([+\-\s])(\s*\d*)\s(.*)$")
-_TOKEN_RE = re.compile(r"\S+\s*|\s+")
-
-
-@dataclass(slots=True)
-class RenderDiffOptions:
-    filePath: str | None = None
+_DIFF_LINE = RegExp(r"^([+-\s])(\s*\d*)\s(.*)$")
+_LEADING_WHITESPACE = RegExp(r"^(\s*)")
 
 
 @dataclass(slots=True)
-class ParsedDiffLine:
+class _ParsedDiffLine:
+    """MISAKA fork: a name for the inline result type of ``parseDiffLine``."""
+
     prefix: str
     lineNum: str
     content: str
 
 
-def parse_diff_line(line: str) -> ParsedDiffLine | None:
-    match = _DIFF_LINE_RE.match(line)
-    if match is None:
+def parseDiffLine(line: str) -> _ParsedDiffLine | None:
+    """Parse diff line to extract prefix, line number, and content.
+    Format: "+123 content" or "-123 content" or " 123 content" or "     ..."
+    """
+    match = js_regexp.match(line, _DIFF_LINE)
+    if not match:
         return None
-    return ParsedDiffLine(prefix=match.group(1), lineNum=match.group(2), content=match.group(3))
+    return _ParsedDiffLine(prefix=match[1], lineNum=match[2], content=match[3])
 
 
-def replace_tabs(text: str) -> str:
+def replaceTabs(text: str) -> str:
+    """Replace tabs with spaces for consistent rendering."""
     return text.replace("\t", "   ")
 
 
-def _tokenize_words(text: str) -> list[str]:
-    return _TOKEN_RE.findall(text)
+def renderIntraLineDiff(oldContent: str, newContent: str) -> tuple[str, str]:
+    """Compute word-level diff and render with inverse on changed parts.
+    Uses diffWords which groups whitespace with adjacent words for cleaner highlighting.
+    Strips leading whitespace from inverse to avoid highlighting indentation.
 
+    MISAKA fork: returns ``(removedLine, addedLine)`` for ``{ removedLine, addedLine }``.
+    """
+    wordDiff = jsdiff.diffWords(oldContent, newContent)
 
-def render_intra_line_diff(oldContent: str, newContent: str) -> tuple[str, str]:
-    matcher = difflib.SequenceMatcher(a=_tokenize_words(oldContent), b=_tokenize_words(newContent))
-    removed_line = ""
-    added_line = ""
-    is_first_removed = True
-    is_first_added = True
+    removedLine = ""
+    addedLine = ""
+    isFirstRemoved = True
+    isFirstAdded = True
 
-    for opcode, a0, a1, b0, b1 in matcher.get_opcodes():
-        old_part = "".join(matcher.a[a0:a1])
-        new_part = "".join(matcher.b[b0:b1])
-        if opcode in {"replace", "delete"}:
-            value = old_part
-            if is_first_removed:
-                leading_ws = re.match(r"^(\s*)", value).group(1) if value else ""
-                value = value[len(leading_ws) :]
-                removed_line += leading_ws
-                is_first_removed = False
+    for part in wordDiff:
+        if part["removed"]:
+            value = part["value"]
+            # Strip leading whitespace from the first removed part
+            if isFirstRemoved:
+                match = js_regexp.match(value, _LEADING_WHITESPACE)
+                leadingWs = (match[1] if match else None) or ""
+                value = value[len(leadingWs) :]
+                removedLine += leadingWs
+                isFirstRemoved = False
             if value:
-                removed_line += theme.inverse(value)
-        if opcode in {"replace", "insert"}:
-            value = new_part
-            if is_first_added:
-                leading_ws = re.match(r"^(\s*)", value).group(1) if value else ""
-                value = value[len(leading_ws) :]
-                added_line += leading_ws
-                is_first_added = False
+                removedLine += theme.inverse(value)
+        elif part["added"]:
+            value = part["value"]
+            # Strip leading whitespace from the first added part
+            if isFirstAdded:
+                match = js_regexp.match(value, _LEADING_WHITESPACE)
+                leadingWs = (match[1] if match else None) or ""
+                value = value[len(leadingWs) :]
+                addedLine += leadingWs
+                isFirstAdded = False
             if value:
-                added_line += theme.inverse(value)
-        if opcode == "equal":
-            removed_line += old_part
-            added_line += new_part
+                addedLine += theme.inverse(value)
+        else:
+            removedLine += part["value"]
+            addedLine += part["value"]
 
-    return removed_line, added_line
+    return removedLine, addedLine
 
 
-def render_diff(diffText: str, _options: RenderDiffOptions | None = None) -> str:
-    del _options
+@dataclass(slots=True)
+class RenderDiffOptions:
+    # File path (unused, kept for API compatibility)
+    filePath: str | None = None
+
+
+def renderDiff(diffText: str, _options: RenderDiffOptions | None = None) -> str:
+    """Render a diff string with colored lines and intra-line change highlighting.
+    - Context lines: dim/gray
+    - Removed lines: red, with inverse on changed tokens
+    - Added lines: green, with inverse on changed tokens
+    """
     lines = diffText.split("\n")
     result: list[str] = []
-    index = 0
 
-    while index < len(lines):
-        parsed = parse_diff_line(lines[index])
-        if parsed is None:
-            result.append(theme.fg("toolDiffContext", lines[index]))
-            index += 1
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        parsed = parseDiffLine(line)
+
+        if not parsed:
+            result.append(theme.fg("toolDiffContext", line))
+            i += 1
             continue
 
         if parsed.prefix == "-":
-            removed_lines: list[ParsedDiffLine] = []
-            while index < len(lines):
-                candidate = parse_diff_line(lines[index])
-                if candidate is None or candidate.prefix != "-":
+            # Collect consecutive removed lines
+            removedLines: list[_ParsedDiffLine] = []
+            while i < len(lines):
+                p = parseDiffLine(lines[i])
+                if not p or p.prefix != "-":
                     break
-                removed_lines.append(candidate)
-                index += 1
+                removedLines.append(p)
+                i += 1
 
-            added_lines: list[ParsedDiffLine] = []
-            while index < len(lines):
-                candidate = parse_diff_line(lines[index])
-                if candidate is None or candidate.prefix != "+":
+            # Collect consecutive added lines
+            addedLines: list[_ParsedDiffLine] = []
+            while i < len(lines):
+                p = parseDiffLine(lines[i])
+                if not p or p.prefix != "+":
                     break
-                added_lines.append(candidate)
-                index += 1
+                addedLines.append(p)
+                i += 1
 
-            if len(removed_lines) == 1 and len(added_lines) == 1:
-                removed = removed_lines[0]
-                added = added_lines[0]
-                removed_line, added_line = render_intra_line_diff(
-                    replace_tabs(removed.content),
-                    replace_tabs(added.content),
+            # Only do intra-line diffing when there's exactly one removed and one added line
+            # (indicating a single line modification). Otherwise, show lines as-is.
+            if len(removedLines) == 1 and len(addedLines) == 1:
+                removed = removedLines[0]
+                added = addedLines[0]
+
+                removedLine, addedLine = renderIntraLineDiff(
+                    replaceTabs(removed.content),
+                    replaceTabs(added.content),
                 )
-                result.append(theme.fg("toolDiffRemoved", f"-{removed.lineNum} {removed_line}"))
-                result.append(theme.fg("toolDiffAdded", f"+{added.lineNum} {added_line}"))
-                continue
 
-            for removed in removed_lines:
-                result.append(theme.fg("toolDiffRemoved", f"-{removed.lineNum} {replace_tabs(removed.content)}"))
-            for added in added_lines:
-                result.append(theme.fg("toolDiffAdded", f"+{added.lineNum} {replace_tabs(added.content)}"))
-            continue
-
-        if parsed.prefix == "+":
-            result.append(theme.fg("toolDiffAdded", f"+{parsed.lineNum} {replace_tabs(parsed.content)}"))
-            index += 1
-            continue
-
-        result.append(theme.fg("toolDiffContext", f" {parsed.lineNum} {replace_tabs(parsed.content)}"))
-        index += 1
+                result.append(theme.fg("toolDiffRemoved", f"-{removed.lineNum} {removedLine}"))
+                result.append(theme.fg("toolDiffAdded", f"+{added.lineNum} {addedLine}"))
+            else:
+                # Show all removed lines first, then all added lines
+                for removed in removedLines:
+                    result.append(theme.fg("toolDiffRemoved", f"-{removed.lineNum} {replaceTabs(removed.content)}"))
+                for added in addedLines:
+                    result.append(theme.fg("toolDiffAdded", f"+{added.lineNum} {replaceTabs(added.content)}"))
+        elif parsed.prefix == "+":
+            # Standalone added line
+            result.append(theme.fg("toolDiffAdded", f"+{parsed.lineNum} {replaceTabs(parsed.content)}"))
+            i += 1
+        else:
+            # Context line
+            result.append(theme.fg("toolDiffContext", f" {parsed.lineNum} {replaceTabs(parsed.content)}"))
+            i += 1
 
     return "\n".join(result)
-
-
-renderDiff = render_diff
-
-__all__ = [
-    "RenderDiffOptions",
-    "renderDiff",
-]

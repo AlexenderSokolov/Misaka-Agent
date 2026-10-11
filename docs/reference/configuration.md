@@ -49,7 +49,8 @@ winning:
 3. the role's `profiles/<role>/settings.json`
 
 MISAKA writes only what is that role's own into a role's file: `defaultProvider` /
-`defaultModel`, `defaultThinkingLevel`, `mcpServers` and `web`.
+`defaultModel`, `defaultThinkingLevel` and `web`. A role's MCP servers have a file of their own,
+`profiles/<role>/mcp.json` (see [Skills and MCP](#skills-and-mcp)).
 
 A role folder may also have its own `.env`, laid over the home's. A variable already set in
 your shell wins over both files.
@@ -105,6 +106,28 @@ Sisters can hand work to sub-agents. These settings rarely need changing.
 | `subagents.memory_home` | `state/agent-memory` | where that memory is kept |
 | `subagents.managed_agents_dir` | none | a folder of sub-agent definitions that take precedence over all others |
 
+## Tools and extensions
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `defaultTools` | `read`, `bash`, `edit`, `write`, `office`, `grep`, `find`, `ls` | the built-in tools a new session starts with |
+| `extensions` | none | extension files to load, and `+`/`-` entries that turn built-in extensions on or off |
+| `quietStartup` | `false` | `"header"` keeps the header and hides the startup details (model scope, loaded resources); `true` hides both. `--verbose` shows everything |
+
+`defaultTools` takes a list of tool names, which replaces the default set, or a list of only
+`+name` and `-name` entries, which changes it: `["+codemode", "-ls"]` adds `codemode` and drops
+`ls`. A file later in the [layers](#which-file-wins) with a list of only `+`/`-` entries changes the
+selection the earlier files made; a list with a plain name replaces it. `--tools` takes the same two
+forms for one run; a list of names there is also every tool that run may use. `/reload` activates
+tools a changed `defaultTools` newly adds; a tool it removes stays on until the next session.
+
+MISAKA ships four built-in extensions, all on by default: `builtin:mcp` (the MCP servers below),
+`builtin:codemode` and `builtin:tool-search` (the two tools below) and `builtin:llama.cpp` (the
+`/llama` command and the llama.cpp provider). `-builtin:<name>` in the home's `extensions` setting
+turns one off, for example `"extensions": ["-builtin:llama.cpp"]`; a trusted project's own
+`extensions` setting may turn it back on with `+builtin:<name>` or off for that project only.
+`-e builtin:<name>` loads one for a single run even when the setting turns it off.
+
 ## Skills and MCP
 
 | Setting | Default | Meaning |
@@ -112,11 +135,78 @@ Sisters can hand work to sub-agents. These settings rarely need changing.
 | `skills.external_dirs` | none | more folders of skills to read (`~/.agents/skills` is always read when it exists) |
 | `skills.disabled` | none | skill names to hide from every role |
 | `skills.copy_cap_mb` | `200` | total size of the skill copies one session may hold in its sandbox |
-| `mcp.init_timeout` / `mcp.call_timeout` | `30` / `120` | seconds for an MCP server to start, and per call |
-| `mcp.required_wait` | `30` | seconds to wait for an MCP server marked required |
+| `mcp.required_wait` | `30` | seconds a sub-agent waits for an MCP server its definition requires |
 
-MCP servers themselves are set per role, under `mcpServers` in `profiles/<role>/settings.json`;
-see [the team guide](../guide/team.md#a-sisters-profile).
+MCP servers are configured in `mcp.json` files, in the `mcpServers` shape other MCP clients use:
+
+1. `~/.misaka/mcp.json`, Last Order's servers
+2. `~/.misaka/profiles/<role>/mcp.json`, one role's own servers
+3. the project's `.misaka/mcp.json`, once you have trusted the project
+
+Roles do not share servers. Last Order reads the home file, with her own `profiles/last_order/mcp.json`
+over it; a Sister reads only her own file and does not get Last Order's servers. The project file adds
+to either, and a later file replaces an entry of the same name. `misaka mcp add` writes entries to the home or the project file and `misaka mcp list` connects
+and checks the servers of those two; a Sister's servers are managed with `/mcp` in her window
+([commands](commands.md)).
+
+A project entry without `command`, `url` or `type` changes only `enabled`, `exposure` and
+`toolExposure` of the server of that name from the home or role file, and keeps the rest of it,
+`env`, `headers` and `auth` included. This turns a server off in one project:
+
+```json
+{ "mcpServers": { "internal-tools": { "enabled": false } } }
+```
+
+In a trusted project, `/mcp` offers *Enable in this project* and *Disable in this project* for the
+servers of `~/.misaka/mcp.json`. They write such an entry, and later changes to that server go to it.
+
+```json
+{
+  "mcpServers": {
+    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] },
+    "docs": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" } }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `command`, `args`, `env`, `cwd` | a server started as a process, speaking on its standard streams; `~` expands, `cwd` is relative to the working directory |
+| `url`, `headers` | a Streamable HTTP server. Without an `Authorization` header it signs in with OAuth when the server asks (`/mcp login`, `misaka mcp login`); `oauth` holds a pre-registered client (`clientId`, `clientSecret`, `callbackUrl`, `callbackPort`, `scope`, `clientName`, `authServerMetadataUrl`); `auth: {"provider": "..."}` sends a `/login` provider's token instead (home and role files only) |
+| `exposure` | how the model reaches the tools: `codemode` (default: from codemode scripts), `deferred` (declared once `tool_search` loads them), `direct` (declared like built-in tools) or `hidden` |
+| `toolExposure` | the exposure of single tools, by name or `*` pattern |
+| `description` | one line about what the server offers; the model sees it |
+| `enabled` | `false` keeps the entry without connecting it |
+| `timeout` | seconds per request, `60` by default |
+
+Values may use `${VAR}` for an environment variable and `!command` for a command's output, read when
+the server connects. Each server's tools are named `mcp__<server>__<tool>`. The top-level
+`autoEnableCodemode` (default `true`) activates the codemode tool when a `codemode` server connects.
+
+Sign-ins are kept in `~/.misaka/credentials/mcp-auth.json`. What servers log goes to
+`~/.misaka/logs/mcp/mcp.log`.
+
+### Codemode
+
+With the `codemode` tool the model writes a JavaScript script that calls the other tools, so it can
+run calls in parallel and filter large results before it reads them. MCP tools reach the model this
+way by default. The tool is off until something names it: `defaultTools` (`["+codemode"]`) or an MCP
+server with `codemode` exposure. Scripts run in a V8 sandbox with no
+file system, network or timers; they call tools through `tools.<name>(args)`. The reference the
+model reads is shipped with MISAKA as `codemode.md`.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `codemode.mode` | `on` | how the other tools are presented while codemode is active: `on` keeps them declared and tells the model how scripts call them; `only` hides them and lists them in the codemode description instead |
+| `codemode.inlineBudget` | `3000` | estimated tokens the codemode description may spend on tool declarations; tools that do not fit are found with `searchTools()` |
+
+### Tool search
+
+The `tool_search` tool lets the model find tools that are not declared to it up front and load the
+ones it needs for its next request. MCP servers with `deferred` exposure reach the model this way,
+and `tool_search` is turned on for them. Otherwise it is off until something names it:
+`defaultTools` (`["+tool_search"]`) or `--tools`. It searches the names and descriptions of the
+deferred tools; a tool it loads is then called like any other.
 
 ## Documents and the web
 
@@ -134,6 +224,14 @@ see [the team guide](../guide/team.md#a-sisters-profile).
 | `tui.esc_timeout_ms` | `10`; `100` over ssh or inside a pane | how long Esc waits to see whether it starts an Alt+key |
 | `showHardwareCursor` | `false` | show the terminal's own cursor |
 | `terminal.clearOnShrink` | `false` | clear the screen when the window shrinks |
+
+Chat also tells a terminal that supports the
+[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501)
+what it is doing: `working` during a run or a compaction, `blocked` while a dialog or a sign-in
+waits for you, `done`, `error` (with the error's first line) and `idle`. A report carries at most
+the conversation's name or the dialog's title, never your prompts or the model's output. It is sent
+only after the terminal answers the protocol's query; tmux and screen do not pass it on.
+`MISAKA_PROGRAM_STATUS` changes that.
 
 ## Long conversations (LCM)
 
@@ -186,6 +284,7 @@ Variables for MISAKA itself:
 | `MISAKA_TIMING` | `0` | `1` prints startup timings |
 | `MISAKA_GHOSTTY_VT` | the bundled library | a terminal library you built yourself, for platforms without a bundled one |
 | `MISAKA_ALLOW_NESTED` | off | `1` lets the panel open inside one of its own panes |
+| `MISAKA_PROGRAM_STATUS` | ask the terminal | `1` always sends program status reports (OSC 7501), `0` never does |
 | `GITHUB_TOKEN` / `GH_TOKEN` | none | a GitHub token for `misaka update` (it also asks `gh auth token`): for a private copy of the repository, or a higher rate limit |
 
 Other `MISAKA_*` names are set by MISAKA for its own processes; leave them alone.

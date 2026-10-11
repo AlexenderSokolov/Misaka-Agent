@@ -15,7 +15,8 @@ from misaka.core.research import runs
 def board(tmp_path):
     con = tasks.connect(str(tmp_path / "board.db"))
     runs.init(con)
-    return con
+    yield con
+    con.close()
 
 
 def test_a_driven_run_reads_its_own_results(board, tmp_path):

@@ -17,7 +17,6 @@ from misaka.ai.types import TextContent
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.tools._common import (
     _drain_worker,
-    _string_arg,
     abort_race,
     regular_file,
     whole_file_bytes,
@@ -25,25 +24,19 @@ from misaka.core.tools._common import (
 )
 from misaka.core.tools.edit_diff import (
     Edit,
-    EditDiffError,
-    EditDiffResult,
-    apply_edits_to_normalized_content,
-    compute_edits_diff,
-    detect_line_ending,
-    generate_diff_string,
-    generate_unified_patch,
-    normalize_to_lf,
-    restore_line_endings,
-    strip_bom,
+    applyEditsToNormalizedContent,
+    detectLineEnding,
+    generateDiffString,
+    generateUnifiedPatch,
+    normalizeToLF,
+    restoreLineEndings,
 )
-from misaka.core.tools.file_mutation_queue import with_file_mutation_queue
-from misaka.core.tools.path_utils import resolve_to_cwd
-from misaka.core.tools.render_utils import render_tool_path
-from misaka.core.tools.tool_definition_wrapper import wrap_tool_definition
-from misaka.ui.tui import Box, Container, Spacer, Text
+from misaka.core.tools.file_mutation_queue import withFileMutationQueue
+from misaka.core.tools.path_utils import resolveToCwd
+from misaka.core.tools.renderers.edit import editRenderers
+from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
+from misaka.utils.text import splitBom
 from misaka.utils.values import read_field, signal_aborted
-
-type EditPreview = EditDiffResult | EditDiffError
 
 
 class ReplaceEditInput(BaseModel):
@@ -59,6 +52,17 @@ class ReplaceEditInput(BaseModel):
         )
     )
     newText: str = Field(description="Replacement text for this targeted edit.")
+
+
+editToolSystemPromptContribution = {
+    "snippet": "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+    "guidelines": [
+        "Use edit for precise changes (edits[].oldText must match exactly)",
+        "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
+        "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+        "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+    ],
+}
 
 
 class EditToolInput(BaseModel):
@@ -100,33 +104,6 @@ class EditToolOptions:
     operations: EditOperations | None = None
 
 
-type RenderableEditArgs = dict[str, Any]
-
-
-class _EditToolResultLike(Protocol):
-    content: list[Any]
-    details: EditToolDetails | None
-
-
-class _EditCallRenderComponent(Box):
-    def __init__(self) -> None:
-        super().__init__(1, 1, lambda text: text)
-        self.preview: EditPreview | None = None
-        self.previewArgsKey: str | None = None
-        self.previewPending = False
-        self.settledError = False
-
-
-def _ensure_edit_call_render_component(component: Box) -> _EditCallRenderComponent:
-    if not hasattr(component, "preview"):
-        component.preview = None
-    if not hasattr(component, "previewArgsKey"):
-        component.previewArgsKey = None
-    if not hasattr(component, "previewPending"):
-        component.previewPending = False
-    if not hasattr(component, "settledError"):
-        component.settledError = False
-    return component  # type: ignore[return-value]
 
 
 @dataclass(slots=True)
@@ -149,7 +126,7 @@ def _coerce_options(options: EditToolOptions | Mapping[str, Any] | None) -> Edit
     return EditToolOptions(operations=options.get("operations"))
 
 
-def prepare_edit_arguments(input_value: Any) -> Any:
+def prepareEditArguments(input_value: Any) -> Any:
     if not isinstance(input_value, dict):
         return input_value
 
@@ -186,7 +163,7 @@ def prepare_edit_arguments(input_value: Any) -> Any:
     return {**rest, "edits": edits}
 
 
-def _validate_edit_input(input_value: EditToolInput) -> tuple[str, list[Edit]]:
+def validateEditInput(input_value: EditToolInput) -> tuple[str, list[Edit]]:
     if not input_value.edits:
         raise RuntimeError("Edit tool input is invalid. edits must contain at least one replacement.")
     return input_value.path, [Edit(oldText=edit.oldText, newText=edit.newText) for edit in input_value.edits]
@@ -200,151 +177,6 @@ def _format_access_error(error: BaseException) -> str:
     if isinstance(error, Exception):
         return f"Error: {error}"
     return str(error)
-
-
-def _get_edit_call_render_component(state: dict[str, Any], last_component: Any) -> _EditCallRenderComponent:
-    if isinstance(last_component, Box):
-        component = _ensure_edit_call_render_component(last_component)
-        state["callComponent"] = component
-        return component
-    component = state.get("callComponent")
-    if isinstance(component, Box):
-        return _ensure_edit_call_render_component(component)
-    component = _ensure_edit_call_render_component(_EditCallRenderComponent())
-    state["callComponent"] = component
-    return component
-
-
-def _get_renderable_preview_input(args: RenderableEditArgs | None) -> tuple[str, list[Edit]] | None:
-    if not args:
-        return None
-
-    raw_path = read_field(args, "path")
-    if not isinstance(raw_path, str):
-        raw_path = read_field(args, "file_path")
-    if not isinstance(raw_path, str) or not raw_path:
-        return None
-
-    edits_value = read_field(args, "edits")
-    if isinstance(edits_value, list) and edits_value:
-        edits: list[Edit] = []
-        for edit in edits_value:
-            old_text = read_field(edit, "oldText")
-            new_text = read_field(edit, "newText")
-            if not isinstance(old_text, str) or not isinstance(new_text, str):
-                return None
-            edits.append(Edit(oldText=old_text, newText=new_text))
-        return raw_path, edits
-
-    old_text = read_field(args, "oldText")
-    new_text = read_field(args, "newText")
-    if isinstance(old_text, str) and isinstance(new_text, str):
-        return raw_path, [Edit(oldText=old_text, newText=new_text)]
-
-    return None
-
-
-def _preview_args_key(path: str, edits: list[Edit]) -> str:
-    return json.dumps(
-        {"path": path, "edits": [{"oldText": edit.oldText, "newText": edit.newText} for edit in edits]},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def _format_edit_call(args: RenderableEditArgs | None, theme_obj: Any, cwd: str) -> str:
-    raw_path = _string_arg(read_field(args, "file_path", read_field(args, "path")))
-    return f"{theme_obj.fg('toolTitle', theme_obj.bold('edit'))} {render_tool_path(raw_path, theme_obj, cwd)}"
-
-
-def _format_edit_result(
-    args: RenderableEditArgs | None,
-    preview: EditPreview | None,
-    result: _EditToolResultLike | Mapping[str, Any],
-    theme_obj: Any,
-    is_error: bool,
-) -> str | None:
-    from misaka.ui.tui.interactive.components.diff import render_diff
-
-    raw_path = _string_arg(read_field(args, "file_path", read_field(args, "path")))
-    preview_diff = preview.diff if isinstance(preview, EditDiffResult) else None
-    preview_error = preview.error if isinstance(preview, EditDiffError) else None
-
-    if is_error:
-        error_text = "\n".join(
-            read_field(block, "text") or ""
-            for block in (read_field(result, "content", []) or [])
-            if read_field(block, "type") == "text"
-        )
-        if not error_text or error_text == preview_error:
-            return None
-        return theme_obj.fg("error", error_text)
-
-    details = read_field(result, "details")
-    result_diff = read_field(details, "diff")
-    if isinstance(result_diff, str) and result_diff != preview_diff:
-        return render_diff(result_diff, {"filePath": raw_path if raw_path is not None else None})
-    return None
-
-
-def _get_edit_header_bg(preview: EditPreview | None, settled_error: bool, theme_obj: Any) -> Callable[[str], str]:
-    if preview is not None:
-        if isinstance(preview, EditDiffError):
-            return lambda text: theme_obj.bg("toolErrorBg", text)
-        return lambda text: theme_obj.bg("toolSuccessBg", text)
-    if settled_error:
-        return lambda text: theme_obj.bg("toolErrorBg", text)
-    return lambda text: theme_obj.bg("toolPendingBg", text)
-
-
-def _build_edit_call_component(
-    component: _EditCallRenderComponent,
-    args: RenderableEditArgs | None,
-    theme_obj: Any,
-    cwd: str,
-) -> _EditCallRenderComponent:
-    from misaka.ui.tui.interactive.components.diff import render_diff
-
-    component.setBgFn(_get_edit_header_bg(component.preview, component.settledError, theme_obj))
-    component.clear()
-    component.addChild(Text(_format_edit_call(args, theme_obj, cwd), 0, 0))
-
-    if component.preview is None:
-        return component
-
-    if isinstance(component.preview, EditDiffError):
-        body = theme_obj.fg("error", component.preview.error)
-    else:
-        body = render_diff(component.preview.diff)
-    component.addChild(Spacer(1))
-    component.addChild(Text(body, 0, 0))
-    return component
-
-
-def _set_edit_preview(
-    component: _EditCallRenderComponent,
-    preview: EditPreview,
-    args_key: str | None,
-) -> bool:
-    current = component.preview
-    changed = (
-        current is None
-        or (
-            isinstance(current, EditDiffError)
-            and isinstance(preview, EditDiffError)
-            and current.error != preview.error
-        )
-        or (isinstance(current, EditDiffError) != isinstance(preview, EditDiffError))
-        or (
-            isinstance(current, EditDiffResult)
-            and isinstance(preview, EditDiffResult)
-            and (current.diff != preview.diff or current.firstChangedLine != preview.firstChangedLine)
-        )
-    )
-    component.preview = preview
-    component.previewArgsKey = args_key
-    component.previewPending = False
-    return changed
 
 
 def _refuse_office_package(absolute_path: str, tool: str) -> None:
@@ -371,7 +203,7 @@ def _refuse_office_package(absolute_path: str, tool: str) -> None:
 _TEXT_OFFICE_SUFFIXES = frozenset({".csv", ".tsv"})
 
 
-def create_edit_tool_definition(
+def createEditToolDefinition(
     cwd: str,
     options: EditToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[EditToolInput | dict[str, Any], EditToolDetails | None]:
@@ -383,11 +215,11 @@ def create_edit_tool_definition(
         input_value: EditToolInput | dict[str, Any],
         signal: Any | None = None,
         _on_update: Callable[[AgentToolResult], None] | None = None,
-        _ctx: Any = None,
+        ctx: Any = None,
     ) -> AgentToolResult:
         parsed = EditToolInput.model_validate(input_value)
-        path, edits = _validate_edit_input(parsed)
-        absolute_path = resolve_to_cwd(path, cwd)
+        path, edits = validateEditInput(parsed)
+        absolute_path = resolveToCwd(path, read_field(ctx, "cwd") or cwd)
         _refuse_office_package(absolute_path, "edit")
 
         async def mutate() -> AgentToolResult:
@@ -417,21 +249,22 @@ def create_edit_tool_definition(
                             f"Could not edit file: {path}. It is not valid UTF-8 text ({error}); "
                             "editing it as text would corrupt it. Use bash for binary files."
                         ) from None
-                    bom, content = strip_bom(raw_content)
-                    original_ending = detect_line_ending(content)
-                    normalized_content = normalize_to_lf(content)
-                    applied = apply_edits_to_normalized_content(normalized_content, edits, path)
+                    split = splitBom(raw_content)
+                    bom, content = split["bom"], split["text"]
+                    original_ending = detectLineEnding(content)
+                    normalized_content = normalizeToLF(content)
+                    applied = applyEditsToNormalizedContent(normalized_content, edits, path)
 
                     if aborted:
                         return None
 
-                    final_content = bom + restore_line_endings(applied.newContent, original_ending)
+                    final_content = bom + restoreLineEndings(applied.newContent, original_ending)
                     await operations.writeFile(absolute_path, final_content)
                     if aborted:
                         return None
 
-                    diff_result = generate_diff_string(applied.baseContent, applied.newContent)
-                    patch = generate_unified_patch(path, applied.baseContent, applied.newContent)
+                    diff_result = generateDiffString(applied.baseContent, applied.newContent)
+                    patch = generateUnifiedPatch(path, applied.baseContent, applied.newContent)
                     return AgentToolResult(
                         content=[TextContent(text=f"Successfully replaced {len(edits)} block(s) in {path}.")],
                         details=EditToolDetails(
@@ -475,81 +308,7 @@ def create_edit_tool_definition(
                         raise asyncio.CancelledError from error
                     raise
 
-        return await with_file_mutation_queue(absolute_path, mutate)
-
-    def render_call(args: RenderableEditArgs | None, theme_obj: Any, context: Any) -> _EditCallRenderComponent:
-        component = _get_edit_call_render_component(context.state, context.lastComponent)
-        preview_input = _get_renderable_preview_input(args)
-        args_key = _preview_args_key(*preview_input) if preview_input is not None else None
-
-        if component.previewArgsKey != args_key:
-            component.preview = None
-            component.previewArgsKey = args_key
-            component.previewPending = False
-            component.settledError = False
-
-        if context.argsComplete and preview_input is not None and component.preview is None and not component.previewPending:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None:
-                component.previewPending = True
-                request_key = args_key
-                path_value, edits_value = preview_input
-
-                async def _load_preview() -> None:
-                    preview = await compute_edits_diff(path_value, edits_value, context.cwd)
-                    if component.previewArgsKey == request_key:
-                        _set_edit_preview(component, preview, request_key)
-                        context.invalidate()
-
-                loop.create_task(_load_preview())
-
-        return _build_edit_call_component(component, args, theme_obj, context.cwd)
-
-    def render_result(
-        result: _EditToolResultLike | Mapping[str, Any],
-        _options: Mapping[str, Any],
-        theme_obj: Any,
-        context: Any,
-    ) -> Container:
-        raw_call_component = context.state.get("callComponent")
-        call_component = _ensure_edit_call_render_component(raw_call_component) if isinstance(raw_call_component, Box) else None
-        preview_input = _get_renderable_preview_input(context.args)
-        args_key = _preview_args_key(*preview_input) if preview_input is not None else None
-        result_diff = read_field(read_field(result, "details"), "diff") if not context.isError else None
-
-        changed = False
-        if call_component is not None:
-            if isinstance(result_diff, str):
-                changed = _set_edit_preview(
-                    call_component,
-                    EditDiffResult(diff=result_diff, firstChangedLine=read_field(read_field(result, "details"), "firstChangedLine")),
-                    args_key,
-                ) or changed
-            if call_component.settledError != context.isError:
-                call_component.settledError = context.isError
-                changed = True
-            if changed:
-                _build_edit_call_component(
-                    call_component, context.args, theme_obj, context.cwd
-                )
-
-        output = _format_edit_result(
-            context.args,
-            call_component.preview if call_component is not None else None,
-            result,
-            theme_obj,
-            context.isError,
-        )
-        component = context.lastComponent if context.lastComponent is not None else Container()
-        component.clear()
-        if not output:
-            return component
-        component.addChild(Spacer(1))
-        component.addChild(Text(output, 1, 0))
-        return component
+        return await withFileMutationQueue(absolute_path, mutate)
 
     return ToolDefinition(
         name="edit",
@@ -560,31 +319,21 @@ def create_edit_tool_definition(
             "merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions "
             "just to connect distant changes."
         ),
-        promptSnippet=(
-            "Make precise file edits with exact text replacement, including multiple disjoint edits in one call"
-        ),
-        promptGuidelines=[
-            "Use edit for precise changes (edits[].oldText must match exactly)",
-            "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-            "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-            "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-        ],
+        promptSnippet=editToolSystemPromptContribution["snippet"],
+        promptGuidelines=[*editToolSystemPromptContribution["guidelines"]],
         parameters=_edit_tool_schema(),
         constrainedSampling={"type": "json_schema", "strict": "prefer"},
         renderShell="self",
-        prepareArguments=prepare_edit_arguments,
+        prepareArguments=prepareEditArguments,
         execute=execute,
-        renderCall=render_call,
-        renderResult=render_result,
+        **editRenderers,
     )
 
 
-def create_edit_tool(cwd: str, options: EditToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
-    return wrap_tool_definition(create_edit_tool_definition(cwd, options))
+def createEditTool(cwd: str, options: EditToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
+    return wrapToolDefinition(createEditToolDefinition(cwd, options))
 
 
-createEditTool = create_edit_tool
-createEditToolDefinition = create_edit_tool_definition
 
 __all__ = [
     "EditOperations",
@@ -593,4 +342,5 @@ __all__ = [
     "EditToolOptions",
     "createEditTool",
     "createEditToolDefinition",
+    "editToolSystemPromptContribution",
 ]

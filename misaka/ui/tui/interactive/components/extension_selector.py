@@ -1,16 +1,27 @@
-"""Generic bordered selector used by interactive extension dialogs."""
+"""Translated from pi's ``modes/interactive/components/extension-selector.ts`` (v1.1.0).
+
+Generic selector component for extensions.
+Displays a list of string options with keyboard navigation.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypedDict
 
 from misaka.ui.tui import Container, Spacer, Text, getKeybindings
 from misaka.ui.tui.interactive.theme.theme import theme
 
 from .countdown_timer import CountdownTimer
 from .dynamic_border import DynamicBorder
-from .keybinding_hints import key_hint, raw_key_hint
+from .keybinding_hints import keyHint, rawKeyHint
+
+
+class ExtensionSelectorOptions(TypedDict, total=False):
+    tui: Any
+    timeout: float | None
+    onToggleToolsExpanded: Callable[[], None] | None
+    description: str | None
 
 
 class ExtensionSelectorComponent(Container):
@@ -20,14 +31,14 @@ class ExtensionSelectorComponent(Container):
         options: list[str],
         onSelect: Callable[[str], None],
         onCancel: Callable[[], None],
-        opts: dict[str, Any] | None = None,
+        opts: ExtensionSelectorOptions | None = None,
     ) -> None:
         super().__init__()
         self.options = options
         self.selectedIndex = 0
         self.onSelectCallback = onSelect
         self.onCancelCallback = onCancel
-        self.onToggleToolsExpanded = (opts or {}).get("onToggleToolsExpanded")
+        self.onToggleToolsExpanded = opts.get("onToggleToolsExpanded") if opts else None
         self.baseTitle = title
         self.countdown: CountdownTimer | None = None
 
@@ -36,20 +47,24 @@ class ExtensionSelectorComponent(Container):
 
         self.titleText = Text(theme.fg("accent", theme.bold(title)), 1, 0)
         self.addChild(self.titleText)
+        description = opts.get("description") if opts else None
+        if description:
+            self.addChild(Spacer(1))
+            self.addChild(Text(theme.fg("text", description), 1, 0))
         self.addChild(Spacer(1))
 
-        timeout = (opts or {}).get("timeout")
-        tui = (opts or {}).get("tui")
-        # Extensions send milliseconds through JSON, so a float (or a bool, which is an
-        # `int` subclass) reaches us as often as a plain int; `CountdownTimer` wants an int.
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0 and tui is not None:
+        timeout = opts.get("timeout") if opts else None
+        tui = opts.get("tui") if opts else None
+        # MISAKA fork: extensions send the timeout through JSON, so a bool (an `int` subclass) or a string can arrive
+        # where a number belongs; only a real number starts the countdown.
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0 and tui:
             self.countdown = CountdownTimer(
-                int(timeout),
+                timeout,
                 tui,
                 lambda seconds: self.titleText.setText(
                     theme.fg("accent", theme.bold(f"{self.baseTitle} ({seconds}s)"))
                 ),
-                self.onCancelCallback,
+                lambda: self.onCancelCallback(),
             )
 
         self.listContainer = Container()
@@ -58,11 +73,11 @@ class ExtensionSelectorComponent(Container):
         self.addChild(Spacer(1))
         self.addChild(
             Text(
-                raw_key_hint("↑↓", "navigate")
+                rawKeyHint("↑↓", "navigate")
                 + "  "
-                + key_hint("tui.select.confirm", "select")
+                + keyHint("tui.select.confirm", "select")
                 + "  "
-                + key_hint("tui.select.cancel", "cancel"),
+                + keyHint("tui.select.cancel", "cancel"),
                 1,
                 0,
             )
@@ -107,4 +122,4 @@ class ExtensionSelectorComponent(Container):
             self.countdown.dispose()
 
 
-__all__ = ["ExtensionSelectorComponent"]
+__all__ = ["ExtensionSelectorComponent", "ExtensionSelectorOptions"]

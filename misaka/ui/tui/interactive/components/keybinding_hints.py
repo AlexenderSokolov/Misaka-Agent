@@ -1,66 +1,51 @@
-"""Utilities for formatting interactive keybinding hints."""
+"""Translated from pi's ``modes/interactive/components/keybinding-hints.ts`` (v1.1.0).
+
+Utilities for formatting keybinding hints in the UI.
+"""
 
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
 
-from misaka.ui.tui import getKeybindings
 from misaka.ui.tui.interactive.theme.theme import theme
-from misaka.ui.tui.keybindings import Keybinding
+from misaka.ui.tui.keybindings import Keybinding, getKeybindings
+from misaka.ui.tui.keys import KeyId
 
 
 @dataclass(slots=True)
 class KeyTextFormatOptions:
-    capitalize: bool = False
+    capitalize: bool | None = None
 
 
-def _format_key_part(part: str, options: KeyTextFormatOptions) -> str:
-    display_part = "option" if sys.platform == "darwin" and part.lower() == "alt" else part
-    if not options.capitalize:
-        return display_part
-    return display_part[:1].upper() + display_part[1:]
+def formatKeyPart(part: str, options: KeyTextFormatOptions) -> str:
+    displayPart = "option" if sys.platform == "darwin" and part.lower() == "alt" else part
+    return displayPart[0:1].upper() + displayPart[1:] if options.capitalize else displayPart
 
 
-def format_key_text(key: str, options: KeyTextFormatOptions | None = None) -> str:
-    resolved = options or KeyTextFormatOptions()
-    return "/".join(
-        "+".join(_format_key_part(part, resolved) for part in option.split("+"))
-        for option in key.split("/")
-    )
+def formatKeyText(key: str, options: KeyTextFormatOptions | None = None) -> str:
+    if options is None:
+        options = KeyTextFormatOptions()
+    return "/".join("+".join(formatKeyPart(part, options) for part in k.split("+")) for k in key.split("/"))
 
 
-def _format_keys(keys: list[str], options: KeyTextFormatOptions | None = None) -> str:
-    if not keys:
+def formatKeys(keys: list[KeyId], options: KeyTextFormatOptions | None = None) -> str:
+    if len(keys) == 0:
         return ""
-    return format_key_text("/".join(keys), options)
+    return formatKeyText("/".join(keys), options)
 
 
-def key_text(keybinding: Keybinding) -> str:
-    return _format_keys(getKeybindings().getKeys(keybinding))
+def keyText(keybinding: Keybinding) -> str:
+    return formatKeys(getKeybindings().getKeys(keybinding))
 
 
-def key_display_text(keybinding: Keybinding) -> str:
-    return _format_keys(getKeybindings().getKeys(keybinding), KeyTextFormatOptions(capitalize=True))
+def keyDisplayText(keybinding: Keybinding) -> str:
+    return formatKeys(getKeybindings().getKeys(keybinding), KeyTextFormatOptions(capitalize=True))
 
 
-def key_hint(keybinding: Keybinding, description: str) -> str:
-    # The description is secondary text everywhere these hints appear; `text` renders it at
-    # body brightness, which is not the hierarchy the dialogs are drawn for.
-    return theme.fg("dim", key_text(keybinding)) + theme.fg("muted", f" {description}")
+def keyHint(keybinding: Keybinding, description: str) -> str:
+    return theme.fg("dim", keyText(keybinding)) + theme.fg("muted", f" {description}")
 
 
-def raw_key_hint(key: str, description: str) -> str:
-    return theme.fg("dim", format_key_text(key)) + theme.fg("muted", f" {description}")
-
-
-keyHint = key_hint
-keyText = key_text
-rawKeyHint = raw_key_hint
-
-__all__ = [
-    "KeyTextFormatOptions",
-    "keyHint",
-    "keyText",
-    "rawKeyHint",
-]
+def rawKeyHint(key: str, description: str) -> str:
+    return theme.fg("dim", formatKeyText(key)) + theme.fg("muted", f" {description}")

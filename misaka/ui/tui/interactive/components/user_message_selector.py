@@ -1,89 +1,113 @@
-"""User-message selection UI for session forking flows."""
+"""Translated from pi's ``modes/interactive/components/user-message-selector.ts`` (v1.1.0)."""
 
 from __future__ import annotations
 
-import asyncio
-import threading
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from misaka.ui.tui import Container, Spacer, Text, getKeybindings, truncateToWidth
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
 from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.utils.js import jsIndex, jsTrim, setTimeout
+
+from .dynamic_border import DynamicBorder
 
 
 @dataclass(slots=True)
 class UserMessageItem:
-    id: str
-    text: str
-    timestamp: str | None = None
+    id: str  # Entry ID in the session
+    text: str  # The message text
+    timestamp: str | None = None  # Optional timestamp if available
 
 
 class UserMessageList:
+    """Custom user message list component with selection"""
+
     def __init__(self, messages: list[UserMessageItem], initialSelectedId: str | None = None) -> None:
-        self.messages = messages
-        initial_index = (
-            next((index for index, message in enumerate(messages) if message.id == initialSelectedId), -1)
-            if initialSelectedId is not None
-            else -1
-        )
-        self.selectedIndex = initial_index if initial_index >= 0 else max(0, len(messages) - 1)
-        self.maxVisible = 10
         self.onSelect: Callable[[str], None] | None = None
         self.onCancel: Callable[[], None] | None = None
+        self.maxVisible: int = 10  # Max messages visible
+
+        # Store messages in chronological order (oldest to newest)
+        self.messages = messages
+        initialIndex = (
+            next((index for index, message in enumerate(messages) if message.id == initialSelectedId), -1)
+            if initialSelectedId
+            else -1
+        )
+        # Start with selected message if provided, else default to the most recent
+        self.selectedIndex: int = initialIndex if initialIndex >= 0 else max(0, len(messages) - 1)
 
     def invalidate(self) -> None:
-        return None
+        # No cached state to invalidate currently
+        pass
 
     def render(self, width: int) -> list[str]:
-        if not self.messages:
-            return [theme.fg("muted", "  No user messages found")]
-
         lines: list[str] = []
-        start_index = max(
+
+        if len(self.messages) == 0:
+            lines.append(theme.fg("muted", "  No user messages found"))
+            return lines
+
+        # Calculate visible range with scrolling
+        startIndex = max(
             0,
-            min(self.selectedIndex - (self.maxVisible // 2), len(self.messages) - self.maxVisible),
+            min(self.selectedIndex - math.floor(self.maxVisible / 2), len(self.messages) - self.maxVisible),
         )
-        end_index = min(start_index + self.maxVisible, len(self.messages))
+        endIndex = min(startIndex + self.maxVisible, len(self.messages))
 
-        for index in range(start_index, end_index):
-            message = self.messages[index]
-            is_selected = index == self.selectedIndex
-            normalized = message.text.replace("\n", " ").strip()
+        # Render visible messages (2 lines per message + blank line)
+        for i in range(startIndex, endIndex):
+            message = self.messages[i]
+            isSelected = i == self.selectedIndex
 
-            cursor = theme.fg("accent", "› ") if is_selected else "  "
-            truncated = truncateToWidth(normalized, width - 2)
-            lines.append(cursor + (theme.bold(truncated) if is_selected else truncated))
+            # Normalize message to single line
+            normalizedMessage = jsTrim(message.text.replace("\n", " "))
 
-            position = f"  Message {index + 1} of {len(self.messages)}"
-            lines.append(theme.fg("muted", position))
-            lines.append("")
+            # First line: cursor + message
+            cursor = theme.fg("accent", "› ") if isSelected else "  "
+            maxMsgWidth = width - 2  # Account for cursor (2 chars)
+            truncatedMsg = truncateToWidth(normalizedMessage, maxMsgWidth)
+            messageLine = cursor + (theme.bold(truncatedMsg) if isSelected else truncatedMsg)
 
-        if start_index > 0 or end_index < len(self.messages):
-            lines.append(theme.fg("muted", f"  ({self.selectedIndex + 1}/{len(self.messages)})"))
+            lines.append(messageLine)
+
+            # Second line: metadata (position in history)
+            position = i + 1
+            metadata = f"  Message {position} of {len(self.messages)}"
+            metadataLine = theme.fg("muted", metadata)
+            lines.append(metadataLine)
+            lines.append("")  # Blank line between messages
+
+        # Add scroll indicator if needed
+        if startIndex > 0 or endIndex < len(self.messages):
+            scrollInfo = theme.fg("muted", f"  ({self.selectedIndex + 1}/{len(self.messages)})")
+            lines.append(scrollInfo)
+
         return lines
 
     def handleInput(self, keyData: str) -> None:
         kb = getKeybindings()
+        # Up arrow - go to previous (older) message, wrap to bottom when at top
         if kb.matches(keyData, "tui.select.up"):
             self.selectedIndex = len(self.messages) - 1 if self.selectedIndex == 0 else self.selectedIndex - 1
+        # Down arrow - go to next (newer) message, wrap to top when at bottom
         elif kb.matches(keyData, "tui.select.down"):
             self.selectedIndex = 0 if self.selectedIndex == len(self.messages) - 1 else self.selectedIndex + 1
+        # Enter - select message and branch
         elif kb.matches(keyData, "tui.select.confirm"):
-            # An empty list leaves selectedIndex at 0 (and ↑ puts it at -1); indexing blindly
-            # raises IndexError out of the TUI's input dispatch. Pi guards with `selected &&`.
-            selected = (
-                self.messages[self.selectedIndex]
-                if 0 <= self.selectedIndex < len(self.messages)
-                else None
-            )
-            if selected is not None and callable(self.onSelect):
+            selected = jsIndex(self.messages, self.selectedIndex)
+            if selected and self.onSelect:
                 self.onSelect(selected.id)
-        elif kb.matches(keyData, "tui.select.cancel") and callable(self.onCancel):
-            self.onCancel()
+        # Escape - cancel
+        elif kb.matches(keyData, "tui.select.cancel"):  # noqa: SIM102 - upstream nests the callback check
+            if self.onCancel:
+                self.onCancel()
 
 
 class UserMessageSelectorComponent(Container):
+    """Component that renders a user message selector for branching"""
+
     def __init__(
         self,
         messages: list[UserMessageItem],
@@ -92,6 +116,8 @@ class UserMessageSelectorComponent(Container):
         initialSelectedId: str | None = None,
     ) -> None:
         super().__init__()
+
+        # Add header
         self.addChild(Spacer(1))
         self.addChild(Text(theme.bold("Fork from Message"), 1, 0))
         self.addChild(
@@ -105,29 +131,20 @@ class UserMessageSelectorComponent(Container):
         self.addChild(DynamicBorder())
         self.addChild(Spacer(1))
 
+        # Create message list
         self.messageList = UserMessageList(messages, initialSelectedId)
         self.messageList.onSelect = onSelect
         self.messageList.onCancel = onCancel
+
         self.addChild(self.messageList)
 
+        # Add bottom border
         self.addChild(Spacer(1))
         self.addChild(DynamicBorder())
 
-        if not messages:
-            # onCancel edits the component tree, so it belongs on the event loop the TUI
-            # renders from (pi uses setTimeout). The bare thread stays as the fallback for
-            # callers that build this component outside a running loop.
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                timer = threading.Timer(0.1, onCancel)
-                timer.daemon = True
-                timer.start()
-            else:
-                loop.call_later(0.1, onCancel)
-
-    def handleInput(self, data: str) -> None:
-        self.messageList.handleInput(data)
+        # Auto-cancel if no messages
+        if len(messages) == 0:
+            setTimeout(lambda: onCancel(), 100)
 
     def getMessageList(self) -> UserMessageList:
         return self.messageList

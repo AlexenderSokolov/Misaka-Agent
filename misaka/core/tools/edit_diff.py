@@ -1,18 +1,20 @@
-"""Shared diff computation helpers for the edit tool."""
+"""Translated from pi's ``packages/coding-agent/src/core/tools/edit-diff.ts`` (v1.1.0).
+
+Shared diff computation utilities for the edit and similar tools.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import bisect
-import difflib
 import errno as errno_module
 import unicodedata
-from collections.abc import Iterator
 from dataclasses import dataclass
-from io import StringIO
 
 from misaka.core.tools._common import regular_file, whole_file_bytes
-from misaka.core.tools.path_utils import resolve_to_cwd
+from misaka.core.tools.path_utils import resolveToCwd
+from misaka.utils.jsdiff import FILE_HEADERS_ONLY, createTwoFilesPatch, diffLines
+from misaka.utils.text import splitBom
 
 
 @dataclass(slots=True)
@@ -56,23 +58,13 @@ class _MatchedEdit:
 
 
 @dataclass(slots=True)
-class _StripBomResult:
-    bom: str
-    text: str
-
-    def __iter__(self) -> Iterator[str]:
-        yield self.bom
-        yield self.text
-
-
-@dataclass(slots=True)
 class _DiffPart:
     value: str
     added: bool = False
     removed: bool = False
 
 
-def detect_line_ending(content: str) -> str:
+def detectLineEnding(content: str) -> str:
     crlf_index = content.find("\r\n")
     lf_index = content.find("\n")
     if lf_index == -1 or crlf_index == -1:
@@ -80,11 +72,11 @@ def detect_line_ending(content: str) -> str:
     return "\r\n" if crlf_index < lf_index else "\n"
 
 
-def normalize_to_lf(text: str) -> str:
+def normalizeToLF(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def restore_line_endings(text: str, ending: str) -> str:
+def restoreLineEndings(text: str, ending: str) -> str:
     return text.replace("\n", "\r\n") if ending == "\r\n" else text
 
 
@@ -100,14 +92,20 @@ _COMPAT_CHAR_MAP = str.maketrans({
 })
 
 
-def normalize_for_fuzzy_match(text: str) -> str:
+def normalizeForFuzzyMatch(text: str) -> str:
+    """Normalize text for fuzzy matching. Applies progressive transformations:
+    - Strip trailing whitespace from each line
+    - Normalize smart quotes to ASCII equivalents
+    - Normalize Unicode dashes/hyphens to ASCII hyphen
+    - Normalize special Unicode spaces to regular space
+    """
     return "\n".join(
         line.rstrip() for line in unicodedata.normalize("NFKC", text).split("\n")
     ).translate(_COMPAT_CHAR_MAP)
 
 
 def _norm_frag(text: str) -> str:
-    """``normalize_for_fuzzy_match`` for an intra-line fragment: no per-line rstrip."""
+    """``normalizeForFuzzyMatch`` for an intra-line fragment: no per-line rstrip."""
     return unicodedata.normalize("NFKC", text).translate(_COMPAT_CHAR_MAP)
 
 
@@ -144,7 +142,7 @@ def _orig_col(orig_line: str, norm_line: str, col: int) -> int | None:
 def _end_cut(orig_line: str, norm_line: str, col: int) -> int | None:
     """``_orig_col`` for a boundary that *ends* a gap.
 
-    ``normalize_for_fuzzy_match`` rstrips every line, so a gap ending at the end of a
+    ``normalizeForFuzzyMatch`` rstrips every line, so a gap ending at the end of a
     normalized line ends, in original coordinates, at the end of the *original* line --
     trailing whitespace included. Asking ``_orig_col`` for that column returns the
     rstripped index instead, which silently drops those bytes even though they sit
@@ -186,7 +184,11 @@ def _recover_gap(
     return "\n".join([head, *orig_lines[line_a + 1 : line_b], tail])
 
 
-def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
+def fuzzyFindText(content: str, old_text: str) -> FuzzyMatchResult:
+    """Find oldText in content, trying exact match first, then fuzzy match.
+    When fuzzy matching is used, the returned contentForReplacement is the
+    fuzzy-normalized version of the content (trailing whitespace stripped,
+    Unicode quotes/dashes normalized to ASCII)."""
     exact_index = content.find(old_text)
     if exact_index != -1:
         return FuzzyMatchResult(
@@ -197,8 +199,8 @@ def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
             contentForReplacement=content,
         )
 
-    fuzzy_content = normalize_for_fuzzy_match(content)
-    fuzzy_old_text = normalize_for_fuzzy_match(old_text)
+    fuzzy_content = normalizeForFuzzyMatch(content)
+    fuzzy_old_text = normalizeForFuzzyMatch(old_text)
     fuzzy_index = fuzzy_content.find(fuzzy_old_text)
     if fuzzy_index == -1:
         return FuzzyMatchResult(
@@ -218,24 +220,20 @@ def fuzzy_find_text(content: str, old_text: str) -> FuzzyMatchResult:
     )
 
 
-def strip_bom(content: str) -> _StripBomResult:
-    return _StripBomResult(bom="\ufeff", text=content[1:]) if content.startswith("\ufeff") else _StripBomResult(bom="", text=content)
-
-
-def _count_occurrences(content: str, old_text: str, *, used_fuzzy_match: bool) -> int:
+def countOccurrences(content: str, old_text: str, *, used_fuzzy_match: bool) -> int:
     """Occurrences of ``old_text`` in ``content``, counted where the match was found.
 
-    An exact match is unique or not in the content's own coordinates; folding both sides
+    MISAKA fork: pi always counts in normalized coordinates. An exact match is unique or not in the content's own coordinates; folding both sides
     first would refuse a uniquely located oldText because an unrelated line happens to
     normalize to the same text (``x—y`` next to ``x-y``, curly next to straight quotes).
     Only a fuzzy match is genuinely ambiguous in normalized coordinates.
     """
     if not used_fuzzy_match:
         return content.count(old_text)
-    return normalize_for_fuzzy_match(content).count(normalize_for_fuzzy_match(old_text))
+    return normalizeForFuzzyMatch(content).count(normalizeForFuzzyMatch(old_text))
 
 
-def _get_not_found_error(path: str, edit_index: int, total_edits: int) -> RuntimeError:
+def getNotFoundError(path: str, edit_index: int, total_edits: int) -> RuntimeError:
     if total_edits == 1:
         return RuntimeError(
             f"Could not find the exact text in {path}. "
@@ -247,7 +245,7 @@ def _get_not_found_error(path: str, edit_index: int, total_edits: int) -> Runtim
     )
 
 
-def _get_duplicate_error(path: str, edit_index: int, total_edits: int, occurrences: int) -> RuntimeError:
+def getDuplicateError(path: str, edit_index: int, total_edits: int, occurrences: int) -> RuntimeError:
     if total_edits == 1:
         return RuntimeError(
             f"Found {occurrences} occurrences of the text in {path}. "
@@ -259,13 +257,13 @@ def _get_duplicate_error(path: str, edit_index: int, total_edits: int, occurrenc
     )
 
 
-def _get_empty_old_text_error(path: str, edit_index: int, total_edits: int) -> RuntimeError:
+def getEmptyOldTextError(path: str, edit_index: int, total_edits: int) -> RuntimeError:
     if total_edits == 1:
         return RuntimeError(f"oldText must not be empty in {path}.")
     return RuntimeError(f"edits[{edit_index}].oldText must not be empty in {path}.")
 
 
-def _get_no_change_error(path: str, total_edits: int) -> RuntimeError:
+def getNoChangeError(path: str, total_edits: int) -> RuntimeError:
     if total_edits == 1:
         return RuntimeError(
             f"No changes made to {path}. The replacement produced identical content. "
@@ -281,44 +279,44 @@ def _get_fuzzy_mapping_error(path: str) -> RuntimeError:
     )
 
 
-def apply_edits_to_normalized_content(
+def applyEditsToNormalizedContent(
     normalized_content: str,
     edits: list[Edit | dict[str, str]],
     path: str,
 ) -> AppliedEditsResult:
     normalized_edits = [
         Edit(
-            oldText=normalize_to_lf(edit.oldText if isinstance(edit, Edit) else edit["oldText"]),
-            newText=normalize_to_lf(edit.newText if isinstance(edit, Edit) else edit["newText"]),
+            oldText=normalizeToLF(edit.oldText if isinstance(edit, Edit) else edit["oldText"]),
+            newText=normalizeToLF(edit.newText if isinstance(edit, Edit) else edit["newText"]),
         )
         for edit in edits
     ]
 
     for index, edit in enumerate(normalized_edits):
-        # Empty *after* normalization, not just literally empty: matching folds each line's
+        # MISAKA fork: empty *after* normalization, not just literally empty: matching folds each line's
         # trailing whitespace away, so a whitespace-only oldText would match at offset 0 with
         # length 0 and splice newText in as an insertion reported as a replacement.
-        if normalize_for_fuzzy_match(edit.oldText) == "":
-            raise _get_empty_old_text_error(path, index, len(normalized_edits))
+        if normalizeForFuzzyMatch(edit.oldText) == "":
+            raise getEmptyOldTextError(path, index, len(normalized_edits))
 
-    initial_matches = [fuzzy_find_text(normalized_content, edit.oldText) for edit in normalized_edits]
+    initial_matches = [fuzzyFindText(normalized_content, edit.oldText) for edit in normalized_edits]
     base_content = (
-        normalize_for_fuzzy_match(normalized_content)
+        normalizeForFuzzyMatch(normalized_content)
         if any(match.usedFuzzyMatch for match in initial_matches)
         else normalized_content
     )
 
     matched_edits: list[_MatchedEdit] = []
     for index, edit in enumerate(normalized_edits):
-        match_result = fuzzy_find_text(base_content, edit.oldText)
+        match_result = fuzzyFindText(base_content, edit.oldText)
         if not match_result.found:
-            raise _get_not_found_error(path, index, len(normalized_edits))
+            raise getNotFoundError(path, index, len(normalized_edits))
 
-        occurrences = _count_occurrences(
+        occurrences = countOccurrences(
             base_content, edit.oldText, used_fuzzy_match=match_result.usedFuzzyMatch
         )
         if occurrences > 1:
-            raise _get_duplicate_error(path, index, len(normalized_edits), occurrences)
+            raise getDuplicateError(path, index, len(normalized_edits), occurrences)
 
         matched_edits.append(
             _MatchedEdit(
@@ -340,7 +338,8 @@ def apply_edits_to_normalized_content(
             )
 
     if base_content is not normalized_content:
-        # Fuzzy coordinates, original spelling: matches were found in the normalized text, but
+        # MISAKA fork (pi: applyReplacementsPreservingUnchangedLines rewrites every touched line from the normalized
+        # base). Fuzzy coordinates, original spelling: matches were found in the normalized text, but
         # the file must not be rewritten in normalized form — that silently NFKC-folds every
         # untouched line (curly quotes, full-width characters, ligatures), which for a corpus
         # of humanities sources is data corruption, not normalization. Splice each newText at
@@ -357,7 +356,7 @@ def apply_edits_to_normalized_content(
 
         effective_edits = [matched for matched in matched_edits if not is_noop(matched)]
         if not effective_edits:
-            raise _get_no_change_error(path, len(normalized_edits))
+            raise getNoChangeError(path, len(normalized_edits))
         reconstructed = _splice_edits_preserving_original(
             normalized_content, base_content, effective_edits
         )
@@ -366,7 +365,7 @@ def apply_edits_to_normalized_content(
             # requested span. Reject the fuzzy edit before the caller reaches writeFile.
             raise _get_fuzzy_mapping_error(path)
         if reconstructed == normalized_content:
-            raise _get_no_change_error(path, len(normalized_edits))
+            raise getNoChangeError(path, len(normalized_edits))
         return AppliedEditsResult(baseContent=normalized_content, newContent=reconstructed)
 
     new_content = base_content
@@ -378,7 +377,7 @@ def apply_edits_to_normalized_content(
         )
 
     if base_content == new_content:
-        raise _get_no_change_error(path, len(normalized_edits))
+        raise getNoChangeError(path, len(normalized_edits))
 
     return AppliedEditsResult(baseContent=base_content, newContent=new_content)
 
@@ -427,44 +426,21 @@ def _splice_edits_preserving_original(
     return "".join(pieces)
 
 
-def generate_unified_patch(path: str, old_content: str, new_content: str, context_lines: int = 4) -> str:
-    patch = "".join(
-        line if line.endswith("\n") else f"{line}\n\\ No newline at end of file\n"
-        for line in difflib.unified_diff(
-            StringIO(old_content).readlines(),
-            StringIO(new_content).readlines(),
-            fromfile=path,
-            tofile=path,
-            n=context_lines,
-        )
+def generateUnifiedPatch(path: str, old_content: str, new_content: str, context_lines: int = 4) -> str:
+    """Generate a standard unified patch."""
+    return createTwoFilesPatch(
+        path, path, old_content, new_content, None, None, {"context": context_lines, "headerOptions": FILE_HEADERS_ONLY}
     )
-    return patch or f"--- {path}\n+++ {path}\n"
 
 
 def _diff_lines(old_content: str, new_content: str) -> list[_DiffPart]:
-    old_chunks = old_content.splitlines(keepends=True)
-    new_chunks = new_content.splitlines(keepends=True)
-    matcher = difflib.SequenceMatcher(a=old_chunks, b=new_chunks)
-
-    parts: list[_DiffPart] = []
-    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
-        if tag == "equal":
-            parts.append(_DiffPart(value="".join(old_chunks[old_start:old_end])))
-        elif tag == "delete":
-            parts.append(_DiffPart(value="".join(old_chunks[old_start:old_end]), removed=True))
-        elif tag == "insert":
-            parts.append(_DiffPart(value="".join(new_chunks[new_start:new_end]), added=True))
-        elif tag == "replace":
-            removed_value = "".join(old_chunks[old_start:old_end])
-            added_value = "".join(new_chunks[new_start:new_end])
-            if removed_value:
-                parts.append(_DiffPart(value=removed_value, removed=True))
-            if added_value:
-                parts.append(_DiffPart(value=added_value, added=True))
-    return parts
+    return [
+        _DiffPart(value=part["value"], added=bool(part.get("added")), removed=bool(part.get("removed")))
+        for part in diffLines(old_content, new_content)
+    ]
 
 
-def generate_diff_string(old_content: str, new_content: str, context_lines: int = 4) -> EditDiffResult:
+def generateDiffString(old_content: str, new_content: str, context_lines: int = 4) -> EditDiffResult:
     parts = _diff_lines(old_content, new_content)
 
     old_lines = old_content.split("\n")
@@ -565,8 +541,10 @@ def _format_access_error(error: BaseException) -> str:
     return str(error)
 
 
-async def compute_edits_diff(path: str, edits: list[Edit | dict[str, str]], cwd: str) -> EditDiffResult | EditDiffError:
-    absolute_path = resolve_to_cwd(path, cwd)
+async def computeEditsDiff(path: str, edits: list[Edit | dict[str, str]], cwd: str) -> EditDiffResult | EditDiffError:
+    """Compute the diff for one or more edit operations without applying them.
+    Used for preview rendering in the TUI before the tool executes."""
+    absolute_path = resolveToCwd(path, cwd)
     try:
         try:
             await asyncio.to_thread(regular_file, absolute_path)
@@ -574,12 +552,19 @@ async def compute_edits_diff(path: str, edits: list[Edit | dict[str, str]], cwd:
             return EditDiffError(error=f"Could not edit file: {path}. {_format_access_error(error)}.")
 
         raw_content = (await asyncio.to_thread(whole_file_bytes, absolute_path, "edit")).decode("utf-8")
-        _bom, content = strip_bom(raw_content)
-        normalized_content = normalize_to_lf(content)
-        applied = apply_edits_to_normalized_content(normalized_content, edits, path)
-        return generate_diff_string(applied.baseContent, applied.newContent)
+        # Strip BOM before matching (LLM won't include invisible BOM in oldText)
+        content = splitBom(raw_content)["text"]
+        normalized_content = normalizeToLF(content)
+        applied = applyEditsToNormalizedContent(normalized_content, edits, path)
+        return generateDiffString(applied.baseContent, applied.newContent)
     except Exception as error:  # noqa: BLE001 - any diff failure is returned as EditDiffError
         return EditDiffError(error=str(error))
+
+
+async def computeEditDiff(path: str, oldText: str, newText: str, cwd: str) -> EditDiffResult | EditDiffError:
+    """Compute the diff for a single edit operation without applying it.
+    Kept as a convenience wrapper for single-edit callers."""
+    return await computeEditsDiff(path, [Edit(oldText=oldText, newText=newText)], cwd)
 
 
 __all__ = [
@@ -588,4 +573,14 @@ __all__ = [
     "EditDiffError",
     "EditDiffResult",
     "FuzzyMatchResult",
+    "applyEditsToNormalizedContent",
+    "computeEditDiff",
+    "computeEditsDiff",
+    "detectLineEnding",
+    "fuzzyFindText",
+    "generateDiffString",
+    "generateUnifiedPatch",
+    "normalizeForFuzzyMatch",
+    "normalizeToLF",
+    "restoreLineEndings",
 ]

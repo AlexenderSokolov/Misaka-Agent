@@ -47,6 +47,8 @@ from misaka.cli.setup_ui import (
     prompt_yes_no,
 )
 from misaka.config import home
+from misaka.core.provider_attribution import CLIENT_NAME
+from misaka.utils.open_browser import openBrowser
 from misaka.utils.tools_manager import find_tool
 
 OPENALEX_KEY_URL = "https://openalex.org/rest-api"
@@ -56,34 +58,10 @@ SECTIONS = ("environment", "model", "sisters", "skills", "documents", "web", "re
 # other provider the registry knows is one menu entry further ("Another provider...").
 #
 # Ordered so the ones that sign in through a browser come first. A subscription is the path
-# that needs no API key at all, and it used to be the buried one: `openai` was featured and
-# takes only a key, while ChatGPT Plus/Pro lives under a different provider id
-# (`openai-codex`) that only the second menu reached -- so the person with a subscription had
-# further to walk than the person with a credit card.
-FEATURED_PROVIDERS = ("anthropic", "openai-codex", "github-copilot", "xai", "openrouter",
-                      "openai", "google", "mistral", "amazon-bedrock", "ollama")
-
-
-def _open_browser(url: str) -> bool:
-    """Hand the URL to the desktop, the way the chat's login dialog does.
-
-    Printing it and waiting is what made the browser logins look like a hang: the flow says
-    "a browser window should open" because whoever drives it is expected to open one.
-    """
-    if sys.platform == "darwin":
-        command = ["open", url]
-    elif sys.platform == "win32":
-        # Never `cmd /c start`: cmd re-parses &, | and ^ before `start` runs, so a
-        # provider-supplied URL could execute. rundll32 takes the target unparsed.
-        command = ["rundll32", "url.dll,FileProtocolHandler", url]
-    else:
-        command = ["xdg-open", url]
-    try:
-        with open(os.devnull, "wb") as sink:
-            subprocess.Popen(command, stdout=sink, stderr=sink, start_new_session=True)
-    except OSError:
-        return False
-    return True
+# that needs no API key at all. A ChatGPT subscription signs in to `openai` itself ("Sign in
+# with ChatGPT"); `openai-codex` is the legacy route to it and stays one menu further.
+FEATURED_PROVIDERS = ("anthropic", "openai", "github-copilot", "xai", "openrouter",
+                      "google", "mistral", "amazon-bedrock", "ollama")
 
 
 def _install_command(binary: str) -> str:
@@ -155,8 +133,8 @@ class Wizard:
         from misaka.core.network import roster
         ui.print_header("Model & Provider")
         cfg = current_config()
-        runtime = _create_runtime(read_only=False)
-        registry = runtime.registry
+        auth_runtime = asyncio.run(_create_runtime(read_only=False, refresh=True))
+        runtime = auth_runtime.runtime
         targets = [("Global default (roles without their own default)", None),
                    ("Last Order", os.path.join(cfg["roles_root"], "last_order")),
                    *[(f"Sister {sid}", os.path.join(cfg["profiles_root"], sid))
@@ -166,12 +144,12 @@ class Wizard:
                                                "A role's saved default does not change other roles or the global default.")]
         pinned = profiles.pinned_model(profile) if profile else ""
         if pinned:
-            selected = findExactModelReferenceMatch(pinned, registry.getAll())
+            selected = findExactModelReferenceMatch(pinned, runtime.getModels())
             if selected is not None:
                 cfg = {**cfg, "provider": selected.provider, "default_model": selected.id}
             else:
                 ui.print_warning(f"Saved role default {pinned!r} is not uniquely identified in the catalog; choose it below.")
-        known = sorted({model.provider for model in registry.getAll()})
+        known = sorted({model.provider for model in runtime.getModels()})
         current = cfg["provider"] if cfg["provider"] in known else None
         ui.print_info(f"{target}: {pinned or cfg['provider'] + '/' + cfg['default_model']}"
                       + (" (following global default)" if profile and not pinned else "")
@@ -179,24 +157,24 @@ class Wizard:
         featured = [p for p in FEATURED_PROVIDERS if p in known]
         if current and current not in featured:
             featured.insert(0, current)
-        oauth_ids = {p.id for p in registry.getOAuthProviders()}
-        labels = [*self._provider_labels(registry, featured, oauth_ids), "Another provider..."]
+        oauth_ids = {p.id for p in runtime.getProviders() if p.auth.oauth is not None}
+        labels = [*self._provider_labels(runtime, featured, oauth_ids), "Another provider..."]
         default = featured.index(current) if current in featured else 0
         picked = prompt_choice(f"Default provider for {target}", labels, default,
                                "A browser sign-in uses a subscription you already pay for; an API key is billed per token.")
         if picked == len(featured):
             others = [p for p in known if p not in featured]
-            provider = others[prompt_choice("Provider", self._provider_labels(registry, others, oauth_ids))]
+            provider = others[prompt_choice("Provider", self._provider_labels(runtime, others, oauth_ids))]
         else:
             provider = featured[picked]
         # The SDK is installed per provider; a missing one is the most common first-run failure.
-        extras = _missing_sdk_extras(registry, provider)
+        extras = _missing_sdk_extras(runtime, provider)
         if extras:
             ui.print_warning(f"The SDK for {provider} is not installed (misaka's {', '.join(extras)} extra).")
             if prompt_yes_no("Install it now?", True):
                 self._add_extras(extras)
-        self._credential(registry, runtime.storage, provider)
-        model_id = self._pick_model(registry, provider, cfg)
+        self._credential(runtime, auth_runtime.credentials, provider)
+        model_id = self._pick_model(runtime, provider, cfg)
         from misaka.core.settings_manager import SettingsManager
         try:
             if profile:
@@ -208,59 +186,66 @@ class Wizard:
             return
         ui.print_success(f"Default model saved for {target}: {provider} / {model_id}")
         self.state["provider"], self.state["model"] = provider, model_id
-        self._verify(registry, provider, model_id)
+        self._verify(runtime, provider, model_id)
 
     @staticmethod
-    def _provider_labels(registry, providers: list[str], oauth_ids: set[str]) -> list[str]:
+    def _provider_labels(runtime, providers: list[str], oauth_ids: set[str]) -> list[str]:
         """The menu rows: who they are, how you sign in, and whether you already have.
 
-        The name column is measured, not guessed: "ChatGPT Plus/Pro (Codex Subscription)" is
-        half again as long as "OpenAI", and a fixed width either wraps it or wastes a third
-        of the row on everything else.
+        The name column is measured, not guessed: "Cloudflare Workers AI" is three times as
+        long as "OpenAI", and a fixed width either wraps it or wastes a third of the row on
+        everything else.
         """
-        names = {p: registry.getProviderDisplayName(p) for p in providers}
+        names = {p: getattr(runtime.getProvider(p), "name", None) or p for p in providers}
         width = max((len(name) for name in names.values()), default=0)
         rows = []
         for provider in providers:
-            status = registry.getProviderAuthStatus(provider)
+            status = runtime.getProviderAuthStatus(provider)
             how = "browser sign-in" if provider in oauth_ids else "API key"
             where = status.source or ("configured" if status.configured else "")
             rows.append(f"{names[provider]:<{width}}  {how:<16}"
                         + (f"({where})" if where else "(not set up yet)"))
         return rows
 
-    def _credential(self, registry, storage, provider: str) -> None:
-        status = registry.getProviderAuthStatus(provider)
+    def _credential(self, runtime, storage, provider: str) -> None:
+        status = runtime.getProviderAuthStatus(provider)
         if status.configured or status.source:
             ui.print_success(f"{provider}: credential found ({status.source or 'configured'})")
             if not prompt_yes_no("Keep it?", True):
-                self._enter_credential(registry, storage, provider)
+                self._enter_credential(runtime, storage, provider)
             return
-        self._enter_credential(registry, storage, provider)
+        self._enter_credential(runtime, storage, provider)
 
-    def _enter_credential(self, registry, storage, provider: str) -> None:
+    def _enter_credential(self, runtime, storage, provider: str) -> None:
         if provider == "amazon-bedrock":
             ui.print_info("Bedrock uses your AWS credentials: an AWS profile, or AWS_ACCESS_KEY_ID / "
                           "AWS_SECRET_ACCESS_KEY / AWS_REGION in the environment. Set those, then run "
                           "`misaka auth check amazon-bedrock`.")
             return
-        oauth_ids = {p.id for p in registry.getOAuthProviders()}
-        kinds = ["API key"] + (["Subscription login in the browser (OAuth)"] if provider in oauth_ids else [])
+        oauth = next((p.auth.oauth for p in runtime.getProviders() if p.id == provider), None)
+        # The method's own label ("Sign in with ChatGPT") names the subscription it uses.
+        kinds = ["API key"] + ([oauth.loginLabel or "Subscription login in the browser (OAuth)"] if oauth else [])
         kind = prompt_choice(f"How do you want to sign in to {provider}?", kinds, 0)
         if kind == 1:
-            self._oauth(registry, provider)
+            self._oauth(runtime, provider)
             return
         key = prompt("API key", password=True)
         if not key:
             ui.print_warning("No key entered; you can add one later with /login inside the chat.")
             return
-        storage.set(provider, {"type": "api_key", "key": key})
-        ui.print_success(f"Key stored in {storage.authPath if hasattr(storage, 'authPath') else home.display(home.path('auth'))}")
+        from misaka.ai.auth.types import ApiKeyCredential
+        from misaka.config import get_auth_path
 
-    def _oauth(self, registry, provider: str) -> None:
+        async def store(_current):
+            return ApiKeyCredential(key=key)
+
+        asyncio.run(storage.modify(provider, store))
+        ui.print_success(f"Key stored in {home.display(get_auth_path())}")
+
+    def _oauth(self, runtime, provider: str) -> None:
         """The same login the chat's /login runs, drawn as terminal lines.
 
-        Every prompt runs on a worker thread. Browser logins (Anthropic, ChatGPT Codex,
+        Every prompt runs on a worker thread. Browser logins (Anthropic, ChatGPT,
         OpenRouter) start a local callback server and race it against a paste-the-code
         prompt, both on the event loop; a prompt that reads the terminal directly blocks that
         loop, so the redirect the browser sends can never be accepted and the login hangs
@@ -292,37 +277,36 @@ class Wizard:
         def notify(event) -> None:
             kind = getattr(event, "type", "")
             if kind == "auth_url":
+                # Hand the URL to the desktop, the way the chat's login dialog does: printing it and waiting is what
+                # made the browser logins look like a hang. Opening is best-effort; the URL is printed either way.
                 ui.print_info(f"Opening your browser: {event.url}")
                 if getattr(event, "instructions", None):
                     ui.print_info(str(event.instructions))
-                if not _open_browser(str(event.url)):
-                    ui.print_warning("The browser could not be opened; copy the URL above.")
+                openBrowser(str(event.url))
             elif kind == "device_code":
                 ui.print_info(f"Go to {event.verificationUri} and enter the code {event.userCode}")
             else:
                 ui.print_info(str(getattr(event, "message", "")))
 
-        # Two doors, as in the chat's own login dialog: the registry owns a provider that
-        # came from a models.json `oauth:` block or from an extension, and refuses every
-        # other one by design. A built-in -- Anthropic, ChatGPT Codex, OpenRouter, the three
-        # this wizard actually offers -- is owned by neither, so calling the registry gave
-        # "Provider anthropic does not use native authentication" and the browser never
-        # opened. Those go through the credential store, which runs the flow directly.
-        from misaka.ai.auth.oauth_bridge import callbacks_for_interaction
+        # One door, as in the chat's own login dialog: every provider's OAuth method, built-in
+        # or from models.json or an extension, runs through the model runtime.
         interaction = SimpleNamespace(signal=None, prompt=ask, notify=notify)
-        registry_owned = (
-            registry.getRegisteredProviderConfig(provider) is not None
-            or registry.getRegisteredNativeProvider(provider) is not None
-        )
+
+        from misaka.ai.auth.types import LoginOptions
+        from misaka.core.settings_manager import SettingsManager
 
         async def run_login() -> None:
             try:
-                if registry_owned:
-                    await registry.login(provider, "oauth", interaction)
-                else:
-                    await registry.authStorage.login(
-                        provider, callbacks_for_interaction(interaction)
-                    )
+                await runtime.login(
+                    provider,
+                    "oauth",
+                    interaction,
+                    # MISAKA fork: misaka introduces itself by its own name.
+                    LoginOptions(
+                        getDeviceId=lambda: SettingsManager.create(os.getcwd()).getOrCreateDeviceId(),
+                        agentName=CLIENT_NAME,
+                    ),
+                )
             finally:
                 # Inside the coroutine, so the paste worker is already on its way out when
                 # the runner goes to join the executor. See the docstring.
@@ -341,8 +325,8 @@ class Wizard:
             cancel.set()
             time.sleep(0.25)
 
-    def _pick_model(self, registry, provider: str, cfg: dict) -> str:
-        models = self._model_choices([m for m in registry.getAll() if m.provider == provider],
+    def _pick_model(self, runtime, provider: str, cfg: dict) -> str:
+        models = self._model_choices([m for m in runtime.getModels() if m.provider == provider],
                                      cfg["default_model"] if cfg["provider"] == provider else None)
         ids = [model.id for model in models]
         if not ids:
@@ -372,22 +356,18 @@ class Wizard:
         kept = [model for model in models if model.id == current or not dated_alias(model)]
         return kept or list(models)
 
-    def _verify(self, registry, provider: str, model_id: str) -> None:
+    def _verify(self, runtime, provider: str, model_id: str) -> None:
         if not prompt_yes_no("Send one tiny request now to confirm the credential works?", True):
             return
-        from misaka.ai.stream import complete_simple
         from misaka.ai.types import Context, SimpleStreamOptions, UserMessage
 
         async def ping() -> str:
-            model = registry.find(provider, model_id)
+            model = runtime.getModel(provider, model_id)
             if model is None:
                 raise RuntimeError(f"{provider}/{model_id} is not in the model catalog")
-            auth = await registry.getApiKeyAndHeaders(model)
-            if not auth.get("ok"):
-                raise RuntimeError(auth.get("error") or "no credential resolved")
-            reply = await complete_simple(
+            reply = await runtime.completeSimple(
                 model, Context(messages=[UserMessage(content="Reply with the single word OK.", timestamp=0)]),
-                SimpleStreamOptions(apiKey=auth.get("apiKey"), headers=auth.get("headers"), maxTokens=16))
+                SimpleStreamOptions(maxTokens=16))
             if reply.stopReason == "error":
                 raise RuntimeError(reply.errorMessage or "request failed")
             return "".join(getattr(part, "text", "") for part in reply.content)
@@ -413,7 +393,7 @@ class Wizard:
                       f"  {ui.tilde(profiles.shared_soul())}",
                       "      the shared identity every role loads first",
                       f"  {ui.tilde(os.path.join(roles_root, 'last_order'))}/",
-                      "      Last Order, the coordinator: settings.json for her model and MCP servers, skills/ for her skills",
+                      "      Last Order, the coordinator: settings.json for her model, mcp.json for her MCP servers, skills/ for her skills",
                       f"  {ui.tilde(os.path.join(roles_root, 'sisters'))}/<id>/",
                       "      one folder per Sister: DESCRIBE.md routes work to her, SOUL.md is her voice", "")
         existing = roster.roster_names()
@@ -454,11 +434,11 @@ class Wizard:
                          "Sisters read and gather; Last Order plans and writes. A cheaper model here is normal.") == 0:
             return None
         try:
-            registry = _create_runtime(read_only=True).registry
-        except Exception as error:  # noqa: BLE001 - a registry that will not open is not worth failing the section for
+            runtime = asyncio.run(_create_runtime(read_only=True, refresh=True)).runtime
+        except Exception as error:  # noqa: BLE001 - a catalog that will not open is not worth failing the section for
             ui.print_warning(f"The model catalog could not be read ({error}); the Sisters follow the default.")
             return None
-        models = self._model_choices([m for m in registry.getAll() if registry.hasConfiguredAuth(m)], None)
+        models = self._model_choices([m for m in runtime.getModels() if runtime.hasConfiguredAuth(m.provider)], None)
         if not models:
             ui.print_warning("No configured models are available; run `misaka setup model` to configure a provider. "
                              "The Sisters follow the global default for now.")
@@ -718,8 +698,8 @@ def configured_anywhere() -> bool:
     try:
         from misaka.cli.auth import _create_runtime
         from misaka.config import current_config
-        registry = _create_runtime(read_only=True).registry
-        status = registry.getProviderAuthStatus(current_config()["provider"])
+        runtime = asyncio.run(_create_runtime(read_only=True, refresh=True)).runtime
+        status = runtime.getProviderAuthStatus(current_config()["provider"])
         return bool(status.configured or status.source)
     except Exception:  # noqa: BLE001 - an unreadable store is not a reason to force the wizard
         return True

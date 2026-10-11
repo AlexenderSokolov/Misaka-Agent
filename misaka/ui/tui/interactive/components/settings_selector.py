@@ -1,13 +1,24 @@
-"""Interactive settings selector with submenus for theme and reasoning choices."""
+"""Translated from pi's ``modes/interactive/components/settings-selector.ts`` (v1.1.0).
+
+MISAKA forks:
+- (D1) The fullscreen rows (``tui-mode``, ``fullscreen-exit-output``, ``fullscreen-scrollbar``,
+  ``fullscreen-copy-on-select``, ``fullscreen-wheel-scroll-lines``) and their config fields and callbacks are not
+  ported: MISAKA has only the regular renderer.
+- No ``mermaid-rendering`` row, ``mermaidRenderingMode`` field or ``onMermaidRenderingModeChange``: Mermaid rendering
+  is not ported (it needs the grok-mermaid package).
+- (D11) No system theme: where upstream lists or falls back to it, MISAKA uses the built-in theme matching the
+  terminal.
+"""
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from misaka.agent.types import ThinkingLevel
-from misaka.ai.models import get_supported_thinking_levels
+from misaka.ai.models import getSupportedThinkingLevels
 from misaka.ai.types import Model, Transport
 from misaka.core.http_dispatcher import (
     HTTP_IDLE_TIMEOUT_CHOICES,
@@ -15,13 +26,14 @@ from misaka.core.http_dispatcher import (
 )
 from misaka.core.settings_manager import (
     CACHE_WARMING_MODES,
+    CacheWarmingMode,
     DefaultProjectTrust,
+    QuietStartup,
     WarningSettings,
 )
 from misaka.ui.tui import (
     Container,
     SelectItem,
-    SelectList,
     SelectListLayoutOptions,
     SettingItem,
     SettingsList,
@@ -29,21 +41,25 @@ from misaka.ui.tui import (
     Text,
     getCapabilities,
 )
-from misaka.ui.tui.components import SettingsListOptions
+from misaka.ui.tui.components.settings_list import SettingsListOptions
 from misaka.ui.tui.interactive.theme.theme import (
-    get_select_list_theme,
-    get_settings_list_theme,
+    TerminalTheme,
+    getSettingsListTheme,
+    getTerminalTheme,
+    parseAutoThemeSetting,
     theme,
 )
+from misaka.utils.collation import localeCompare
 
 from .dynamic_border import DynamicBorder
-from .keybinding_hints import key_display_text
+from .keybinding_hints import keyDisplayText
+from .settings_submenu import SelectSubmenu, SteppedSubmenu, SteppedSubmenuStep
 
 type SteeringMode = Literal["all", "one-at-a-time"]
 type DoubleEscapeAction = Literal["fork", "tree", "none"]
 type TreeFilterMode = Literal["default", "no-tools", "user-only", "labeled-only", "all"]
 
-SETTINGS_SUBMENU_SELECT_LIST_LAYOUT = SelectListLayoutOptions(minPrimaryColumnWidth=12, maxPrimaryColumnWidth=32)
+MODEL_PICKER_LAYOUT = SelectListLayoutOptions(minPrimaryColumnWidth=12, maxPrimaryColumnWidth=46)
 
 THINKING_DESCRIPTIONS: dict[ThinkingLevel, str] = {
     "off": "No reasoning",
@@ -60,14 +76,18 @@ DEFAULT_PROJECT_TRUST_LABELS: dict[DefaultProjectTrust, str] = {
     "always": "Always trust",
     "never": "Never trust",
 }
-DEFAULT_PROJECT_TRUST_BY_LABEL = {
+
+DEFAULT_PROJECT_TRUST_BY_LABEL: dict[str, DefaultProjectTrust] = {
     label: value for value, label in DEFAULT_PROJECT_TRUST_LABELS.items()
 }
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class SettingsConfig:
     autoCompact: bool
+    defaultModel: str
+    currentModel: Model | None = None
+    availableDefaultModels: list[Model]
     showImages: bool
     imageWidthCells: int
     autoResizeImages: bool
@@ -77,33 +97,31 @@ class SettingsConfig:
     followUpMode: SteeringMode
     transport: Transport
     httpIdleTimeoutMs: int
-    cacheWarmingMode: str
+    cacheWarmingMode: CacheWarmingMode
     thinkingLevel: ThinkingLevel
     availableThinkingLevels: list[ThinkingLevel]
-    currentModel: Model | None
-    availableDefaultModels: list[Model]
     modelThinkingLevels: dict[str, ThinkingLevel]
     currentTheme: str
+    terminalTheme: TerminalTheme
     availableThemes: list[str]
     hideThinkingBlock: bool
+    showCacheMissNotices: bool
     collapseChangelog: bool
+    enableInstallTelemetry: bool
     doubleEscapeAction: DoubleEscapeAction
     treeFilterMode: TreeFilterMode
     showHardwareCursor: bool
     editorPaddingX: int
     outputPad: Literal[0, 1]
     autocompleteMaxVisible: int
-    quietStartup: bool
+    quietStartup: QuietStartup
     defaultProjectTrust: DefaultProjectTrust
     clearOnShrink: bool
     showTerminalProgress: bool
     warnings: WarningSettings
-    # Off is also SettingsManager's default; a host that does not pass the matching
-    # callback below shows no row for it.
-    enableInstallTelemetry: bool = False
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class SettingsCallbacks:
     onAutoCompactChange: Callable[[bool], None]
     onShowImagesChange: Callable[[bool], None]
@@ -115,230 +133,477 @@ class SettingsCallbacks:
     onFollowUpModeChange: Callable[[SteeringMode], None]
     onTransportChange: Callable[[Transport], None]
     onHttpIdleTimeoutMsChange: Callable[[int], None]
-    onCacheWarmingModeChange: Callable[[str], None]
+    onCacheWarmingModeChange: Callable[[CacheWarmingMode], None]
+    # MISAKA fork: the global default thinking level row (see `thinking` below).
     onThinkingLevelChange: Callable[[ThinkingLevel], None]
     onModelThinkingLevelChange: Callable[[str, str, ThinkingLevel], None]
     onModelThinkingLevelRemove: Callable[[str, str], None]
     onThemeChange: Callable[[str], None]
-    onThemePreview: Callable[[str], None] | None
+    onThemePreview: Callable[[str], None] | None = None
     onHideThinkingBlockChange: Callable[[bool], None]
+    onShowCacheMissNoticesChange: Callable[[bool], None]
     onCollapseChangelogChange: Callable[[bool], None]
+    onEnableInstallTelemetryChange: Callable[[bool], None]
     onDoubleEscapeActionChange: Callable[[DoubleEscapeAction], None]
     onTreeFilterModeChange: Callable[[TreeFilterMode], None]
     onShowHardwareCursorChange: Callable[[bool], None]
     onEditorPaddingXChange: Callable[[int], None]
     onOutputPadChange: Callable[[Literal[0, 1]], None]
     onAutocompleteMaxVisibleChange: Callable[[int], None]
-    onQuietStartupChange: Callable[[bool], None]
+    onQuietStartupChange: Callable[[QuietStartup], None]
     onDefaultProjectTrustChange: Callable[[DefaultProjectTrust], None]
     onClearOnShrinkChange: Callable[[bool], None]
     onShowTerminalProgressChange: Callable[[bool], None]
     onWarningsChange: Callable[[WarningSettings], None]
     onCancel: Callable[[], None]
-    # Optional: the client-attribution row appears only for a host that passes it.
-    onEnableInstallTelemetryChange: Callable[[bool], None] | None = None
 
 
 class WarningSettingsSubmenu(Container):
-    def __init__(self, warnings: WarningSettings, onChange, onCancel) -> None:
+    """A submenu component for selecting from a list of options."""
+
+    def __init__(
+        self,
+        warnings: WarningSettings,
+        onChange: Callable[[WarningSettings], None],
+        onCancel: Callable[[], None],
+    ) -> None:
         super().__init__()
-        self.state = dict(warnings)
-        items = [
+
+        self.state: WarningSettings = {**warnings}
+
+        anthropicExtraUsage = self.state.get("anthropicExtraUsage")
+        items: list[SettingItem] = [
             SettingItem(
                 id="anthropic-extra-usage",
                 label="Anthropic extra usage",
                 description="Warn when Anthropic subscription auth may use paid extra usage",
-                currentValue="true" if self.state.get("anthropicExtraUsage", True) else "false",
+                currentValue="true" if (anthropicExtraUsage if anthropicExtraUsage is not None else True) else "false",
                 values=["true", "false"],
-            )
+            ),
         ]
+
+        def onSettingChange(id: str, newValue: str) -> None:
+            match id:
+                case "anthropic-extra-usage":
+                    self.state = {**self.state, "anthropicExtraUsage": newValue == "true"}
+                    onChange({**self.state})
+
         self.settingsList = SettingsList(
             items,
             min(len(items), 10),
-            get_settings_list_theme(),
-            lambda setting_id, new_value: self._apply_change(setting_id, new_value, onChange),
+            getSettingsListTheme(),
+            onSettingChange,
             onCancel,
         )
-        self.addChild(self.settingsList)
 
-    def _apply_change(self, setting_id: str, new_value: str, onChange) -> None:
-        if setting_id == "anthropic-extra-usage":
-            self.state = {**self.state, "anthropicExtraUsage": new_value == "true"}
-            onChange(dict(self.state))
+        self.addChild(self.settingsList)
 
     def handleInput(self, data: str) -> None:
         self.settingsList.handleInput(data)
 
 
-class SelectSubmenu(Container):
-    def __init__(
-        self,
-        title: str,
-        description: str,
-        options: list[SelectItem],
-        currentValue: str,
-        onSelect: Callable[[str], None],
-        onCancel: Callable[[], None],
-        onSelectionChange: Callable[[str], None] | None = None,
-    ) -> None:
-        super().__init__()
-        self.addChild(Text(theme.bold(theme.fg("accent", title)), 0, 0))
-        if description:
-            self.addChild(Spacer(1))
-            self.addChild(Text(theme.fg("muted", description), 0, 0))
-        self.addChild(Spacer(1))
-
-        self.selectList = SelectList(
-            options,
-            min(len(options), 10),
-            get_select_list_theme(),
-            SETTINGS_SUBMENU_SELECT_LIST_LAYOUT,
-        )
-        current_index = next((index for index, item in enumerate(options) if item.value == currentValue), -1)
-        if current_index >= 0:
-            self.selectList.setSelectedIndex(current_index)
-
-        self.selectList.onSelect = lambda item: onSelect(item.value)
-        self.selectList.onCancel = onCancel
-        if onSelectionChange is not None:
-            self.selectList.onSelectionChange = lambda item: onSelectionChange(item.value)
-
-        self.addChild(self.selectList)
-        self.addChild(Spacer(1))
-        self.addChild(Text(theme.fg("dim", "  Enter to select · Esc to go back"), 0, 0))
-
-    def handleInput(self, data: str) -> None:
-        self.selectList.handleInput(data)
+CLEAR_OVERRIDE_VALUE = "__clear__"
 
 
-_CLEAR_MODEL_THINKING_OVERRIDE = "__clear__"
-_NO_MODEL = "__none__"
-
-
-def _model_setting_key(model: Model) -> str:
+def modelSettingKey(model: Model) -> str:
     return f"{model.provider}/{model.id}"
 
 
-def _model_thinking_summary(overrides: dict[str, ThinkingLevel]) -> str:
+def modelDisplayLabel(model: Model) -> str:
+    return f"{model.id} [{model.provider}]"
+
+
+def modelThinkingOverridesSummary(overrides: dict[str, ThinkingLevel]) -> str:
     count = len(overrides)
-    return "none" if count == 0 else f"{count} configured"
+    if count == 0:
+        return "none"
+    return f"{count} configured"
 
 
-class ModelThinkingSettingsSubmenu(Container):
-    """Two-step model/level selector using Misaka's existing submenu primitives."""
+def modelItemLabel(model: Model) -> str:
+    return f"{model.id} {theme.fg('muted', f'[{model.provider}]')}"
 
+
+def themeItems(availableThemes: list[str], currentTheme: str) -> list[SelectItem]:
+    # MISAKA fork (D11): no system theme, so no "Theme created from your terminal's colors" description.
+    return [SelectItem(value=name, label=f"{'✓ ' if name == currentTheme else '  '}{name}") for name in availableThemes]
+
+
+AUTOMATIC_THEME_VALUE = "/"
+
+
+def singleModeThemeItems(availableThemes: list[str], currentTheme: str) -> list[SelectItem]:
+    """Automatic mode comes first, then the themes. MISAKA fork (D11): upstream puts the system theme before it."""
+    items = themeItems(availableThemes, currentTheme)
+    return [
+        SelectItem(
+            value=AUTOMATIC_THEME_VALUE,
+            label="  automatic",
+            description="Use separate themes for light and dark terminal appearance",
+        ),
+        *items,
+    ]
+
+
+def preferredTheme(availableThemes: list[str], preferred: str | None, fallback: str) -> str:
+    if preferred and preferred in availableThemes:
+        return preferred
+    if fallback in availableThemes:
+        return fallback
+    return availableThemes[0] if availableThemes else fallback
+
+
+def defaultAutomaticThemes(currentThemeSetting: str, availableThemes: list[str]) -> dict[str, str]:
+    autoTheme = parseAutoThemeSetting(currentThemeSetting)
+    if autoTheme:
+        return {"lightTheme": autoTheme["lightTheme"], "darkTheme": autoTheme["darkTheme"]}
+
+    currentFixedTheme = None if "/" in currentThemeSetting else currentThemeSetting
+    # MISAKA fork (D11): the fallback is the built-in theme matching the terminal, not the system theme.
+    themeName = preferredTheme(availableThemes, currentFixedTheme, getTerminalTheme())
+    return {"lightTheme": themeName, "darkTheme": themeName}
+
+
+class ThemeSubmenu(Container):
     def __init__(
         self,
-        models: list[Model],
-        currentModel: Model | None,
-        globalDefault: ThinkingLevel,
-        overrides: dict[str, ThinkingLevel],
-        onChange: Callable[[str, str, ThinkingLevel], None],
-        onRemove: Callable[[str, str], None],
-        onDone: Callable[[str], None],
+        currentThemeSetting: str,
+        terminalTheme: TerminalTheme,
+        availableThemes: list[str],
+        callbacks: SettingsCallbacks,
+        onDone: Callable[..., None],
     ) -> None:
         super().__init__()
-        self.models = sorted(
-            models,
-            key=lambda model: (
-                0 if currentModel is not None and _model_setting_key(model) == _model_setting_key(currentModel) else 1,
-                model.provider,
-                model.id,
-            ),
-        )
-        self.modelsByKey = {_model_setting_key(model): model for model in self.models}
-        self.currentModelKey = _model_setting_key(currentModel) if currentModel is not None else None
-        self.globalDefault = globalDefault
-        self.overrides = dict(overrides)
-        self.onChange = onChange
-        self.onRemove = onRemove
+        self.inputComponent: Any = None
+        self.callbacks = callbacks
+        self.availableThemes = availableThemes
+        self.terminalTheme: TerminalTheme = terminalTheme
         self.onDone = onDone
-        self.activeSubmenu: SelectSubmenu | None = None
-        self._show_models()
-
-    def _replace(self, submenu: SelectSubmenu) -> None:
-        self.clear()
-        self.activeSubmenu = submenu
-        self.addChild(submenu)
-
-    def _show_models(self, selectedKey: str | None = None) -> None:
-        options = [
-            SelectItem(
-                value=key,
-                label=f"{model.id} [{model.provider}]",
-                description=self.overrides.get(key),
-            )
-            for key, model in self.modelsByKey.items()
-        ]
-        if not options:
-            options = [
-                SelectItem(
-                    value=_NO_MODEL,
-                    label="No models available",
-                    description="Log in to a provider or configure an API key first",
-                )
-            ]
-        self._replace(
-            SelectSubmenu(
-                "Per-Model Thinking Level",
-                "Select a model to configure",
-                options,
-                selectedKey or self.currentModelKey or "",
-                self._select_model,
-                lambda: self.onDone(_model_thinking_summary(self.overrides)),
-            )
+        self.originalThemeSetting = currentThemeSetting
+        autoTheme = parseAutoThemeSetting(currentThemeSetting)
+        automaticThemes = defaultAutomaticThemes(currentThemeSetting, availableThemes)
+        fixedTheme = None if autoTheme or "/" in currentThemeSetting else currentThemeSetting
+        self.mode: Literal["single", "automatic"] = "automatic" if autoTheme else "single"
+        self.lightTheme = automaticThemes["lightTheme"]
+        self.darkTheme = automaticThemes["darkTheme"]
+        self.singleTheme = preferredTheme(
+            availableThemes,
+            fixedTheme if fixedTheme is not None else (self.getActiveAutomaticTheme() if autoTheme else None),
+            # MISAKA fork (D11): the built-in theme matching the terminal, not the system theme.
+            getTerminalTheme(),
         )
 
-    def _select_model(self, key: str) -> None:
-        model = self.modelsByKey.get(key)
-        if model is None:
-            return
-        levels = get_supported_thinking_levels(model)
-        options = [
-            SelectItem(value=level, label=level, description=THINKING_DESCRIPTIONS[level])
-            for level in levels
-        ]
-        if key in self.overrides:
-            options.append(
-                SelectItem(
-                    value=_CLEAR_MODEL_THINKING_OVERRIDE,
-                    label="(clear override)",
-                    description=f"Revert to global default ({self.globalDefault})",
-                )
-            )
-        self._replace(
-            SelectSubmenu(
-                f"Thinking Level for {model.id} [{model.provider}]",
-                "Select default thinking level for this model",
-                options,
-                self.overrides.get(key, ""),
-                lambda level: self._select_level(model, level),
-                lambda: self._show_models(key),
-            )
-        )
-
-    def _select_level(self, model: Model, level: str) -> None:
-        key = _model_setting_key(model)
-        if level == _CLEAR_MODEL_THINKING_OVERRIDE:
-            self.onRemove(model.provider, model.id)
-            self.overrides.pop(key, None)
+        if self.mode == "automatic":
+            self.showAutomaticMenu()
         else:
-            self.onChange(model.provider, model.id, level)  # type: ignore[arg-type]
-            self.overrides[key] = level  # type: ignore[assignment]
-        self._show_models(key)
+            self.showSingleMenu()
 
     def handleInput(self, data: str) -> None:
-        if self.activeSubmenu is not None:
-            self.activeSubmenu.handleInput(data)
+        handleInput = getattr(self.inputComponent, "handleInput", None)
+        if handleInput is not None:
+            handleInput(data)
+
+    def setContent(self, renderComponent: Any, inputComponent: Any = None) -> None:
+        self.clear()
+        self.addChild(renderComponent)
+        self.inputComponent = inputComponent if inputComponent is not None else renderComponent
+
+    def _preview(self, themeSetting: str) -> None:
+        """``this.callbacks.onThemePreview?.(themeSetting)``."""
+        if self.callbacks.onThemePreview:
+            self.callbacks.onThemePreview(themeSetting)
+
+    def showSingleMenu(self) -> None:
+        self.mode = "single"
+
+        def onSelect(value: str) -> None:
+            if value == AUTOMATIC_THEME_VALUE:
+                self.mode = "automatic"
+                self._preview(self.getThemeSetting())
+                self.showAutomaticMenu()
+                return
+
+            self.singleTheme = value
+            self.apply(value)
+
+        def onSelectionChange(value: str) -> None:
+            self._preview(self.getAutomaticThemeSetting() if value == AUTOMATIC_THEME_VALUE else value)
+
+        menu = SelectSubmenu(
+            "Theme",
+            "Select a theme, or choose automatic to follow terminal appearance.",
+            singleModeThemeItems(self.availableThemes, self.singleTheme),
+            self.singleTheme,
+            onSelect,
+            lambda: self.cancel(),
+            onSelectionChange,
+        )
+        self.setContent(menu)
+
+    def showAutomaticMenu(self) -> None:
+        self.mode = "automatic"
+        content = Container()
+        content.addChild(Text(theme.bold(theme.fg("accent", "Automatic Theme")), 0, 0))
+        content.addChild(Spacer(1))
+        content.addChild(Text(theme.fg("muted", "Choose themes for terminal light and dark appearance."), 0, 0))
+        content.addChild(Text(theme.fg("muted", "Light/dark detection requires terminal support."), 0, 0))
+        content.addChild(Spacer(1))
+
+        def lightSubmenu(currentValue: str, done: Callable[..., None]) -> SelectSubmenu:
+            def onSelect(value: str) -> None:
+                self.lightTheme = value
+                self._preview(self.getThemeSetting())
+                done(value)
+
+            return self.createThemeSelect(
+                "Light Theme",
+                "Select the theme to use for light terminal appearance",
+                currentValue,
+                done,
+                onSelect,
+            )
+
+        def darkSubmenu(currentValue: str, done: Callable[..., None]) -> SelectSubmenu:
+            def onSelect(value: str) -> None:
+                self.darkTheme = value
+                self._preview(self.getThemeSetting())
+                done(value)
+
+            return self.createThemeSelect(
+                "Dark Theme",
+                "Select the theme to use for dark terminal appearance",
+                currentValue,
+                done,
+                onSelect,
+            )
+
+        items: list[SettingItem] = [
+            SettingItem(
+                id="light-theme",
+                label="Light theme",
+                description="Theme to use in automatic mode when the terminal is light",
+                currentValue=self.lightTheme,
+                submenu=lightSubmenu,
+            ),
+            SettingItem(
+                id="dark-theme",
+                label="Dark theme",
+                description="Theme to use in automatic mode when the terminal is dark",
+                currentValue=self.darkTheme,
+                submenu=darkSubmenu,
+            ),
+            SettingItem(
+                id="apply",
+                label="Apply",
+                description="Save and go back",
+                currentValue="save and go back",
+                values=["save and go back"],
+            ),
+            SettingItem(
+                id="single-mode",
+                label="Change mode",
+                description="Switch to one theme for light and dark",
+                currentValue="switch to single theme",
+                values=["switch to single theme"],
+            ),
+        ]
+
+        def onChange(id: str, _newValue: str) -> None:
+            match id:
+                case "single-mode":
+                    self.mode = "single"
+                    self.singleTheme = self.getActiveAutomaticTheme()
+                    self._preview(self.singleTheme)
+                    self.showSingleMenu()
+                case "apply":
+                    self.apply(self.getAutomaticThemeSetting())
+
+        settingsList = SettingsList(
+            items,
+            min(len(items), 10),
+            getSettingsListTheme(),
+            onChange,
+            lambda: self.cancel(),
+        )
+        content.addChild(settingsList)
+        self.setContent(content, settingsList)
+
+    def createThemeSelect(
+        self,
+        title: str,
+        description: str,
+        currentValue: str,
+        done: Callable[..., None],
+        onSelect: Callable[[str], None],
+    ) -> SelectSubmenu:
+        def onCancel() -> None:
+            self._preview(self.getThemeSetting())
+            done()
+
+        return SelectSubmenu(
+            title,
+            description,
+            themeItems(self.availableThemes, currentValue),
+            currentValue,
+            onSelect,
+            onCancel,
+            lambda value: self._preview(value),
+        )
+
+    def getThemeSetting(self) -> str:
+        return self.getAutomaticThemeSetting() if self.mode == "automatic" else self.singleTheme
+
+    def getActiveAutomaticTheme(self) -> str:
+        return self.lightTheme if self.terminalTheme == "light" else self.darkTheme
+
+    def getAutomaticThemeSetting(self) -> str:
+        return f"{self.lightTheme}/{self.darkTheme}"
+
+    def apply(self, themeSetting: str) -> None:
+        self.onDone(themeSetting)
+
+    def cancel(self) -> None:
+        self._preview(self.originalThemeSetting)
+        self.onDone()
 
 
 class SettingsSelectorComponent(Container):
+    """Main settings selector component."""
+
     def __init__(self, config: SettingsConfig, callbacks: SettingsCallbacks) -> None:
         super().__init__()
-        supports_images = bool(getCapabilities().images)
-        follow_up_key = key_display_text("app.message.followUp")
-        cycle_thinking_key = key_display_text("app.thinking.cycle")
-        self.currentWarnings = dict(config.warnings)
+
+        supportsImages = getCapabilities().images
+        followUpKey = keyDisplayText("app.message.followUp")
+        cycleThinkingKey = keyDisplayText("app.thinking.cycle")
+        currentWarnings: WarningSettings = {**config.warnings}
+        currentModelThinkingLevels: dict[str, ThinkingLevel] = {**config.modelThinkingLevels}
+        defaultModelByValue = {modelSettingKey(model): model for model in config.availableDefaultModels}
+        currentDefaultModelKey = config.defaultModel if config.defaultModel in defaultModelByValue else None
+        currentModelKey = modelSettingKey(config.currentModel) if config.currentModel else None
+
+        def warningsSubmenu(_currentValue: str, done: Callable[..., None]) -> WarningSettingsSubmenu:
+            def onChange(warnings: WarningSettings) -> None:
+                nonlocal currentWarnings
+                currentWarnings = warnings
+                callbacks.onWarningsChange(warnings)
+
+            return WarningSettingsSubmenu(currentWarnings, onChange, lambda: done())
+
+        def thinkingSubmenu(currentValue: str, done: Callable[..., None]) -> SelectSubmenu:
+            def onSelect(value: str) -> None:
+                callbacks.onThinkingLevelChange(value)  # type: ignore[arg-type]
+                done(value)
+
+            return SelectSubmenu(
+                "Thinking Level",
+                "Select reasoning depth for thinking-capable models",
+                [
+                    SelectItem(value=level, label=level, description=THINKING_DESCRIPTIONS[level])
+                    for level in config.availableThinkingLevels
+                ],
+                currentValue,
+                onSelect,
+                lambda: done(),
+            )
+
+        def modelThinkingSubmenu(_currentValue: str, done: Callable[..., None]) -> SteppedSubmenu:
+            def modelOptions(_ctx: dict[str, str]) -> list[SelectItem]:
+                def byPreference(a: Model, b: Model) -> int:
+                    aKey = modelSettingKey(a)
+                    bKey = modelSettingKey(b)
+                    if aKey == currentModelKey:
+                        return -1
+                    if bKey == currentModelKey:
+                        return 1
+                    if aKey == currentDefaultModelKey:
+                        return -1
+                    if bKey == currentDefaultModelKey:
+                        return 1
+                    return localeCompare(a.provider, b.provider)
+
+                sorted_ = sorted(config.availableDefaultModels, key=functools.cmp_to_key(byPreference))
+                items: list[SelectItem] = []
+                for model in sorted_:
+                    key = modelSettingKey(model)
+                    override = currentModelThinkingLevels.get(key)
+                    items.append(SelectItem(value=key, label=modelItemLabel(model), description=override))
+                if len(items) == 0:
+                    items.append(
+                        SelectItem(
+                            value="__none__",
+                            label="No models available",
+                            description="Log in to a provider or configure an API key first",
+                        )
+                    )
+                return items
+
+            def levelTitle(ctx: dict[str, str]) -> str:
+                m = defaultModelByValue.get(ctx["model"])
+                return f"Thinking Level for {modelDisplayLabel(m) if m else ctx['model']}"
+
+            def levelOptions(ctx: dict[str, str]) -> list[SelectItem]:
+                model = defaultModelByValue.get(ctx["model"])
+                if not model:
+                    return []
+                levels: list[ThinkingLevel] = list(getSupportedThinkingLevels(model)) if model.reasoning else ["off"]
+                activeLevel = currentModelThinkingLevels.get(ctx["model"])
+                items = [
+                    SelectItem(
+                        value=level,
+                        label=f"{'✓ ' if level == activeLevel else '  '}{level}",
+                        description=THINKING_DESCRIPTIONS[level],
+                    )
+                    for level in levels
+                ]
+                if currentModelThinkingLevels.get(ctx["model"]) is not None:
+                    items.append(
+                        SelectItem(
+                            value=CLEAR_OVERRIDE_VALUE,
+                            label="  (clear override)",
+                            description=f"Revert to global default ({config.thinkingLevel})",
+                        )
+                    )
+                return items
+
+            steps: list[SteppedSubmenuStep] = [
+                SteppedSubmenuStep(
+                    key="model",
+                    title="Per-Model Thinking Level",
+                    description="Select a model to configure",
+                    options=modelOptions,
+                    preselect=lambda _ctx: currentModelKey if currentModelKey is not None else currentDefaultModelKey,
+                    searchable=True,
+                    layout=MODEL_PICKER_LAYOUT,
+                ),
+                SteppedSubmenuStep(
+                    key="level",
+                    title=levelTitle,
+                    description="Select default thinking level for this model",
+                    options=levelOptions,
+                    preselect=lambda ctx: currentModelThinkingLevels.get(ctx["model"]),
+                ),
+            ]
+
+            def summary() -> str:
+                return modelThinkingOverridesSummary(currentModelThinkingLevels)
+
+            def onComplete(selections: dict[str, str]) -> None:
+                model = defaultModelByValue.get(selections["model"])
+                if not model:
+                    return
+                if selections["level"] == CLEAR_OVERRIDE_VALUE:
+                    callbacks.onModelThinkingLevelRemove(model.provider, model.id)
+                    currentModelThinkingLevels.pop(selections["model"], None)
+                else:
+                    level: Any = selections["level"]
+                    callbacks.onModelThinkingLevelChange(model.provider, model.id, level)
+                    currentModelThinkingLevels[selections["model"]] = level
+
+            return SteppedSubmenu(steps, onComplete, lambda: done(summary()), {"loop": True})
+
+        def themeSubmenu(currentValue: str, done: Callable[..., None]) -> ThemeSubmenu:
+            return ThemeSubmenu(currentValue, config.terminalTheme, config.availableThemes, callbacks, done)
 
         items: list[SettingItem] = [
             SettingItem(
@@ -362,8 +627,8 @@ class SettingsSelectorComponent(Container):
                 id="follow-up-mode",
                 label="Follow-up mode",
                 description=(
-                    f"{follow_up_key} queues follow-up messages until agent stops. "
-                    "'one-at-a-time': deliver one, wait for response. 'all': deliver all at once."
+                    f"{followUpKey} queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait "
+                    "for response. 'all': deliver all at once."
                 ),
                 currentValue=config.followUpMode,
                 values=["one-at-a-time", "all"],
@@ -379,8 +644,8 @@ class SettingsSelectorComponent(Container):
                 id="http-idle-timeout",
                 label="HTTP idle timeout",
                 description=(
-                    "Maximum idle gap while waiting for HTTP headers or body chunks. "
-                    "Disable for local models that pause longer than five minutes."
+                    "Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local models that "
+                    "pause longer than five minutes."
                 ),
                 currentValue=formatHttpIdleTimeoutMs(config.httpIdleTimeoutMs),
                 values=[str(choice["label"]) for choice in HTTP_IDLE_TIMEOUT_CHOICES],
@@ -390,13 +655,20 @@ class SettingsSelectorComponent(Container):
                 label="Cache warming",
                 description="off; streaming while the agent runs; idle also between runs while continuation stays profitable",
                 currentValue=config.cacheWarmingMode,
-                values=list(CACHE_WARMING_MODES),
+                values=[*CACHE_WARMING_MODES],
             ),
             SettingItem(
                 id="hide-thinking",
                 label="Hide thinking",
                 description="Hide thinking blocks in assistant responses",
                 currentValue="true" if config.hideThinkingBlock else "false",
+                values=["true", "false"],
+            ),
+            SettingItem(
+                id="cache-miss-notices",
+                label="Cache miss notices",
+                description="Show transcript notices for cache costs and provider recovery diagnostics",
+                currentValue="true" if config.showCacheMissNotices else "false",
                 values=["true", "false"],
             ),
             SettingItem(
@@ -409,19 +681,24 @@ class SettingsSelectorComponent(Container):
             SettingItem(
                 id="quiet-startup",
                 label="Quiet startup",
-                description="Disable verbose printing at startup",
-                currentValue="true" if config.quietStartup else "false",
+                description="Disable verbose printing at startup (header: keep only the startup header)",
+                currentValue="header" if config.quietStartup == "header" else "true" if config.quietStartup else "false",
+                values=["true", "header", "false"],
+            ),
+            SettingItem(
+                id="install-telemetry",
+                # MISAKA fork: MISAKA sends no install ping; the setting names the client "misaka" to these gateways.
+                label="Client attribution",
+                description='Name this client "misaka" to OpenRouter, NVIDIA and Cloudflare gateways; nothing else is sent',
+                currentValue="true" if config.enableInstallTelemetry else "false",
                 values=["true", "false"],
             ),
             SettingItem(
                 id="default-project-trust",
                 label="Default project trust",
-                description=(
-                    "Fallback behavior when no extension or saved trust decision "
-                    "decides project trust"
-                ),
+                description="Fallback behavior when no extension or saved trust decision decides project trust",
                 currentValue=DEFAULT_PROJECT_TRUST_LABELS[config.defaultProjectTrust],
-                values=list(DEFAULT_PROJECT_TRUST_LABELS.values()),
+                values=[*DEFAULT_PROJECT_TRUST_LABELS.values()],
             ),
             SettingItem(
                 id="double-escape-action",
@@ -442,68 +719,42 @@ class SettingsSelectorComponent(Container):
                 label="Warnings",
                 description="Enable or disable individual warnings",
                 currentValue="configure",
-                submenu=lambda _current_value, done: WarningSettingsSubmenu(
-                    self.currentWarnings,
-                    lambda warnings: self._update_warnings(warnings, callbacks),
-                    lambda: done(),
-                ),
+                submenu=warningsSubmenu,
             ),
             SettingItem(
                 id="thinking",
                 label="Thinking level",
-                # MISAKA fork: in a Last Order or Sister window the default saved here is hers alone.
+                # MISAKA fork: a global default thinking level row; in a Last Order or Sister window the default saved
+                # here is hers alone.
                 description="Default reasoning depth; in a Last Order or Sister window, hers alone",
                 currentValue=config.thinkingLevel,
-                submenu=lambda current_value, done: SelectSubmenu(
-                    "Thinking Level",
-                    "Select reasoning depth for thinking-capable models",
-                    [
-                        SelectItem(value=level, label=level, description=THINKING_DESCRIPTIONS[level])
-                        for level in config.availableThinkingLevels
-                    ],
-                    current_value,
-                    lambda value: self._select_and_close(value, callbacks.onThinkingLevelChange, done),
-                    lambda: done(),
-                ),
+                submenu=thinkingSubmenu,
             ),
             SettingItem(
                 id="model-thinking",
                 label="Default thinking level per model",
+                # MISAKA fork: an agent with her own default thinking level keeps it.
                 description=(
-                    "Override the default thinking level for specific models "
-                    "(an agent with her own default keeps it). "
-                    f"{cycle_thinking_key} cycles in-session."
+                    "Override the default thinking level for specific models (an agent with her own default keeps "
+                    f"it). {cycleThinkingKey} cycles in-session."
                 ),
-                currentValue=_model_thinking_summary(config.modelThinkingLevels),
-                submenu=lambda _current_value, done: ModelThinkingSettingsSubmenu(
-                    config.availableDefaultModels,
-                    config.currentModel,
-                    config.thinkingLevel,
-                    config.modelThinkingLevels,
-                    callbacks.onModelThinkingLevelChange,
-                    callbacks.onModelThinkingLevelRemove,
-                    done,
-                ),
+                currentValue=modelThinkingOverridesSummary(currentModelThinkingLevels),
+                submenu=modelThinkingSubmenu,
             ),
             SettingItem(
                 id="theme",
                 label="Theme",
                 description="Color theme for the interface",
                 currentValue=config.currentTheme,
-                submenu=lambda current_value, done: SelectSubmenu(
-                    "Theme",
-                    "Select color theme",
-                    [SelectItem(value=name, label=name) for name in config.availableThemes],
-                    current_value,
-                    lambda value: self._select_and_close(value, callbacks.onThemeChange, done),
-                    lambda: self._cancel_theme_preview(current_value, callbacks, done),
-                    (lambda value: callbacks.onThemePreview(value)) if callbacks.onThemePreview else None,
-                ),
+                submenu=themeSubmenu,
             ),
         ]
 
-        if supports_images:
-            items[1:1] = [
+        # Only show image toggle if terminal supports it
+        if supportsImages:
+            # Insert after autocompact
+            items.insert(
+                1,
                 SettingItem(
                     id="show-images",
                     label="Show images",
@@ -511,6 +762,9 @@ class SettingsSelectorComponent(Container):
                     currentValue="true" if config.showImages else "false",
                     values=["true", "false"],
                 ),
+            )
+            items.insert(
+                2,
                 SettingItem(
                     id="image-width-cells",
                     label="Image width",
@@ -518,210 +772,205 @@ class SettingsSelectorComponent(Container):
                     currentValue=str(config.imageWidthCells),
                     values=["60", "80", "120"],
                 ),
-            ]
+            )
 
-        insert_index = 3 if supports_images else 1
-        items[insert_index:insert_index] = [
+        # Image auto-resize toggle (always available, affects both attached and read images)
+        items.insert(
+            3 if supportsImages else 1,
             SettingItem(
                 id="auto-resize-images",
                 label="Auto-resize images",
                 description="Resize large images to 2000x2000 max for better model compatibility",
                 currentValue="true" if config.autoResizeImages else "false",
                 values=["true", "false"],
-            )
-        ]
+            ),
+        )
 
-        block_images_index = next(index for index, item in enumerate(items) if item.id == "auto-resize-images") + 1
-        items[block_images_index:block_images_index] = [
+        def indexOf(id: str) -> int:
+            return next((index for index, item in enumerate(items) if item.id == id), -1)
+
+        # Block images toggle (always available, insert after auto-resize-images)
+        autoResizeIndex = indexOf("auto-resize-images")
+        items.insert(
+            autoResizeIndex + 1,
             SettingItem(
                 id="block-images",
                 label="Block images",
                 description="Prevent images from being sent to LLM providers",
                 currentValue="true" if config.blockImages else "false",
                 values=["true", "false"],
-            )
-        ]
+            ),
+        )
 
-        extra_items = [
-            (
-                "skill-commands",
-                "Skill commands",
-                "Register automatic /skill-name commands (explicit /skill remains available)",
-                "true" if config.enableSkillCommands else "false",
-                ["true", "false"],
+        # Skill commands toggle (insert after block-images)
+        blockImagesIndex = indexOf("block-images")
+        items.insert(
+            blockImagesIndex + 1,
+            SettingItem(
+                id="skill-commands",
+                label="Skill commands",
+                # MISAKA fork: skills register as /skill-name (no /skill: prefix), and /skill stays available.
+                description="Register automatic /skill-name commands (explicit /skill remains available)",
+                currentValue="true" if config.enableSkillCommands else "false",
+                values=["true", "false"],
             ),
-            (
-                "show-hardware-cursor",
-                "Show hardware cursor",
-                "Show the terminal cursor while still positioning it for IME support",
-                "true" if config.showHardwareCursor else "false",
-                ["true", "false"],
-            ),
-            (
-                "editor-padding",
-                "Editor padding",
-                "Horizontal padding for input editor (0-3)",
-                str(config.editorPaddingX),
-                ["0", "1", "2", "3"],
-            ),
-            (
-                "output-padding",
-                "Output padding",
-                "Horizontal padding for user messages, assistant messages, and thinking",
-                str(config.outputPad),
-                ["0", "1"],
-            ),
-            (
-                "autocomplete-max-visible",
-                "Autocomplete max items",
-                "Max visible items in autocomplete dropdown (3-20)",
-                str(config.autocompleteMaxVisible),
-                ["3", "5", "7", "10", "15", "20"],
-            ),
-            (
-                "clear-on-shrink",
-                "Clear on shrink",
-                "Clear empty rows when content shrinks (may cause flicker)",
-                "true" if config.clearOnShrink else "false",
-                ["true", "false"],
-            ),
-            (
-                "terminal-progress",
-                "Terminal progress",
-                "Show OSC 9;4 progress indicators in the terminal tab bar",
-                "true" if config.showTerminalProgress else "false",
-                ["true", "false"],
-            ),
-        ]
-        if callbacks.onEnableInstallTelemetryChange is not None:
-            extra_items.append(
-                (
-                    "install-telemetry",
-                    "Client attribution",
-                    "Name this client \"misaka\" to OpenRouter, NVIDIA and Cloudflare gateways; nothing else is sent",
-                    "true" if config.enableInstallTelemetry else "false",
-                    ["true", "false"],
-                )
-            )
+        )
 
-        insert_after = next(index for index, item in enumerate(items) if item.id == "block-images") + 1
-        for offset, (item_id, label, description, current_value, values) in enumerate(extra_items):
-            items.insert(
-                insert_after + offset,
-                SettingItem(
-                    id=item_id,
-                    label=label,
-                    description=description,
-                    currentValue=current_value,
-                    values=values,
-                ),
-            )
+        # Hardware cursor toggle (insert after skill-commands)
+        skillCommandsIndex = indexOf("skill-commands")
+        items.insert(
+            skillCommandsIndex + 1,
+            SettingItem(
+                id="show-hardware-cursor",
+                label="Show hardware cursor",
+                description="Show the terminal cursor while still positioning it for IME support",
+                currentValue="true" if config.showHardwareCursor else "false",
+                values=["true", "false"],
+            ),
+        )
 
+        # Editor padding toggle (insert after show-hardware-cursor)
+        hardwareCursorIndex = indexOf("show-hardware-cursor")
+        items.insert(
+            hardwareCursorIndex + 1,
+            SettingItem(
+                id="editor-padding",
+                label="Editor padding",
+                description="Horizontal padding for input editor (0-3)",
+                currentValue=str(config.editorPaddingX),
+                values=["0", "1", "2", "3"],
+            ),
+        )
+
+        # Output padding toggle (insert after editor-padding)
+        editorPaddingIndex = indexOf("editor-padding")
+        items.insert(
+            editorPaddingIndex + 1,
+            SettingItem(
+                id="output-padding",
+                label="Output padding",
+                description="Horizontal padding for messages, tool output, and command output",
+                currentValue=str(config.outputPad),
+                values=["0", "1"],
+            ),
+        )
+
+        # Autocomplete max visible toggle (insert after output-padding)
+        outputPaddingIndex = indexOf("output-padding")
+        items.insert(
+            outputPaddingIndex + 1,
+            SettingItem(
+                id="autocomplete-max-visible",
+                label="Autocomplete max items",
+                description="Max visible items in autocomplete dropdown (3-20)",
+                currentValue=str(config.autocompleteMaxVisible),
+                values=["3", "5", "7", "10", "15", "20"],
+            ),
+        )
+
+        # Clear on shrink toggle (insert after autocomplete-max-visible)
+        autocompleteIndex = indexOf("autocomplete-max-visible")
+        items.insert(
+            autocompleteIndex + 1,
+            SettingItem(
+                id="clear-on-shrink",
+                label="Clear on shrink",
+                description="Clear empty rows when content shrinks (may cause flicker)",
+                currentValue="true" if config.clearOnShrink else "false",
+                values=["true", "false"],
+            ),
+        )
+
+        # Terminal progress toggle (insert after clear-on-shrink)
+        clearOnShrinkIndex = indexOf("clear-on-shrink")
+        items.insert(
+            clearOnShrinkIndex + 1,
+            SettingItem(
+                id="terminal-progress",
+                label="Terminal progress",
+                description="Show OSC 9;4 progress indicators in the terminal tab bar",
+                currentValue="true" if config.showTerminalProgress else "false",
+                values=["true", "false"],
+            ),
+        )
+
+        # Add borders
         self.addChild(DynamicBorder())
+
+        def onChange(id: str, newValue: str) -> None:
+            value: Any = newValue
+            match id:
+                case "autocompact":
+                    callbacks.onAutoCompactChange(newValue == "true")
+                case "show-images":
+                    callbacks.onShowImagesChange(newValue == "true")
+                case "image-width-cells":
+                    callbacks.onImageWidthCellsChange(int(newValue, 10))
+                case "auto-resize-images":
+                    callbacks.onAutoResizeImagesChange(newValue == "true")
+                case "block-images":
+                    callbacks.onBlockImagesChange(newValue == "true")
+                case "skill-commands":
+                    callbacks.onEnableSkillCommandsChange(newValue == "true")
+                case "steering-mode":
+                    callbacks.onSteeringModeChange(value)
+                case "follow-up-mode":
+                    callbacks.onFollowUpModeChange(value)
+                case "transport":
+                    callbacks.onTransportChange(value)
+                case "http-idle-timeout":
+                    choice: Any = next((item for item in HTTP_IDLE_TIMEOUT_CHOICES if item["label"] == newValue), None)
+                    if choice:
+                        callbacks.onHttpIdleTimeoutMsChange(choice["timeoutMs"])
+                case "cache-warming-mode":
+                    callbacks.onCacheWarmingModeChange(value)
+                case "hide-thinking":
+                    callbacks.onHideThinkingBlockChange(newValue == "true")
+                case "cache-miss-notices":
+                    callbacks.onShowCacheMissNoticesChange(newValue == "true")
+                case "collapse-changelog":
+                    callbacks.onCollapseChangelogChange(newValue == "true")
+                case "quiet-startup":
+                    callbacks.onQuietStartupChange("header" if newValue == "header" else newValue == "true")
+                case "install-telemetry":
+                    callbacks.onEnableInstallTelemetryChange(newValue == "true")
+                case "default-project-trust":
+                    defaultProjectTrust = DEFAULT_PROJECT_TRUST_BY_LABEL.get(newValue)
+                    if defaultProjectTrust:
+                        callbacks.onDefaultProjectTrustChange(defaultProjectTrust)
+                case "double-escape-action":
+                    callbacks.onDoubleEscapeActionChange(value)
+                case "tree-filter-mode":
+                    callbacks.onTreeFilterModeChange(value)
+                case "show-hardware-cursor":
+                    callbacks.onShowHardwareCursorChange(newValue == "true")
+                case "editor-padding":
+                    callbacks.onEditorPaddingXChange(int(newValue, 10))
+                case "output-padding":
+                    callbacks.onOutputPadChange(0 if newValue == "0" else 1)
+                case "autocomplete-max-visible":
+                    callbacks.onAutocompleteMaxVisibleChange(int(newValue, 10))
+                case "clear-on-shrink":
+                    callbacks.onClearOnShrinkChange(newValue == "true")
+                case "terminal-progress":
+                    callbacks.onShowTerminalProgressChange(newValue == "true")
+                case "theme":
+                    callbacks.onThemeChange(newValue)
+
         self.settingsList = SettingsList(
             items,
             10,
-            get_settings_list_theme(),
-            lambda setting_id, new_value: self._apply_change(setting_id, new_value, callbacks),
+            getSettingsListTheme(),
+            onChange,
             callbacks.onCancel,
             SettingsListOptions(enableSearch=True),
         )
+
         self.addChild(self.settingsList)
         self.addChild(DynamicBorder())
 
-    def _update_warnings(self, warnings: WarningSettings, callbacks: SettingsCallbacks) -> None:
-        self.currentWarnings = dict(warnings)
-        callbacks.onWarningsChange(dict(warnings))
-
-    def _select_and_close(
-        self,
-        value: str,
-        callback: Callable[[str], None],
-        done: Callable[[str | None], None],
-    ) -> None:
-        callback(value)
-        done(value)
-
-    def _cancel_theme_preview(
-        self,
-        current_value: str,
-        callbacks: SettingsCallbacks,
-        done: Callable[[str | None], None],
-    ) -> None:
-        if callbacks.onThemePreview is not None:
-            callbacks.onThemePreview(current_value)
-        done()
-
-    def _apply_change(self, setting_id: str, new_value: str, callbacks: SettingsCallbacks) -> None:
-        match setting_id:
-            case "autocompact":
-                callbacks.onAutoCompactChange(new_value == "true")
-            case "show-images":
-                callbacks.onShowImagesChange(new_value == "true")
-            case "image-width-cells":
-                callbacks.onImageWidthCellsChange(int(new_value))
-            case "auto-resize-images":
-                callbacks.onAutoResizeImagesChange(new_value == "true")
-            case "block-images":
-                callbacks.onBlockImagesChange(new_value == "true")
-            case "skill-commands":
-                callbacks.onEnableSkillCommandsChange(new_value == "true")
-            case "steering-mode":
-                callbacks.onSteeringModeChange(new_value)
-            case "follow-up-mode":
-                callbacks.onFollowUpModeChange(new_value)
-            case "transport":
-                callbacks.onTransportChange(new_value)  # type: ignore[arg-type]
-            case "http-idle-timeout":
-                choice = next(
-                    (item for item in HTTP_IDLE_TIMEOUT_CHOICES if item["label"] == new_value),
-                    None,
-                )
-                if choice is not None:
-                    callbacks.onHttpIdleTimeoutMsChange(int(choice["timeoutMs"]))
-            case "cache-warming-mode":
-                callbacks.onCacheWarmingModeChange(new_value)
-            case "hide-thinking":
-                callbacks.onHideThinkingBlockChange(new_value == "true")
-            case "collapse-changelog":
-                callbacks.onCollapseChangelogChange(new_value == "true")
-            case "quiet-startup":
-                callbacks.onQuietStartupChange(new_value == "true")
-            case "default-project-trust":
-                value = DEFAULT_PROJECT_TRUST_BY_LABEL.get(new_value)
-                if value is not None:
-                    callbacks.onDefaultProjectTrustChange(value)
-            case "double-escape-action":
-                callbacks.onDoubleEscapeActionChange(new_value)
-            case "tree-filter-mode":
-                callbacks.onTreeFilterModeChange(new_value)
-            case "show-hardware-cursor":
-                callbacks.onShowHardwareCursorChange(new_value == "true")
-            case "editor-padding":
-                callbacks.onEditorPaddingXChange(int(new_value))
-            case "output-padding":
-                callbacks.onOutputPadChange(0 if new_value == "0" else 1)
-            case "autocomplete-max-visible":
-                callbacks.onAutocompleteMaxVisibleChange(int(new_value))
-            case "clear-on-shrink":
-                callbacks.onClearOnShrinkChange(new_value == "true")
-            case "terminal-progress":
-                callbacks.onShowTerminalProgressChange(new_value == "true")
-            case "install-telemetry":
-                if callbacks.onEnableInstallTelemetryChange is not None:
-                    callbacks.onEnableInstallTelemetryChange(new_value == "true")
-
     def getSettingsList(self) -> SettingsList:
         return self.settingsList
-
-    def handleInput(self, data: str) -> None:
-        # Without this, keystrokes are dropped once /settings opens (even Esc).
-        # Forward to the active submenu if one is open, else the settings list.
-        submenu = getattr(self, "activeSubmenu", None)
-        target = submenu if submenu is not None else self.settingsList
-        handler = getattr(target, "handleInput", None)
-        if callable(handler):
-            handler(data)
 
 
 __all__ = [

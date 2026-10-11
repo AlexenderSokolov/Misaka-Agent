@@ -14,34 +14,28 @@ from misaka.agent.types import AgentTool, AgentToolResult
 from misaka.ai.types import TextContent
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.tools._common import _ignore_background_task_result, abort_race
-from misaka.core.tools.path_utils import resolve_to_cwd
-from misaka.core.tools.render_utils import (
-    get_text_output,
-    invalid_arg_text,
-    shorten_path,
-    str_value,
-)
-from misaka.core.tools.tool_definition_wrapper import wrap_tool_definition
+from misaka.core.tools.path_utils import resolveToCwd
+from misaka.core.tools.renderers.find import findRenderers
+from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
 from misaka.core.tools.truncate import (
     DEFAULT_MAX_BYTES,
     TruncationOptions,
     TruncationResult,
-    format_size,
-    truncate_head,
+    formatSize,
+    truncateHead,
 )
-from misaka.ui.tui import Text
 from misaka.utils.tools_manager import find_tool, missing_tool_message
 from misaka.utils.values import maybe_await, read_field, signal_aborted
 
 T = TypeVar("T")
 
 
-def _relativize_find_result(
-    path_value: str,
-    search_path: str,
-    path_module: Any | None = None,
+def relativizeFindResultPath(
+    resultPath: str,
+    searchPath: str,
+    pathModule: Any | None = None,
 ) -> str:
-    """Make a result path relative to search_path (pi #7569/523b5a491).
+    """Relativize a find result against the search root and normalize it to posix separators (pi #7569/523b5a491).
 
     Absolute paths go through relpath: prefix slicing loses the first segment at the
     root ("/etc" under "/" becomes "tc") and mistakes shared-prefix siblings
@@ -49,16 +43,16 @@ def _relativize_find_result(
     glob already yields relative results, and relpath would wrongly resolve them
     against cwd.
     """
-    paths = os.path if path_module is None else path_module
-    had_trailing_separator = path_value.endswith(paths.sep) or (
-        paths.sep == "\\" and path_value.endswith("/")
+    paths = os.path if pathModule is None else pathModule
+    had_trailing_separator = resultPath.endswith(paths.sep) or (
+        paths.sep == "\\" and resultPath.endswith("/")
     )
-    is_absolute = paths.isabs(path_value) or (
-        paths.sep == "\\" and path_value.startswith(("\\", "/"))
+    is_absolute = paths.isabs(resultPath) or (
+        paths.sep == "\\" and resultPath.startswith(("\\", "/"))
     )
     if is_absolute:
         try:
-            relative_path = paths.relpath(path_value, search_path)
+            relative_path = paths.relpath(resultPath, searchPath)
         except ValueError:
             # Match win32.relative() across drives/UNC roots and root-relative paths.
             def node_normalize(value: str) -> str:
@@ -77,8 +71,8 @@ def _relativize_find_result(
                     return normalized + paths.sep
                 return normalized
 
-            relative_path = node_normalize(path_value)
-            source_path = node_normalize(search_path)
+            relative_path = node_normalize(resultPath)
+            source_path = node_normalize(searchPath)
             target_parts = [
                 part for part in relative_path.lstrip(paths.sep).split(paths.sep) if part
             ]
@@ -100,12 +94,18 @@ def _relativize_find_result(
             # Node's path.relative(path, path) returns "", while Python returns ".".
             relative_path = ""
     else:
-        relative_path = path_value
+        relative_path = resultPath
 
     posix_path = relative_path.replace(paths.sep, "/")
     if had_trailing_separator and not posix_path.endswith("/"):
         return f"{posix_path}/"
     return posix_path
+
+
+findToolSystemPromptContribution = {
+    "snippet": "Find files by glob pattern (respects .gitignore)",
+    "guidelines": [],
+}
 
 
 class FindToolInput(BaseModel):
@@ -143,55 +143,6 @@ def _coerce_options(options: FindToolOptions | Mapping[str, Any] | None) -> Find
     if isinstance(options, FindToolOptions):
         return options
     return FindToolOptions(operations=options.get("operations"))
-
-
-def _format_find_call(args: Mapping[str, Any] | None, theme_obj: Any) -> str:
-    pattern = str_value(read_field(args, "pattern"))
-    raw_path = str_value(read_field(args, "path"))
-    path_value = shorten_path(raw_path or ".") if raw_path is not None else None
-    limit = read_field(args, "limit")
-    invalid_arg = invalid_arg_text(theme_obj)
-
-    text = (
-        theme_obj.fg("toolTitle", theme_obj.bold("find"))
-        + " "
-        + (invalid_arg if pattern is None else theme_obj.fg("accent", pattern or ""))
-        + theme_obj.fg("toolOutput", f" in {invalid_arg if path_value is None else path_value}")
-    )
-    if limit is not None:
-        text += theme_obj.fg("toolOutput", f" (limit {limit})")
-    return text
-
-
-def _format_find_result(result: Any, options: Any, theme_obj: Any, show_images: bool) -> str:
-    from misaka.ui.tui.interactive.components.keybinding_hints import key_hint
-
-    output = get_text_output(result, show_images).strip()
-    text = ""
-    if output:
-        lines = output.split("\n")
-        max_lines = len(lines) if bool(read_field(options, "expanded")) else 20
-        display_lines = lines[:max_lines]
-        remaining = len(lines) - max_lines
-        text += "\n" + "\n".join(theme_obj.fg("toolOutput", line) for line in display_lines)
-        if remaining > 0:
-            more_lines_text = theme_obj.fg("muted", f"\n... ({remaining} more lines,")
-            text += (
-                f"{more_lines_text} {key_hint('app.tools.expand', 'to expand')})"
-            )
-
-    details = read_field(result, "details")
-    result_limit = read_field(details, "resultLimitReached")
-    truncation = read_field(details, "truncation")
-    if result_limit or bool(read_field(truncation, "truncated")):
-        warnings: list[str] = []
-        if result_limit:
-            warnings.append(f"{result_limit} results limit")
-        if bool(read_field(truncation, "truncated")):
-            warnings.append(f"{format_size(read_field(truncation, 'maxBytes') or DEFAULT_MAX_BYTES)} limit")
-        warning_text = f"[Truncated: {', '.join(warnings)}]"
-        text += "\n" + theme_obj.fg("warning", warning_text)
-    return text
 
 
 def _details_or_none(details: FindToolDetails) -> FindToolDetails | None:
@@ -239,7 +190,7 @@ async def _run_fd_search(fd_path: str, args: list[str], signal: Any | None) -> t
     return stdout, stderr, process.returncode
 
 
-def create_find_tool_definition(
+def createFindToolDefinition(
     cwd: str,
     options: FindToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[FindToolInput | dict[str, Any], FindToolDetails | None]:
@@ -250,13 +201,14 @@ def create_find_tool_definition(
         params: FindToolInput | dict[str, Any],
         signal: Any | None = None,
         _on_update: Callable[[AgentToolResult], None] | None = None,
-        _ctx: Any = None,
+        ctx: Any = None,
     ) -> AgentToolResult:
         if signal_aborted(signal):
             raise RuntimeError("Operation aborted")
 
         parsed = FindToolInput.model_validate(params)
-        search_path = resolve_to_cwd(parsed.path or ".", cwd)
+        search_path = resolveToCwd(parsed.path or ".", read_field(ctx, "cwd") or cwd)
+        # MISAKA fork: MISAKA's credentials and the web evidence vault are out of the tools' reach.
         from misaka.core.web.evidence import check_material_read
         check_material_read(search_path)
         effective_limit = parsed.limit if parsed.limit is not None else DEFAULT_LIMIT
@@ -288,12 +240,12 @@ def create_find_tool_definition(
                     )
 
                 relativized = [
-                    _relativize_find_result(path_value, search_path)
+                    relativizeFindResultPath(path_value, search_path)
                     for path_value in results
                 ]
                 result_limit_reached = len(relativized) >= effective_limit
                 raw_output = "\n".join(relativized)
-                truncation = truncate_head(
+                truncation = truncateHead(
                     raw_output, TruncationOptions(maxLines=2**31 - 1)
                 )
                 result_output = truncation.content
@@ -303,7 +255,7 @@ def create_find_tool_definition(
                     notices.append(f"{effective_limit} results limit reached")
                     details.resultLimitReached = effective_limit
                 if truncation.truncated:
-                    notices.append(f"{format_size(DEFAULT_MAX_BYTES)} limit reached")
+                    notices.append(f"{formatSize(DEFAULT_MAX_BYTES)} limit reached")
                     details.truncation = truncation
                 if notices:
                     result_output += f"\n\n[{'. '.join(notices)}]"
@@ -394,11 +346,11 @@ def create_find_tool_definition(
             line = raw_line.rstrip("\r").strip()
             if not line:
                 continue
-            relativized.append(_relativize_find_result(line, search_path))
+            relativized.append(relativizeFindResultPath(line, search_path))
 
         result_limit_reached = len(relativized) >= effective_limit
         raw_output = "\n".join(relativized)
-        truncation = truncate_head(raw_output, TruncationOptions(maxLines=2**31 - 1))
+        truncation = truncateHead(raw_output, TruncationOptions(maxLines=2**31 - 1))
         result_output = truncation.content
         details = FindToolDetails()
         notices: list[str] = []
@@ -408,7 +360,7 @@ def create_find_tool_definition(
             )
             details.resultLimitReached = effective_limit
         if truncation.truncated:
-            notices.append(f"{format_size(DEFAULT_MAX_BYTES)} limit reached")
+            notices.append(f"{formatSize(DEFAULT_MAX_BYTES)} limit reached")
             details.truncation = truncation
         if notices:
             result_output += f"\n\n[{'. '.join(notices)}]"
@@ -418,16 +370,6 @@ def create_find_tool_definition(
             details=_details_or_none(details),
         )
 
-    def render_call(args: Mapping[str, Any] | None, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        text.setText(_format_find_call(args, theme_obj))
-        return text
-
-    def render_result(result: Any, options_obj: Any, theme_obj: Any, context: Any) -> Text:
-        text = context.lastComponent if isinstance(context.lastComponent, Text) else Text("", 0, 0)
-        text.setText(_format_find_result(result, options_obj, theme_obj, bool(context.showImages)))
-        return text
-
     return ToolDefinition(
         name="find",
         label="find",
@@ -435,20 +377,17 @@ def create_find_tool_definition(
             "Search for files by glob pattern. Returns matching file paths relative to the search directory. "
             "Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first)."
         ),
-        promptSnippet="Find files by glob pattern (respects .gitignore)",
+        promptSnippet=findToolSystemPromptContribution["snippet"],
         parameters=FindToolInput,
         execute=execute,
-        renderCall=render_call,
-        renderResult=render_result,
+        **findRenderers,
     )
 
 
-def create_find_tool(cwd: str, options: FindToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
-    return wrap_tool_definition(create_find_tool_definition(cwd, options))
+def createFindTool(cwd: str, options: FindToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
+    return wrapToolDefinition(createFindToolDefinition(cwd, options))
 
 
-createFindTool = create_find_tool
-createFindToolDefinition = create_find_tool_definition
 
 __all__ = [
     "FindOperations",
@@ -457,4 +396,6 @@ __all__ = [
     "FindToolOptions",
     "createFindTool",
     "createFindToolDefinition",
+    "findToolSystemPromptContribution",
+    "relativizeFindResultPath",
 ]

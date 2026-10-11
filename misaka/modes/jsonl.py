@@ -20,7 +20,7 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
-def _to_json_assistant_message_event(event: Any) -> Any:
+def toJsonAssistantMessageEvent(event: Any) -> Any:
     if not isinstance(event, dict):
         return event
 
@@ -43,7 +43,7 @@ def _to_json_assistant_message_event(event: Any) -> Any:
     return event
 
 
-def to_json_event(value: Any) -> Any:
+def toJsonEvent(value: Any) -> Any:
     """Convert an event to its wire form.
 
     ``message_update`` events carry only the delta: the accumulated ``partial``
@@ -66,5 +66,5 @@ def to_json_event(value: Any) -> Any:
     return {
         "type": "message_update",
         "usage": message.get("usage"),
-        "assistantMessageEvent": _to_json_assistant_message_event(data.get("assistantMessageEvent")),
+        "assistantMessageEvent": toJsonAssistantMessageEvent(data.get("assistantMessageEvent")),
     }

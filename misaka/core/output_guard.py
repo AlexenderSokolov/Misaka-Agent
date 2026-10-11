@@ -96,7 +96,7 @@ def _retry_transient(operation: Callable[[], Any]) -> None:
             time.sleep(RAW_STDOUT_RETRY_DELAY_S)
 
 
-def _write_raw_stdout_chunk(text: str) -> None:
+def writeRawStdoutChunk(text: str) -> None:
     write = _rawStdoutWrite()
     stream = getattr(write, "__self__", None)
     buffer = getattr(stream, "buffer", None)
@@ -126,7 +126,7 @@ def _write_raw_stdout_chunk(text: str) -> None:
 def writeRawStdout(text: str) -> None:
     if not text:
         return
-    _write_raw_stdout_chunk(text)
+    writeRawStdoutChunk(text)
 
 
 async def waitForRawStdoutBackpressure() -> None:
@@ -137,7 +137,7 @@ async def waitForRawStdoutBackpressure() -> None:
 
 async def flushRawStdout() -> None:
     await waitForRawStdoutBackpressure()
-    _write_raw_stdout_chunk("")
+    writeRawStdoutChunk("")
 
 
 __all__ = [

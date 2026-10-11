@@ -260,7 +260,7 @@ def test_the_final_report_is_written_from_indexed_documents_one_command_per_part
     def run_llm_json(_profile, prompt, _provider, _model, **options):
         seen.append(prompt)
         names = [tool.name for tool in options["extra_tools"]]
-        assert "misaka_research_report" in names and "doc_read" in options["tools"]
+        assert "misaka_research_report" in names
         assert "declared_findings" not in prompt                  # no material catalog inlined
         assert '"conclusion": ' in prompt or "ended without calling" in prompt   # the doc-id catalog, or the nudge
         assert '"rationale"' not in prompt.split("# Catalog")[-1].split("# Corrections")[0]   # counts, not issue texts

@@ -20,7 +20,7 @@ from ruamel.yaml import YAML
 from misaka.config import home
 from misaka.core.platform import repo, tasks
 from misaka.utils import atomic
-from misaka.utils.frontmatter import parse_frontmatter
+from misaka.utils.frontmatter import parseFrontmatter
 
 LOG_HEADING = "## log"
 _FIELD_ORDER = ("id", "title", "status", "generation", "assignee", "reviewer", "model",
@@ -142,7 +142,7 @@ def _write_file(path, text):
 
 def read(path):
     """``{"fields": frontmatter, "body": contract text}`` for one card file."""
-    parsed = parse_frontmatter(Path(path).read_text(encoding="utf-8"))
+    parsed = parseFrontmatter(Path(path).read_text(encoding="utf-8"))
     return {"fields": parsed.frontmatter or {}, "body": (parsed.body or "").strip()}
 
 

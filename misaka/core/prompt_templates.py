@@ -11,9 +11,21 @@ from typing import TypedDict
 
 from misaka.config import home
 from misaka.core.diagnostics import ResourceDiagnostic
-from misaka.core.source_info import SourceInfo, create_synthetic_source_info
-from misaka.utils.frontmatter import parse_frontmatter
-from misaka.utils.paths import resolve_path
+from misaka.core.source_info import SourceInfo, createSyntheticSourceInfo
+from misaka.utils.frontmatter import parseFrontmatter
+from misaka.utils.js import (
+    ECMASCRIPT_WHITESPACE,
+    jsLength,
+    jsSlice,
+    jsTrim,
+    toWellFormed,
+)
+from misaka.utils.node_fs import readdirEntries
+from misaka.utils.paths import resolvePath
+
+# misaka.core.subagent imports this name from here (a set it tests characters against).
+_ECMASCRIPT_WHITESPACE = frozenset(ECMASCRIPT_WHITESPACE)
+
 
 
 @dataclass(slots=True)
@@ -32,14 +44,9 @@ class LoadPromptTemplatesOptions(TypedDict):
     promptPaths: list[str]
 
 
-_ECMASCRIPT_WHITESPACE = frozenset(
-    "\t\n\v\f\r \u00a0\u1680"
-    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
-    "\u2028\u2029\u202f\u205f\u3000\ufeff"
-)
 
 
-def parse_command_args(args_string: str) -> list[str]:
+def parseCommandArgs(args_string: str) -> list[str]:
     args: list[str] = []
     current = ""
     in_quote: str | None = None
@@ -51,7 +58,7 @@ def parse_command_args(args_string: str) -> list[str]:
                 current += char
         elif char in {'"', "'"}:
             in_quote = char
-        elif char in _ECMASCRIPT_WHITESPACE:
+        elif char in ECMASCRIPT_WHITESPACE:
             if current:
                 args.append(current)
                 current = ""
@@ -82,7 +89,7 @@ def _parse_decimal_capped(raw: str, cap: int) -> int:
     return int(normalized)
 
 
-def substitute_args(content: str, args: list[str]) -> str:
+def substituteArgs(content: str, args: list[str]) -> str:
     """Substitute argument placeholders in template content.
 
     Supports ``$1``/``$2``..., ``$@`` and ``$ARGUMENTS`` for all args, ``${N:-default}``
@@ -126,13 +133,13 @@ def parse_prompt_template_invocation(text: str) -> tuple[str, str] | None:
         return None
 
     name_end = 1
-    while name_end < len(text) and text[name_end] not in _ECMASCRIPT_WHITESPACE:
+    while name_end < len(text) and text[name_end] not in ECMASCRIPT_WHITESPACE:
         name_end += 1
     if name_end == 1:
         return None
 
     args_start = name_end
-    while args_start < len(text) and text[args_start] in _ECMASCRIPT_WHITESPACE:
+    while args_start < len(text) and text[args_start] in ECMASCRIPT_WHITESPACE:
         args_start += 1
     return text[1:name_end], text[args_start:]
 
@@ -151,9 +158,9 @@ class _LoadedTemplate:
     diagnostics: list[ResourceDiagnostic]
 
 
-def load_prompt_templates(options: LoadPromptTemplatesOptions) -> LoadedPromptTemplates:
-    resolved_cwd = resolve_path(options["cwd"])
-    resolved_agent_dir = resolve_path(options["agentDir"])
+def loadPromptTemplates(options: LoadPromptTemplatesOptions) -> LoadedPromptTemplates:
+    resolved_cwd = resolvePath(options["cwd"])
+    resolved_agent_dir = resolvePath(options["agentDir"])
     prompt_paths = options["promptPaths"]
 
     templates: list[PromptTemplate] = []
@@ -176,36 +183,36 @@ def load_prompt_templates(options: LoadPromptTemplatesOptions) -> LoadedPromptTe
 
     def get_source_info(resolved_path: str) -> SourceInfo:
         if is_under_path(resolved_path, global_prompts_dir):
-            return create_synthetic_source_info(
+            return createSyntheticSourceInfo(
                 resolved_path,
                 {"source": "local", "scope": "user", "baseDir": global_prompts_dir},
             )
         if project_prompts_dir is not None and is_under_path(resolved_path, project_prompts_dir):
-            return create_synthetic_source_info(
+            return createSyntheticSourceInfo(
                 resolved_path,
                 {"source": "local", "scope": "project", "baseDir": project_prompts_dir},
             )
         base_dir = resolved_path if os.path.isdir(resolved_path) else os.path.dirname(resolved_path)
-        return create_synthetic_source_info(
+        return createSyntheticSourceInfo(
             resolved_path,
             {"source": "local", "baseDir": base_dir},
         )
 
-    # `includeDefaults` used to sit here (always False at the one call site,
+    # MISAKA fork: no `includeDefaults` option. It used to sit here (always False at the one call site,
     # `resource_loader.py`), auto-loading `<agentDir>/prompts` and -- with no
     # `isProjectTrusted()` gate of its own -- `<cwd>/.misaka/prompts`. The package manager
     # is where project prompts get their trust gate, so the dead branch was a latent hole
     # rather than a feature; removed with the option (audit 2026-09-02, core-config-05).
 
     for raw_path in prompt_paths:
-        resolved = resolve_path(raw_path, resolved_cwd, trim=True)
+        resolved = resolvePath(raw_path, resolved_cwd, trim=True)
         if not os.path.exists(resolved):
             continue
         try:
             if os.path.isdir(resolved):
-                add_result(_load_templates_from_dir(resolved, get_source_info))
+                add_result(loadTemplatesFromDir(resolved, get_source_info))
             elif os.path.isfile(resolved) and resolved.endswith(".md"):
-                result = _load_template_from_file(resolved, get_source_info(resolved))
+                result = loadTemplateFromFile(resolved, get_source_info(resolved))
                 if result.template is not None:
                     templates.append(result.template)
                 diagnostics.extend(result.diagnostics)
@@ -216,7 +223,7 @@ def load_prompt_templates(options: LoadPromptTemplatesOptions) -> LoadedPromptTe
     return LoadedPromptTemplates(templates=templates, diagnostics=diagnostics)
 
 
-def expand_prompt_template(text: str, templates: list[PromptTemplate]) -> str:
+def expandPromptTemplate(text: str, templates: list[PromptTemplate]) -> str:
     invocation = parse_prompt_template_invocation(text)
     if invocation is None:
         return text
@@ -224,10 +231,10 @@ def expand_prompt_template(text: str, templates: list[PromptTemplate]) -> str:
     template = next((candidate for candidate in templates if candidate.name == template_name), None)
     if template is None:
         return text
-    return substitute_args(template.content, parse_command_args(args_string))
+    return substituteArgs(template.content, parseCommandArgs(args_string))
 
 
-def _load_templates_from_dir(
+def loadTemplatesFromDir(
     dir_path: str,
     get_source_info: Callable[[str], SourceInfo],
 ) -> LoadedPromptTemplates:
@@ -237,7 +244,7 @@ def _load_templates_from_dir(
     if not os.path.isdir(dir_path):
         return LoadedPromptTemplates(templates=templates, diagnostics=diagnostics)
     try:
-        for entry in os.scandir(dir_path):
+        for entry in readdirEntries(dir_path):
             entry_path = entry.path
             is_file = entry.is_file(follow_symlinks=False)
             if entry.is_symlink():
@@ -246,7 +253,7 @@ def _load_templates_from_dir(
                 except Exception:  # noqa: BLE001, S112 - an unreadable entry is skipped
                     continue
             if is_file and entry.name.endswith(".md"):
-                result = _load_template_from_file(entry_path, get_source_info(entry_path))
+                result = loadTemplateFromFile(entry_path, get_source_info(entry_path))
                 if result.template is not None:
                     templates.append(result.template)
                 diagnostics.extend(result.diagnostics)
@@ -255,16 +262,17 @@ def _load_templates_from_dir(
     return LoadedPromptTemplates(templates=templates, diagnostics=diagnostics)
 
 
-def _load_template_from_file(file_path: str, source_info: SourceInfo) -> _LoadedTemplate:
+def loadTemplateFromFile(file_path: str, source_info: SourceInfo) -> _LoadedTemplate:
     diagnostics: list[ResourceDiagnostic] = []
     try:
-        raw_content = Path(file_path).read_text(encoding="utf-8")
+        # readFileSync(..., "utf-8") decodes invalid bytes to U+FFFD rather than failing.
+        raw_content = Path(file_path).read_text(encoding="utf-8", errors="replace")
     except Exception as error:  # noqa: BLE001 - reported, not swallowed
         message = str(error) or "failed to read prompt template file"
         diagnostics.append(ResourceDiagnostic(type="warning", message=message, path=file_path))
         return _LoadedTemplate(template=None, diagnostics=diagnostics)
     try:
-        parsed = parse_frontmatter(raw_content)
+        parsed = parseFrontmatter(raw_content)
     except Exception as error:  # noqa: BLE001 - reported, not swallowed
         message = str(error) or "failed to parse prompt template file"
         diagnostics.append(ResourceDiagnostic(type="warning", message=message, path=file_path))
@@ -275,10 +283,14 @@ def _load_template_from_file(file_path: str, source_info: SourceInfo) -> _Loaded
     # Get description from frontmatter or first non-empty line
     description = frontmatter.get("description") if isinstance(frontmatter.get("description"), str) else ""
     if not description:
-        first_line = next((line for line in body.split("\n") if line.strip()), None)
+        first_line = next((line for line in body.split("\n") if jsTrim(line)), None)
         if first_line:
             # Truncate if too long
-            description = first_line[:60] + ("..." if len(first_line) > 60 else "")
+            # MISAKA fork: a cut through a surrogate pair becomes U+FFFD here (Node writes U+FFFD for it on output;
+            # Python cannot encode a lone surrogate at all).
+            description = toWellFormed(jsSlice(first_line, 0, 60))
+            if jsLength(first_line) > 60:
+                description += "..."
     argument_hint = frontmatter.get("argument-hint") if isinstance(frontmatter.get("argument-hint"), str) else None
     return _LoadedTemplate(
         template=PromptTemplate(

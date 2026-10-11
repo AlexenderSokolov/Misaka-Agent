@@ -13,7 +13,7 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 from misaka.config import home
-from misaka.utils.paths import normalize_path
+from misaka.utils.paths import normalizePath
 
 # MISAKA is not white-labelled: these were read out of a package.json / [tool.harn]
 # section that this repository does not have, so every one of them always took its
@@ -28,8 +28,24 @@ except importlib_metadata.PackageNotFoundError:
     VERSION = "0.0.0"
 
 
+def _startupMetadataFile() -> Path | None:
+    """MISAKA fork: pi records the package.json it read at startup; here the distribution's METADATA file."""
+    try:
+        distribution = importlib_metadata.distribution("misaka")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+    for file in distribution.files or []:
+        if file.name == "METADATA" and file.parent.name.endswith(".dist-info"):
+            return Path(str(distribution.locate_file(file)))
+    return None
+
+
+# The distribution metadata this process started from, if one existed.
+_startupMetadataPath: Path | None = _startupMetadataFile()
+
+
 def expand_tilde_path(path: str) -> str:
-    return normalize_path(path)
+    return normalizePath(path)
 
 
 def get_agent_dir() -> str:
@@ -112,6 +128,34 @@ def bundle_installer(root: Path) -> str:
     return ""
 
 
+# `{ kind: "updated"; version }` or `{ kind: "removed" }`.
+type InstallChange = dict[str, str]
+
+
+def detectInstallChange(metadataPath: Path | None = None) -> InstallChange | None:
+    """Detect that the package this process runs from changed on disk, for example after `misaka update`
+    in another terminal. Code loaded on demand can then be missing or from another version.
+
+    Checks the metadata read at startup. Resolving it again could find another installation of the
+    package on the path.
+    """
+    path = metadataPath if metadataPath is not None else _startupMetadataPath
+    # MISAKA fork: a release archive keeps every version in a directory of its own, so replacing it does not
+    # affect this process (pi: the Bun binary embeds its code).
+    if bundle_root() is not None or not path:
+        return None
+    try:
+        installed = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {"kind": "removed"}
+    except OSError:
+        return None
+    version = next(
+        (line.partition(":")[2].strip() for line in installed.splitlines() if line.startswith("Version:")), None
+    )
+    return {"kind": "updated", "version": version} if version and version != VERSION else None
+
+
 def _get_package_module_dir() -> Path:
     """Return the ``misaka`` package directory via ``__file__``.
 
@@ -149,4 +193,6 @@ __all__ = [
     "APP_TITLE",
     "CONFIG_DIR_NAME",
     "VERSION",
+    "InstallChange",
+    "detectInstallChange",
     ]

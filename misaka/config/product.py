@@ -33,8 +33,6 @@ _KNOBS = {
 # must fit (None: any JSON value). Defaults stay with the callers -- two of them are computed.
 KNOBS = {
     ("documents", "ocr_langs"): str,
-    ("mcp", "call_timeout"): float,
-    ("mcp", "init_timeout"): float,
     ("mcp", "required_wait"): float,
     ("network", "max_concurrent_per_sister"): int,
     ("network", "max_concurrent_sisters"): int,

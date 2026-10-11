@@ -1,9 +1,12 @@
 {
 	"$schema": "http://json-schema.org/draft-07/schema#",
-	"title": "Harn Coding Agent Theme",
-	"description": "Theme schema for Harn coding agent",
+	"title": "MISAKA Coding Agent Theme",
+	"description": "Theme schema for the MISAKA coding agent",
 	"type": "object",
-	"required": ["name", "colors"],
+	"required": [
+		"name",
+		"colors"
+	],
 	"properties": {
 		"$schema": {
 			"type": "string",
@@ -11,7 +14,16 @@
 		},
 		"name": {
 			"type": "string",
-			"description": "Theme name"
+			"pattern": "^[^/]+$",
+			"description": "Theme name. Must not contain '/' because it is reserved for automatic light/dark theme settings."
+		},
+		"appearance": {
+			"type": "string",
+			"enum": [
+				"dark",
+				"light"
+			],
+			"description": "Background the theme is designed for. Detected from the theme colors when omitted."
 		},
 		"vars": {
 			"type": "object",
@@ -20,7 +32,7 @@
 				"oneOf": [
 					{
 						"type": "string",
-						"description": "Hex color (#RRGGBB), variable reference, or empty string for terminal default"
+						"description": "Hex color (#RGB or #RRGGBB), variable reference, or empty string for terminal default"
 					},
 					{
 						"type": "integer",
@@ -33,7 +45,7 @@
 		},
 		"colors": {
 			"type": "object",
-			"description": "Theme color definitions (all required)",
+			"description": "Theme color definitions (scrollbar, thinkingMax, and search highlight colors are optional and use compatible fallbacks)",
 			"required": [
 				"accent",
 				"border",
@@ -135,6 +147,22 @@
 				"selectedBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Selected item background"
+				},
+				"scrollbarTrack": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Fullscreen scrollbar track foreground (falls back to muted when omitted)"
+				},
+				"scrollbarThumb": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Fullscreen scrollbar thumb foreground (falls back to text when omitted)"
+				},
+				"searchMatchBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Transcript search match background and current-match text (falls back to selectedBg when omitted)"
+				},
+				"searchMatchText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Transcript search match text and current-match background (falls back to text when omitted)"
 				},
 				"userMessageBg": {
 					"$ref": "#/$defs/colorValue",
@@ -286,7 +314,11 @@
 				},
 				"thinkingXhigh": {
 					"$ref": "#/$defs/colorValue",
-					"description": "Thinking level border: xhigh (OpenAI codex-max only)"
+					"description": "Thinking level border: xhigh"
+				},
+				"thinkingMax": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Thinking level border: max (falls back to thinkingXhigh when omitted)"
 				},
 				"bashMode": {
 					"$ref": "#/$defs/colorValue",
@@ -333,7 +365,7 @@
 			"oneOf": [
 				{
 					"type": "string",
-					"description": "Hex color (#RRGGBB), variable reference, or empty string for terminal default"
+					"description": "Hex color (#RGB or #RRGGBB), variable reference, or empty string for terminal default"
 				},
 				{
 					"type": "integer",

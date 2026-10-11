@@ -188,7 +188,7 @@ def test_initial_and_followup_prompts_use_saved_mode(board, tmp_path, monkeypatc
         prompt = call.call_args.args[5]
     else:
         monkeypatch.setattr(planner, "task_sources", lambda *a: {})
-        monkeypatch.setattr(planner, "find_most_recent_session", lambda *a: None)
+        monkeypatch.setattr(planner, "findMostRecentSession", lambda *a: None)
         call = Mock(return_value=(None, "Conclusion", None))
         monkeypatch.setattr(planner, "_call", call)
         planner.synthesize(board, run, cfg, object(), node, [], followup=object(), left=1)

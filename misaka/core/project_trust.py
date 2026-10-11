@@ -8,13 +8,16 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict, TypeVar
+from typing import Any, Literal, TypedDict, TypeVar
 
 from filelock import FileLock, Timeout
 
 from misaka.config import APP_NAME, home
 from misaka.utils import atomic
-from misaka.utils.paths import canonicalize_path, resolve_path
+from misaka.utils.paths import canonicalizePath, resolvePath
+
+# MISAKA fork: no RPC mode.
+type AppMode = Literal["interactive", "print", "json"]
 
 type ProjectTrustDecision = bool | None
 
@@ -46,7 +49,7 @@ class ProjectTrustOptions(TypedDict, total=False):
 
 
 def _normalize_cwd(cwd: str) -> str:
-    return canonicalize_path(resolve_path(cwd))
+    return canonicalizePath(resolvePath(cwd))
 
 
 def get_project_trust_parent_path(cwd: str) -> str | None:
@@ -108,12 +111,12 @@ def get_project_trust_options(
     return trust_options
 
 
-def has_trust_requiring_project_resources(cwd: str) -> bool:
+def hasTrustRequiringProjectResources(cwd: str) -> bool:
     current = Path(_normalize_cwd(cwd))
     config_dir = home.project_dir(current)
     if config_dir is not None and any(
         (config_dir / entry).exists()
-        for entry in ("settings.json", "prompts", "themes")
+        for entry in ("settings.json", "mcp.json", "prompts", "themes")
     ):
         return True
 
@@ -175,7 +178,7 @@ class ProjectTrustStore:
     def __init__(self, agent_dir: str) -> None:
         # pi keeps trust.json in the agent directory. The home keeps it with its state; an
         # embedder's own engine directory still gets it beside its settings.
-        directory = Path(os.path.realpath(resolve_path(agent_dir)))
+        directory = Path(os.path.realpath(resolvePath(agent_dir)))
         self.trust_path = str(home.path("trust") if directory == home.home() else directory / "trust.json")
         self.trustPath = self.trust_path
 
@@ -235,10 +238,10 @@ class ProjectTrustStore:
     setMany = set_many
 
 
-def _format_project_trust_prompt(cwd: str) -> str:
+def formatProjectTrustPrompt(cwd: str) -> str:
     return (
         f"Trust project folder?\n{cwd}\n\n"
-        f"This allows {APP_NAME} to load {home.DIR_NAME}/settings.json, "
+        f"This allows {APP_NAME} to load {home.DIR_NAME}/settings.json, {home.DIR_NAME}/mcp.json, "
         f"{home.DIR_NAME}/prompts, {home.DIR_NAME}/themes, and Sisters project "
         f"agent definitions from {home.DIR_NAME}/{home.SUBAGENTS_DIR}."
     )
@@ -248,21 +251,21 @@ def _member(source: Any, name: str) -> Any:
     return source[name] if isinstance(source, Mapping) else getattr(source, name)
 
 
-async def resolve_project_trusted(options: dict[str, Any]) -> bool:
+async def resolveProjectTrusted(options: dict[str, Any]) -> bool:
     trust_override = options.get("trustOverride")
     if trust_override is not None:
         return trust_override
 
     cwd = options["cwd"]
-    if not has_trust_requiring_project_resources(cwd):
+    if not hasTrustRequiringProjectResources(cwd):
         return True
 
     trust_store: ProjectTrustStore = options["trustStore"]
     extensions_result = options.get("extensionsResult")
     if extensions_result is not None:
-        from misaka.core.extensions.runner import emit_project_trust_event
+        from misaka.core.extensions.runner import emitProjectTrustEvent
 
-        emitted = await emit_project_trust_event(
+        emitted = await emitProjectTrustEvent(
             extensions_result,
             {"type": "project_trust", "cwd": cwd},
             options["projectTrustContext"],
@@ -297,7 +300,7 @@ async def resolve_project_trusted(options: dict[str, Any]) -> bool:
     trust_options = get_project_trust_options(cwd, {"includeSessionOnly": True})
     select = _member(_member(context, "ui"), "select")
     selected_label = await select(
-        _format_project_trust_prompt(cwd),
+        formatProjectTrustPrompt(cwd),
         [option.label for option in trust_options],
     )
     selected = next(
@@ -311,9 +314,9 @@ async def resolve_project_trusted(options: dict[str, Any]) -> bool:
     return selected.trusted
 
 
-hasTrustRequiringProjectResources = has_trust_requiring_project_resources
 
 __all__ = [
+    "AppMode",
     "ProjectTrustDecision",
     "ProjectTrustOption",
     "ProjectTrustOptions",
@@ -323,6 +326,5 @@ __all__ = [
     "get_project_trust_options",
     "get_project_trust_parent_path",
     "hasTrustRequiringProjectResources",
-    "has_trust_requiring_project_resources",
-    "resolve_project_trusted",
+    "resolveProjectTrusted",
 ]

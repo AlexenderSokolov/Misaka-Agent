@@ -48,7 +48,7 @@ def resolve_session(session, who):
 
 def launch(who, model=None, cont=False, pick=False, session=None, read_only=False, catalog=None, attach=False, skills=None):
     """Open chat; only the writable form assembles an agent. ``who=None`` means Last Order."""
-    from misaka.core.session_manager import read_session_header
+    from misaka.core.session_manager import readSessionHeader
     # `chat` is a full-screen TUI in every form, not just under --pick. Without a terminal the
     # picker died on a bare OSError(EINVAL) from registering stdin with the event loop, while
     # every other form exited 0 having printed nothing at all -- so a piped `misaka chat` looked
@@ -69,12 +69,13 @@ def launch(who, model=None, cont=False, pick=False, session=None, read_only=Fals
         path = session or catalog
         if session and not ("/" in session or "\\" in session or session.endswith(".jsonl")):
             path = resolve_session(session, None)
+        from misaka.config.engine import get_agent_dir
         from misaka.core.settings_manager import SettingsManager
-        from misaka.ui.tui import TUI, ProcessTerminal
+        from misaka.ui.tui import ProcessTerminal, TuiMainScreen
         from misaka.ui.tui.interactive.conversation import Conversation
 
         settings = SettingsManager.create(os.getcwd())
-        ui = TUI(ProcessTerminal(), settings.getShowHardwareCursor())
+        ui = TuiMainScreen(ProcessTerminal(), settings.getShowHardwareCursor(), get_agent_dir())
         ui.setClearOnShrink(settings.getClearOnShrink())
         screen = Conversation(ui, settings, os.getcwd())
         try:
@@ -91,7 +92,7 @@ def launch(who, model=None, cont=False, pick=False, session=None, read_only=Fals
         # A resumed conversation goes back to the folder it worked in, whatever folder the
         # shell or the panel sits in: the bucket, the workspace, the skills, and every tool
         # follow the session. A folder that is gone is an error, not a silent move.
-        header = read_session_header(session)
+        header = readSessionHeader(session)
         folder = header.get("cwd")
         if not folder or not os.path.isdir(folder):
             sys.exit(f"Cannot resume {session}: its folder {folder or '(unknown)'} no longer exists.")
@@ -140,10 +141,10 @@ def launch(who, model=None, cont=False, pick=False, session=None, read_only=Fals
 
 def _display_value(value):
     """Saved strings are content, not terminal control instructions."""
-    from misaka.utils.ansi import strip_ansi
+    from misaka.utils.ansi import stripAnsi
 
     if isinstance(value, str):
-        return "".join(ch for ch in strip_ansi(value) if ch in "\n\t" or ch.isprintable())
+        return "".join(ch for ch in stripAnsi(value) if ch in "\n\t" or ch.isprintable())
     if isinstance(value, list):
         return [_display_value(item) for item in value]
     if isinstance(value, dict):
@@ -152,7 +153,7 @@ def _display_value(value):
 
 
 def read_session_snapshot(path):
-    from misaka.core.session_manager import _parse_jsonl_entries, build_context_entries
+    from misaka.core.session_manager import _parse_jsonl_entries, buildContextEntries
 
     # The writer may be mid-UTF-8 or mid-entry. Read only committed lines; never
     # open a writable SessionManager to repair, migrate or flush someone else's file.
@@ -161,7 +162,7 @@ def read_session_snapshot(path):
     if not entries or entries[0].get("type") != "session" or not isinstance(entries[0].get("id"), str):
         raise ValueError("Waiting for a complete session header")
     header, *entries = _display_value(entries)
-    return header, build_context_entries(entries)
+    return header, buildContextEntries(entries)
 
 
 async def follow_session(screen, path, *, catalog=False, attach=False):
@@ -170,19 +171,19 @@ async def follow_session(screen, path, *, catalog=False, attach=False):
     from misaka.core.platform import processes
     from misaka.core.settings_manager import SettingsManager
     from misaka.ui.tui import Text, matchesKey, setCapabilityOverrides, setKeybindings
-    from misaka.ui.tui.interactive.components.keybinding_hints import key_hint
-    from misaka.ui.tui.interactive.theme.theme import init_theme, theme
+    from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
+    from misaka.ui.tui.interactive.theme.theme import initTheme, theme
 
     closed = asyncio.Event()
     keybindings = KeybindingsManager.create()
     setKeybindings(keybindings)
-    init_theme(screen.settingsManager.getTheme())
+    initTheme(screen.settingsManager.getTheme())
     setCapabilityOverrides(screen.settingsManager.getTerminalCapabilityOverrides())
     header, notice = Text("", 1, 1), Text("", 1, 1)
     screen.headerContainer.addChild(header)
     screen.statusContainer.addChild(notice)
     footer_text = "Read-only · saved messages · " + " · ".join((
-        key_hint("app.tools.expand", "tools"), key_hint("app.thinking.toggle", "thinking"),
+        keyHint("app.tools.expand", "tools"), keyHint("app.thinking.toggle", "thinking"),
         "Ctrl+C/D closes window",
     ))
     screen.footer = Text("", 1, 1)
@@ -192,12 +193,12 @@ async def follow_session(screen, path, *, catalog=False, attach=False):
         from misaka.core.session_catalog import _object, owner_record
         from misaka.core.session_control import request
         from misaka.ui.tui.interactive.components.custom_editor import CustomEditor
-        from misaka.ui.tui.interactive.theme.theme import get_editor_theme
+        from misaka.ui.tui.interactive.theme.theme import getEditorTheme
 
         owner = _display_value(_object(path) if catalog else owner_record(path))
         if not owner.get("control") or owner.get("state") == "saved":
             raise ValueError("This session has no live input endpoint; open its saved history instead.")
-        screen.editor = CustomEditor(screen.ui, get_editor_theme(), keybindings)
+        screen.editor = CustomEditor(screen.ui, getEditorTheme(), keybindings)
         screen.editorContainer.addChild(screen.editor)
         screen.ui.setFocus(screen.editor)
         footer_text = "Original session · Enter sends/steers · /pause /resume · Ctrl+C/D detaches"
@@ -282,7 +283,7 @@ async def follow_session(screen, path, *, catalog=False, attach=False):
                         if info["id"] != session_id:
                             screen.cwd = info.get("cwd") or str(path.parent)
                             screen.settingsManager = SettingsManager.create(screen.cwd)
-                            init_theme(screen.settingsManager.getTheme())
+                            initTheme(screen.settingsManager.getTheme())
                             setCapabilityOverrides(screen.settingsManager.getTerminalCapabilityOverrides())
                             screen.hideThinkingBlock = screen.settingsManager.getHideThinkingBlock()
                             screen.outputPad = screen.settingsManager.getOutputPad()

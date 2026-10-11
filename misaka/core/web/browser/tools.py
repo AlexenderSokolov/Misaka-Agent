@@ -12,7 +12,7 @@ from misaka.core.web.runtime import current_runtime
 from misaka.core.web.vision import describe, selected_model
 from misaka.utils.async_lifecycle import run_in_thread
 from misaka.utils.atomic import write_bytes
-from misaka.utils.image_process import process_image
+from misaka.utils.image_process import processImage
 
 # Protocol-declared binary fields are bytes, not text; redacting a coincidental
 # key substring would corrupt CDP screenshots/PDFs. Runtime.evaluate cannot opt in.
@@ -60,7 +60,7 @@ def _save_image(cwd, body):
 
 
 async def image_content(body, question, ctx):
-    processed = await process_image(body, 'image/png')
+    processed = await processImage(body, 'image/png')
     if not processed.ok:
         raise ValueError(processed.message)
     image = {'type': 'image', 'data': processed.data, 'mimeType': processed.mimeType}

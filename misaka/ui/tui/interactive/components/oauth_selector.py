@@ -1,12 +1,16 @@
-"""Searchable provider selector for login/logout flows."""
+"""Searchable provider selector for login/logout flows.
+
+Translated from pi's ``coding-agent/src/modes/interactive/components/oauth-selector.ts``.
+"""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from misaka.core.auth_storage import AuthStatus, AuthStorage
+from misaka.ai.auth.types import AuthCheck
 from misaka.ui.tui import (
     Container,
     Input,
@@ -19,32 +23,59 @@ from misaka.ui.tui.interactive.theme.theme import theme
 
 from .dynamic_border import DynamicBorder
 
+_ENV_NAMES = re.compile(r"[A-Z][A-Z0-9_]*(?:, [A-Z][A-Z0-9_]*)*")
+
 
 @dataclass(slots=True)
 class AuthSelectorProvider:
     id: str
     name: str
     authType: Literal["oauth", "api_key"]
+    # The provider's ApiKeyAuth or OAuthAuth.
+    method: Any = None
+    status: AuthCheck | None = None
+    # Whether the provider's OAuth sign-in is backed by a subscription. `False` labels it as an
+    # account; unset keeps the "subscription" label.
+    subscription: bool | None = None
+
+
+def formatAuthSelectorProviderType(authType: str, subscription: bool | None = None) -> str:
+    if authType == "api_key":
+        return "API key"
+    return "account" if subscription is False else "subscription"
+
+
+def formatAuthSelectorProviderStatus(provider: AuthSelectorProvider) -> str:
+    """Themed suffix describing whether and how a login option is configured, for example " ✓ configured"."""
+    if not provider.status:
+        return theme.fg("muted", " • not configured")
+    if provider.status.type != provider.authType:
+        label = f"{formatAuthSelectorProviderType(provider.status.type, provider.subscription)} configured"
+        return theme.fg("muted", " • ") + theme.fg("warning", label)
+    if not provider.status.source or provider.status.source in ("OAuth", "stored credential"):
+        return theme.fg("success", " ✓ configured")
+    source = f"env: {provider.status.source}" if _ENV_NAMES.fullmatch(provider.status.source) else provider.status.source
+    return theme.fg("success", f" ✓ {source}")
 
 
 class OAuthSelectorComponent(Container):
+    """Component that renders an auth provider selector."""
+
     def __init__(
         self,
         mode: Literal["login", "logout"],
-        authStorage: AuthStorage,
         providers: list[AuthSelectorProvider],
-        onSelect: Callable[[str], None],
+        onSelect: Callable[[str, str], Any],
         onCancel: Callable[[], None],
-        getAuthStatus: Callable[[str], AuthStatus] | None = None,
+        initialSearchInput: str | None = None,
     ) -> None:
         super().__init__()
         self._focused = False
         self.mode = mode
-        self.authStorage = authStorage
-        self.getAuthStatus = getAuthStatus or authStorage.getAuthStatus
         self.allProviders = providers
         self.filteredProviders = providers
         self.selectedIndex = 0
+        self.showAuthTypeLabels = len({provider.authType for provider in providers}) > 1
         self.onSelectCallback = onSelect
         self.onCancelCallback = onCancel
 
@@ -55,6 +86,8 @@ class OAuthSelectorComponent(Container):
         self.addChild(Spacer(1))
 
         self.searchInput = Input()
+        if initialSearchInput:
+            self.searchInput.setValue(initialSearchInput)
         self.searchInput.onSubmit = lambda _value: self._submit_selected()
         self.addChild(self.searchInput)
         self.addChild(Spacer(1))
@@ -64,7 +97,7 @@ class OAuthSelectorComponent(Container):
         self.addChild(Spacer(1))
         self.addChild(DynamicBorder())
 
-        self.filterProviders("")
+        self.filterProviders(initialSearchInput or "")
 
     @property
     def focused(self) -> bool:
@@ -80,7 +113,10 @@ class OAuthSelectorComponent(Container):
             fuzzyFilter(
                 self.allProviders,
                 query,
-                lambda provider: f"{provider.name} {provider.id} {provider.authType}",
+                lambda provider: (
+                    f"{provider.name} {provider.id} {provider.authType} "
+                    f"{getattr(provider.method, 'name', None) or ''}"
+                ),
             )
             if query
             else self.allProviders
@@ -100,11 +136,16 @@ class OAuthSelectorComponent(Container):
         for index in range(startIndex, endIndex):
             provider = self.filteredProviders[index]
             isSelected = index == self.selectedIndex
-            statusIndicator = self.formatStatusIndicator(provider)
+            statusIndicator = formatAuthSelectorProviderStatus(provider)
+            authTypeLabel = (
+                theme.fg("muted", f" [{formatAuthSelectorProviderType(provider.authType, provider.subscription)}]")
+                if self.showAuthTypeLabels
+                else ""
+            )
             line = (
-                theme.fg("accent", "→ ") + theme.fg("accent", provider.name) + statusIndicator
+                theme.fg("accent", "→ ") + theme.fg("accent", provider.name) + authTypeLabel + statusIndicator
                 if isSelected
-                else f"  {theme.fg('text', provider.name)}{statusIndicator}"
+                else f"  {theme.fg('text', provider.name)}{authTypeLabel}{statusIndicator}"
             )
             self.listContainer.addChild(TruncatedText(line, 1, 0))
 
@@ -124,35 +165,10 @@ class OAuthSelectorComponent(Container):
                 message = "No matching providers"
             self.listContainer.addChild(TruncatedText(theme.fg("muted", f"  {message}"), 1, 0))
 
-    def formatStatusIndicator(self, provider: AuthSelectorProvider) -> str:
-        credential = self.authStorage.get(provider.id)
-        if isinstance(credential, dict) and credential.get("type") == provider.authType:
-            return theme.fg("success", " ✓ configured")
-        if credential:
-            label = "subscription configured" if credential.get("type") == "oauth" else "API key configured"
-            return theme.fg("muted", " • ") + theme.fg("warning", label)
-        if provider.authType != "api_key":
-            return theme.fg("muted", " • unconfigured")
-
-        status = self.getAuthStatus(provider.id)
-        match status.source:
-            case "environment":
-                return theme.fg("success", f" ✓ env: {status.label or 'API key'}")
-            case "runtime":
-                return theme.fg("success", " ✓ runtime API key")
-            case "fallback":
-                return theme.fg("success", " ✓ custom API key")
-            case "models_json_key":
-                return theme.fg("success", " ✓ key in models.json")
-            case "models_json_command":
-                return theme.fg("success", " ✓ command in models.json")
-            case _:
-                return theme.fg("muted", " • unconfigured")
-
     def _submit_selected(self) -> None:
         selected = self.filteredProviders[self.selectedIndex] if self.filteredProviders else None
         if selected is not None:
-            self.onSelectCallback(selected.id)
+            self.onSelectCallback(selected.id, selected.authType)
 
     def handleInput(self, keyData: str) -> None:
         kb = getKeybindings()
@@ -179,4 +195,9 @@ class OAuthSelectorComponent(Container):
         self.filterProviders(self.searchInput.getValue())
 
 
-__all__ = ["AuthSelectorProvider", "OAuthSelectorComponent"]
+__all__ = [
+    "AuthSelectorProvider",
+    "OAuthSelectorComponent",
+    "formatAuthSelectorProviderStatus",
+    "formatAuthSelectorProviderType",
+]

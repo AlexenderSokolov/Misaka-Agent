@@ -3,34 +3,37 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import copy
+import functools
 import hashlib
 import json
 import os
 import re
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, runtime_checkable
 
-from misaka.agent.harness.messages import (
-    BashExecutionMessage,
-    CustomMessage,
-    convert_to_llm,
-    create_branch_summary_message,
-    create_compaction_summary_message,
-    create_custom_message,
-)
-from misaka.agent.harness.session.uuid import uuidv7
-from misaka.agent.harness.types import SessionContext
 from misaka.agent.types import AgentMessage
 from misaka.ai.types import ImageContent, MessageValue, TextContent, Usage
-from misaka.ai.utils.transcript import get_current_system_message
+from misaka.ai.utils.transcript import getCurrentSystemMessage
+from misaka.ai.utils.uuid import uuidv7
 from misaka.config import get_sessions_dir
+from misaka.core.messages import (
+    BashExecutionMessage,
+    CustomMessage,
+    convertToLlm,
+    createBranchSummaryMessage,
+    createCompactionSummaryMessage,
+    createCustomMessage,
+)
 from misaka.utils import atomic
-from misaka.utils.paths import canonicalize_path, normalize_path, resolve_path
+from misaka.utils.collation import localeCompare
+from misaka.utils.js import jsCall, jsTrim, throwIfAborted
+from misaka.utils.paths import canonicalizePath, normalizePath, resolvePath
 from misaka.utils.values import read_field
 
 CURRENT_SESSION_VERSION = 3
@@ -63,7 +66,16 @@ type ContextEditEntry = dict[str, Any]
 type SessionEntry = dict[str, Any]
 type FileEntry = dict[str, Any]
 type SessionModelInfo = dict[str, str]
-type SessionListProgress = Callable[[int, int], None]
+# `partialSessions`: sessions loaded so far, sorted by activity. Present on periodic updates. Callers may take two
+# arguments; the listing calls it through `jsCall`, as JavaScript drops the arguments a function does not declare.
+type SessionListProgress = Callable[[int, int, Sequence[SessionInfo] | None], None]
+
+
+@dataclass(slots=True)
+class SessionContext:
+    messages: list[AgentMessage]
+    thinkingLevel: str
+    model: SessionModelInfo | None = None
 
 
 @dataclass(slots=True)
@@ -86,6 +98,8 @@ class SessionProjection:
 _LEAF_UNSET = object()
 _UNSET = object()
 MAX_CONCURRENT_SESSION_INFO_LOADS = 10
+CURRENT_SESSION_LIST_PUBLISH_INTERVAL = 10
+ALL_SESSION_LIST_PUBLISH_INTERVAL = 100
 
 
 class InvalidSessionFileError(ValueError):
@@ -169,11 +183,19 @@ class ReadonlySessionManager(Protocol):
     def getSessionName(self) -> str | None: ...
 
 
-def create_session_id() -> str:
+def createSessionId() -> str:
     return uuidv7()
 
 
-def generate_id(byId: Mapping[str, Any] | set[str]) -> str:
+def assertValidSessionId(id: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", id):
+        raise ValueError(
+            "Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end "
+            "with an alphanumeric character"
+        )
+
+
+def generateId(byId: Mapping[str, Any] | set[str]) -> str:
     for _ in range(100):
         candidate = uuid.uuid4().hex[:8]
         if candidate not in byId:
@@ -196,7 +218,7 @@ def require_current_version(entries: list[FileEntry], file_path: str) -> None:
         raise InvalidSessionFileError(file_path, f"session version {version}; this build reads v{CURRENT_SESSION_VERSION}")
 
 
-def get_latest_compaction_entry(entries: list[SessionEntry]) -> SessionEntry | None:
+def getLatestCompactionEntry(entries: list[SessionEntry]) -> SessionEntry | None:
     for entry in reversed(entries):
         if entry.get("type") == "compaction":
             return entry
@@ -232,12 +254,12 @@ def session_entry_to_display_messages(entry: SessionEntry) -> list[AgentMessage]
     ``contextSummaries``; nothing here reads their text to guess, or the engine's own ``details``.
     """
     if entry.get("type") != "compaction" or entry.get("contextMessages") is None:
-        return session_entry_to_context_messages(entry)
+        return sessionEntryToContextMessages(entry)
     scaffolds = set(entry.get("contextSummaries") or [])
     shown: list[AgentMessage] = []
     for index, message in enumerate(_copy_context_messages(entry["contextMessages"])):
         if index in scaffolds and _message_role(message) == "user":
-            shown.append(create_compaction_summary_message(
+            shown.append(createCompactionSummaryMessage(
                 _unfenced(_content_text(message)), int(entry.get("tokensBefore", 0) or 0),
                 entry.get("timestamp")))
         else:
@@ -267,11 +289,11 @@ def _copy_context_messages(messages: list[AgentMessage]) -> list[AgentMessage]:
     snapshot = copy.deepcopy(messages)
     # Use the actual provider projection, including native content-block validation.
     # Keep the original native shapes, not its lossy user-role projection.
-    convert_to_llm(snapshot)
+    convertToLlm(snapshot)
     return snapshot
 
 
-def session_entry_to_context_messages(entry: SessionEntry) -> list[AgentMessage]:
+def sessionEntryToContextMessages(entry: SessionEntry) -> list[AgentMessage]:
     """Project one session entry into the messages consumed by the active context."""
     entry_type = entry.get("type")
     if entry_type == "message":
@@ -299,7 +321,7 @@ def session_entry_to_context_messages(entry: SessionEntry) -> list[AgentMessage]
     if entry_type == "custom_message":
         content = entry.get("content")
         return [
-            create_custom_message(
+            createCustomMessage(
                 str(entry.get("customType")),
                 [] if content is None else content,
                 bool(entry.get("display")),
@@ -309,7 +331,7 @@ def session_entry_to_context_messages(entry: SessionEntry) -> list[AgentMessage]
         ]
     if entry_type == "branch_summary" and entry.get("summary"):
         return [
-            create_branch_summary_message(
+            createBranchSummaryMessage(
                 str(entry.get("summary")),
                 str(entry.get("fromId")),
                 entry.get("timestamp"),
@@ -322,7 +344,7 @@ def session_entry_to_context_messages(entry: SessionEntry) -> list[AgentMessage]
             # the prompt and tool state it replayed under lead it, as they lead a summary.
             replaced = _copy_context_messages(entry["contextMessages"])
             return [system_message, *replaced] if system_message else replaced
-        summary = create_compaction_summary_message(
+        summary = createCompactionSummaryMessage(
             str(entry.get("summary")),
             int(entry.get("tokensBefore", 0)),
             entry.get("timestamp"),
@@ -331,7 +353,7 @@ def session_entry_to_context_messages(entry: SessionEntry) -> list[AgentMessage]
     return []
 
 
-def _build_session_path(
+def buildSessionPath(
     entries: list[SessionEntry],
     leaf_id: str | None | object = _LEAF_UNSET,
     by_id: Mapping[str, SessionEntry] | None = None,
@@ -392,17 +414,17 @@ def _context_entries_from_path(path: list[SessionEntry]) -> list[SessionEntry]:
     return context_entries
 
 
-def build_context_entries(
+def buildContextEntries(
     entries: list[SessionEntry],
     leaf_id: str | None | object = _LEAF_UNSET,
     by_id: Mapping[str, SessionEntry] | None = None,
 ) -> list[SessionEntry]:
     """Return the active leaf path after applying the latest compaction boundary."""
-    return _context_entries_from_path(_build_session_path(entries, leaf_id, by_id))
+    return _context_entries_from_path(buildSessionPath(entries, leaf_id, by_id))
 
 
-def _project_context_entry(entry: SessionEntry, edit: ContextEditEntry | None) -> list[AgentMessage]:
-    messages = session_entry_to_context_messages(entry)
+def projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | None) -> list[AgentMessage]:
+    messages = sessionEntryToContextMessages(entry)
     if not edit:
         return messages
     replacement = edit.get("replacement")
@@ -446,13 +468,13 @@ def _session_context_settings(path: list[SessionEntry]) -> tuple[str, SessionMod
     return thinking_level, model
 
 
-def build_session_projection(
+def buildSessionProjection(
     entries: list[SessionEntry],
     leaf_id: str | None | object = _LEAF_UNSET,
     by_id: Mapping[str, SessionEntry] | None = None,
 ) -> SessionProjection:
     """Build provenance-preserving, compaction-aware model context."""
-    path = _build_session_path(entries, leaf_id, by_id)
+    path = buildSessionPath(entries, leaf_id, by_id)
     thinking_level, model = _session_context_settings(path)
     context_entries = _context_entries_from_path(path)
     edits: dict[str, ContextEditEntry] = {}
@@ -468,7 +490,7 @@ def build_session_projection(
             messages=(
                 []
                 if source_entry.get("type") == "compaction" and index > 0
-                else _project_context_entry(source_entry, edits.get(str(source_entry.get("id"))))
+                else projectContextEntry(source_entry, edits.get(str(source_entry.get("id"))))
             ),
         )
         for index, source_entry in enumerate(context_entries)
@@ -481,18 +503,18 @@ def build_session_projection(
     )
 
 
-def build_session_context(
+def buildSessionContext(
     entries: list[SessionEntry],
     leaf_id: str | None | object = _LEAF_UNSET,
     by_id: Mapping[str, SessionEntry] | None = None,
 ) -> SessionContext:
     """Build the finalized model context from the canonical session projection."""
-    projection = build_session_projection(entries, leaf_id, by_id)
+    projection = buildSessionProjection(entries, leaf_id, by_id)
     return SessionContext(messages=projection.messages, thinkingLevel=projection.thinkingLevel, model=projection.model)
 
 
 def _canonical_cwd(cwd: str) -> str:
-    return os.path.normcase(canonicalize_path(resolve_path(cwd)))
+    return os.path.normcase(canonicalizePath(resolvePath(cwd)))
 
 
 def encode_cwd(cwd: str) -> str:
@@ -505,7 +527,7 @@ def encode_cwd(cwd: str) -> str:
 
 def get_session_dir_for_cwd(cwd: str, sessions_root: str) -> str:
     """The canonical bucket for this working directory."""
-    session_dir = os.path.join(resolve_path(sessions_root), encode_cwd(_canonical_cwd(cwd)))
+    session_dir = os.path.join(resolvePath(sessions_root), encode_cwd(_canonical_cwd(cwd)))
     os.makedirs(session_dir, mode=0o700, exist_ok=True)
     try:
         os.chmod(session_dir, 0o700)              # buckets from before privacy was enforced
@@ -514,7 +536,7 @@ def get_session_dir_for_cwd(cwd: str, sessions_root: str) -> str:
     return session_dir
 
 
-def get_default_session_dir(cwd: str, agent_dir: str | None = None) -> str:
+def getDefaultSessionDir(cwd: str, agent_dir: str | None = None) -> str:
     """The bucket for ``cwd`` when no session directory was given.
 
     With an ``agent_dir`` named by the caller -- an embedder running the engine out of its
@@ -523,7 +545,7 @@ def get_default_session_dir(cwd: str, agent_dir: str | None = None) -> str:
     ``config.sessions``), never ``~/.misaka/agent/sessions``, which nothing lists.
     """
     if agent_dir is not None:
-        return get_session_dir_for_cwd(cwd, os.path.join(resolve_path(agent_dir), "sessions"))
+        return get_session_dir_for_cwd(cwd, os.path.join(resolvePath(agent_dir), "sessions"))
     return get_session_dir_for_cwd(cwd, get_sessions_dir())
 
 
@@ -541,14 +563,14 @@ def sessions_root_of(session_dir: str | None) -> str | None:
     """
     if not session_dir:
         return None
-    normalized = os.path.normpath(normalize_path(session_dir))
+    normalized = os.path.normpath(normalizePath(session_dir))
     parent, name = os.path.split(normalized)
     return parent if name.startswith("--") and name.endswith("--") else normalized
 
 
 def iter_session_files(root: str, *, recursive: bool = False) -> Iterator[str]:
     """Enumerate transcript files without reading, creating or migrating a store."""
-    for directory, dirs, files in os.walk(normalize_path(root)):
+    for directory, dirs, files in os.walk(normalizePath(root)):
         dirs[:] = [d for d in dirs if d not in {".git", ".catalog"}]
         for name in files:
             path = os.path.join(directory, name)
@@ -562,29 +584,29 @@ def _is_session_header(value: Any) -> bool:
     return isinstance(value, dict) and value.get("type") == "session" and isinstance(value.get("id"), str)
 
 
-def _session_cwd_matches(actual: str | None, cwd: str) -> bool:
+def sessionCwdMatches(actual: str | None, cwd: str) -> bool:
     return isinstance(actual, str) and bool(actual) and _canonical_cwd(actual) == _canonical_cwd(cwd)
 
 
-def read_session_header(file_path: str) -> dict[str, Any]:
+def readSessionHeader(file_path: str) -> dict[str, Any]:
     """The header line of a session file (``id``, ``cwd``, ``timestamp``), or ``{}``.
     Reads one line: the panel calls this for every file it lists."""
     try:
-        with open(normalize_path(file_path), encoding="utf-8") as handle:
+        with open(normalizePath(file_path), encoding="utf-8") as handle:
             entry = json.loads(handle.readline())
     except (OSError, ValueError):
         return {}
     return entry if _is_session_header(entry) else {}
 
 
-def load_entries_from_file(
+def loadEntriesFromFile(
     file_path: str,
     *,
     strict: bool = False,
     repair_unterminated: bool = False,
 ) -> list[FileEntry]:
     """Load a session, optionally terminating a fully validated writable JSONL file."""
-    resolved_file_path = normalize_path(file_path)
+    resolved_file_path = normalizePath(file_path)
     path = Path(resolved_file_path)
     if not path.exists():
         return []
@@ -610,7 +632,7 @@ def load_entries_from_file(
     return entries
 
 
-def find_most_recent_session(session_dir: str, cwd: str | None = None) -> str | None:
+def findMostRecentSession(session_dir: str, cwd: str | None = None) -> str | None:
     """The newest session whose header matches. Candidates are checked in modification-time
     order and the scan stops at the first match, so `--continue` reads one header, not every
     file's (pi 0.86)."""
@@ -622,8 +644,8 @@ def find_most_recent_session(session_dir: str, cwd: str | None = None) -> str | 
             continue
     files.sort(key=lambda item: item[1], reverse=True)
     for path, _mtime in files:
-        header = read_session_header(path)
-        if header and (cwd is None or _session_cwd_matches(header.get("cwd"), cwd)):
+        header = readSessionHeader(path)
+        if header and (cwd is None or sessionCwdMatches(header.get("cwd"), cwd)):
             return path
     return None
 
@@ -635,9 +657,11 @@ class SessionManager:
         sessionDir: str,
         sessionFile: str | None = None,
         persist: bool = True,
+        newSessionOptions: NewSessionOptions | None = None,
+        preloadedFileEntries: list[FileEntry] | None = None,
     ) -> None:
-        self.cwd = resolve_path(cwd)
-        self.sessionDir = normalize_path(sessionDir)
+        self.cwd = resolvePath(cwd)
+        self.sessionDir = normalizePath(sessionDir)
         self.persist = persist
         self.sessionId = ""
         self.sessionFile: str | None = None
@@ -652,18 +676,39 @@ class SessionManager:
             os.makedirs(self.sessionDir, mode=0o700, exist_ok=True)
 
         if sessionFile:
-            self.setSessionFile(sessionFile)
+            self._setSessionFile(sessionFile, preloadedFileEntries)
+        elif preloadedFileEntries:
+            self._loadEntries(preloadedFileEntries, newSessionOptions)
         else:
-            self.newSession()
+            self.newSession(newSessionOptions)
+
+    def _loadEntries(self, entries: list[FileEntry], options: NewSessionOptions | None = None) -> None:
+        header = next((entry for entry in entries if entry.get("type") == "session"), None)
+
+        if header is not None:
+            self.fileEntries = entries
+            self.sessionId = str(header.get("id"))
+            # MISAKA fork: a session is version 3 or refused (pi migrates older headers in place).
+            require_current_version(self.fileEntries, "<preloaded entries>")
+        else:
+            self.newSession(options)
+            self.fileEntries = self.fileEntries + entries
+
+        self._buildIndex()
 
     def setSessionFile(self, sessionFile: str) -> None:
-        self.sessionFile = resolve_path(sessionFile)
+        """Switch to a different session file (used for resume and branching)"""
+        self._setSessionFile(sessionFile)
+
+    def _setSessionFile(self, sessionFile: str, preloadedFileEntries: list[FileEntry] | None = None) -> None:
+        self.sessionFile = resolvePath(sessionFile)
         if os.path.exists(self.sessionFile):
-            self.fileEntries = load_entries_from_file(
-                self.sessionFile,
-                strict=True,
-                repair_unterminated=True,
+            self.fileEntries = (
+                preloadedFileEntries
+                if preloadedFileEntries is not None
+                else loadEntriesFromFile(self.sessionFile, strict=True, repair_unterminated=True)
             )
+            # MISAKA fork: an empty file is refused like an unparseable one (pi writes a new header into it).
             if not self.fileEntries:
                 raise InvalidSessionFileError(self.sessionFile)
 
@@ -671,7 +716,7 @@ class SessionManager:
             self.sessionId = (
                 str(header.get("id"))
                 if isinstance(header, dict) and header.get("id")
-                else create_session_id()
+                else createSessionId()
             )
             require_current_version(self.fileEntries, self.sessionFile)
             self._buildIndex()
@@ -683,7 +728,9 @@ class SessionManager:
         self.sessionFile = explicit_path
 
     def newSession(self, options: NewSessionOptions | None = None) -> str | None:
-        self.sessionId = options.id if options and options.id else create_session_id()
+        if options is not None and options.id is not None:
+            assertValidSessionId(options.id)
+        self.sessionId = options.id if options is not None and options.id is not None else createSessionId()
         timestamp = _iso_now()
         header: SessionHeader = {
             "type": "session",
@@ -797,7 +844,7 @@ class SessionManager:
     def appendMessage(self, message: MessageValue | dict[str, Any] | CustomMessage[Any] | BashExecutionMessage) -> str:
         entry: SessionEntry = {
             "type": "message",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
             "message": message,
@@ -808,7 +855,7 @@ class SessionManager:
     def appendThinkingLevelChange(self, thinkingLevel: str) -> str:
         entry: SessionEntry = {
             "type": "thinking_level_change",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
             "thinkingLevel": thinkingLevel,
@@ -819,7 +866,7 @@ class SessionManager:
     def appendModelChange(self, provider: str, modelId: str) -> str:
         entry: SessionEntry = {
             "type": "model_change",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
             "provider": provider,
@@ -834,7 +881,7 @@ class SessionManager:
         """Append model-attributed usage that does not participate in LLM context. Returns the appended entry."""
         entry: SessionEntry = {
             "type": "usage",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
             "kind": kind,
@@ -864,8 +911,8 @@ class SessionManager:
         boundary. The current system message (prompt and tools replayed from the branch) is
         stored on the entry so the context after the boundary still starts with it."""
         timestamp = _iso_now()
-        system_message = get_current_system_message(self.buildSessionProjection().messages)
-        entry_id = generate_id(self.byId)
+        system_message = getCurrentSystemMessage(self.buildSessionProjection().messages)
+        entry_id = generateId(self.byId)
         entry: SessionEntry = {
             "type": "compaction",
             "id": entry_id,
@@ -899,7 +946,7 @@ class SessionManager:
         entry: SessionEntry = {
             "type": "custom",
             "customType": customType,
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
         }
@@ -909,12 +956,13 @@ class SessionManager:
         return str(entry["id"])
 
     def appendSessionInfo(self, name: str) -> str:
+        sanitizedName = jsTrim(re.sub(r"[\r\n]+", " ", name))
         entry: SessionEntry = {
             "type": "session_info",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
-            "name": name.strip(),
+            "name": sanitizedName,
         }
         self._appendEntry(entry)
         return str(entry["id"])
@@ -940,7 +988,7 @@ class SessionManager:
             "customType": customType,
             "content": content,
             "display": display,
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
         }
@@ -978,7 +1026,7 @@ class SessionManager:
         )
         entry: SessionEntry = {
             "type": "context_edit",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
             "targetId": targetId,
@@ -1007,7 +1055,7 @@ class SessionManager:
             raise ValueError(f"Entry {targetId} not found")
         entry: SessionEntry = {
             "type": "label",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": self.leafId,
             "timestamp": _iso_now(),
             "targetId": targetId,
@@ -1033,10 +1081,10 @@ class SessionManager:
         return path
 
     def buildContextEntries(self) -> list[SessionEntry]:
-        return build_context_entries(self.getEntries(), self.leafId, self.byId)
+        return buildContextEntries(self.getEntries(), self.leafId, self.byId)
 
     def buildSessionProjection(self) -> SessionProjection:
-        return build_session_projection(self.getEntries(), self.leafId, self.byId)
+        return buildSessionProjection(self.getEntries(), self.leafId, self.byId)
 
     def buildSessionContext(self) -> SessionContext:
         """Build the session context (what gets sent to the LLM). Uses tree traversal from current leaf."""
@@ -1113,7 +1161,7 @@ class SessionManager:
         from_id = self.leafId if self.leafId is not None else "root"
         entry: SessionEntry = {
             "type": "branch_summary",
-            "id": generate_id(self.byId),
+            "id": generateId(self.byId),
             "parentId": branchFromId,
             "timestamp": _iso_now(),
             "fromId": from_id,
@@ -1134,8 +1182,33 @@ class SessionManager:
         if not path:
             raise ValueError(f"Entry {leafId} not found")
 
-        path_without_labels = [entry for entry in path if entry.get("type") != "label"]
-        new_session_id = create_session_id()
+        # Filter out LabelEntry from path - we'll recreate them from the resolved map.
+        # Because labels are real tree entries, later entries can be children of labels;
+        # removing labels requires re-chaining the retained path to avoid orphaned subtrees.
+        path_without_labels: list[SessionEntry] = []
+        replacementByLabelId: dict[str, str] = {}
+        pendingLabelIds: list[str] = []
+        pathParentId: str | None = None
+        for entry in path:
+            if entry.get("type") == "label":
+                pendingLabelIds.append(str(entry["id"]))
+                continue
+            for labelId in pendingLabelIds:
+                replacementByLabelId[labelId] = str(entry["id"])
+            pendingLabelIds.clear()
+            path_without_labels.append(
+                {
+                    **entry,
+                    "parentId": pathParentId,
+                    "firstKeptEntryId": entry["id"]
+                    if entry.get("firstKeptEntryId") == entry["id"]
+                    else replacementByLabelId.get(entry.get("firstKeptEntryId"), entry.get("firstKeptEntryId")),
+                }
+                if entry.get("type") == "compaction"
+                else {**entry, "parentId": pathParentId}
+            )
+            pathParentId = str(entry["id"])
+        new_session_id = createSessionId()
         timestamp = _iso_now()
         file_timestamp = timestamp.replace(":", "-").replace(".", "-")
         new_session_file = os.path.join(self.getSessionDir(), f"{file_timestamp}_{new_session_id}.jsonl")
@@ -1165,7 +1238,7 @@ class SessionManager:
         for target_id, label, label_timestamp in labels_to_write:
             label_entry: SessionEntry = {
                 "type": "label",
-                "id": generate_id(existing_ids),
+                "id": generateId(existing_ids),
                 "parentId": parent_id,
                 "timestamp": label_timestamp,
                 "targetId": target_id,
@@ -1190,9 +1263,9 @@ class SessionManager:
         return new_session_file if self.persist else None
 
     @classmethod
-    def create(cls, cwd: str, sessionDir: str | None = None) -> SessionManager:
-        directory = normalize_path(sessionDir) if sessionDir else get_default_session_dir(cwd)
-        return cls(cwd, directory, None, True)
+    def create(cls, cwd: str, sessionDir: str | None = None, options: NewSessionOptions | None = None) -> SessionManager:
+        directory = normalizePath(sessionDir) if sessionDir else getDefaultSessionDir(cwd)
+        return cls(cwd, directory, None, True, options)
 
     @classmethod
     def open(
@@ -1201,17 +1274,19 @@ class SessionManager:
         sessionDir: str | None = None,
         cwdOverride: str | None = None,
     ) -> SessionManager:
-        resolved_path = resolve_path(path)
+        resolved_path = resolvePath(path)
+        # MISAKA fork: a missing file is refused (pi starts a new session at that path), as are empty or unparseable
+        # ones (pi writes a header into an empty file): a session that is not there is not quietly replaced.
         if not os.path.isfile(resolved_path):
-            raise FileNotFoundError(resolved_path)
-        entries = load_entries_from_file(resolved_path, strict=True)
+            raise FileNotFoundError(f"Session file not found: {resolved_path}")
+        entries = loadEntriesFromFile(resolved_path, strict=True)
         header = next((entry for entry in entries if entry.get("type") == "session"), None)
         cwd = (
             cwdOverride
             if cwdOverride is not None
             else (str(header.get("cwd")) if isinstance(header, dict) and isinstance(header.get("cwd"), str) else os.getcwd())
         )
-        directory = normalize_path(sessionDir) if sessionDir else str(Path(resolved_path).parent)
+        directory = normalizePath(sessionDir) if sessionDir else str(Path(resolved_path).parent)
         return cls(cwd, directory, resolved_path, True)
 
     @classmethod
@@ -1221,11 +1296,11 @@ class SessionManager:
         cwdOverride: str | None = None,
     ) -> SessionManager:
         """Load a session snapshot without retaining or modifying its source file."""
-        resolved_path = resolve_path(path)
+        resolved_path = resolvePath(path)
         if not os.path.isfile(resolved_path):
             raise FileNotFoundError(resolved_path)
         try:
-            entries = load_entries_from_file(
+            entries = loadEntriesFromFile(
                 resolved_path,
                 strict=True,
                 repair_unterminated=False,
@@ -1240,7 +1315,7 @@ class SessionManager:
         )
         manager = cls.inMemory(cwd)
         manager.fileEntries = entries
-        manager.sessionId = str(header["id"]) if header.get("id") else create_session_id()
+        manager.sessionId = str(header["id"]) if header.get("id") else createSessionId()
         require_current_version(manager.fileEntries, resolved_path)
         manager._buildIndex()
         return manager
@@ -1248,15 +1323,15 @@ class SessionManager:
     @classmethod
     def findById(cls, cwd: str, id: str, sessionDir: str | None = None) -> str | None:
         """Find an exact session ID without loading transcript bodies (pi #9601)."""
-        directory = normalize_path(sessionDir) if sessionDir else get_default_session_dir(cwd)
-        filter_cwd = sessionDir is not None and directory != get_default_session_dir(cwd)
-        resolved_cwd = resolve_path(cwd)
+        directory = normalizePath(sessionDir) if sessionDir else getDefaultSessionDir(cwd)
+        filter_cwd = sessionDir is not None and directory != getDefaultSessionDir(cwd)
+        resolved_cwd = resolvePath(cwd)
         try:
             for path in iter_session_files(directory):
-                header = read_session_header(path)
+                header = readSessionHeader(path)
                 if not header or header.get("id") != id:
                     continue
-                if filter_cwd and not _session_cwd_matches(header.get("cwd"), resolved_cwd):
+                if filter_cwd and not sessionCwdMatches(header.get("cwd"), resolved_cwd):
                     continue
                 return path
         except OSError:
@@ -1266,15 +1341,20 @@ class SessionManager:
 
     @classmethod
     def continueRecent(cls, cwd: str, sessionDir: str | None = None) -> SessionManager:
-        directory = normalize_path(sessionDir) if sessionDir else get_default_session_dir(cwd)
-        most_recent = find_most_recent_session(directory, cwd=cwd)
+        directory = normalizePath(sessionDir) if sessionDir else getDefaultSessionDir(cwd)
+        most_recent = findMostRecentSession(directory, cwd=cwd)
         if most_recent:
             return cls(cwd, directory, most_recent, True)
         return cls(cwd, directory, None, True)
 
     @classmethod
-    def inMemory(cls, cwd: str | None = None) -> SessionManager:
-        return cls(os.getcwd() if cwd is None else cwd, "", None, False)
+    def inMemory(
+        cls,
+        cwd: str | None = None,
+        options: NewSessionOptions | None = None,
+        entries: list[FileEntry] | None = None,
+    ) -> SessionManager:
+        return cls(os.getcwd() if cwd is None else cwd, "", None, False, options, entries)
 
     @classmethod
     def forkFrom(
@@ -1284,10 +1364,10 @@ class SessionManager:
         sessionDir: str | None = None,
         options: NewSessionOptions | None = None,
     ) -> SessionManager:
-        resolved_source_path = resolve_path(sourcePath)
-        resolved_target_cwd = resolve_path(targetCwd)
+        resolved_source_path = resolvePath(sourcePath)
+        resolved_target_cwd = resolvePath(targetCwd)
         try:
-            source_entries = load_entries_from_file(resolved_source_path, strict=True)
+            source_entries = loadEntriesFromFile(resolved_source_path, strict=True)
         except (OSError, UnicodeError, InvalidSessionFileError) as error:
             raise RuntimeError(
                 f"Cannot fork: source session file is empty or invalid: {resolved_source_path}"
@@ -1299,9 +1379,11 @@ class SessionManager:
         if source_header is None:
             raise RuntimeError(f"Cannot fork: source session has no header: {resolved_source_path}")
 
-        directory = normalize_path(sessionDir) if sessionDir else get_default_session_dir(resolved_target_cwd)
+        directory = normalizePath(sessionDir) if sessionDir else getDefaultSessionDir(resolved_target_cwd)
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        new_session_id = options.id if options and options.id else create_session_id()
+        if options is not None and options.id is not None:
+            assertValidSessionId(options.id)
+        new_session_id = options.id if options is not None and options.id is not None else createSessionId()
         timestamp = _iso_now()
         file_timestamp = timestamp.replace(":", "-").replace(".", "-")
         new_session_file = os.path.join(directory, f"{file_timestamp}_{new_session_id}.jsonl")
@@ -1327,50 +1409,96 @@ class SessionManager:
         cwd: str,
         sessionDir: str | None = None,
         onProgress: SessionListProgress | None = None,
+        signal: Any = None,
     ) -> list[SessionInfo]:
-        directory = normalize_path(sessionDir) if sessionDir else get_default_session_dir(cwd)
-        sessions = [s for s in await _list_sessions_from_dir(directory, onProgress)
-                    if _session_cwd_matches(s.cwd, cwd)]
-        sessions.sort(key=lambda session: session.modified, reverse=True)
-        return sessions
+        directory = normalizePath(sessionDir) if sessionDir else getDefaultSessionDir(cwd)
+
+        def includeSession(session: SessionInfo) -> bool:
+            return sessionCwdMatches(session.cwd, cwd)
+
+        progress: SessionListProgress | None = None
+        if onProgress is not None:
+            report = onProgress
+
+            def progress(loaded: int, total: int, partialSessions: Sequence[SessionInfo] | None) -> None:
+                jsCall(
+                    report,
+                    loaded,
+                    total,
+                    [session for session in partialSessions if includeSession(session)]
+                    if partialSessions is not None
+                    else None,
+                )
+
+        sessions = [s for s in await listSessionsFromDir(directory, progress, signal) if includeSession(s)]
+        return sortSessionInfos(sessions)
 
     @classmethod
     async def listAll(
         cls,
         sessionsRoot: str | SessionListProgress | None = None,
-        onProgress: SessionListProgress | None = None,
-    ) -> list[SessionInfo]:
+        onProgress: SessionListProgress | Any = None,
+        signal: Any = None,
+    ) -> builtins.list[SessionInfo]:
         """Every session under one sessions root (its per-cwd buckets), newest first.
 
-        pi session-manager.ts:1655-1663 overloads this the same way: the root is optional and a
-        lone callback is the progress reporting, so ``listAll(onProgress)`` keeps working."""
+        pi overloads this the same way: the root is optional, so ``listAll(onProgress, signal)`` and
+        ``listAll(root, onProgress, signal)`` both work."""
         if callable(sessionsRoot):
-            sessionsRoot, onProgress = None, sessionsRoot
+            sessionsRoot, onProgress, signal = None, sessionsRoot, onProgress if signal is None else signal
+        progress: SessionListProgress | None = onProgress if callable(onProgress) else None
+        abortSignal = signal if callable(onProgress) or isinstance(sessionsRoot, str) else (onProgress or signal)
+        throwIfAborted(abortSignal)
+        # MISAKA fork: a given root is a store of cwd buckets plus loose files (pi lists only its files), and the
+        # store's `.git`/`.catalog` directories are not buckets.
         explicit_root = sessionsRoot is not None
-        sessions_dir = normalize_path(sessionsRoot) if sessionsRoot else get_sessions_dir()
+        sessions_dir = normalizePath(sessionsRoot) if sessionsRoot else get_sessions_dir()
         try:
             directories = [os.path.join(sessions_dir, entry) for entry in os.listdir(sessions_dir)
                            if entry not in {".git", ".catalog"} and os.path.isdir(os.path.join(sessions_dir, entry))]
         except OSError:
+            throwIfAborted(abortSignal)
             return []
         if explicit_root:
-            directories.insert(0, sessions_dir)  # explicit stores may contain files and cwd buckets
-        all_files = list(dict.fromkeys(path for directory in directories for path in iter_session_files(directory)))
-        total_files = len(all_files)
-        sessions: list[SessionInfo] = []
-        loaded_ref = {"value": 0}
+            directories.insert(0, sessions_dir)
+        allFiles = list(dict.fromkeys(path for directory in directories for path in iter_session_files(directory)))
+        throwIfAborted(abortSignal)
 
-        def on_loaded() -> None:
-            loaded_ref["value"] += 1
-            if onProgress is not None:
-                onProgress(loaded_ref["value"], total_files)
+        def mtimeMs(path: str) -> float:
+            try:
+                return os.stat(path).st_mtime * 1000
+            except OSError:
+                return float("-inf")
 
-        results = await _build_session_infos_with_concurrency(all_files, on_loaded)
-        for info in results:
+        mtimes = {path: mtimeMs(path) for path in allFiles}
+
+        def byActivity(a: str, b: str) -> int:
+            return (mtimes[b] > mtimes[a]) - (mtimes[b] < mtimes[a]) or localeCompare(
+                os.path.basename(b), os.path.basename(a)
+            )
+
+        candidates = sorted(allFiles, key=functools.cmp_to_key(byActivity))
+
+        totalFiles = len(candidates)
+        loaded = 0
+        firstCandidateLoaded = False
+        partialSessions: list[SessionInfo] = []
+
+        def onLoaded(info: SessionInfo | None, index: int) -> None:
+            nonlocal loaded, firstCandidateLoaded
+            loaded += 1
+            if index == 0:
+                firstCandidateLoaded = True
             if info is not None:
-                sessions.append(info)
-        sessions.sort(key=lambda session: session.modified, reverse=True)
-        return sessions
+                partialSessions.append(info)
+            publishPartial = firstCandidateLoaded and (
+                index == 0 or loaded % ALL_SESSION_LIST_PUBLISH_INTERVAL == 0 or loaded == totalFiles
+            )
+            if progress is not None:
+                jsCall(progress, loaded, totalFiles, sortSessionInfos([*partialSessions]) if publishPartial else None)
+
+        results = await buildSessionInfosWithConcurrency(candidates, onLoaded, abortSignal)
+        return sortSessionInfos([info for info in results if info is not None])
 
 
 def _parse_jsonl_entries(content: str, *, strict: bool = False) -> list[FileEntry]:
@@ -1397,7 +1525,7 @@ def _message_role(message: Any) -> str | None:
     return role if isinstance(role, str) else None
 
 
-def _is_message_with_content(message: Any) -> bool:
+def isMessageWithContent(message: Any) -> bool:
     if not isinstance(_message_role(message), str):
         return False
     if isinstance(message, dict):
@@ -1412,7 +1540,7 @@ def _set_message_role(message: Any, role: str) -> None:
         message.role = role
 
 
-def _text_content(message: Any) -> str:
+def textContent(message: Any) -> str:
     content = read_field(message, "content")
     if isinstance(content, str):
         return content
@@ -1428,14 +1556,14 @@ def _text_content(message: Any) -> str:
     return " ".join(parts)
 
 
-def _last_activity_time(entries: list[FileEntry]) -> int | None:
+def lastActivityTime(entries: list[FileEntry]) -> int | None:
     last_activity: int | None = None
     for entry in entries:
         if entry.get("type") != "message":
             continue
 
         message = entry.get("message")
-        if not _is_message_with_content(message):
+        if not isMessageWithContent(message):
             continue
         if _message_role(message) not in {"user", "assistant"}:
             continue
@@ -1452,7 +1580,7 @@ def _last_activity_time(entries: list[FileEntry]) -> int | None:
 
 
 def _session_modified_date(entries: list[FileEntry], header: SessionHeader, stats_mtime: float) -> datetime:
-    last_activity = _last_activity_time(entries)
+    last_activity = lastActivityTime(entries)
     if last_activity is not None:
         return datetime.fromtimestamp(last_activity / 1000, UTC)
 
@@ -1493,7 +1621,7 @@ def _build_session_info_sync(file_path: str) -> SessionInfo | None:
             if _message_role(message) not in {"user", "assistant"}:
                 continue
 
-            text = _text_content(message)
+            text = textContent(message)
             if not text:
                 continue
 
@@ -1522,13 +1650,19 @@ def _build_session_info_sync(file_path: str) -> SessionInfo | None:
         return None
 
 
-async def _build_session_info(file_path: str) -> SessionInfo | None:
+async def buildSessionInfo(file_path: str) -> SessionInfo | None:
     return await asyncio.to_thread(_build_session_info_sync, file_path)
 
 
-async def _build_session_infos_with_concurrency(
+def sortSessionInfos(sessions: list[SessionInfo]) -> list[SessionInfo]:
+    sessions.sort(key=lambda session: session.modified.timestamp(), reverse=True)
+    return sessions
+
+
+async def buildSessionInfosWithConcurrency(
     files: list[str],
-    on_loaded: Callable[[], None],
+    on_loaded: Callable[[SessionInfo | None, int], None],
+    signal: Any = None,
 ) -> list[SessionInfo | None]:
     results: list[SessionInfo | None] = [None] * len(files)
     in_flight: set[asyncio.Task[None]] = set()
@@ -1543,11 +1677,12 @@ async def _build_session_infos_with_concurrency(
 
         async def run() -> None:
             try:
-                results[index] = await _build_session_info(files[index])
+                results[index] = await buildSessionInfo(files[index])
             except Exception:  # noqa: BLE001 - a corrupt session file is skipped in the picker
                 results[index] = None
-            finally:
-                on_loaded()
+            # pi's `buildSessionInfo` reads through a stream the signal closes, and rethrows the abort.
+            throwIfAborted(signal)
+            on_loaded(results[index], index)
 
         task = asyncio.create_task(run())
         in_flight.add(task)
@@ -1555,35 +1690,45 @@ async def _build_session_infos_with_concurrency(
 
     while next_index < len(files) or in_flight:
         while next_index < len(files) and len(in_flight) < MAX_CONCURRENT_SESSION_INFO_LOADS:
+            throwIfAborted(signal)
             start_next()
         if in_flight:
-            await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+            done, _pending = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                error = None if task.cancelled() else task.exception()
+                if error is not None:
+                    for other in in_flight:
+                        other.cancel()
+                    raise error
 
     return results
 
 
-async def _list_sessions_from_dir(
+async def listSessionsFromDir(
     session_dir: str,
-    on_progress: SessionListProgress | None = None,
-    progress_offset: int = 0,
-    progress_total: int | None = None,
+    onProgress: SessionListProgress | None = None,
+    signal: Any = None,
 ) -> list[SessionInfo]:
-    files = list(iter_session_files(session_dir))
+    throwIfAborted(signal)
+    def byNameDescending(a: str, b: str) -> int:
+        return localeCompare(os.path.basename(b), os.path.basename(a))
 
-    sessions: list[SessionInfo] = []
-    total = progress_total if progress_total is not None else len(files)
-    loaded_ref = {"value": 0}
+    files = sorted(iter_session_files(session_dir), key=functools.cmp_to_key(byNameDescending))
+    total = len(files)
+    partialSessions: list[SessionInfo] = []
+    loaded = 0
 
-    def on_loaded() -> None:
-        loaded_ref["value"] += 1
-        if on_progress is not None:
-            on_progress(progress_offset + loaded_ref["value"], total)
-
-    results = await _build_session_infos_with_concurrency(files, on_loaded)
-    for info in results:
+    def onLoaded(info: SessionInfo | None, _index: int) -> None:
+        nonlocal loaded
+        loaded += 1
         if info is not None:
-            sessions.append(info)
-    return sessions
+            partialSessions.append(info)
+        publishPartial = loaded == 1 or loaded % CURRENT_SESSION_LIST_PUBLISH_INTERVAL == 0 or loaded == len(files)
+        if onProgress is not None:
+            jsCall(onProgress, loaded, total, sortSessionInfos([*partialSessions]) if publishPartial else None)
+
+    results = await buildSessionInfosWithConcurrency(files, onLoaded, signal)
+    return [info for info in results if info is not None]
 
 
 def _iso_now() -> str:
@@ -1647,8 +1792,6 @@ def _dump_jsonl(entries: list[FileEntry]) -> str:
     return "".join(f"{_dump_json(entry)}\n" for entry in entries)
 
 
-buildContextEntries = build_context_entries
-buildSessionContext = build_session_context
 
 __all__ = [
     "CURRENT_SESSION_VERSION",
@@ -1672,9 +1815,9 @@ __all__ = [
     "SessionMessageEntry",
     "SessionTreeNode",
     "ThinkingLevelChangeEntry",
+    "assertValidSessionId",
     "buildContextEntries",
     "buildSessionContext",
-    "build_context_entries",
-    "session_entry_to_context_messages",
+    "sessionEntryToContextMessages",
     "sessions_root_of",
 ]

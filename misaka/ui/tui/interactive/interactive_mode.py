@@ -1,32 +1,54 @@
-"""Interactive-mode runtime shell and foundational helpers."""
+"""Translated from pi's ``modes/interactive/interactive-mode.ts`` (v1.1.0).
+
+Interactive mode for the coding agent.
+Handles TUI rendering and user interaction, delegating business logic to AgentSession.
+
+MISAKA forks that shape the whole file:
+- (D1) The fullscreen renderer is not ported: no ``TuiAltScreen``, ``switchTuiMode``, chat viewport, ``tuiMode`` option or
+  setting, right-click paste, fullscreen copy-on-select and wheel settings, and no clickable header logo.
+- (D11) No system theme: the theme controller resolves settings against the terminal's light/dark appearance once and
+  falls back to the built-in theme matching the terminal.
+- MISAKA's read-only/attach session viewer (``misaka chat --read-only/--attach``) draws with its own ``Conversation``
+  screen and ``TranscriptRenderer``; this file does not use either.
+- MISAKA has no ``/bug`` (pi's reports go to the Pi developers), no ``/changelog`` and changelog notices (no changelog
+  ships), no package sources or package updates, no pi version check, no install telemetry ping, and no managed fd/rg
+  download; the easter eggs are not ported. Mermaid diagrams are not rendered (the renderer needs the grok-mermaid
+  package).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import contextvars
+import errno
+import functools
 import inspect
 import json
 import os
+import posixpath
 import re
-import shutil
+import shlex
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+import traceback
+import unicodedata
+import uuid
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import replace as dataclasses_replace
 from datetime import UTC, datetime
-from importlib import import_module
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
-from uuid import uuid4
+from typing import Any, Literal, NoReturn, Protocol, TypedDict, TypeGuard
 
-from misaka.ai.models import getProviders
-from misaka.ai.types import ImageContent
+from misaka.agent.types import ThinkingLevel
+from misaka.ai.auth.types import AuthCheck, AuthOperationOptions, LoginOptions
+from misaka.ai.models import ModelsRefreshOptions
+from misaka.ai.types import ImageContent, Model
+from misaka.ai.utils.retry import isRetryableAssistantError
 from misaka.config import (
     APP_NAME,
     APP_TITLE,
@@ -36,19 +58,31 @@ from misaka.config import (
     get_debug_log_path,
     home,
 )
+from misaka.config.engine import detectInstallChange
+from misaka.core.agent_session import parseSkillBlock
 from misaka.core.agent_session_runtime import (
     ContextCarryUnsupportedError,
     SessionImportFileNotFoundError,
 )
+from misaka.core.auth_storage import oauth_account_key
 from misaka.core.bash_executor import BashResult
-from misaka.core.cache_warmer import (
-    format_cache_warming_status,
-    format_cache_warming_usage,
+from misaka.core.cache_stats import (
+    CACHE_TTL_MS,
+    CacheMiss,
+    collectCacheMisses,
+    computeCacheWaste,
+    detectCacheMiss,
 )
-from misaka.core.defaults import DEFAULT_THINKING_LEVEL
+from misaka.core.cache_warmer import (
+    formatCacheWarmingStatus,
+    formatCacheWarmingUsage,
+)
+from misaka.core.crash_log import findExtensionStackMatches
+from misaka.core.defaults import DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS
 from misaka.core.extensions import startup_sections
+from misaka.core.extensions.types import ProjectTrustContext, WorkingIndicatorOptions
 from misaka.core.footer_data_provider import FooterDataProvider
-from misaka.core.http_dispatcher import formatHttpIdleTimeoutMs
+from misaka.core.http_dispatcher import configureHttpDispatcher, formatHttpIdleTimeoutMs
 from misaka.core.keybindings import KeybindingsManager
 from misaka.core.messages import createCompactionSummaryMessage, createCustomMessage
 from misaka.core.model_resolver import (
@@ -56,15 +90,17 @@ from misaka.core.model_resolver import (
     findExactModelReferenceMatch,
     resolveModelScopeFromModels,
 )
+from misaka.core.model_runtime import CredentialSynchronizationError
 from misaka.core.project_trust import (
     ProjectTrustStore,
-    has_trust_requiring_project_resources,
+    hasTrustRequiringProjectResources,
 )
 from misaka.core.prompt_templates import parse_prompt_template_invocation
-from misaka.core.provider_display_names import BUILT_IN_PROVIDER_DISPLAY_NAMES
+from misaka.core.provider_attribution import CLIENT_NAME
+from misaka.core.radius import RADIUS_PROVIDER_ID
 from misaka.core.session_cwd import (
     MissingSessionCwdError,
-    format_missing_session_cwd_prompt,
+    formatMissingSessionCwdPrompt,
 )
 from misaka.core.session_manager import (
     InvalidSessionFileError,
@@ -72,133 +108,173 @@ from misaka.core.session_manager import (
     session_entry_to_display_messages,
     sessions_root_of,
 )
-from misaka.core.settings_manager import DefaultProjectTrust
 from misaka.core.slash_commands import (
     _LOCAL_ALIAS_SLASH_COMMANDS,
     BUILTIN_SLASH_COMMANDS,
 )
+from misaka.core.tools.renderers import withBuiltInRenderers
 from misaka.core.tools.truncate import TruncationResult
 from misaka.core.usage_totals import getUsageCostBreakdown
 from misaka.ui.tui import (
-    TUI,
     AutocompleteProvider,
     CombinedAutocompleteProvider,
     Container,
-    EditorOptions,
-    Loader,
     LoaderIndicatorOptions,
     Markdown,
-    ProcessTerminal,
     SlashCommand,
     Spacer,
     Text,
     TruncatedText,
+    fuzzyFilter,
     matchesKey,
     setCapabilityOverrides,
     setKeybindings,
+    visibleWidth,
 )
-from misaka.ui.tui.interactive.components.assistant_message import (
-    AssistantMessageComponent,
+from misaka.ui.tui.autocomplete import AutocompleteItem
+from misaka.utils import loop_watchdog
+from misaka.utils._abort_signal import TimeoutAbortSignal
+from misaka.utils.abort import raceWithAbortSignal
+from misaka.utils.chalk import chalk
+from misaka.utils.clipboard import (
+    copyToClipboard,
+    readClipboardFilePaths,
+    readClipboardText,
 )
-from misaka.ui.tui.interactive.components.bash_execution import BashExecutionComponent
-from misaka.ui.tui.interactive.components.countdown_timer import CountdownTimer
-from misaka.ui.tui.interactive.components.custom_editor import CustomEditor
-from misaka.ui.tui.interactive.components.custom_message import CustomMessageComponent
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.components.extension_editor import (
-    ExtensionEditorComponent,
+from misaka.utils.clipboard_image import (
+    extensionForImageMimeType,
+    readClipboardImage,
 )
-from misaka.ui.tui.interactive.components.extension_input import ExtensionInputComponent
-from misaka.ui.tui.interactive.components.extension_selector import (
-    ExtensionSelectorComponent,
+from misaka.utils.collation import localeCompare, localeSortKey
+from misaka.utils.image_convert import ensurePngTranscoder
+from misaka.utils.js import (
+    ECMASCRIPT_WHITESPACE,
+    UNDEFINED,
+    AbortController,
+    clearTimeout,
+    errorMessage,
+    jsIndex,
+    jsonStringify,
+    jsRound,
+    jsTrim,
+    jsTrimStart,
+    setTimeout,
+    spawn,
+    toFixed,
 )
-from misaka.ui.tui.interactive.components.footer import FooterComponent, format_tokens
-from misaka.ui.tui.interactive.components.keybinding_hints import (
+from misaka.utils.paths import getCwdRelativePath
+from misaka.utils.shell import killTrackedDetachedChildren
+from misaka.utils.tools_manager import find_tool
+from misaka.utils.values import maybe_await, read_field, signal_aborted
+
+from .components.assistant_message import AssistantMessageComponent
+from .components.bash_execution import BashExecutionComponent
+from .components.branch_summary_message import BranchSummaryMessageComponent
+from .components.compaction_summary_message import CompactionSummaryMessageComponent
+from .components.custom_editor import CustomEditor, CustomEditorOptions
+from .components.custom_entry import CustomEntryComponent
+from .components.custom_message import CustomMessageComponent
+from .components.dynamic_border import DynamicBorder
+from .components.extension_editor import ExtensionEditorComponent
+from .components.extension_input import ExtensionInputComponent
+from .components.extension_selector import ExtensionSelectorComponent
+from .components.footer import FooterComponent, formatTokens
+from .components.keybinding_hints import (
     KeyTextFormatOptions,
-    format_key_text,
-    key_display_text,
-    key_hint,
-    key_text,
-    raw_key_hint,
+    formatKeyText,
+    keyDisplayText,
+    keyHint,
+    keyText,
+    rawKeyHint,
 )
-from misaka.ui.tui.interactive.components.login_dialog import LoginDialogComponent
-from misaka.ui.tui.interactive.components.model_selector import (
+from .components.login_dialog import LoginDialogComponent
+from .components.model_selector import (
+    DefaultModelReference,
     ModelSelectorComponent,
     ScopedModelItem,
 )
-from misaka.ui.tui.interactive.components.oauth_selector import (
+from .components.oauth_selector import (
     AuthSelectorProvider,
     OAuthSelectorComponent,
+    formatAuthSelectorProviderStatus,
+    formatAuthSelectorProviderType,
 )
-from misaka.ui.tui.interactive.components.scoped_models_selector import (
+from .components.radius_login_selector import RadiusOption, createLoginMenuSelector
+from .components.scoped_models_selector import (
     ModelsCallbacks,
     ModelsConfig,
     ScopedModelsSelectorComponent,
 )
-from misaka.ui.tui.interactive.components.session_selector import (
-    SessionSelectorComponent,
-)
-from misaka.ui.tui.interactive.components.settings_selector import (
+from .components.session_selector import SessionSelectorComponent
+from .components.settings_selector import (
     SettingsCallbacks,
     SettingsConfig,
     SettingsSelectorComponent,
 )
-from misaka.ui.tui.interactive.components.thinking_selector import (
-    ThinkingSelectorComponent,
+from .components.skill_invocation_message import SkillInvocationMessageComponent
+from .components.status_indicator import (
+    BranchSummaryStatusIndicator,
+    CompactionStatusIndicator,
+    IdleStatus,
+    RetryStatusIndicator,
+    StatusIndicator,
+    WorkingStatusIndicator,
 )
-from misaka.ui.tui.interactive.components.tool_execution import ToolExecutionComponent
-from misaka.ui.tui.interactive.components.transcript import (
-    TranscriptRenderer,
-    user_text,
-)
-from misaka.ui.tui.interactive.components.tree_selector import TreeSelectorComponent
-from misaka.ui.tui.interactive.components.trust_selector import (
-    TrustSelectorComponent,
-    TrustSelectorOptions,
-)
-from misaka.ui.tui.interactive.components.user_message import UserMessageComponent
-from misaka.ui.tui.interactive.components.user_message_selector import (
+from .components.themed_text import ThemedText
+from .components.thinking_selector import ThinkingSelectorComponent
+from .components.tool_execution import ToolExecutionComponent
+from .components.tree_selector import TreeSelectorComponent
+from .components.trust_selector import TrustSelectorComponent, TrustSelectorOptions
+from .components.user_message import UserMessageComponent
+from .components.user_message_selector import (
     UserMessageItem,
     UserMessageSelectorComponent,
 )
-from misaka.ui.tui.interactive.conversation import (
-    Conversation,
-    _safe_call_bool,
-    _safe_call_int,
-    _safe_call_str,
+from .external_editor import editInExternalEditor
+from .model_catalog_refresh import refreshModelCatalogs
+from .model_search import ModelSearchItem, getModelSearchText
+from .program_status_reporter import BlockedStatus, ProgramStatusReporter
+from .session_share import SessionShareContext, shareSession
+from .theme.theme import (
+    Theme,
+    ThemeColor,
+    getAvailableThemes,
+    getAvailableThemesWithPaths,
+    getEditorTheme,
+    getMarkdownTheme,
+    getThemeByName,
+    onThemeChange,
+    setRegisteredThemes,
+    stopThemeWatcher,
+    theme,
 )
-from misaka.ui.tui.utils import visibleWidth
-from misaka.utils.clipboard import copy_to_clipboard
-from misaka.utils.clipboard_image import (
-    extension_for_image_mime_type,
-    read_clipboard_image,
-)
-from misaka.utils.shell import kill_tracked_detached_children
-from misaka.utils.tools_manager import find_tool
-from misaka.utils.values import maybe_await, read_field, signal_aborted
-
-interactive_theme = import_module("misaka.ui.tui.interactive.theme.theme")
-
-ANTHROPIC_SUBSCRIPTION_AUTH_WARNING = (
-    "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per "
-    "token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage."
-)
-
-_BUILT_IN_MODEL_PROVIDERS = frozenset(getProviders())
-_BEDROCK_PROVIDER_ID = "amazon-bedrock"
+from .theme.theme_controller import InteractiveThemeController
+from .tui_renderer import InteractiveTuiOptions, createInteractiveTui
 
 
-@dataclass(slots=True)
-class InteractiveModeOptions:
-    modelFallbackMessage: str | None = None
-    initialMessage: str | None = None
-    initialImages: list[ImageContent] | None = None
-    initialMessages: list[str] | None = None
-    verbose: bool = False
-    autoTrustOnReloadCwd: str | None = None
+class Expandable(Protocol):
+    """Interface for components that can be expanded/collapsed"""
+
+    def setExpanded(self, expanded: bool) -> None: ...
 
 
-class ExpandableText(Text):
+class WorkingStatusEditor(Protocol):
+    embedWorkingStatus: bool
+
+    def setWorkingStatusIndicator(self, indicator: StatusIndicator | None) -> None: ...
+
+
+def isWorkingStatusEditor(editor: Any) -> TypeGuard[WorkingStatusEditor]:
+    return getattr(editor, "embedWorkingStatus", None) is True and callable(
+        getattr(editor, "setWorkingStatusIndicator", None)
+    )
+
+
+def isExpandable(obj: Any) -> TypeGuard[Expandable]:
+    return obj is not None and callable(getattr(obj, "setExpanded", None))
+
+
+class ExpandableText(ThemedText):
     def __init__(
         self,
         getCollapsedText: Callable[[], str],
@@ -207,32 +283,358 @@ class ExpandableText(Text):
         paddingX: int = 0,
         paddingY: int = 0,
     ) -> None:
-        self._getCollapsedText = getCollapsedText
-        self._getExpandedText = getExpandedText
-        self.expanded = expanded
-        super().__init__(getExpandedText() if expanded else getCollapsedText(), paddingX, paddingY)
+        state = {"expanded": expanded}
+        super().__init__(lambda: getExpandedText() if state["expanded"] else getCollapsedText(), paddingX, paddingY)
+        self.state = state
 
     def setExpanded(self, expanded: bool) -> None:
-        self.expanded = expanded
-        self.refreshText()
+        self.state["expanded"] = expanded
+        self.invalidate()
 
-    def refreshText(self) -> None:
-        """Re-evaluate the text. The constructor samples it once, so content that loads
-        asynchronously (such as MCP connection results) would otherwise stay frozen at
-        the initial snapshot."""
-        self.setText(self._getExpandedText() if self.expanded else self._getCollapsedText())
+
+# MISAKA fork (D1): pi's `BuiltInHeader` only adds the logo click that plays an easter egg in fullscreen mode; the
+# header is an `ExpandableText`.
+
+
+class CompactionQueuedMessage(TypedDict):
+    text: str
+    mode: Literal["steer", "followUp"]
+
+
+class CompactionCostNotice(TypedDict):
+    type: Literal["compaction_cost"]
+    kind: Literal["compaction", "branch_summary"]
+    usage: Any
+
+
+def isCustomSessionEntry(item: Any) -> bool:
+    return read_field(item, "type") == "custom"
+
+
+def isCompactionCostNotice(item: Any) -> bool:
+    return read_field(item, "type") == "compaction_cost"
+
+
+def isUsageSessionEntry(item: Any) -> bool:
+    return read_field(item, "type") == "usage"
+
+
+# EIO: tty reads/ioctls from an orphaned background process group, or writes after hangup.
+# ENOTTY: the tty was revoked (macOS) and stdin is no longer a terminal.
+DEAD_TERMINAL_ERROR_CODES = {"EIO", "EPIPE", "ENOTCONN", "ENOTTY"}
+
+
+def isDeadTerminalError(error: Any) -> bool:
+    # MISAKA fork: Node names the errno in `error.code`; Python carries the number in `OSError.errno`.
+    if not isinstance(error, OSError) or error.errno is None:
+        return False
+    code = errno.errorcode.get(error.errno)
+    return code is not None and code in DEAD_TERMINAL_ERROR_CODES
+
+
+def formatCrashExtensionHint(extensionMatches: Sequence[str] | None) -> str | None:
+    matches = (
+        [match for match in extensionMatches if isinstance(match, str) and len(match) > 0]
+        if isinstance(extensionMatches, (list, tuple))
+        else []
+    )
+    if len(matches) == 0:
+        return None
+    quoted = [f"`{match}`" for match in matches]
+    labels = (
+        quoted[0]
+        if len(quoted) == 1
+        else " and ".join(quoted)
+        if len(quoted) == 2
+        else f"{', '.join(quoted[:-1])}, and {quoted[-1]}"
+    )
+    noun = "extension" if len(matches) == 1 else "extensions"
+    # MISAKA fork: MISAKA has no `config` command to disable an extension with, so only the `-ne` check is offered.
+    return f"A stack frame came from loaded {noun} {labels}, which may be involved. Run `{APP_NAME} -ne` to confirm."
+
+
+ANTHROPIC_SUBSCRIPTION_AUTH_WARNING = (
+    "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, "
+    "not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in "
+    "/settings."
+)
+
+
+def isAnthropicSubscriptionAuthKey(apiKey: str | None) -> bool:
+    return isinstance(apiKey, str) and apiKey.startswith("sk-ant-oat")
+
+
+def isUnknownModel(model: Any) -> bool:
+    return (
+        bool(model)
+        and read_field(model, "provider") == "unknown"
+        and read_field(model, "id") == "unknown"
+        and read_field(model, "api") == "unknown"
+    )
+
+
+_SHELL_SAFE = re.compile(r"[^a-zA-Z0-9_\-./~:@]")
+
+
+def quoteIfNeeded(value: str) -> str:
+    if len(value) > 0 and not _SHELL_SAFE.search(value):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def formatResumeCommand(sessionManager: Any) -> str | None:
+    if not sys.stdout.isatty():
+        return None
+    if not sessionManager.isPersisted():
+        return None
+
+    sessionFile = sessionManager.getSessionFile()
+    if not sessionFile or not os.path.exists(sessionFile):
+        return None
+
+    # MISAKA fork: MISAKA resumes a conversation through `misaka chat`, which finds the session in the window's
+    # own store (`--as <Sister>` outside Last Order); there is no `--session-dir` to name.
+    args = [APP_NAME, "chat"]
+    who = os.environ.get("MISAKA_WHO")
+    if who and who != "last-order":
+        args.extend(["--as", quoteIfNeeded(who)])
+    args.extend(["--session", sessionManager.getSessionId()])
+    return " ".join(args)
+
+
+def _byProviderName(a: AuthSelectorProvider, b: AuthSelectorProvider) -> int:
+    """MISAKA fork: ``(a, b) => a.name.localeCompare(b.name)``."""
+    return localeCompare(a.name, b.name)
+
+
+def hasDefaultModelProvider(providerId: str) -> bool:
+    return providerId in defaultModelPerProvider
+
+
+def llamaCppPostLoginGuidance(actionLabel: str, loadedModelCount: int) -> str:
+    return (
+        f"{actionLabel}. No llama.cpp models are loaded. Use /llama to load a model, then /model to select it."
+        if loadedModelCount == 0
+        else f"{actionLabel}. Use /model to select a loaded llama.cpp model, or /llama to manage models."
+    )
+
+
+@dataclass(slots=True)
+class LoginProviderCompletionOption:
+    id: str
+    name: str
+    authTypes: list[str]
+    subscription: bool | None = None
+
+
+RADIUS_LOGIN_INTRO = "Radius is a service crafted for Pi by the builders of Pi, Earendil Works"
+
+AUTH_TYPE_ORDER = {"oauth": 0, "api_key": 1}
+
+
+def createFuzzyAutocompleteItems[T](
+    items: list[T],
+    prefix: str,
+    getSearchText: Callable[[T], str],
+    toAutocompleteItem: Callable[[T], AutocompleteItem],
+) -> list[AutocompleteItem] | None:
+    filtered = fuzzyFilter(items, prefix, getSearchText)
+    if len(filtered) == 0:
+        return None
+    return [toAutocompleteItem(item) for item in filtered]
+
+
+def getLoginProviderCompletionOptions(providerOptions: list[AuthSelectorProvider]) -> list[LoginProviderCompletionOption]:
+    byId: dict[str, LoginProviderCompletionOption] = {}
+    for provider in providerOptions:
+        existing = byId.get(provider.id)
+        if existing:
+            if provider.authType not in existing.authTypes:
+                existing.authTypes.append(provider.authType)
+                existing.authTypes.sort(key=lambda authType: AUTH_TYPE_ORDER[authType])
+            continue
+        byId[provider.id] = LoginProviderCompletionOption(
+            id=provider.id,
+            name=provider.name,
+            authTypes=[provider.authType],
+            subscription=provider.subscription,
+        )
+    return sorted(byId.values(), key=lambda option: localeSortKey(option.name))
+
+
+def getLoginProviderSearchText(provider: LoginProviderCompletionOption) -> str:
+    authTypes = " ".join(
+        f"{authType} {formatAuthSelectorProviderType(authType, provider.subscription)}" for authType in provider.authTypes
+    )
+    return f"{provider.id} {provider.name} {authTypes}"
+
+
+def formatLoginProviderCompletionDescription(provider: LoginProviderCompletionOption) -> str:
+    authTypes = "/".join(formatAuthSelectorProviderType(authType, provider.subscription) for authType in provider.authTypes)
+    return authTypes if provider.name == provider.id else f"{provider.name} · {authTypes}"
+
+
+@dataclass(slots=True, kw_only=True)
+class InteractiveModeOptions:
+    """Options for InteractiveMode initialization.
+
+    MISAKA forks: no ``migratedProviders`` (MISAKA migrates no credentials) and no ``tuiMode`` (D1).
+    """
+
+    # Diagnostics collected before the interactive TUI was initialized.
+    startupDiagnostics: list[Any] | None = None
+    # Warning message if session model couldn't be restored
+    modelFallbackMessage: str | None = None
+    # Cwd to trust after reload if it gained a .pi directory during this implicitly trusted session.
+    autoTrustOnReloadCwd: str | None = None
+    # Initial message to send on startup (can include @file content)
+    initialMessage: str | None = None
+    # Images to attach to the initial message
+    initialImages: list[ImageContent] | None = None
+    # Additional messages to send after the initial message
+    initialMessages: list[str] | None = None
+    # Force verbose startup (overrides quietStartup setting)
+    verbose: bool | None = None
+    # Initial interactive theme setting for this invocation.
+    initialThemeSetting: str | None = None
+    # Terminal implementation. Defaults to the current process terminal.
+    terminal: Any = None
+
+
+# --- MISAKA forks: Python helpers for JavaScript idioms the interactive mode uses ---
+
+
+def _spread_tool_result(raw: Any, isError: bool, durationMs: float | None = None) -> dict[str, Any]:
+    """MISAKA fork: ``{ ...event.result, isError, durationMs }`` for a tool result of either shape (a dataclass result
+    has no JavaScript spread)."""
+    return {
+        "content": list(read_field(raw, "content", []) or []),
+        "details": read_field(raw, "details"),
+        "isError": isError,
+        "durationMs": durationMs,
+    }
+
+
+def _set_field(target: Any, name: str, value: Any) -> None:
+    """MISAKA fork: ``target.name = value`` for a message that is a dict or an object."""
+    if isinstance(target, dict):
+        target[name] = value
+    else:
+        setattr(target, name, value)
+
+
+# JavaScript's `\s`: Python's differs at U+001C-U+001F and U+0085 (spaces there, not in JavaScript)
+# and at U+FEFF (the other way round).
+_JS_WHITESPACE = re.compile(f"[{re.escape(ECMASCRIPT_WHITESPACE)}]")
+
+
+def _coerce_bash_result(result: Any) -> BashResult:
+    """MISAKA fork: Python extensions answer `user_bash` with dicts; this reads one as a `BashResult`."""
+    if isinstance(result, BashResult):
+        return result
+
+    exitCode = read_field(result, "exitCode", read_field(result, "exit_code"))
+    try:
+        resolvedExitCode = int(exitCode) if exitCode is not None else None
+    except (TypeError, ValueError):
+        resolvedExitCode = None
+
+    fullOutputPath = read_field(result, "fullOutputPath", read_field(result, "full_output_path"))
+    return BashResult(
+        output=str(read_field(result, "output", "") or ""),
+        exitCode=resolvedExitCode,
+        cancelled=bool(read_field(result, "cancelled", False)),
+        truncated=bool(read_field(result, "truncated", False)),
+        fullOutputPath=str(fullOutputPath) if fullOutputPath is not None else None,
+    )
+
+
+def _make_bash_truncation_result(content: str) -> TruncationResult:
+    """MISAKA fork: upstream casts `{ truncated: true, content }` to a TruncationResult; Python builds a whole one."""
+    encoded = content.encode("utf-8")
+    lines = content.split("\n") if content else []
+    if content.endswith("\n") and lines:
+        lines.pop()
+    totalLines = len(lines)
+    totalBytes = len(encoded)
+    return TruncationResult(
+        content=content,
+        truncated=True,
+        truncatedBy="bytes",
+        totalLines=totalLines,
+        totalBytes=totalBytes,
+        outputLines=totalLines,
+        outputBytes=totalBytes,
+        lastLinePartial=False,
+        firstLineExceedsLimit=False,
+        maxLines=0,
+        maxBytes=0,
+    )
+
+
+def _register_abort_handler(signal_: Any, callback: Callable[[], None]) -> Callable[[], None]:
+    """MISAKA fork: ``signal.addEventListener("abort", callback, { once: true })`` for both of MISAKA's signal shapes
+    (pi-style signals with listeners and flag-style controllers with ``wait()``). Returns the remover."""
+    if signal_ is None:
+        return lambda: None
+
+    if signal_aborted(signal_):
+        callback()
+        return lambda: None
+
+    addListener = getattr(signal_, "addEventListener", None)
+    removeListener = getattr(signal_, "removeEventListener", None)
+    if callable(addListener):
+        addListener("abort", callback, {"once": True})
+
+        def removeEventListener() -> None:
+            if callable(removeListener):
+                removeListener("abort", callback)
+
+        return removeEventListener
+
+    wait = getattr(signal_, "wait", None)
+    if callable(wait):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return lambda: None
+
+        async def watchAbort() -> None:
+            await wait()
+            callback()
+
+        task = loop.create_task(watchAbort())
+
+        def cancel() -> None:
+            task.cancel()
+
+        return cancel
+
+    return lambda: None
+
+
+def _toLoaderIndicatorOptions(options: WorkingIndicatorOptions | None) -> LoaderIndicatorOptions | None:
+    """MISAKA fork: the extension API's `WorkingIndicatorOptions` (a TypedDict) as the TUI loader's options."""
+    if options is None:
+        return None
+    if isinstance(options, LoaderIndicatorOptions):
+        return options
+    return LoaderIndicatorOptions(frames=read_field(options, "frames"), intervalMs=read_field(options, "intervalMs"))
 
 
 @dataclass(slots=True)
 class DefaultFlagArgs:
-    """Parsed arguments of commands like ``/thinking --default high`` (pi 496185f6 parseDefaultFlagArgs)."""
+    """MISAKA fork: parsed arguments of `/thinking --default <level>` (from pi 496185f6, which no release carries;
+    MISAKA documents it)."""
+
     persist: bool = False
     searchTerm: str | None = None
     error: str | None = None
 
 
 def parse_default_flag_args(commandName: str, args: str | None) -> DefaultFlagArgs:
-    """Accept only ``--default``; any other ``--x`` option is an error. Pure, so testable."""
+    """Accept only ``--default``; any other ``--x`` option is an error."""
     tokens = (args or "").strip().split()
     persist = False
     rest: list[str] = []
@@ -241,225 +643,53 @@ def parse_default_flag_args(commandName: str, args: str | None) -> DefaultFlagAr
             if token == "--default":
                 persist = True
                 continue
-            return DefaultFlagArgs(
-                error=f'Unknown /{commandName} option "{token}". Supported option: --default.')
+            return DefaultFlagArgs(error=f'Unknown /{commandName} option "{token}". Supported option: --default.')
         rest = tokens[index:]
         break
     return DefaultFlagArgs(persist=persist, searchTerm=" ".join(rest) or None)
 
 
-def is_anthropic_subscription_auth_key(api_key: str | None) -> bool:
-    return isinstance(api_key, str) and api_key.startswith("sk-ant-oat")
-
-
-def isApiKeyLoginProvider(
-    providerId: str,
-    oauthProviderIds: frozenset[str] | set[str],
-    builtInProviderIds: frozenset[str] | set[str] = _BUILT_IN_MODEL_PROVIDERS,
-) -> bool:
-    if BUILT_IN_PROVIDER_DISPLAY_NAMES.get(providerId):
-        return True
-    if providerId in builtInProviderIds:
-        return False
-    return providerId not in oauthProviderIds
-
-
-def _spread_tool_result(raw: Any, is_error: bool) -> dict[str, Any]:
-    """pi interactive-mode.ts ``{ ...event.result, isError }`` for a result of either shape.
-
-    The agent loop hands the TUI an ``AgentToolResult`` -- a slotted dataclass -- and a
-    JavaScript spread has no Python spelling that accepts one: ``dict(result)`` raised
-    ``'AgentToolResult' object is not iterable`` on every tool call, and the notice went
-    to the screen as a bare error line. The three keys are the ones ``updateResult`` reads.
-    """
-    return {
-        "content": list(read_field(raw, "content", []) or []),
-        "details": read_field(raw, "details"),
-        "isError": is_error,
-    }
-
-
-def _is_unknown_model(model: Any) -> bool:
-    return (
-        model is not None
-        and read_field(model, "provider") == "unknown"
-        and read_field(model, "id") == "unknown"
-        and read_field(model, "api") == "unknown"
-    )
-
-
-async def _noop_async(*_args: Any, **_kwargs: Any) -> Any:
-    return None
-
-
-async def _cancelled_async_result(*_args: Any, **_kwargs: Any) -> dict[str, bool]:
-    return {"cancelled": True}
-
-
-def _callable_attr(obj: Any, name: str) -> Callable[..., Any] | None:
-    value = getattr(obj, name, None)
-    return value if callable(value) else None
-
-
-def _coerce_bash_result(result: Any) -> BashResult:
-    if isinstance(result, BashResult):
-        return result
-
-    exit_code = read_field(result, "exitCode", read_field(result, "exit_code"))
-    try:
-        resolved_exit_code = int(exit_code) if exit_code is not None else None
-    except (TypeError, ValueError):
-        resolved_exit_code = None
-
-    full_output_path = read_field(result, "fullOutputPath", read_field(result, "full_output_path"))
-    return BashResult(
-        output=str(read_field(result, "output", "") or ""),
-        exitCode=resolved_exit_code,
-        cancelled=bool(read_field(result, "cancelled", False)),
-        truncated=bool(read_field(result, "truncated", False)),
-        fullOutputPath=str(full_output_path) if full_output_path is not None else None,
-    )
-
-
-def _make_bash_truncation_result(content: str) -> TruncationResult:
-    encoded = content.encode("utf-8")
-    lines = content.split("\n") if content else []
-    if content.endswith("\n") and lines:
-        lines.pop()
-    total_lines = len(lines)
-    total_bytes = len(encoded)
-    return TruncationResult(
-        content=content,
-        truncated=True,
-        truncatedBy="bytes",
-        totalLines=total_lines,
-        totalBytes=total_bytes,
-        outputLines=total_lines,
-        outputBytes=total_bytes,
-        lastLinePartial=False,
-        firstLineExceedsLimit=False,
-        maxLines=0,
-        maxBytes=0,
-    )
-
-
-def _register_abort_handler(signal: Any, callback: Callable[[], None]) -> Callable[[], None]:
-    if signal is None:
-        return lambda: None
-
-    if signal_aborted(signal):
-        callback()
-        return lambda: None
-
-    add_listener = getattr(signal, "addEventListener", None)
-    remove_listener = getattr(signal, "removeEventListener", None)
-    if callable(add_listener):
-        add_listener("abort", callback, {"once": True})
-
-        def _remove_event_listener() -> None:
-            if callable(remove_listener):
-                remove_listener("abort", callback)
-
-        return _remove_event_listener
-
-    wait = getattr(signal, "wait", None)
-    if callable(wait):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return lambda: None
-
-        async def _watch_abort() -> None:
-            await wait()
-            callback()
-
-        task = loop.create_task(_watch_abort())
-
-        def _cancel_task() -> None:
-            task.cancel()
-
-        return _cancel_task
-
-    return lambda: None
-
-
-def _message_role(message: Any) -> str | None:
-    role = read_field(message, "role")
-    return role if isinstance(role, str) else None
-
-
-def _tool_definition(session: Any, name: str) -> Any | None:
-    getter = _callable_attr(session, "getToolDefinition")
-    return getter(name) if getter is not None else None
-
-
 class _ExtensionUIContext:
+    """MISAKA fork: the object ``createExtensionUIContext`` returns. Upstream builds an object literal with a ``theme``
+    getter; Python has no literal with a getter, so the members live on this class, in upstream order."""
+
     def __init__(self, mode: InteractiveMode) -> None:
         self._mode = mode
 
-    @property
-    def theme(self) -> interactive_theme.Theme:
-        return interactive_theme.theme
+    def select(self, title: str, options: list[str], opts: Any = None) -> Awaitable[str | None]:
+        return self._mode.showExtensionSelector(title, options, opts)
+
+    def confirm(self, title: str, message: str, opts: Any = None) -> Awaitable[bool]:
+        return self._mode.showExtensionConfirm(title, message, opts)
+
+    def input(self, title: str, placeholder: str | None = None, opts: Any = None) -> Awaitable[str | None]:
+        return self._mode.showExtensionInput(title, placeholder, opts)
 
     def notify(self, message: str, type: str | None = None) -> None:
         self._mode.showExtensionNotify(message, type)
 
-    async def select(
-        self,
-        title: str,
-        options: list[str],
-        opts: dict[str, Any] | None = None,
-    ) -> str | None:
-        return await self._mode.showExtensionSelector(title, options, opts)
-
-    async def confirm(
-        self,
-        title: str,
-        message: str,
-        opts: dict[str, Any] | None = None,
-    ) -> bool:
-        return await self._mode.showExtensionConfirm(title, message, opts)
-
-    async def input(
-        self,
-        title: str,
-        placeholder: str | None = None,
-        opts: dict[str, Any] | None = None,
-    ) -> str | None:
-        return await self._mode.showExtensionInput(title, placeholder, opts)
-
-    def onTerminalInput(self, handler: Any) -> Any:
+    def onTerminalInput(self, handler: Any) -> Callable[[], None]:
         return self._mode.addExtensionTerminalInputListener(handler)
-
-    def refresh(self) -> None:
-        """Request a redraw. Extensions call this after loading resources asynchronously so
-        lazily evaluated startup-screen sections update (ExtensionUI previously offered only
-        select/confirm/input/notify, with no way to trigger a redraw)."""
-        refresh_blocks = getattr(self._mode, "_refresh_expandables", None)
-        if callable(refresh_blocks):
-            refresh_blocks()          # Re-evaluate first, then redraw; otherwise the old snapshot is painted.
-        request = getattr(self._mode, "_request_render", None)
-        if callable(request):
-            request(True)
 
     def setStatus(self, key: str, text: str | None = None) -> None:
         self._mode.setExtensionStatus(key, text)
 
-    def setWorkingMessage(self, message: str | None) -> None:
+    def setWorkingMessage(self, message: str | None = None) -> None:
         self._mode.workingMessage = message
-        if self._mode.loadingAnimation is not None:
-            self._mode.loadingAnimation.setMessage(self._mode.getWorkingLoaderMessage())
+        indicator = self._mode.activeStatusIndicator
+        if indicator is not None and indicator.kind == "working":
+            indicator.setMessage(message if message is not None else self._mode.defaultWorkingMessage)
 
     def setWorkingVisible(self, visible: bool) -> None:
         self._mode.setWorkingVisible(visible)
 
-    def setWorkingIndicator(self, options: LoaderIndicatorOptions | None = None) -> None:
+    def setWorkingIndicator(self, options: WorkingIndicatorOptions | None = None) -> None:
         self._mode.setWorkingIndicator(options)
 
     def setHiddenThinkingLabel(self, label: str | None = None) -> None:
         self._mode.setHiddenThinkingLabel(label)
 
-    def setWidget(self, key: str, content: Any, options: dict[str, Any] | None = None) -> None:
+    def setWidget(self, key: str, content: Any, options: Any = None) -> None:
         self._mode.setExtensionWidget(key, content, options)
 
     def setFooter(self, factory: Any) -> None:
@@ -469,37 +699,22 @@ class _ExtensionUIContext:
         self._mode.setExtensionHeader(factory)
 
     def setTitle(self, title: str) -> None:
-        set_title = _callable_attr(getattr(self._mode.ui, "terminal", None), "setTitle")
-        if set_title is not None:
-            set_title(title)
+        self._mode.ui.terminal.setTitle(title)
 
-    async def custom(self, factory: Any, options: dict[str, Any] | None = None) -> Any:
-        return await self._mode.showExtensionCustom(factory, options)
+    def custom(self, factory: Any, options: Any = None) -> Awaitable[Any]:
+        return self._mode.showExtensionCustom(factory, options)
 
     def pasteToEditor(self, text: str) -> None:
-        editor = self._mode.editor
-        handle_input = _callable_attr(editor, "handleInput")
-        if handle_input is not None:
-            handle_input(f"\x1b[200~{text}\x1b[201~")
-            return
-        self.setEditorText(text)
+        self._mode.editor.handleInput(f"\x1b[200~{text}\x1b[201~")
 
     def setEditorText(self, text: str) -> None:
-        set_text = _callable_attr(self._mode.editor, "setText")
-        if set_text is not None:
-            set_text(text)
+        self._mode.editor.setText(text)
 
     def getEditorText(self) -> str:
-        expanded = _callable_attr(self._mode.editor, "getExpandedText")
-        if expanded is not None:
-            return str(expanded())
-        get_text = _callable_attr(self._mode.editor, "getText")
-        if get_text is not None:
-            return str(get_text())
-        return ""
+        return self._mode.getEditorExpandedText()
 
-    async def editor(self, title: str, prefill: str | None = None) -> str | None:
-        return await self._mode.showExtensionEditor(title, prefill)
+    def editor(self, title: str, prefill: str | None = None) -> Awaitable[str | None]:
+        return self._mode.showExtensionEditor(title, prefill)
 
     def addAutocompleteProvider(self, factory: Callable[[AutocompleteProvider], AutocompleteProvider]) -> None:
         self._mode.autocompleteProviderWrappers.append(factory)
@@ -511,979 +726,1912 @@ class _ExtensionUIContext:
     def getEditorComponent(self) -> Any:
         return self._mode.editorComponentFactory
 
+    @property
+    def theme(self) -> Theme:
+        return theme
+
     def getAllThemes(self) -> list[Any]:
-        return interactive_theme.get_available_themes_with_paths()
+        return getAvailableThemesWithPaths()
 
-    def getTheme(self, name: str | None = None) -> interactive_theme.Theme:
-        return interactive_theme.get_theme_by_name(name)
+    def getTheme(self, name: str) -> Theme | None:
+        return getThemeByName(name)
 
-    def setTheme(self, theme_or_name: str | interactive_theme.Theme) -> dict[str, Any]:
-        if isinstance(theme_or_name, interactive_theme.Theme):
-            interactive_theme.set_theme_instance(theme_or_name)
-            self._mode._request_render()
-            return {"success": True}
-
-        result = interactive_theme.set_theme(theme_or_name, True)
-        if bool(read_field(result, "success", False)):
-            current_theme = None
-            get_theme = _callable_attr(self._mode.settingsManager, "getTheme")
-            if get_theme is not None:
-                current_theme = get_theme()
-            if current_theme != theme_or_name:
-                set_theme = _callable_attr(self._mode.settingsManager, "setTheme")
-                if set_theme is not None:
-                    set_theme(theme_or_name)
-            self._mode._request_render()
+    def setTheme(self, themeOrName: str | Theme) -> Any:
+        if isinstance(themeOrName, Theme):
+            return self._mode.themeController.setThemeInstance(themeOrName)
+        result = self._mode.themeController.setThemeName(themeOrName)
+        if result["success"]:  # noqa: SIM102 - upstream nesting
+            if self._mode.settingsManager.getTheme() != themeOrName:
+                self._mode.settingsManager.setTheme(themeOrName)
         return result
 
     def getToolsExpanded(self) -> bool:
-        return bool(self._mode.toolOutputExpanded)
+        return self._mode.toolOutputExpanded
 
     def setToolsExpanded(self, expanded: bool) -> None:
         self._mode.setToolsExpanded(expanded)
 
 
-class InteractiveMode(Conversation):
+class InteractiveMode:
+    # Maximum total widget lines to prevent viewport overflow
     MAX_WIDGET_LINES = 10
 
-    def __init__(
-        self,
-        runtimeHost: Any | None = None,
-        options: InteractiveModeOptions | dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        runtime_host = runtimeHost if runtimeHost is not None else kwargs.pop("runtimeHost", None)
-        runtime_session = getattr(runtime_host, "session", None)
+    # Convenience accessors
+    @property
+    def session(self) -> Any:
+        return self.runtimeHost.session
 
-        if "session" not in kwargs and runtime_session is not None:
-            kwargs["session"] = runtime_session
-        if "sessionManager" not in kwargs and getattr(runtime_session, "sessionManager", None) is not None:
-            kwargs["sessionManager"] = runtime_session.sessionManager
-        if "settingsManager" not in kwargs and getattr(runtime_session, "settingsManager", None) is not None:
-            kwargs["settingsManager"] = runtime_session.settingsManager
+    @property
+    def agent(self) -> Any:
+        return self.session.agent
 
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+    @property
+    def sessionManager(self) -> Any:
+        return self.session.sessionManager
 
-        self.runtimeHost = runtime_host
-        self.options = (
-            options
-            if isinstance(options, InteractiveModeOptions)
-            else InteractiveModeOptions(**dict(options or {}))
+    @property
+    def settingsManager(self) -> Any:
+        return self.session.settingsManager
+
+    def __init__(self, runtimeHost: Any, options: InteractiveModeOptions | dict[str, Any] | None = None) -> None:
+        if options is None:
+            options = InteractiveModeOptions()
+        elif isinstance(options, dict):
+            # MISAKA fork: the engine passes the options as a dict.
+            options = InteractiveModeOptions(**options)
+
+        self.autocompleteProviderWrappers: list[Callable[[AutocompleteProvider], AutocompleteProvider]] = []
+        self.editorComponentFactory: Any = None
+        self.autocompleteProvider: AutocompleteProvider | None = None
+        self.fdPath: str | None = None
+        self.activeSelectorToken: object | None = None
+        self.activeSelectorDispose: Callable[[], None] | None = None
+        self.isInitialized = False
+        self.onInputCallback: Callable[[str], None] | None = None
+        self.pendingUserInputs: list[str] = []
+        self.activeStatusIndicator: StatusIndicator | None = None
+        self.activeWorkingIndicatorEmbedded = False
+        self.idleStatus = IdleStatus()
+        self.workingMessage: str | None = None
+        self.workingVisible = True
+        self.workingIndicatorOptions: WorkingIndicatorOptions | None = None
+        self.defaultWorkingMessage = "Working"
+        self.defaultHiddenThinkingLabel = "Thinking..."
+        self.hiddenThinkingLabel = self.defaultHiddenThinkingLabel
+
+        self.lastSigintTime: float = 0
+        self.lastEscapeTime: float = 0
+        self.anthropicSubscriptionWarningShown = False
+
+        # Status line tracking (for mutating immediately-sequential status updates)
+        self.lastStatusSpacer: Spacer | None = None
+        self.lastStatusText: ThemedText | None = None
+        self.lastStatusMessage = ""
+
+        # Streaming message tracking
+        self.streamingComponent: AssistantMessageComponent | None = None
+        self.entriesRenderedByBoundaryCompaction: set[str] = set()
+        self.streamingMessage: Any = None
+
+        # Tool execution tracking: toolCallId -> component
+        self.pendingTools: dict[str, ToolExecutionComponent] = {}
+
+        # Tool output expansion state
+        self.toolOutputExpanded = False
+
+        # Thinking block visibility state
+        self.hideThinkingBlock = False
+        self.outputPad = 1
+
+        # Agent subscription unsubscribe function
+        self.unsubscribe: Callable[[], None] | None = None
+        self.signalCleanupHandlers: list[Callable[[], None]] = []
+
+        # Track if editor is in bash mode (text starts with !)
+        self.isBashMode = False
+
+        # Track current bash execution component
+        self.bashComponent: BashExecutionComponent | None = None
+
+        # Track pending bash components (shown in pending area, moved to chat on submit)
+        self.pendingBashComponents: list[BashExecutionComponent] = []
+
+        # Auto-compaction state
+        self.autoCompactionEscapeHandler: Callable[[], None] | None = None
+
+        # Auto-retry state
+        self.retryEscapeHandler: Callable[[], None] | None = None
+
+        # Messages queued while compaction is running
+        self.compactionQueuedMessages: list[CompactionQueuedMessage] = []
+
+        # Shutdown state
+        self.shutdownRequested = False
+        self.isShuttingDown = False
+
+        # Reports working, blocked, done, and error states to terminals that support OSC 7501.
+        self.programStatus = ProgramStatusReporter(
+            lambda: self.ui.terminal,
+            lambda: self.sessionManager.getSessionName(),
         )
-        self.autoTrustOnReloadCwd = self.options.autoTrustOnReloadCwd
 
-        self.session = getattr(
-            self,
-            "session",
-            SimpleNamespace(
-                promptTemplates=[],
-                scopedModels=[],
-                autoCompactionEnabled=False,
-                isStreaming=False,
-                isCompacting=False,
-                extensionRunner=SimpleNamespace(
-                    get_registered_commands=list,
-                    get_entry_renderer=lambda _custom_type: None,
-                    get_markdown_transformers=list,
-                    get_message_renderer=lambda _custom_type: None,
-                ),
-                resourceLoader=SimpleNamespace(getThemes=lambda: {"themes": []}),
-                modelRegistry=SimpleNamespace(
-                    authStorage=SimpleNamespace(get=lambda *_args, **_kwargs: None),
-                    getApiKeyForProvider=_noop_async,
-                    getAvailable=list,
-                    isUsingOAuth=lambda _model: False,
-                    isUsingSubscription=lambda _model: False,
-                ),
-                state=SimpleNamespace(messages=[], model=None, thinkingLevel="off"),
-                subscribe=lambda _listener: (lambda: None),
-                bindExtensions=_noop_async,
-                prompt=_noop_async,
-                setModel=_noop_async,
-                cycleModel=_noop_async,
-                cycleThinkingLevel=lambda: None,
-                setThinkingLevel=lambda _level, _persist=False: None,
-                getAvailableThinkingLevels=lambda: ["off", "minimal", "low", "medium", "high"],
-                executeBash=_noop_async,
-                navigateTree=_cancelled_async_result,
-                abortBranchSummary=lambda: None,
-            ),
-        )
-        self.sessionManager = getattr(
-            self,
-            "sessionManager",
-            SimpleNamespace(
-                getCwd=lambda: os.getcwd(),
-                getLeafId=lambda: None,
-                getSessionFile=lambda: None,
-                getSessionDir=lambda: None,
-                getSessionName=lambda: None,
-                buildContextEntries=list,
-                buildSessionContext=lambda: SimpleNamespace(messages=[]),
-                getEntries=list,
-                getTree=list,
-                appendLabelChange=lambda _entry_id, _label: None,
-            ),
-        )
-        self.settingsManager = getattr(
-            self,
-            "settingsManager",
-            SimpleNamespace(
-                getTheme=lambda: None,
-                setTheme=lambda _theme: None,
-                getWarnings=dict,
-                getEnableSkillCommands=lambda: True,
-                getShowTerminalProgress=lambda: False,
-                getQuietStartup=lambda: False,
-                getCollapseChangelog=lambda: True,
-                getCodeBlockIndent=lambda: "  ",
-                getHideThinkingBlock=lambda: False,
-                getEditorPaddingX=lambda: 0,
-                getOutputPad=lambda: 1,
-                getAutocompleteMaxVisible=lambda: 5,
-                getClearOnShrink=lambda: False,
-                getShowHardwareCursor=lambda: False,
-                setHideThinkingBlock=lambda _hide: None,
-                setOutputPad=lambda _padding: None,
-            ),
-        )
-        # Unlike `session`/`ui`/`settingsManager`, `runtimeHost` was already assigned above
-        # (possibly None), so the `getattr` form this used to share with them never fired and
-        # the fallback was dead: `/new`, `/clear`, `/resume`, `/import`, `/fork` then died on
-        # `NoneType.newSession` inside `handleFatalRuntimeError` (showError + SystemExit).
-        if self.runtimeHost is None:
-            self.runtimeHost = SimpleNamespace(
-                importFromJsonl=_noop_async,
-                fork=_noop_async,
-                switchSession=_noop_async,
-                newSession=_noop_async,
-                dispose=_noop_async,
-                setBeforeSessionInvalidate=lambda *_args, **_kwargs: None,
-                setRebindSession=lambda *_args, **_kwargs: None,
-            )
-        setCapabilityOverrides(getattr(self.settingsManager, "getTerminalCapabilityOverrides", dict)())
-        if getattr(self, "ui", None) is None:
-            if runtime_session is not None:
-                self.ui = TUI(ProcessTerminal(), _safe_call_bool(self.settingsManager, "getShowHardwareCursor"))
-                self.ui.setClearOnShrink(_safe_call_bool(self.settingsManager, "getClearOnShrink"))
-            else:
-                self.ui = SimpleNamespace(
-                    requestRender=lambda *_args, **_kwargs: None,
-                    start=lambda: None,
-                    stop=lambda: None,
-                    addChild=lambda _component: None,
-                    removeChild=lambda _component: None,
-                    setFocus=lambda _component: None,
-                    showOverlay=lambda component, _options=None: SimpleNamespace(
-                        hide=lambda: None,
-                        focus=lambda: None,
-                        component=component,
-                    ),
-                    hideOverlay=lambda: None,
-                    invalidate=lambda: None,
-                    terminal=SimpleNamespace(
-                        setProgress=lambda *_args, **_kwargs: None,
-                        setTitle=lambda *_args, **_kwargs: None,
-                    ),
-                )
-        super().__init__(self.ui, self.settingsManager, self.sessionManager.getCwd())
-        self.defaultEditor = getattr(self, "defaultEditor", None)
-        self.editor = getattr(self, "editor", None)
-        self.keybindings = getattr(self, "keybindings", None)
-        if self.keybindings is None:
-            self.keybindings = KeybindingsManager.create() if runtime_session is not None else KeybindingsManager()
-        if self.defaultEditor is None:
-            if runtime_session is not None:
-                self.defaultEditor = CustomEditor(
-                    self.ui,
-                    interactive_theme.get_editor_theme(),
-                    self.keybindings,
-                    EditorOptions(
-                        paddingX=_safe_call_int(self.settingsManager, "getEditorPaddingX", 0),
-                        autocompleteMaxVisible=_safe_call_int(
-                            self.settingsManager, "getAutocompleteMaxVisible", 5
-                        ),
-                    ),
-                )
-            else:
-                self.defaultEditor = SimpleNamespace(
-                    onEscape=None,
-                    onCtrlD=None,
-                    onPasteImage=None,
-                    onExtensionShortcut=None,
-                    onChange=None,
-                    onSubmit=None,
-                    borderColor=lambda text: text,
-                    actionHandlers={},
-                    paddingX=0,
-                    autocompleteMaxVisible=5,
-                    addToHistory=lambda _text: None,
-                    setAutocompleteProvider=lambda _provider: None,
-                    setText=lambda _text: None,
-                    getText=lambda: "",
-                    getExpandedText=lambda: "",
-                    setPaddingX=lambda _padding: None,
-                    setAutocompleteMaxVisible=lambda _visible: None,
-                    onAction=lambda _action, _handler: None,
-                )
-        if self.editor is None:
-            self.editor = self.defaultEditor
-        if getattr(self.editorContainer, "children", None) == []:
-            add_child = _callable_attr(self.editorContainer, "addChild")
-            if add_child is not None:
-                add_child(self.editor)
+        self.installChangeWarningShown = False
 
-        self.footerDataProvider = getattr(self, "footerDataProvider", None)
-        if self.footerDataProvider is None:
-            self.footerDataProvider = FooterDataProvider(self.sessionManager.getCwd())
-        self.footer = getattr(self, "footer", None)
-        if self.footer is None:
-            self.footer = FooterComponent(self.session, self.footerDataProvider)
-        self.lastStatusSpacer = getattr(self, "lastStatusSpacer", None)
-        self.lastStatusText = getattr(self, "lastStatusText", None)
-        self.autocompleteProviderWrappers = list(getattr(self, "autocompleteProviderWrappers", []))
-        self.autocompleteProvider = getattr(self, "autocompleteProvider", None)
-        self.customFooter = getattr(self, "customFooter", None)
-        self.editorComponentFactory = getattr(self, "editorComponentFactory", None)
-        self.extensionSelector = getattr(self, "extensionSelector", None)
-        self.extensionInput = getattr(self, "extensionInput", None)
-        self.extensionEditor = getattr(self, "extensionEditor", None)
+        # Extension UI state
+        self.extensionSelector: ExtensionSelectorComponent | None = None
+        self.extensionInput: ExtensionInputComponent | None = None
+        self.extensionEditor: ExtensionEditorComponent | None = None
+        self.extensionTerminalInputSubscriptions: list[dict[str, Any]] = []
+
+        # Extension widgets (components rendered above/below the editor)
+        self.extensionWidgetsAbove: dict[str, Any] = {}
+        self.extensionWidgetsBelow: dict[str, Any] = {}
+
+        # Custom footer from extension (undefined = use built-in footer)
+        self.customFooter: Any = None
+
+        # Built-in header (logo + keybinding hints + changelog)
+        self.builtInHeader: Any = None
+
+        # Custom header from extension (undefined = use built-in header)
+        self.customHeader: Any = None
+
+        # MISAKA fork: extension dialogs run one at a time; a second waits for the first, a dialog opened from inside
+        # another is refused, and resetting the extension UI cancels the waiting one. Sisters, research and extension
+        # parts can all ask at once, and upstream's displacement would strand the displaced dialog's caller.
         self._extensionPromptLock = asyncio.Lock()
         self._extensionPromptOwner: object | None = None
         self._extensionPromptTask: asyncio.Task[Any] | None = None
         self._extensionPromptCancel: Callable[[], None] | None = None
         self._extensionPromptGeneration = 0
-        self._extensionPromptContext: contextvars.ContextVar[object | None] = (
-            contextvars.ContextVar(f"misaka_extension_prompt_{id(self)}", default=None)
+        self._extensionPromptContext: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+            f"misaka_extension_prompt_{id(self)}", default=None
         )
         self._extensionPromptContextToken: contextvars.Token[object | None] | None = None
-        self.loadingAnimation = getattr(self, "loadingAnimation", None)
-        self.autoCompactionEscapeHandler = getattr(self, "autoCompactionEscapeHandler", None)
-        self.autoCompactionLoader = getattr(self, "autoCompactionLoader", None)
-        self.branchSummaryLoader = getattr(self, "branchSummaryLoader", None)
-        self.extensionWidgetsAbove: dict[str, Any] = dict(getattr(self, "extensionWidgetsAbove", {}))
-        self.extensionWidgetsBelow: dict[str, Any] = dict(getattr(self, "extensionWidgetsBelow", {}))
-        self.extensionTerminalInputUnsubscribers: set[Callable[[], None]] = set(
-            getattr(self, "extensionTerminalInputUnsubscribers", set())
-        )
-        self.fdPath = getattr(self, "fdPath", None)
-        self.anthropicSubscriptionWarningShown = bool(
-            getattr(self, "anthropicSubscriptionWarningShown", False)
-        )
-        self.version = getattr(self, "version", VERSION)
-        self.isInitialized = bool(getattr(self, "isInitialized", False))
-        self.lastSigintTime = float(getattr(self, "lastSigintTime", 0))
-        self.onInputCallback = getattr(self, "onInputCallback", None)
-        self.defaultWorkingMessage = getattr(self, "defaultWorkingMessage", "Working...")
-        self.workingMessage = getattr(self, "workingMessage", None)
-        self.workingVisible = bool(getattr(self, "workingVisible", True))
-        self.workingIndicatorOptions = getattr(self, "workingIndicatorOptions", None)
-        self.compactionQueuedMessages = list(getattr(self, "compactionQueuedMessages", []))
-        self.deferredInputMessages = list(getattr(self, "deferredInputMessages", []))
-        self.pendingBashComponents = list(getattr(self, "pendingBashComponents", []))
-        self.bashComponent = getattr(self, "bashComponent", None)
-        self.streamingComponent = getattr(self, "streamingComponent", None)
-        self.streamingMessage = getattr(self, "streamingMessage", None)
-        self.retryEscapeHandler = getattr(self, "retryEscapeHandler", None)
-        self.retryCountdown = getattr(self, "retryCountdown", None)
-        self.retryLoader = getattr(self, "retryLoader", None)
-        self.isBashMode = bool(getattr(self, "isBashMode", False))
-        self.shutdownRequested = bool(getattr(self, "shutdownRequested", False))
-        self.isShuttingDown = bool(getattr(self, "isShuttingDown", False))
-        self.signalCleanupHandlers: list[Callable[[], None]] = list(
-            getattr(self, "signalCleanupHandlers", [])
-        )
+        # MISAKA fork: `run` returns the exit code through this future (the engine awaits it), and `void` promises are
+        # tasks held here until they finish (asyncio holds tasks weakly).
         self._shutdownFuture: asyncio.Future[int] | None = None
         self._pendingUserInputFuture: asyncio.Future[str] | None = None
         self._backgroundTasks: set[asyncio.Task[Any]] = set()
-        self._sessionUnsubscribe: Callable[[], None] | None = None
-        self._handleClearCount = 0
-        self.lastEscapeTime = float(getattr(self, "lastEscapeTime", 0))
 
-        if callable(_callable_attr(self.footer, "setAutoCompactEnabled")):
-            self.footer.setAutoCompactEnabled(bool(getattr(self.session, "autoCompactionEnabled", False)))
+        self.runtimeHost = runtimeHost
+        setCapabilityOverrides(self.settingsManager.getTerminalCapabilityOverrides())
+        self.options = options
+        self.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd
+        self.runtimeHost.setBeforeSessionInvalidate(lambda: self.resetExtensionUI())
 
-        if runtime_host is not None:
-            before_invalidate = _callable_attr(runtime_host, "setBeforeSessionInvalidate")
-            if before_invalidate is not None:
-                before_invalidate(lambda: self.resetExtensionUI())
-            set_rebind = _callable_attr(runtime_host, "setRebindSession")
-            if set_rebind is not None:
-                set_rebind(self.rebindCurrentSession)
+        async def rebindSession(_session: Any = None) -> None:
+            await self.rebindCurrentSession({"renderBeforeBind": True})
+            self.themeController.applyFromSettings()
 
-    def _refresh_expandables(self) -> None:
-        containers = (getattr(self.chatContainer, "children", None) or [],
-                      getattr(getattr(self, "headerContainer", None), "children", None) or [])
-        for child in [c for kids in containers for c in kids]:
-            refresh = getattr(child, "refreshText", None)
-            if callable(refresh):
-                try:
-                    refresh()
-                except Exception:  # noqa: BLE001, S110 - one broken block must not block the redraw
-                    pass
+        # MISAKA fork: the runtime passes the new session; the bound accessors read it from the runtime anyway.
+        self.runtimeHost.setRebindSession(rebindSession)
+        self.version = VERSION
+        # MISAKA fork (D1): the main-screen renderer only, so no renderer reference is needed.
+        self.ui = createInteractiveTui(
+            InteractiveTuiOptions(
+                showHardwareCursor=self.settingsManager.getShowHardwareCursor(),
+                logDirectory=get_agent_dir(),
+                terminal=options.terminal,
+            )
+        )
+        self.ui.setClearOnShrink(self.settingsManager.getClearOnShrink())
+        self.headerContainer = Container()
+        self.loadedResourcesContainer = Container()
+        self.chatContainer = Container()
+        self.documentContainer = Container()
+        self.documentContainer.addChild(self.headerContainer)
+        self.documentContainer.addChild(self.loadedResourcesContainer)
+        self.documentContainer.addChild(self.chatContainer)
+        self.pendingMessagesContainer = Container()
+        self.statusContainer = Container()
+        self.widgetContainerAbove = Container()
+        self.widgetContainerBelow = Container()
+        self.keybindings = KeybindingsManager.create()
+        setKeybindings(self.keybindings)
+        editorPaddingX = self.settingsManager.getEditorPaddingX()
+        autocompleteMaxVisible = self.settingsManager.getAutocompleteMaxVisible()
+        self.defaultEditor = CustomEditor(
+            self.ui,
+            getEditorTheme(),
+            self.keybindings,
+            CustomEditorOptions(
+                paddingX=editorPaddingX,
+                autocompleteMaxVisible=autocompleteMaxVisible,
+                embedWorkingStatus=True,
+            ),
+        )
+        self.editor: Any = self.defaultEditor
+        self.editorContainer = Container()
+        self.editorContainer.addChild(self.editor)
+        self.footerDataProvider = FooterDataProvider(self.sessionManager.getCwd())
+        self.footer = FooterComponent(self.session, self.footerDataProvider)
+        self.footer.setAutoCompactEnabled(self.session.autoCompactionEnabled)
+        self.footerContainer = Container()
+        self.footerContainer.addChild(self.footer)
 
-    def prefixAutocompleteDescription(self, description: str | None, source_info: Any = None) -> str | None:
-        source_path = read_field(source_info, "path")
-        if description and source_path:
-            return f"{description} [{source_path}]"
-        return description or source_path
+        # Load hide thinking block setting
+        self.hideThinkingBlock = self.settingsManager.getHideThinkingBlock()
+        self.outputPad = self.settingsManager.getOutputPad()
+
+        # Register themes from resource loader and initialize
+        setRegisteredThemes(read_field(self.session.resourceLoader.getThemes(), "themes", []))
+        self.themeController = InteractiveThemeController(
+            self.ui,
+            getSettingsManager=lambda: self.settingsManager,
+            showError=lambda message: self.showError(message),
+            onChanged=lambda: self.updateEditorBorderColor(),
+            initialThemeSetting=options.initialThemeSetting,
+        )
+
+    def getAutocompleteSourceTag(self, sourceInfo: Any = None) -> str | None:
+        # Built-in extension commands are untagged, like built-in commands.
+        if not sourceInfo or read_field(sourceInfo, "source") == "builtin":
+            return None
+
+        scope = read_field(sourceInfo, "scope")
+        scopePrefix = "u" if scope == "user" else "p" if scope == "project" else "t"
+        source = jsTrim(str(read_field(sourceInfo, "source", "")))
+
+        if source == "auto" or source == "local" or source == "cli":
+            return scopePrefix
+
+        # MISAKA fork: MISAKA has no package sources (npm:/git:), so every other source is tagged by its scope.
+        return scopePrefix
+
+    def prefixAutocompleteDescription(self, description: str | None, sourceInfo: Any = None) -> str | None:
+        sourceTag = self.getAutocompleteSourceTag(sourceInfo)
+        if not sourceTag:
+            return description
+        return f"[{sourceTag}] {description}" if description else f"[{sourceTag}]"
+
+    def getBuiltInCommandConflictDiagnostics(self, extensionRunner: Any) -> list[dict[str, Any]]:
+        builtinNames = {command.name for command in BUILTIN_SLASH_COMMANDS}
+        return [
+            {
+                "type": "warning",
+                "message": (
+                    f"Extension command '/{command.name}' conflicts with built-in interactive command. Skipping in "
+                    "autocomplete."
+                    if command.invocationName == command.name
+                    else f"Extension command '/{command.name}' conflicts with built-in interactive command. Available "
+                    f"as '/{command.invocationName}'."
+                ),
+                "path": read_field(command.sourceInfo, "path"),
+            }
+            for command in extensionRunner.getRegisteredCommands()
+            if command.name in builtinNames
+        ]
 
     def createBaseAutocompleteProvider(self) -> AutocompleteProvider:
-        builtin_commands = [
-            SlashCommand(
-                name=command.name,
-                description=command.description,
-                argumentHint=command.argumentHint,
-            )
+        # Define commands for autocomplete
+        slashCommands = [
+            SlashCommand(name=command.name, description=command.description, argumentHint=command.argumentHint)
             for command in BUILTIN_SLASH_COMMANDS
         ]
-        builtin_commands.extend(
-            SlashCommand(
-                name=command.name,
-                description=command.description,
-                argumentHint=command.argumentHint,
-            )
+        # MISAKA fork: MISAKA's own commands (`/clear`, `/board`).
+        slashCommands.extend(
+            SlashCommand(name=command.name, description=command.description, argumentHint=command.argumentHint)
             for command in _LOCAL_ALIAS_SLASH_COMMANDS
         )
-        model_command = next((command for command in builtin_commands if command.name == "model"), None)
-        if model_command is not None:
-            model_command.getArgumentCompletions = lambda prefix: _model_argument_completions(
-                self.session,
-                prefix,
-            )
 
-        commands = list(builtin_commands)
-        seen_names = {command.name for command in commands}
-        get_slash_commands = _callable_attr(self.session, "getSlashCommands") or _callable_attr(
-            self.session, "getCommands"
-        )
-        if get_slash_commands is not None:
-            for command_info in get_slash_commands() or []:
-                command_name = str(read_field(command_info, "name", "")).strip()
-                if not command_name or command_name in seen_names:
-                    continue
-                seen_names.add(command_name)
-                commands.append(
-                    SlashCommand(
-                        name=command_name,
-                        description=self.prefixAutocompleteDescription(
-                            read_field(command_info, "description"),
-                            read_field(command_info, "sourceInfo"),
-                        ),
-                    )
+        modelCommand = next((command for command in slashCommands if command.name == "model"), None)
+        if modelCommand:
+
+            def modelCompletions(prefix: str) -> list[AutocompleteItem] | None:
+                models = (
+                    [read_field(scoped, "model") for scoped in self.session.scopedModels]
+                    if len(self.session.scopedModels) > 0
+                    else self.session.modelRuntime.getAvailableSnapshot()
                 )
 
-        cwd = str(self.sessionManager.getCwd())
-        return CombinedAutocompleteProvider(commands, cwd, self.fdPath)
+                if len(models) == 0:
+                    return None
+
+                # Create items with provider/id format
+                items = [
+                    ModelSearchItem(id=m.id, provider=m.provider, name=getattr(m, "name", None)) for m in models
+                ]
+
+                return createFuzzyAutocompleteItems(
+                    items,
+                    prefix,
+                    getModelSearchText,
+                    lambda item: AutocompleteItem(
+                        value=f"{item.provider}/{item.id}", label=item.id, description=item.provider
+                    ),
+                )
+
+            modelCommand.getArgumentCompletions = modelCompletions  # type: ignore[assignment]
+
+        thinkingCommand = next((command for command in slashCommands if command.name == "thinking"), None)
+        if thinkingCommand:
+
+            def thinkingCompletions(prefix: str) -> list[AutocompleteItem] | None:
+                return createFuzzyAutocompleteItems(
+                    list(self.session.getAvailableThinkingLevels()),
+                    prefix,
+                    lambda level: level,
+                    lambda level: AutocompleteItem(value=level, label=level),
+                )
+
+            thinkingCommand.getArgumentCompletions = thinkingCompletions  # type: ignore[assignment]
+
+        loginCommand = next((command for command in slashCommands if command.name == "login"), None)
+        if loginCommand:
+
+            def loginCompletions(prefix: str) -> list[AutocompleteItem] | None:
+                providers = getLoginProviderCompletionOptions(self.getLoginProviderOptions())
+                return createFuzzyAutocompleteItems(
+                    providers,
+                    prefix,
+                    getLoginProviderSearchText,
+                    lambda provider: AutocompleteItem(
+                        value=provider.id,
+                        label=provider.id,
+                        description=formatLoginProviderCompletionDescription(provider),
+                    ),
+                )
+
+            loginCommand.getArgumentCompletions = loginCompletions  # type: ignore[assignment]
+
+        # Convert prompt templates to SlashCommand format for autocomplete
+        templateCommands = [
+            SlashCommand(
+                name=cmd.name,
+                description=self.prefixAutocompleteDescription(cmd.description, cmd.sourceInfo),
+                argumentHint=cmd.argumentHint,
+            )
+            for cmd in self.session.promptTemplates
+        ]
+
+        # Convert extension commands to SlashCommand format
+        builtinCommandNames = {c.name for c in slashCommands}
+        extensionCommands = [
+            SlashCommand(
+                name=cmd.invocationName,
+                description=self.prefixAutocompleteDescription(cmd.description, cmd.sourceInfo),
+                getArgumentCompletions=cmd.getArgumentCompletions,  # type: ignore[arg-type]
+            )
+            for cmd in self.session.extensionRunner.getRegisteredCommands()
+            if cmd.name not in builtinCommandNames
+        ]
+
+        # MISAKA fork: skills are MISAKA core commands (the parts' moments), not pi's `skill:` commands; they and the
+        # other core commands follow the extension commands.
+        knownNames = {command.name for command in [*slashCommands, *templateCommands, *extensionCommands]}
+        coreCommandList = [
+            SlashCommand(
+                name=command.name,
+                description=self.prefixAutocompleteDescription(command.description, None),
+            )
+            for command in self.session.moments.commands()
+            if command.name not in knownNames
+        ]
+
+        return CombinedAutocompleteProvider(
+            [*slashCommands, *templateCommands, *extensionCommands, *coreCommandList],
+            self.sessionManager.getCwd(),
+            self.fdPath,
+        )
 
     def setupAutocompleteProvider(self) -> None:
         provider = self.createBaseAutocompleteProvider()
-        for wrap_provider in self.autocompleteProviderWrappers:
-            provider = wrap_provider(provider)
+        triggerCharacters: list[str] = []
+        for wrapProvider in self.autocompleteProviderWrappers:
+            provider = wrapProvider(provider)
+            triggerCharacters.extend(getattr(provider, "triggerCharacters", None) or [])
+        if len(triggerCharacters) > 0:
+            provider.triggerCharacters = list(dict.fromkeys(triggerCharacters))  # type: ignore[attr-defined]
 
         self.autocompleteProvider = provider
-        set_default = _callable_attr(self.defaultEditor, "setAutocompleteProvider")
-        if set_default is not None:
-            set_default(provider)
+        self.defaultEditor.setAutocompleteProvider(provider)
         if self.editor is not self.defaultEditor:
-            set_current = _callable_attr(self.editor, "setAutocompleteProvider")
-            if set_current is not None:
-                set_current(provider)
+            setAutocompleteProvider = getattr(self.editor, "setAutocompleteProvider", None)
+            if setAutocompleteProvider is not None:
+                setAutocompleteProvider(provider)
 
+    # MISAKA fork: no `showStartupNoticesIfNeeded`: it shows only the changelog ("What's New"), which MISAKA does not
+    # ship.
 
-    def createExtensionUIContext(self) -> _ExtensionUIContext:
-        return _ExtensionUIContext(self)
+    def mountInteractiveTui(self, tui: Any, components: list[Any]) -> None:
+        for component in components:
+            tui.addChild(component)
 
-    def createProjectTrustContext(self, cwd: str) -> dict[str, Any]:
-        return {"cwd": cwd, "mode": "tui", "hasUI": True, "ui": self.createExtensionUIContext()}
+    def stopInteractiveTui(self) -> None:
+        # MISAKA fork (D1): the fullscreen exit output and `preserveScreen` belong to the fullscreen renderer.
+        self.ui.stop()
 
-    def showStatus(self, message: str) -> None:
-        children = getattr(self.chatContainer, "children", [])
-        last = children[-1] if len(children) > 0 else None
-        second_last = children[-2] if len(children) > 1 else None
+    # MISAKA fork (D1): no `switchTuiMode`.
 
-        if last is self.lastStatusText and second_last is self.lastStatusSpacer and last is not None:
-            set_text = _callable_attr(last, "setText")
-            if set_text is not None:
-                set_text(interactive_theme.theme.fg("dim", message))
-            self._request_render()
+    async def init(self) -> None:
+        if self.isInitialized:
             return
 
-        spacer = Spacer(1)
-        text = Text(interactive_theme.theme.fg("dim", message), 1, 0)
-        self.chatContainer.addChild(spacer)
-        self.chatContainer.addChild(text)
-        self.lastStatusSpacer = spacer
-        self.lastStatusText = text
-        self._request_render()
+        self.registerSignalHandlers()
 
-    def _append_notice(
-        self,
-        message: str,
-        color: str,
-        prefix: str,
-        trailing_spacer: bool = False,
-        padding: int = 1,
-    ) -> None:
-        self.chatContainer.addChild(Spacer(1))
-        self.chatContainer.addChild(
-            Text(interactive_theme.theme.fg(color, f"{prefix}: {message}"), padding, 0)
-        )
-        if trailing_spacer:
-            self.chatContainer.addChild(Spacer(1))
-        self._request_render()
+        # MISAKA fork: no changelog is loaded (MISAKA ships none).
 
-    def showError(self, message: str) -> None:
-        self._append_notice(
-            message,
-            "error",
-            "Error",
-            trailing_spacer=True,
-            padding=self.outputPad,
-        )
-
-    def showWarning(self, message: str) -> None:
-        self._append_notice(message, "warning", "Warning")
-
-
-    def getAllQueuedMessages(self) -> dict[str, list[str]]:
-        get_steering = _callable_attr(self.session, "getSteeringMessages")
-        get_follow_up = _callable_attr(self.session, "getFollowUpMessages")
-        steering = list(get_steering() or []) if get_steering is not None else []
-        follow_up = list(get_follow_up() or []) if get_follow_up is not None else []
-        return {
-            "steering": [
-                *steering,
-                *[
-                    str(read_field(message, "text", ""))
-                    for message in self.compactionQueuedMessages
-                    if read_field(message, "mode") == "steer"
-                ],
-            ],
-            "followUp": [
-                *follow_up,
-                *[
-                    str(read_field(message, "text", ""))
-                    for message in self.compactionQueuedMessages
-                    if read_field(message, "mode") == "followUp"
-                ],
-                # Held for an unarmed input loop: they go out as their own turn once it re-arms.
-                *[str(message) for message in self.deferredInputMessages],
-            ],
-        }
-
-    def clearAllQueues(self) -> dict[str, list[str]]:
-        clear_queue = _callable_attr(self.session, "clearQueue")
-        cleared = clear_queue() if clear_queue is not None else {}
-        steering = list(read_field(cleared, "steering", []) or [])
-        follow_up = list(read_field(cleared, "followUp", []) or [])
-        compaction_steering = [
-            str(read_field(message, "text", ""))
-            for message in self.compactionQueuedMessages
-            if read_field(message, "mode") == "steer"
-        ]
-        compaction_follow_up = [
-            str(read_field(message, "text", ""))
-            for message in self.compactionQueuedMessages
-            if read_field(message, "mode") == "followUp"
-        ]
-        deferred = [str(message) for message in self.deferredInputMessages]
-        self.compactionQueuedMessages = []
-        self.deferredInputMessages = []
-        return {
-            "steering": [*steering, *compaction_steering],
-            "followUp": [*follow_up, *compaction_follow_up, *deferred],
-        }
-
-    def getAppKeyDisplay(self, action: str) -> str:
-        return key_display_text(action)
-
-    def updatePendingMessagesDisplay(self) -> None:
-        clear = _callable_attr(self.pendingMessagesContainer, "clear")
-        if clear is not None:
-            clear()
-        queued = self.getAllQueuedMessages()
-        steering_messages = list(queued.get("steering", []))
-        follow_up_messages = list(queued.get("followUp", []))
-        if not steering_messages and not follow_up_messages:
-            return
-
-        add_child = _callable_attr(self.pendingMessagesContainer, "addChild")
-        if add_child is None:
-            return
-
-        add_child(Spacer(1))
-        for message in steering_messages:
-            add_child(TruncatedText(interactive_theme.theme.fg("dim", f"Steering: {message}"), 1, 0))
-        for message in follow_up_messages:
-            add_child(TruncatedText(interactive_theme.theme.fg("dim", f"Follow-up: {message}"), 1, 0))
-        dequeue_hint = self.getAppKeyDisplay("app.message.dequeue")
-        add_child(
-            TruncatedText(interactive_theme.theme.fg("dim", f"↳ {dequeue_hint} to edit all queued messages"), 1, 0)
-        )
-
-    def restoreQueuedMessagesToEditor(self, options: dict[str, Any] | None = None) -> int:
-        cleared = self.clearAllQueues()
-        all_queued = [*list(cleared.get("steering", [])), *list(cleared.get("followUp", []))]
-        if not all_queued:
-            self.updatePendingMessagesDisplay()
-            if bool(read_field(options, "abort", False)):
-                abort = _callable_attr(getattr(self.session, "agent", None), "abort")
-                if abort is not None:
-                    abort()
-            return 0
-
-        queued_text = "\n\n".join(all_queued)
-        current_text = read_field(options, "currentText")
-        if current_text is None:
-            get_text = _callable_attr(self.editor, "getText")
-            current_text = str(get_text() or "") if get_text is not None else ""
-        combined_text = "\n\n".join(part for part in (queued_text, str(current_text)) if str(part).strip())
-        self._set_editor_text(combined_text)
-        self.updatePendingMessagesDisplay()
-        if bool(read_field(options, "abort", False)):
-            abort = _callable_attr(getattr(self.session, "agent", None), "abort")
-            if abort is not None:
-                abort()
-        return len(all_queued)
-
-    def queueCompactionMessage(self, text: str, mode: str) -> None:
-        self.compactionQueuedMessages.append({"text": text, "mode": mode})
-        add_history = _callable_attr(self.editor, "addToHistory")
-        if add_history is not None:
-            add_history(text)
-        self._set_editor_text("")
-        self.updatePendingMessagesDisplay()
-        self.showStatus("Queued message for after compaction")
-
-    def queueDeferredInputMessage(self, text: str) -> None:
-        """Hold text submitted while the input loop is not waiting for it.
-
-        The loop arms onInputCallback only inside getUserInput(), and it stays inside
-        session.prompt() for the whole auto-retry countdown -- where isStreaming is already
-        False, so neither busy branch catches the text. Dropping it left the user with a
-        cleared editor and nothing sent; getUserInput() delivers this queue instead.
-        """
-        self.deferredInputMessages.append(text)
-        add_history = _callable_attr(self.editor, "addToHistory")
-        if add_history is not None:
-            add_history(text)
-        self._set_editor_text("")
-        self.updatePendingMessagesDisplay()
-        self.showStatus("Queued message for after the current turn")
-        self._request_render()
-
-    def isExtensionCommand(self, text: str) -> bool:
-        if not text.startswith("/"):
-            return False
-        if self.isCorePromptCommand(text):
-            return False
-        extension_runner = getattr(self.session, "extensionRunner", None)
-        get_command = _callable_attr(extension_runner, "getCommand") or _callable_attr(extension_runner, "get_command")
-        if get_command is None:
-            return False
-        space_index = text.find(" ")
-        command_name = text[1:] if space_index == -1 else text[1:space_index]
-        if get_command(command_name):
-            return True
-        moments = getattr(self.session, "moments", None)  # MISAKA fork: a part's command runs the same way
-        return moments is not None and moments.command(command_name) is not None
-
-    def isCorePromptCommand(self, text: str) -> bool:
-        get_command = _callable_attr(self.session, "getCorePromptCommand")
-        return get_command is not None and get_command(text) is not None
-
-    def isPromptTemplate(self, text: str) -> bool:
-        """Whether this names a prompt template, which the menu offers and prompt() expands."""
-        invocation = parse_prompt_template_invocation(text)
-        if invocation is None:
-            return False
-        name, _args = invocation
-        return any(str(t.name) == name for t in getattr(self.session, "promptTemplates", []) or [])
-
-    async def flushCompactionQueue(self, options: dict[str, Any] | None = None) -> None:
-        if not self.compactionQueuedMessages:
-            return
-
-        queued_messages = list(self.compactionQueuedMessages)
-        pending = list(queued_messages)
-        self.compactionQueuedMessages = []
-        self.updatePendingMessagesDisplay()
-        restored = False
-        task: asyncio.Task[Any] | None = None
-
-        def accepted(message: Any) -> None:
-            pending[:] = [item for item in pending if item is not message]
-            if restored:
-                self.compactionQueuedMessages = [item for item in self.compactionQueuedMessages if item is not message]
-                self.updatePendingMessagesDisplay()
-
-        def restore_queue(error: Exception | str) -> None:
-            nonlocal restored
-            if restored:
-                return
-            restored = True
-            # Never clear already accepted steer/follow-up messages, or retry a
-            # prompt which has reached its preflight acceptance point.
-            self.compactionQueuedMessages = [*pending, *self.compactionQueuedMessages]
-            self.updatePendingMessagesDisplay()
-            error_message = error if isinstance(error, str) else str(error)
-            suffix = "s" if len(pending) != 1 else ""
-            self.showError(f"Failed to send queued message{suffix}: {error_message}")
-
-        async def dispatch_message(message: Any, *, force_queue: bool = False) -> None:
-            if restored:
-                return
-            text = str(read_field(message, "text", ""))
-            if self.isExtensionCommand(text):
-                await self.session.prompt(text)
-            elif self.isCorePromptCommand(text) or (
-                not force_queue and not bool(getattr(self.session, "isStreaming", False))
-            ):
-                # Skill preparation can outlast even a compaction retry. prompt()
-                # rechecks whether to queue or start after preparation finishes.
-                await self.session.prompt(text, {
-                    "streamingBehavior": read_field(message, "mode"),
-                    "preflightResult": lambda _disposition: accepted(message),
-                })
-            elif read_field(message, "mode") == "followUp":
-                await self.session.followUp(text)
-            else:
-                await self.session.steer(text)
-            accepted(message)
-
-        try:
-            if bool(read_field(options, "willRetry", False)):
-                for message in queued_messages:
-                    await dispatch_message(message, force_queue=True)
-                self.updatePendingMessagesDisplay()
-                return
-
-            first_prompt_index = next(
-                (index for index, message in enumerate(queued_messages) if not self.isExtensionCommand(str(read_field(message, "text", "")))),
-                -1,
+        if len(self.session.scopedModels) > 0 and self.shouldShowStartupDetails():
+            modelList = ", ".join(
+                f"{sm.model.id}{f':{sm.thinkingLevel}' if sm.thinkingLevel else ''}" for sm in self.session.scopedModels
             )
-            if first_prompt_index == -1:
-                for message in queued_messages:
-                    await dispatch_message(message)
-                return
-
-            for message in queued_messages[:first_prompt_index]:
-                await dispatch_message(message)
-
-            first_prompt = queued_messages[first_prompt_index]
-            preflight = asyncio.get_running_loop().create_future()
-
-            def report_preflight(success: bool) -> None:
-                if success:
-                    accepted(first_prompt)
-                if not preflight.done():
-                    preflight.set_result(success)
-
-            def on_disposition(_disposition: str) -> None:
-                # prompt() calls this only for an accepted prompt.
-                report_preflight(True)
-
-            task = asyncio.Task(
-                self.session.prompt(str(read_field(first_prompt, "text", "")), {
-                    "streamingBehavior": read_field(first_prompt, "mode"),
-                    "preflightResult": on_disposition,
-                }),
-                loop=asyncio.get_running_loop(),
-                eager_start=True,
+            cycleKeys = self.keybindings.getKeys("app.model.cycleForward")
+            cycleHint = (
+                theme.fg("muted", f" ({formatKeyText('/'.join(cycleKeys), KeyTextFormatOptions(capitalize=True))} to cycle)")
+                if len(cycleKeys) > 0
+                else ""
             )
-            self._backgroundTasks.add(task)
+            print(theme.fg("dim", f"Model scope: {modelList}{cycleHint}"))
 
-            def finish_prompt(prompt_task: asyncio.Task[Any]) -> None:
-                self._backgroundTasks.discard(prompt_task)
-                try:
-                    prompt_task.result()
-                except asyncio.CancelledError:
-                    if any(item is first_prompt for item in pending):
-                        restore_queue("Queued prompt cancelled before submission")
-                except Exception as error:  # noqa: BLE001
-                    restore_queue(error)
+        # Keep one component tree and remount it when changing renderers.
+        self.renderWidgets()  # Initialize with default spacer
+        # MISAKA fork (D1): no fullscreen chat viewport.
+        self.mountInteractiveTui(
+            self.ui,
+            [
+                self.documentContainer,
+                self.pendingMessagesContainer,
+                self.statusContainer,
+                self.widgetContainerAbove,
+                self.editorContainer,
+                self.widgetContainerBelow,
+                self.footerContainer,
+            ],
+        )
+        # Accept text while startup completes, but only enable interrupt, exit, and submission feedback.
+        self.defaultEditor.onAction("app.clear", lambda: self.handleCtrlC())
+        self.defaultEditor.onCtrlD = lambda: self.handleCtrlD()
+        self.defaultEditor.onSubmit = lambda text: self.handleStartupSubmit(text)
+        self.ui.setFocus(self.editor)
+
+        # MISAKA fork: the header title's agent part follows the terminal background (light or dark), from the
+        # terminal's OSC 11 answer and its mode-2031 light/dark notifications, and is redrawn when that changes.
+        self._terminalBgIsLight = False
+        self.ui.setTerminalColorSchemeNotifications(True)
+
+        def applyBackgroundLightness(isLight: bool) -> None:
+            if self._terminalBgIsLight == isLight:
+                return
+            self._terminalBgIsLight = isLight
+            if self.builtInHeader is not None:
+                self.builtInHeader.invalidate()
+            self.ui.requestRender(True)
+
+        self.ui.onTerminalColorSchemeChange(lambda scheme: applyBackgroundLightness(scheme == "light"))
+
+        # Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+        self.ui.start()
+        self.isInitialized = True
+        self.programStatus.report()
+        self.ensurePngTranscoder()
+
+        self.themeController.applyFromSettings()
+
+        async def probeTerminalBackground() -> None:
+            try:
+                rgb = await self.ui.queryTerminalBackgroundColor(timeoutMs=1000)
+            except Exception:  # noqa: BLE001 - no background colour answer within the timeout
+                return
+            if rgb is None:
+                return
+            from misaka.ui.tui.terminal_colors import getThemeForRgbColor
+
+            applyBackgroundLightness(getThemeForRgbColor(rgb) == "light")
+
+        self._schedule_task(probeTerminalBackground())
+
+        # Add header with keybindings from config (unless silenced)
+        if self.shouldShowStartupHeader():
+            showDetails = self.shouldShowStartupDetails()
+            # MISAKA fork: MISAKA's title in place of the Pi logo. `MISAKA_APP_TITLE` ("MISAKA · <agent>") overrides
+            # only the displayed title; the brand keeps the accent colour and the agent part takes `appTitleOnLight`
+            # on light terminals and `appTitle` otherwise.
+            titleText = os.environ.get("MISAKA_APP_TITLE") or APP_NAME
+
+            def withLogo(hints: str) -> str:
+                agentSlot: Any = "appTitleOnLight" if self._terminalBgIsLight else "appTitle"
+                if " · " in titleText:
+                    brand, agent = titleText.split(" · ", 1)
+                    title = theme.fg("accent", brand + " · ") + theme.fg(agentSlot, agent)
                 else:
-                    report_preflight(True)
-                finally:
-                    if not preflight.done():
-                        preflight.set_result(False)
+                    title = theme.fg("accent", titleText)
+                return f"{theme.bold(title)}{theme.fg('dim', f' v{self.version}')}\n{hints}"
 
-            task.add_done_callback(finish_prompt)
-            # Do not dispatch later messages while the first is still preparing:
-            # otherwise its failure could restore messages already sent by them.
-            if not await asyncio.shield(preflight):
-                return
-            for message in queued_messages[first_prompt_index + 1:]:
-                await dispatch_message(message)
-            self.updatePendingMessagesDisplay()
-        except asyncio.CancelledError:
-            if task is not None and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            restore_queue("Queued submission cancelled")
-            raise
-        except Exception as error:  # noqa: BLE001
-            restore_queue(error)
+            # Build startup instructions using keybinding hint helpers
+            def hint(keybinding: str, description: str) -> str:
+                return keyHint(keybinding, description)
 
-    def flushPendingBashComponents(self) -> None:
-        remove_child = _callable_attr(self.pendingMessagesContainer, "removeChild")
-        add_child = _callable_attr(self.chatContainer, "addChild")
-        if add_child is None:
-            return
-        for component in self.pendingBashComponents:
-            if remove_child is not None:
-                remove_child(component)
-            add_child(component)
-        self.pendingBashComponents = []
+            def expandedInstructions() -> str:
+                return "\n".join(
+                    [
+                        hint("app.interrupt", "to interrupt"),
+                        hint("app.clear", "to clear"),
+                        rawKeyHint(f"{keyText('app.clear')} twice", "to exit"),
+                        hint("app.exit", "to exit (empty)"),
+                        hint("app.suspend", "to suspend"),
+                        keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
+                        hint("app.thinking.cycle", "to cycle thinking level"),
+                        rawKeyHint(
+                            f"{keyText('app.model.cycleForward')}/{keyText('app.model.cycleBackward')}",
+                            "to cycle models",
+                        ),
+                        hint("app.model.select", "to select model"),
+                        hint("app.tools.expand", "to expand tools"),
+                        hint("app.thinking.toggle", "to expand thinking"),
+                        hint("app.editor.external", "for external editor"),
+                        rawKeyHint("/", "for commands"),
+                        rawKeyHint("!", "to run bash"),
+                        rawKeyHint("!!", "to run bash (no context)"),
+                        hint("app.message.followUp", "to queue follow-up"),
+                        hint("app.message.dequeue", "to edit all queued messages"),
+                        hint("app.clipboard.pasteImage", "to paste files on macOS, images, or text"),
+                        rawKeyHint("drop files", "to attach"),
+                    ]
+                )
 
-    def showExtensionNotify(self, message: str, type: str | None = None) -> None:
-        if type == "error":
-            self.showError(message)
-            return
-        if type == "warning":
-            self.showWarning(message)
-            return
-        self.showStatus(message)
+            def compactInstructions() -> str:
+                return theme.fg("muted", " · ").join(
+                    [
+                        hint("app.interrupt", "interrupt"),
+                        rawKeyHint(f"{keyText('app.clear')}/{keyText('app.exit')}", "clear/exit"),
+                        rawKeyHint("/", "commands"),
+                        rawKeyHint("!", "bash"),
+                        hint("app.tools.expand", "more"),
+                    ]
+                )
 
-    def showExtensionError(self, extensionPath: str, error: str, stack: str | None = None) -> None:
-        self.chatContainer.addChild(Spacer(1))
-        self.chatContainer.addChild(
-            Text(interactive_theme.theme.fg("error", f'Extension "{extensionPath}" error: {error}'), 1, 0)
-        )
-        if stack:
-            stack_lines = [
-                interactive_theme.theme.fg("dim", f"  {line.strip()}")
-                for line in stack.splitlines()[1:]
-                if line.strip()
-            ]
-            if stack_lines:
-                self.chatContainer.addChild(Text("\n".join(stack_lines), 1, 0))
-        self._request_render()
+            def compactOnboarding() -> str:
+                return theme.fg(
+                    "dim",
+                    f"Press {keyText('app.tools.expand')} to show full startup help"
+                    f"{' and loaded resources' if showDetails else ''}.",
+                )
+
+            def onboarding() -> str:
+                # MISAKA fork: the window's tagline (`MISAKA_TAGLINE`) in place of pi's self-help note.
+                return theme.fg("dim", os.environ.get("MISAKA_TAGLINE") or "MISAKA research system ready.")
+
+            header = ExpandableText(
+                lambda: f"{withLogo(compactInstructions())}\n{compactOnboarding()}\n\n{onboarding()}",
+                lambda: f"{withLogo(expandedInstructions())}\n\n{onboarding()}",
+                self.getStartupExpansionState(),
+                1,
+                0,
+            )
+            self.builtInHeader = header
+
+            # Setup UI layout
+            self.headerContainer.addChild(Spacer(1))
+            self.headerContainer.addChild(self.builtInHeader)
+            self.headerContainer.addChild(Spacer(1))
+        else:
+            # Minimal header when silenced
+            self.builtInHeader = Text("", 0, 0)
+            self.headerContainer.addChild(self.builtInHeader)
+        self.ui.requestRender()
+
+        # MISAKA fork: fd is looked up on PATH; MISAKA never downloads tools at runtime, and rg is found by the tools
+        # that use it.
+        self.fdPath = find_tool("fd")
+
+        # Enable the remaining input handlers only after managed-tool setup completes.
+        self.setupKeyHandlers()
+        self.setupEditorSubmitHandler()
+        self.ui.requestRender()
+
+        # Initialize extensions first so resources are shown before messages
+        await self.rebindCurrentSession()
+
+        # Render initial messages AFTER showing loaded resources
+        self.renderInitialMessages()
+
+        # Set up theme file watcher
+        def themeChanged() -> None:
+            self.ui.invalidate()
+            self.updateEditorBorderColor()
+            self.ui.requestRender()
+
+        onThemeChange(themeChanged)
+
+        # Set up git branch watcher (uses provider instead of footer)
+        self.footerDataProvider.onBranchChange(lambda: self.ui.requestRender())
+
+        # Initialize available provider count for footer display
+        self.updateAvailableProviderCount()
+
+        # Flush the completed startup state.
+        self.ui.renderNow()
 
     def updateTerminalTitle(self) -> None:
-        set_title = _callable_attr(getattr(self.ui, "terminal", None), "setTitle")
-        if set_title is None:
-            return
-        cwd_name = os.path.basename(self.sessionManager.getCwd()) or self.sessionManager.getCwd()
-        session_name = self.sessionManager.getSessionName()
-        if session_name:
-            set_title(f"{APP_TITLE} - {session_name} - {cwd_name}")
-            return
-        set_title(f"{APP_TITLE} - {cwd_name}")
+        """Update terminal title with session name and cwd."""
+        cwdBasename = os.path.basename(self.sessionManager.getCwd())
+        sessionName = self.sessionManager.getSessionName()
+        if sessionName:
+            self.ui.terminal.setTitle(f"{APP_TITLE} - {sessionName} - {cwdBasename}")
+        else:
+            self.ui.terminal.setTitle(f"{APP_TITLE} - {cwdBasename}")
 
-    def setExtensionStatus(self, key: str, text: str | None = None) -> None:
-        self.footerDataProvider.setExtensionStatus(key, text)
-        self._request_render()
+    async def run(self) -> int:
+        """Run the interactive mode. This is the main entry point.
+        Initializes the UI, shows warnings, processes initial messages, and starts the interactive loop.
 
-    def getWorkingLoaderMessage(self) -> str:
-        return str(self.workingMessage or self.defaultWorkingMessage)
+        MISAKA fork: returns the exit code (the engine exits with it) once `shutdown` finishes, instead of exiting the
+        process from inside.
+        """
+        await self.init()
+        self._shutdownFuture = asyncio.get_running_loop().create_future()
+        if self.shutdownRequested:
+            await self.checkShutdownRequested()
+            return await self._shutdownFuture
 
-    def createWorkingLoader(self) -> Loader:
-        return Loader(
-            self.ui,
-            lambda spinner: interactive_theme.theme.fg("accent", spinner),
-            lambda text: interactive_theme.theme.fg("muted", text),
-            self.getWorkingLoaderMessage(),
-            self.workingIndicatorOptions,
+        # MISAKA fork: offline mode is `MISAKA_OFFLINE`, where upstream reads `PI_OFFLINE`.
+        if not os.environ.get("MISAKA_OFFLINE"):
+            controller = AbortController()
+            timeout = setTimeout(lambda: controller.abort(), 15_000)
+
+            async def refreshCatalogs() -> None:
+                try:
+                    await refreshModelCatalogs(self.session.modelRuntime, controller.signal)
+                    self.updateAvailableProviderCount()
+                except Exception:  # noqa: BLE001, S110 - upstream `.catch(() => {})`
+                    pass
+                finally:
+                    timeout.cancel()
+
+            self._schedule_task(refreshCatalogs())
+
+        # MISAKA fork: no pi version check and no package update check (MISAKA updates through `misaka update` and has
+        # no package sources).
+
+        # Check tmux keyboard setup asynchronously
+        async def tmuxCheck() -> None:
+            warning = await self.checkTmuxKeyboardSetup()
+            if warning:
+                self.showWarning(warning)
+
+        self._schedule_task(tmuxCheck())
+
+        # Show startup warnings
+        startupDiagnostics = self.options.startupDiagnostics
+        modelFallbackMessage = self.options.modelFallbackMessage
+
+        for diagnostic in startupDiagnostics or []:
+            diagnosticType = read_field(diagnostic, "type")
+            message = read_field(diagnostic, "message")
+            if diagnosticType == "error":
+                self.showError(message)
+            elif diagnosticType == "warning":
+                self.showWarning(message)
+            else:
+                self.showStatus(message)
+
+        modelsJsonError = self.session.modelRuntime.getError()
+        if modelsJsonError:
+            self.showError(f"models.json error: {modelsJsonError}")
+
+        if modelFallbackMessage:
+            self.showWarning(modelFallbackMessage)
+
+        # MISAKA fork: no crash notice (MISAKA keeps no crash log for `/bug`).
+
+        self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth())
+
+        # Process initial messages
+        await self._promptInitialMessages()
+
+        # Main interactive loop
+        self._schedule_task(self._runInputLoop())
+
+        return await self._shutdownFuture
+
+    async def _promptInitialMessages(self) -> None:
+        """MISAKA fork: pi sends these bare, and nothing else starts a turn during its startup. Here the network wiring
+        flushes inbox deliveries with ``triggerTurn`` at bind, so a ``card-shell --resume --say`` note could arrive
+        mid-turn; ``prompt()`` then refused it ("Agent is already processing") and the note was lost. ``followUp``
+        queues it behind that turn; an idle session is unchanged."""
+        initialMessage = self.options.initialMessage
+        if initialMessage:
+            try:
+                await self.session.prompt(
+                    initialMessage, {"images": self.options.initialImages, "streamingBehavior": "followUp"}
+                )
+            except Exception as error:  # noqa: BLE001 - upstream `catch (error)` shows any failure
+                self.showError(errorMessage(error) or "Unknown error occurred")
+
+        for message in self.options.initialMessages or []:
+            try:
+                await self.session.prompt(message, {"streamingBehavior": "followUp"})
+            except Exception as error:  # noqa: BLE001 - upstream `catch (error)` shows any failure
+                self.showError(errorMessage(error) or "Unknown error occurred")
+
+    async def _runInputLoop(self) -> None:
+        """MISAKA fork: the main loop as a task, so `run` can return the exit code."""
+        while self._shutdownFuture is not None and not self._shutdownFuture.done():
+            try:
+                userInput = await self.getUserInput()
+            except asyncio.CancelledError:
+                return
+            if self._shutdownFuture is not None and self._shutdownFuture.done():
+                return
+            try:
+                # MISAKA fork: the input was taken while the agent was idle, but a research driver or a notification
+                # can start a turn in between (pi has no such turn starters). Without a behaviour, prompt() raised
+                # "Agent is already processing" and the typed message was lost; steer is what Enter would have queued
+                # had the turn started a moment earlier. Idle is unchanged.
+                await self.session.prompt(userInput, {"streamingBehavior": "steer"})
+            except Exception as error:  # noqa: BLE001 - upstream `catch (error)` shows any failure
+                self.showError(errorMessage(error) or "Unknown error occurred")
+
+    # MISAKA fork: no `checkForPackageUpdates` (MISAKA has no package sources).
+
+    async def checkTmuxKeyboardSetup(self) -> str | None:
+        if not os.environ.get("TMUX"):
+            return None
+
+        async def runTmuxShow(option: str) -> str | None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux",
+                    "show",
+                    "-gv",
+                    option,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            except OSError:
+                return None
+
+            try:
+                stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=2)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                return None
+
+            return jsTrim(stdout.decode("utf-8", errors="replace")) if proc.returncode == 0 else None
+
+        extendedKeys, extendedKeysFormat = await asyncio.gather(
+            runTmuxShow("extended-keys"),
+            runTmuxShow("extended-keys-format"),
         )
 
-    def _show_working_loader(self) -> None:
-        if self.loadingAnimation is not None:
-            return
-        clear_status = _callable_attr(self.statusContainer, "clear")
-        if clear_status is not None:
-            clear_status()
-        self.loadingAnimation = self.createWorkingLoader()
-        add_child = _callable_attr(self.statusContainer, "addChild")
-        if add_child is not None:
-            add_child(self.loadingAnimation)
+        # If we couldn't query tmux (timeout, sandbox, etc.), don't warn
+        if extendedKeys is None:
+            return None
 
-    def stopWorkingLoader(self) -> None:
-        if self.loadingAnimation is not None:
-            stop = _callable_attr(self.loadingAnimation, "stop")
-            if stop is not None:
-                stop()
-            self.loadingAnimation = None
-        clear_status = _callable_attr(self.statusContainer, "clear")
-        if clear_status is not None:
-            clear_status()
+        if extendedKeys != "on" and extendedKeys != "always":
+            return (
+                "tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to "
+                "~/.tmux.conf and restart tmux."
+            )
+
+        if extendedKeysFormat == "xterm":
+            # MISAKA fork: the product name.
+            return (
+                "tmux extended-keys-format is xterm. MISAKA works best with csi-u. Add `set -g extended-keys-format "
+                "csi-u` to ~/.tmux.conf and restart tmux."
+            )
+
+        return None
+
+    # MISAKA fork: no `getChangelogForDisplay` or `reportInstallTelemetry` (no changelog ships, and MISAKA pings
+    # nothing).
+
+    def getMarkdownThemeWithSettings(self) -> Any:
+        return dataclasses_replace(getMarkdownTheme(), codeBlockIndent=self.settingsManager.getCodeBlockIndent())
+
+    # =========================================================================
+    # Extension System
+    # =========================================================================
+
+    def formatDisplayPath(self, p: str) -> str:
+        homeDir = os.path.expanduser("~")
+        result = p
+
+        # Replace home directory with ~
+        if result.startswith(homeDir):
+            result = f"~{result[len(homeDir):]}"
+
+        return result
+
+    def formatExtensionDisplayPath(self, path: str) -> str:
+        result = self.formatDisplayPath(path)
+        # MISAKA fork: MISAKA extensions are Python packages, so `/index.py` is stripped as well.
+        for suffix in ("/index.ts", "/index.js", "/index.py"):
+            result = result.removesuffix(suffix)
+        return result
+
+    def formatContextPath(self, p: str) -> str:
+        cwd = os.path.abspath(self.sessionManager.getCwd())
+        absolutePath = os.path.abspath(p) if os.path.isabs(p) else os.path.abspath(os.path.join(cwd, p))
+        relativePath = getCwdRelativePath(absolutePath, cwd)
+        if relativePath is not None:
+            return relativePath
+
+        return self.formatDisplayPath(absolutePath)
+
+    def getStartupExpansionState(self) -> bool:
+        return bool(self.options.verbose or self.toolOutputExpanded)
+
+    def shouldShowStartupHeader(self) -> bool:
+        """Startup header (logo, version, key hints). Hidden only by quietStartup: true."""
+        return self.options.verbose is True or self.settingsManager.getQuietStartup() is not True
+
+    def shouldShowStartupDetails(self) -> bool:
+        """Startup details (model scope, loaded resources). Hidden by quietStartup: true or "header"."""
+        return self.options.verbose is True or self.settingsManager.getQuietStartup() is False
+
+    def getShortPath(self, fullPath: str, sourceInfo: Any = None) -> str:
+        """Get a short path relative to the package root for display."""
+        normalizedFullPath = fullPath.replace("\\", "/")
+        baseDir = read_field(sourceInfo, "baseDir")
+        if baseDir and self.isPackageSource(sourceInfo):
+            normalizedBaseDir = str(baseDir).replace("\\", "/")
+            npmRootMatch = re.match(r"^(.*/node_modules)/(@?[^/]+(?:/[^/]+)?)$", normalizedBaseDir)
+            # If fullPath is under the same node_modules root as baseDir, preserve that relative topology.
+            if npmRootMatch and npmRootMatch.group(1) and normalizedFullPath.startswith(f"{npmRootMatch.group(1)}/"):
+                return posixpath.relpath(normalizedFullPath, normalizedBaseDir)
+
+            try:
+                relativePath = os.path.relpath(os.path.abspath(fullPath), os.path.abspath(str(baseDir)))
+            except ValueError:
+                relativePath = ""
+            if (
+                relativePath
+                and relativePath != "."
+                and not relativePath.startswith("..")
+                and not relativePath.startswith(f"..{os.sep}")
+                and not os.path.isabs(relativePath)
+            ):
+                return relativePath.replace("\\", "/")
+
+        source = str(read_field(sourceInfo, "source", ""))
+        npmMatch = re.search(r"node_modules/(@?[^/]+(?:/[^/]+)?)/(.*)", normalizedFullPath)
+        if npmMatch and source.startswith("npm:"):
+            return npmMatch.group(2)
+
+        gitMatch = re.search(r"git/[^/]+/[^/]+/(.*)", normalizedFullPath)
+        if gitMatch and source.startswith("git:"):
+            return gitMatch.group(1)
+
+        return self.formatDisplayPath(fullPath)
+
+    def getCompactPathLabel(self, resourcePath: str, sourceInfo: Any = None) -> str:
+        shortPath = self.getShortPath(resourcePath, sourceInfo)
+        normalizedPath = shortPath.replace("\\", "/")
+        segments = [segment for segment in normalizedPath.split("/") if len(segment) > 0 and segment != "~"]
+        if len(segments) > 0:
+            return segments[-1]
+        return shortPath
+
+    def getCompactPackageSourceLabel(self, sourceInfo: Any = None) -> str:
+        source = str(read_field(sourceInfo, "source", ""))
+        if source.startswith("npm:"):
+            return source[len("npm:") :] or source
+
+        # MISAKA fork: no git URL parsing (MISAKA has no git package sources).
+        return source
+
+    def getCompactExtensionLabel(self, resourcePath: str, sourceInfo: Any = None) -> str:
+        if not self.isPackageSource(sourceInfo):
+            return self.getCompactPathLabel(resourcePath, sourceInfo)
+
+        sourceLabel = self.getCompactPackageSourceLabel(sourceInfo)
+        if not sourceLabel:
+            return self.getCompactPathLabel(resourcePath, sourceInfo)
+
+        shortPath = self.getShortPath(resourcePath, sourceInfo).replace("\\", "/")
+        packagePath = shortPath.removeprefix("extensions/")
+        parsedDir = posixpath.dirname(packagePath)
+        parsedName = posixpath.splitext(posixpath.basename(packagePath))[0]
+
+        if parsedName == "index":
+            return sourceLabel if not parsedDir or parsedDir == "." else f"{sourceLabel}:{parsedDir}"
+
+        return f"{sourceLabel}:{packagePath}"
+
+    def getCompactDisplayPathSegments(self, resourcePath: str) -> list[str]:
+        return [
+            segment
+            for segment in self.formatDisplayPath(resourcePath).replace("\\", "/").split("/")
+            if len(segment) > 0 and segment != "~"
+        ]
+
+    def getCompactNonPackageExtensionLabel(self, resourcePath: str, index: int, allPaths: list[dict[str, Any]]) -> str:
+        item = jsIndex(allPaths, index)
+        segments = item["segments"] if item else None
+        if not segments or len(segments) == 0:
+            return self.getCompactPathLabel(resourcePath)
+
+        for segmentCount in range(1, len(segments) + 1):
+            candidate = "/".join(segments[-segmentCount:])
+            isUnique = all(
+                itemIndex == index or "/".join(other["segments"][-segmentCount:]) != candidate
+                for itemIndex, other in enumerate(allPaths)
+            )
+
+            if isUnique:
+                return candidate
+
+        return "/".join(segments)
+
+    def getCompactExtensionLabels(self, extensions: list[dict[str, Any]]) -> list[str]:
+        nonPackageExtensions = []
+        for extension in extensions:
+            segments = self.getCompactDisplayPathSegments(extension["path"])
+            lastSegment = segments[-1] if segments else None
+            # MISAKA fork: `index.py` too.
+            if len(segments) > 1 and lastSegment in ("index.ts", "index.js", "index.py"):
+                segments.pop()
+            if not self.isPackageSource(extension.get("sourceInfo")):
+                nonPackageExtensions.append(
+                    {"path": extension["path"], "sourceInfo": extension.get("sourceInfo"), "segments": segments}
+                )
+
+        labels = []
+        for extension in extensions:
+            if self.isPackageSource(extension.get("sourceInfo")):
+                labels.append(self.getCompactExtensionLabel(extension["path"], extension.get("sourceInfo")))
+                continue
+
+            nonPackageIndex = next(
+                (index for index, item in enumerate(nonPackageExtensions) if item["path"] == extension["path"]), -1
+            )
+            if nonPackageIndex == -1:
+                labels.append(self.getCompactPathLabel(extension["path"], extension.get("sourceInfo")))
+                continue
+
+            labels.append(
+                self.getCompactNonPackageExtensionLabel(extension["path"], nonPackageIndex, nonPackageExtensions)
+            )
+        return labels
+
+    def getDisplaySourceInfo(self, sourceInfo: Any = None) -> dict[str, Any]:
+        source = read_field(sourceInfo, "source", "local")
+        scope = read_field(sourceInfo, "scope", "project")
+        if source == "local":
+            if scope == "user":
+                return {"label": "user", "color": "muted"}
+            if scope == "project":
+                return {"label": "project", "color": "muted"}
+            if scope == "temporary":
+                return {"label": "path", "scopeLabel": "temp", "color": "muted"}
+            return {"label": "path", "color": "muted"}
+
+        if source == "cli":
+            return {"label": "path", "scopeLabel": "temp" if scope == "temporary" else None, "color": "muted"}
+
+        scopeLabel = (
+            "user" if scope == "user" else "project" if scope == "project" else "temp" if scope == "temporary" else None
+        )
+        return {"label": source, "scopeLabel": scopeLabel, "color": "accent"}
+
+    def getScopeGroup(self, sourceInfo: Any = None) -> Literal["user", "project", "path"]:
+        source = read_field(sourceInfo, "source", "local")
+        scope = read_field(sourceInfo, "scope", "project")
+        if source == "cli" or scope == "temporary":
+            return "path"
+        if scope == "user":
+            return "user"
+        if scope == "project":
+            return "project"
+        return "path"
+
+    def isPackageSource(self, sourceInfo: Any = None) -> bool:
+        source = str(read_field(sourceInfo, "source", ""))
+        return source.startswith(("npm:", "git:"))
+
+    def buildScopeGroups(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {
+            "user": {"scope": "user", "paths": [], "packages": {}},
+            "project": {"scope": "project", "paths": [], "packages": {}},
+            "path": {"scope": "path", "paths": [], "packages": {}},
+        }
+
+        for item in items:
+            groupKey = self.getScopeGroup(item.get("sourceInfo"))
+            group = groups[groupKey]
+            source = read_field(item.get("sourceInfo"), "source", "local")
+
+            if self.isPackageSource(item.get("sourceInfo")):
+                group["packages"].setdefault(source, []).append(item)
+            else:
+                group["paths"].append(item)
+
+        return [
+            group
+            for group in (groups["project"], groups["user"], groups["path"])
+            if len(group["paths"]) > 0 or len(group["packages"]) > 0
+        ]
+
+    def formatScopeGroups(self, groups: list[dict[str, Any]], options: dict[str, Callable[..., str]]) -> str:
+        lines: list[str] = []
+
+        def byPath(a: dict[str, Any], b: dict[str, Any]) -> int:
+            return localeCompare(a["path"], b["path"])
+
+        for group in groups:
+            lines.append(f"  {theme.fg('accent', group['scope'])}")
+
+            sortedPaths = sorted(group["paths"], key=functools.cmp_to_key(byPath))
+            for item in sortedPaths:
+                lines.append(theme.fg("dim", f"    {options['formatPath'](item)}"))
+
+            def bySource(a: tuple[str, Any], b: tuple[str, Any]) -> int:
+                return localeCompare(a[0], b[0])
+
+            sortedPackages = sorted(group["packages"].items(), key=functools.cmp_to_key(bySource))
+            for source, packageItems in sortedPackages:
+                lines.append(f"    {theme.fg('mdLink', source)}")
+                for item in sorted(packageItems, key=functools.cmp_to_key(byPath)):
+                    lines.append(theme.fg("dim", f"      {options['formatPackagePath'](item, source)}"))
+
+        return "\n".join(lines)
+
+    def findSourceInfoForPath(self, p: str, sourceInfos: dict[str, Any]) -> Any:
+        exact = sourceInfos.get(p)
+        if exact:
+            return exact
+
+        current = p
+        while "/" in current:
+            current = current[: current.rfind("/")]
+            parent = sourceInfos.get(current)
+            if parent:
+                return parent
+
+        return None
+
+    def formatPathWithSource(self, p: str, sourceInfo: Any = None) -> str:
+        if sourceInfo:
+            shortPath = self.getShortPath(p, sourceInfo)
+            info = self.getDisplaySourceInfo(sourceInfo)
+            scopeLabel = info.get("scopeLabel")
+            labelText = f"{info['label']} ({scopeLabel})" if scopeLabel else info["label"]
+            return f"{labelText} {shortPath}"
+        return self.formatDisplayPath(p)
+
+    def formatDiagnostics(self, diagnostics: list[Any], sourceInfos: dict[str, Any]) -> str:
+        lines: list[str] = []
+
+        # Group collision diagnostics by name
+        collisions: dict[str, list[Any]] = {}
+        otherDiagnostics: list[Any] = []
+
+        for d in diagnostics:
+            collision = read_field(d, "collision")
+            if read_field(d, "type") == "collision" and collision:
+                collisions.setdefault(read_field(collision, "name"), []).append(d)
+            else:
+                otherDiagnostics.append(d)
+
+        # Format collision diagnostics grouped by name
+        for name, collisionList in collisions.items():
+            first = read_field(collisionList[0], "collision") if collisionList else None
+            if not first:
+                continue
+            winnerPath = read_field(first, "winnerPath")
+            lines.append(theme.fg("warning", f'  "{name}" collision:'))
+            lines.append(
+                theme.fg(
+                    "dim",
+                    f"    {theme.fg('success', '✓')} "
+                    f"{self.formatPathWithSource(winnerPath, self.findSourceInfoForPath(winnerPath, sourceInfos))}",
+                )
+            )
+            for d in collisionList:
+                collision = read_field(d, "collision")
+                if collision:
+                    loserPath = read_field(collision, "loserPath")
+                    lines.append(
+                        theme.fg(
+                            "dim",
+                            f"    {theme.fg('warning', '✗')} "
+                            f"{self.formatPathWithSource(loserPath, self.findSourceInfoForPath(loserPath, sourceInfos))}"
+                            " (skipped)",
+                        )
+                    )
+
+        for d in otherDiagnostics:
+            color: ThemeColor = "error" if read_field(d, "type") == "error" else "warning"
+            path = read_field(d, "path")
+            if path:
+                formattedPath = self.formatPathWithSource(path, self.findSourceInfoForPath(path, sourceInfos))
+                lines.append(theme.fg(color, f"  {formattedPath}"))
+                lines.append(theme.fg(color, f"    {read_field(d, 'message')}"))
+            else:
+                lines.append(theme.fg(color, f"  {read_field(d, 'message')}"))
+
+        return "\n".join(lines)
+
+    def showLoadedResources(self, options: dict[str, Any] | None = None) -> None:
+        # Resource rendering is idempotent; chat clears no longer clear this separate container.
+        self.loadedResourcesContainer.clear()
+
+        showListing = bool(read_field(options, "force")) or self.shouldShowStartupDetails()
+        showDiagnostics = showListing or read_field(options, "showDiagnosticsWhenQuiet") is True
+        if not showListing and not showDiagnostics:
+            return
+
+        def sectionHeader(name: str, color: str = "mdHeading") -> str:
+            # MISAKA fork: section titles use MISAKA's `sectionTitle` theme slot, falling back to accent for themes
+            # without it.
+            try:
+                return theme.fg("sectionTitle", f"[{name}]")  # type: ignore[arg-type]
+            except KeyError:
+                return theme.fg("accent", f"[{name}]")
+
+        def formatCompactList(items: list[str], sort: bool = True) -> str:
+            labels = [label for label in (jsTrim(item) for item in items) if len(label) > 0]
+            if sort:
+                labels.sort(key=functools.cmp_to_key(localeCompare))
+            return theme.fg("dim", f"  {', '.join(labels)}")
+
+        # Bodies are built on demand so the listing follows theme changes.
+        def addLoadedSection(
+            name: str,
+            collapsedBody: Callable[[], str],
+            expandedBody: Callable[[], str] | None = None,
+            color: str = "mdHeading",
+        ) -> None:
+            expanded = expandedBody if expandedBody is not None else collapsedBody
+            section = ExpandableText(
+                lambda: f"{sectionHeader(name, color)}\n{collapsedBody()}",
+                lambda: f"{sectionHeader(name, color)}\n{expanded()}",
+                self.getStartupExpansionState(),
+                0,
+                0,
+            )
+            self.loadedResourcesContainer.addChild(section)
+            self.loadedResourcesContainer.addChild(Spacer(1))
+
+        # MISAKA fork: no skills from the resource loader; MISAKA's skills are core commands and list themselves through
+        # `startup_sections`.
+        promptsResult = self.session.resourceLoader.getPrompts()
+        themesResult = self.session.resourceLoader.getThemes()
+        extensions = read_field(options, "extensions")
+        if extensions is None:
+            extensions = [
+                {"path": extension.path, "sourceInfo": extension.sourceInfo}
+                for extension in self.session.resourceLoader.getExtensions().extensions
+                if not getattr(extension, "hidden", False)
+            ]
+        sourceInfos: dict[str, Any] = {}
+        for extension in extensions:
+            if extension.get("sourceInfo"):
+                sourceInfos[extension["path"]] = extension["sourceInfo"]
+        for prompt in read_field(promptsResult, "prompts", []):
+            if prompt.sourceInfo:
+                sourceInfos[prompt.filePath] = prompt.sourceInfo
+        for loadedTheme in read_field(themesResult, "themes", []):
+            sourcePath = getattr(loadedTheme, "sourcePath", None)
+            sourceInfo = getattr(loadedTheme, "sourceInfo", None)
+            if sourcePath and sourceInfo:
+                sourceInfos[sourcePath] = sourceInfo
+
+        if showListing:
+            systemPromptSource = self.session.resourceLoader.getSystemPromptSource()
+            contextFiles = [
+                *([systemPromptSource] if systemPromptSource else []),
+                *self.session.resourceLoader.getAppendSystemPromptSources(),
+                *read_field(self.session.resourceLoader.getAgentsFiles(), "agentsFiles", []),
+            ]
+            if len(contextFiles) > 0:
+                self.loadedResourcesContainer.addChild(Spacer(1))
+
+                def contextList() -> str:
+                    return "\n".join(
+                        theme.fg("dim", f"  {self.formatDisplayPath(read_field(f, 'path'))}") for f in contextFiles
+                    )
+
+                def contextCompactList() -> str:
+                    return formatCompactList(
+                        [self.formatContextPath(read_field(contextFile, "path")) for contextFile in contextFiles],
+                        sort=False,
+                    )
+
+                addLoadedSection("Context", contextCompactList, contextList)
+
+            templates = self.session.promptTemplates
+            if len(templates) > 0:
+                templateGroups = self.buildScopeGroups(
+                    [{"path": template.filePath, "sourceInfo": template.sourceInfo} for template in templates]
+                )
+                templateByPath = {t.filePath: t for t in templates}
+
+                def formatTemplatePath(item: dict[str, Any], _source: str | None = None) -> str:
+                    template = templateByPath.get(item["path"])
+                    return f"/{template.name}" if template else self.formatDisplayPath(item["path"])
+
+                def templateList() -> str:
+                    return self.formatScopeGroups(
+                        templateGroups, {"formatPath": formatTemplatePath, "formatPackagePath": formatTemplatePath}
+                    )
+
+                def promptCompactList() -> str:
+                    return formatCompactList([f"/{template.name}" for template in templates])
+
+                addLoadedSection("Prompts", promptCompactList, templateList)
+
+            if len(extensions) > 0:
+                extensionGroups = self.buildScopeGroups(extensions)
+
+                def extList() -> str:
+                    return self.formatScopeGroups(
+                        extensionGroups,
+                        {
+                            "formatPath": lambda item: self.formatExtensionDisplayPath(item["path"]),
+                            "formatPackagePath": lambda item, _source: self.formatExtensionDisplayPath(
+                                self.getShortPath(item["path"], item.get("sourceInfo"))
+                            ),
+                        },
+                    )
+
+                extensionLabels = self.getCompactExtensionLabels(extensions)
+                addLoadedSection("Extensions", lambda: formatCompactList(extensionLabels), extList, "mdHeading")
+
+            # MISAKA fork: sections registered by extensions and core parts (MISAKA's [Skills] among them). Their text
+            # may be a callable, evaluated on every render, so an asynchronously loaded resource updates by itself.
+            for registered in list(startup_sections.SECTIONS):
+                registeredName = str(registered.get("name") or "")
+                if not registeredName:
+                    continue
+
+                def collapsedSection(section: dict[str, Any] = registered) -> str:
+                    return startup_sections.resolve(section.get("collapsed"))
+
+                def expandedSection(section: dict[str, Any] = registered) -> str:
+                    return startup_sections.resolve(section.get("expanded") or section.get("collapsed"))
+
+                addLoadedSection(registeredName, collapsedSection, expandedSection)
+
+        if showDiagnostics:
+            # MISAKA fork: no [Skill conflicts] (no skill resources in the loader).
+            promptDiagnostics = read_field(promptsResult, "diagnostics", [])
+            if len(promptDiagnostics) > 0:
+                self.loadedResourcesContainer.addChild(
+                    ThemedText(
+                        lambda: f"{theme.fg('warning', '[Prompt conflicts]')}\n"
+                        f"{self.formatDiagnostics(promptDiagnostics, sourceInfos)}",
+                        0,
+                        0,
+                    )
+                )
+                self.loadedResourcesContainer.addChild(Spacer(1))
+
+            extensionDiagnostics: list[Any] = []
+            extensionsResult = self.session.resourceLoader.getExtensions()
+            for error in extensionsResult.errors:
+                extensionDiagnostics.append(
+                    {"type": "error", "message": read_field(error, "error"), "path": read_field(error, "path")}
+                )
+            for warning in extensionsResult.warnings or []:
+                extensionDiagnostics.append(
+                    {"type": "warning", "message": read_field(warning, "warning"), "path": read_field(warning, "path")}
+                )
+
+            commandDiagnostics = self.session.extensionRunner.getCommandDiagnostics()
+            extensionDiagnostics.extend(commandDiagnostics)
+            extensionDiagnostics.extend(self.getBuiltInCommandConflictDiagnostics(self.session.extensionRunner))
+
+            shortcutDiagnostics = self.session.extensionRunner.getShortcutDiagnostics()
+            extensionDiagnostics.extend(shortcutDiagnostics)
+
+            if len(extensionDiagnostics) > 0:
+                self.loadedResourcesContainer.addChild(
+                    ThemedText(
+                        lambda: f"{theme.fg('warning', '[Extension issues]')}\n"
+                        f"{self.formatDiagnostics(extensionDiagnostics, sourceInfos)}",
+                        0,
+                        0,
+                    )
+                )
+                self.loadedResourcesContainer.addChild(Spacer(1))
+
+            themeDiagnostics = read_field(themesResult, "diagnostics", [])
+            if len(themeDiagnostics) > 0:
+                self.loadedResourcesContainer.addChild(
+                    ThemedText(
+                        lambda: f"{theme.fg('warning', '[Theme conflicts]')}\n"
+                        f"{self.formatDiagnostics(themeDiagnostics, sourceInfos)}",
+                        0,
+                        0,
+                    )
+                )
+                self.loadedResourcesContainer.addChild(Spacer(1))
+
+    async def bindCurrentSessionExtensions(self) -> None:
+        """Initialize the extension system with TUI-based UI context."""
+        uiContext = self.createExtensionUIContext()
+
+        async def newSession(options: Any = None) -> Any:
+            self.clearStatusIndicator()
+            try:
+                return await self.runtimeHost.newSession(options)
+            except ContextCarryUnsupportedError as error:
+                # MISAKA fork: an extension asked to carry the context over (`carryOverContext`) and the context
+                # engine refused; the current session is intact, so this is reported rather than fatal.
+                self.showError(str(error))
+                return {"cancelled": True}
+            except Exception as error:  # noqa: BLE001 - upstream catches everything
+                return await self.handleFatalRuntimeError("Failed to create session", error)
+
+        async def fork(entryId: str, options: Any = None) -> Any:
+            try:
+                result = await self.runtimeHost.fork(entryId, options)
+                if not read_field(result, "cancelled"):
+                    self.editor.setText(read_field(result, "selectedText") or "")
+                    self.showStatus("Forked to new session")
+                return {"cancelled": read_field(result, "cancelled")}
+            except Exception as error:  # noqa: BLE001 - upstream catches everything
+                return await self.handleFatalRuntimeError("Failed to fork session", error)
+
+        async def navigateTree(targetId: str, options: Any = None) -> Any:
+            result = await self.session.navigateTree(
+                targetId,
+                {
+                    "summarize": read_field(options, "summarize"),
+                    "customInstructions": read_field(options, "customInstructions"),
+                    "replaceInstructions": read_field(options, "replaceInstructions"),
+                    "label": read_field(options, "label"),
+                },
+            )
+            if read_field(result, "cancelled"):
+                return {"cancelled": True}
+
+            self.chatContainer.clear()
+            self.renderInitialMessages()
+            editorText = read_field(result, "editorText")
+            if editorText and not jsTrim(self.editor.getText()):
+                self.editor.setText(editorText)
+            self.showStatus("Navigated to selected point")
+            self._schedule_task(self.flushCompactionQueue({"willRetry": False}))
+            return {"cancelled": False}
+
+        async def switchSession(sessionPath: str, options: Any = None) -> Any:
+            return await self.handleResumeSession(sessionPath, options)
+
+        async def reload() -> None:
+            await self.handleReloadCommand()
+
+        def shutdownHandler() -> None:
+            self.shutdownRequested = True
+            # MISAKA fork: until `run` has created the exit-code future, `run` performs the requested shutdown itself.
+            if self.session.isIdle and self._shutdownFuture is not None:
+                self._schedule_task(self.shutdown())
+
+        await self.session.bindExtensions(
+            {
+                "uiContext": uiContext,
+                "mode": "tui",
+                "abortHandler": lambda: self.restoreQueuedMessagesToEditor({"abort": True}),
+                "commandContextActions": {
+                    "waitForIdle": lambda: self.session.waitForIdle(),
+                    "newSession": newSession,
+                    "fork": fork,
+                    "navigateTree": navigateTree,
+                    "switchSession": switchSession,
+                    "reload": reload,
+                },
+                "shutdownHandler": shutdownHandler,
+                "onError": lambda error: self.showExtensionError(
+                    read_field(error, "extensionPath"), read_field(error, "error"), read_field(error, "stack")
+                ),
+            }
+        )
+
+        setRegisteredThemes(read_field(self.session.resourceLoader.getThemes(), "themes", []))
+        self.setupAutocompleteProvider()
+
+        extensionRunner = self.session.extensionRunner
+        self.setupExtensionShortcuts(extensionRunner)
+        self.showLoadedResources({"force": False, "showDiagnosticsWhenQuiet": True})
+        # MISAKA fork: no `showStartupNoticesIfNeeded` (no changelog ships).
+
+    # MISAKA fork (D1): no `applyFullscreenScrollbarSetting`.
+
+    def ensurePngTranscoder(self) -> None:
+        """Lets extension images use the PNG transcoder; tool results register it themselves."""
+
+        def onRegistered() -> None:
+            self.ui.invalidate()
+            self.ui.requestRender()
+
+        ensurePngTranscoder(onRegistered)
+
+    def applyRuntimeSettings(self) -> None:
+        setCapabilityOverrides(self.settingsManager.getTerminalCapabilityOverrides())
+        self.ensurePngTranscoder()
+        configureHttpDispatcher(self.settingsManager.getHttpIdleTimeoutMs())
+        self.footer.setSession(self.session)
+        self.footer.setAutoCompactEnabled(self.session.autoCompactionEnabled)
+        self.footerDataProvider.setCwd(self.sessionManager.getCwd())
+        self.hideThinkingBlock = self.settingsManager.getHideThinkingBlock()
+        self.outputPad = self.settingsManager.getOutputPad()
+        self.ui.setShowHardwareCursor(self.settingsManager.getShowHardwareCursor())
+        clearOnShrink = self.settingsManager.getClearOnShrink()
+        self.ui.setClearOnShrink(clearOnShrink)
+        if not clearOnShrink and not self.activeStatusIndicator:
+            self.statusContainer.clear()
+        editorPaddingX = self.settingsManager.getEditorPaddingX()
+        autocompleteMaxVisible = self.settingsManager.getAutocompleteMaxVisible()
+        self.defaultEditor.setPaddingX(editorPaddingX)
+        self.defaultEditor.setAutocompleteMaxVisible(autocompleteMaxVisible)
+        if self.editor is not self.defaultEditor:
+            setPaddingX = getattr(self.editor, "setPaddingX", None)
+            if callable(setPaddingX):
+                setPaddingX(editorPaddingX)
+            setAutocompleteMaxVisible = getattr(self.editor, "setAutocompleteMaxVisible", None)
+            if callable(setAutocompleteMaxVisible):
+                setAutocompleteMaxVisible(autocompleteMaxVisible)
+
+    async def rebindCurrentSession(self, options: dict[str, Any] | None = None) -> None:
+        if options is None:
+            options = {}
+        session = self.session
+
+        if self.unsubscribe is not None:
+            self.unsubscribe()
+        self.unsubscribe = None
+        self.programStatus.reset()
+        self.applyRuntimeSettings()
+
+        if options.get("renderBeforeBind"):
+            self.renderCurrentSessionState()
+            self.subscribeToAgent()
+
+        await self.bindCurrentSessionExtensions()
+
+        if self.session is not session:
+            return
+
+        if not options.get("renderBeforeBind"):
+            self.subscribeToAgent()
+
+        self.updateAvailableProviderCount()
+        self.updateEditorBorderColor()
+        self.updateTerminalTitle()
+
+    async def handleFatalRuntimeError(self, prefix: str, error: Any) -> NoReturn:
+        message = errorMessage(error)
+        self.showError(f"{prefix}: {message}")
+        extensionHint = self.getCrashExtensionHint(error)
+        if extensionHint:
+            self.chatContainer.addChild(ThemedText(lambda: theme.fg("warning", extensionHint), self.outputPad, 0))
+        # MISAKA fork: no crash record or `/bug` instructions (MISAKA has no `/bug`).
+        stopThemeWatcher()
+        self.stop()
+        # MISAKA fork: `SystemExit` in place of `process.exit(1)`.
+        raise SystemExit(1)
+
+    def getCrashExtensionHint(self, error: Any) -> str | None:
+        try:
+            # MISAKA fork: the stack is the Python traceback.
+            stack = (
+                "".join(traceback.format_exception(error)) if isinstance(error, BaseException) else None
+            )
+            return formatCrashExtensionHint(
+                findExtensionStackMatches(stack, self.session.resourceLoader.getExtensions().extensions)
+            )
+        except Exception:  # noqa: BLE001 - upstream `catch { return undefined }`
+            return None
+
+    # MISAKA fork: no `recordCrash`, `crashReportInstructions` or `suggestBugReport` (MISAKA has no `/bug`).
+
+    def maybeSuggestBugReport(self, message: Any) -> None:
+        """MISAKA fork: with no `/bug` to suggest, an unexpected error only checks whether the install changed."""
+        if read_field(message, "stopReason") != "error" or isRetryableAssistantError(message):
+            return
+        if re.search(r"\b(?:abort(?:ed)?|cancel(?:l?ed)?)\b", read_field(message, "errorMessage") or "", re.IGNORECASE):
+            return
+        self.maybeShowInstallChangeWarning()
+
+    def maybeShowInstallChangeWarning(self) -> bool:
+        """After an error, check whether an update replaced or removed this install while the session ran.
+        Code loaded on demand then fails with missing modules until restart (#10439). Returns true when
+        the install changed.
+        """
+        if self.installChangeWarningShown:
+            return True
+        change = detectInstallChange()
+        if not change:
+            return False
+        self.installChangeWarningShown = True
+        cause = (
+            f"{APP_NAME} was updated to {change['version']} while this session was running ({VERSION})"
+            if change["kind"] == "updated"
+            else f"The {APP_NAME} installation this session runs from was removed or replaced"
+        )
+        resumeCommand = formatResumeCommand(self.sessionManager)
+        restart = f"Restart with `{resumeCommand}` to continue this session." if resumeCommand else f"Restart {APP_NAME}."
+        self.showWarning(f"{cause}. Features that load code on demand can fail until restart. {restart}")
+        return True
+
+    def renderCurrentSessionState(self) -> None:
+        self.loadedResourcesContainer.clear()
+        self.chatContainer.clear()
+        self.pendingMessagesContainer.clear()
+        self.compactionQueuedMessages = []
+        # MISAKA fork: a `!` command run while the agent streams keeps its block in the pending area, and its message
+        # waits in the session (not in the transcript redrawn below) until the run settles. `/reload` and the turn-end
+        # custom-message flush redraw mid-run, so the blocks go back into the pending area; once the session has
+        # nothing pending, the session itself changed (`/new`, `/resume`, fork) and they are dropped.
+        if self.session.hasPendingBashMessages:
+            for component in self.pendingBashComponents:
+                self.pendingMessagesContainer.addChild(component)
+        else:
+            self.pendingBashComponents = []
+        self.streamingComponent = None
+        self.streamingMessage = None
+        self.pendingTools.clear()
+        self.renderInitialMessages()
+
+    def getRegisteredToolDefinition(self, toolName: str) -> Any:
+        """Extension-registered definition, falling back to the built-in one. The renderer components take
+        whatever this returns, so they never reach into the tool registry themselves.
+        """
+        return self.session.extensionRunner.resolveToolRenderers(
+            toolName, lambda: withBuiltInRenderers(toolName, self.session.getToolDefinition(toolName))
+        )
+
+    def getMarkdownTransformers(self) -> list[Any]:
+        # MISAKA fork: no Mermaid transformer (its renderer needs the grok-mermaid package).
+        return [*self.session.extensionRunner.getMarkdownTransformers()]
+
+    def setupExtensionShortcuts(self, extensionRunner: Any) -> None:
+        """Set up keyboard shortcuts registered by extensions."""
+        shortcuts = extensionRunner.getShortcuts(self.keybindings.getEffectiveConfig())
+        if len(shortcuts) == 0:
+            return
+
+        # Create a context for shortcut handlers
+        def createContext() -> Any:
+            def shutdown() -> None:
+                self.shutdownRequested = True
+
+            def compact(options: Any = None) -> None:
+                async def run() -> None:
+                    try:
+                        result = await self.session.compact(read_field(options, "customInstructions"))
+                        onComplete = read_field(options, "onComplete")
+                        if onComplete:
+                            onComplete(result)
+                    except Exception as error:  # noqa: BLE001 - reported to the caller
+                        onError = read_field(options, "onError")
+                        if onError:
+                            onError(error)
+
+                self._schedule_task(run())
+
+            # MISAKA fork: a namespace stands in for the object literal.
+            return SimpleNamespace(
+                ui=self.createExtensionUIContext(),
+                mode="tui",
+                hasUI=True,
+                cwd=self.sessionManager.getCwd(),
+                sessionManager=self.sessionManager,
+                modelRegistry=extensionRunner.modelRegistry,
+                model=self.session.model,
+                scopedModels=self.session.scopedModels,
+                thinkingLevel=self.session.thinkingLevel,
+                isIdle=lambda: self.session.isIdle,
+                isProjectTrusted=lambda: self.settingsManager.isProjectTrusted(),
+                signal=self.session.agent.signal,
+                abort=lambda: self.restoreQueuedMessagesToEditor({"abort": True}),
+                hasPendingMessages=lambda: self.session.pendingMessageCount > 0,
+                shutdown=shutdown,
+                getContextUsage=lambda: self.session.getContextUsage(),
+                compact=compact,
+                getSystemPrompt=lambda: self.session.systemPrompt,
+            )
+
+        async def runHandler(handler: Any) -> None:
+            try:
+                await maybe_await(handler(createContext()))
+            except Exception as err:  # noqa: BLE001 - shown to the user
+                self.showError(f"Shortcut handler error: {errorMessage(err)}")
+
+        # Set up the extension shortcut handler on the default editor
+        def onExtensionShortcut(data: str) -> bool:
+            for shortcutStr, shortcut in shortcuts.items():
+                # Cast to KeyId - extension shortcuts use the same format
+                if matchesKey(data, shortcutStr):
+                    # Run handler async, don't block input
+                    self._schedule_task(runHandler(shortcut.handler))
+                    return True
+            return False
+
+        self.defaultEditor.onExtensionShortcut = onExtensionShortcut
+
+    def setExtensionStatus(self, key: str, text: str | None) -> None:
+        """Set extension status text in the footer."""
+        self.footerDataProvider.setExtensionStatus(key, text)
+        self.ui.requestRender()
+
+    def setEditorWorkingStatusIndicator(self, indicator: StatusIndicator | None) -> bool:
+        self.defaultEditor.setWorkingStatusIndicator(None)
+        if not isWorkingStatusEditor(self.editor):
+            return False
+        self.editor.setWorkingStatusIndicator(indicator)
+        return True
+
+    def showStatusIndicator(self, indicator: StatusIndicator) -> None:
+        if self.activeStatusIndicator is not None:
+            self.activeStatusIndicator.dispose()
+        self.activeStatusIndicator = indicator
+        self.activeWorkingIndicatorEmbedded = False
+        self.statusContainer.clear()
+        self.setEditorWorkingStatusIndicator(None)
+        if self.setEditorWorkingStatusIndicator(indicator):
+            self.activeWorkingIndicatorEmbedded = True
+            return
+        self.statusContainer.addChild(indicator)
+
+    def clearStatusIndicator(self, kind: str | None = None) -> None:
+        if kind and (self.activeStatusIndicator.kind if self.activeStatusIndicator else None) != kind:
+            return
+        clearedIndicator = self.activeStatusIndicator
+        clearedIndicatorWasEmbedded = self.activeWorkingIndicatorEmbedded
+        if clearedIndicator is not None:
+            clearedIndicator.dispose()
+        self.activeStatusIndicator = None
+        self.activeWorkingIndicatorEmbedded = False
+        self.statusContainer.clear()
+        self.setEditorWorkingStatusIndicator(None)
+        # MISAKA fork (D1): the main screen is the only renderer, so pi's `tuiMode === "regular"` test always holds.
+        if clearedIndicator and not clearedIndicatorWasEmbedded and self.ui.getClearOnShrink():
+            self.statusContainer.addChild(self.idleStatus)
+
+    def showWorkingStatusIndicator(self) -> None:
+        colorFn = (
+            (
+                lambda text: (
+                    getattr(self.editor, "borderColor", None)
+                    or theme.getThinkingBorderColor(self.session.thinkingLevel or "off")
+                )(text)
+            )
+            if isWorkingStatusEditor(self.editor)
+            else None
+        )
+        self.showStatusIndicator(
+            WorkingStatusIndicator(
+                self.ui,
+                self.workingMessage if self.workingMessage is not None else self.defaultWorkingMessage,
+                _toLoaderIndicatorOptions(self.workingIndicatorOptions),
+                colorFn,
+            )
+        )
 
     def setWorkingVisible(self, visible: bool) -> None:
         self.workingVisible = visible
         if not visible:
-            self.stopWorkingLoader()
-            self._request_render()
+            self.clearStatusIndicator("working")
+            self.ui.requestRender()
             return
-        if bool(getattr(self.session, "isStreaming", False)) and self.loadingAnimation is None:
-            self._show_working_loader()
-        self._request_render()
+        if self.session.isStreaming and (self.activeStatusIndicator.kind if self.activeStatusIndicator else None) != (
+            "working"
+        ):
+            self.showWorkingStatusIndicator()
+        self.ui.requestRender()
 
-    def setWorkingIndicator(self, options: LoaderIndicatorOptions | None = None) -> None:
+    def setWorkingIndicator(self, options: WorkingIndicatorOptions | None = None) -> None:
         self.workingIndicatorOptions = options
-        if self.loadingAnimation is not None:
-            self.loadingAnimation.setIndicator(options)
-        self._request_render()
+        if self.activeStatusIndicator is not None and self.activeStatusIndicator.kind == "working":
+            self.activeStatusIndicator.setIndicator(_toLoaderIndicatorOptions(options))
+        self.ui.requestRender()
 
     def setHiddenThinkingLabel(self, label: str | None = None) -> None:
         self.hiddenThinkingLabel = label if label is not None else self.defaultHiddenThinkingLabel
-        for child in getattr(self.chatContainer, "children", []):
+        for child in self.chatContainer.children:
             if isinstance(child, AssistantMessageComponent):
-                set_hidden_label = _callable_attr(child, "setHiddenThinkingLabel")
-                if set_hidden_label is not None:
-                    set_hidden_label(self.hiddenThinkingLabel)
-        streaming_component = getattr(self, "streamingComponent", None)
-        set_streaming_label = _callable_attr(streaming_component, "setHiddenThinkingLabel")
-        if set_streaming_label is not None:
-            set_streaming_label(self.hiddenThinkingLabel)
-        self._request_render()
+                child.setHiddenThinkingLabel(self.hiddenThinkingLabel)
+        if self.streamingComponent:
+            self.streamingComponent.setHiddenThinkingLabel(self.hiddenThinkingLabel)
+        self.ui.requestRender()
 
-    def setExtensionWidget(self, key: str, content: Any, options: dict[str, Any] | None = None) -> None:
-        placement = str(read_field(options, "placement", "aboveEditor"))
+    def setExtensionWidget(self, key: str, content: Any, options: Any = None) -> None:
+        """Set an extension widget (string array or custom component)."""
+        placement = read_field(options, "placement") or "aboveEditor"
 
-        def _remove_existing(widgets: dict[str, Any]) -> None:
-            existing = widgets.pop(key, None)
-            dispose = _callable_attr(existing, "dispose")
-            if dispose is not None:
+        def removeExisting(widgets: dict[str, Any]) -> None:
+            existing = widgets.get(key)
+            dispose = getattr(existing, "dispose", None)
+            if callable(dispose):
                 dispose()
+            widgets.pop(key, None)
 
-        _remove_existing(self.extensionWidgetsAbove)
-        _remove_existing(self.extensionWidgetsBelow)
+        removeExisting(self.extensionWidgetsAbove)
+        removeExisting(self.extensionWidgetsBelow)
 
         if content is None:
             self.renderWidgets()
             return
 
         if isinstance(content, list):
-            component = Container()
-            for line in content[: self.MAX_WIDGET_LINES]:
-                component.addChild(Text(str(line), 1, 0))
-            if len(content) > self.MAX_WIDGET_LINES:
-                component.addChild(Text(interactive_theme.theme.fg("muted", "... (widget truncated)"), 1, 0))
+            # Wrap string array in a Container with Text components
+            component: Any = Container()
+            for line in content[: InteractiveMode.MAX_WIDGET_LINES]:
+                component.addChild(Text(line, 1, 0))
+            if len(content) > InteractiveMode.MAX_WIDGET_LINES:
+                component.addChild(ThemedText(lambda: theme.fg("muted", "... (widget truncated)"), 1, 0))
         else:
-            component = content(self.ui, interactive_theme.theme)
+            # Factory function - create component
+            component = content(self.ui, theme)
 
-        target = self.extensionWidgetsBelow if placement == "belowEditor" else self.extensionWidgetsAbove
-        target[key] = component
+        targetMap = self.extensionWidgetsBelow if placement == "belowEditor" else self.extensionWidgetsAbove
+        targetMap[key] = component
         self.renderWidgets()
 
     def clearExtensionWidgets(self) -> None:
-        for widget in [*self.extensionWidgetsAbove.values(), *self.extensionWidgetsBelow.values()]:
-            dispose = _callable_attr(widget, "dispose")
-            if dispose is not None:
+        for widget in self.extensionWidgetsAbove.values():
+            dispose = getattr(widget, "dispose", None)
+            if callable(dispose):
+                dispose()
+        for widget in self.extensionWidgetsBelow.values():
+            dispose = getattr(widget, "dispose", None)
+            if callable(dispose):
                 dispose()
         self.extensionWidgetsAbove.clear()
         self.extensionWidgetsBelow.clear()
         self.renderWidgets()
 
+    def resetExtensionUI(self) -> None:
+        # MISAKA fork: cancels the dialog that waits for its turn as well as the open one.
+        self._resetExtensionPrompts()
+        if self.extensionSelector:
+            self.hideExtensionSelector()
+        if self.extensionInput:
+            self.hideExtensionInput()
+        if self.extensionEditor:
+            self.hideExtensionEditor()
+        self.ui.hideOverlay()
+        self.clearExtensionTerminalInputListeners()
+        self.setExtensionFooter(None)
+        self.setExtensionHeader(None)
+        self.clearExtensionWidgets()
+        self.footerDataProvider.clearExtensionStatuses()
+        self.footer.invalidate()
+        self.autocompleteProviderWrappers = []
+        self.setCustomEditorComponent(None)
+        self.setupAutocompleteProvider()
+        self.defaultEditor.onExtensionShortcut = None
+        self.updateTerminalTitle()
+        self.workingMessage = None
+        self.workingVisible = True
+        self.setWorkingIndicator()
+        if self.activeStatusIndicator is not None and self.activeStatusIndicator.kind == "working":
+            self.activeStatusIndicator.setMessage(
+                f"{self.defaultWorkingMessage} ({keyText('app.interrupt')} to interrupt)"
+            )
+        self.setHiddenThinkingLabel()
+
+    def renderWidgets(self) -> None:
+        """Render all extension widgets to the widget container."""
+        if not self.widgetContainerAbove or not self.widgetContainerBelow:
+            return
+        self.renderWidgetContainer(self.widgetContainerAbove, self.extensionWidgetsAbove, True, True)
+        self.renderWidgetContainer(self.widgetContainerBelow, self.extensionWidgetsBelow, False, False)
+        self.ui.requestRender()
+
     def renderWidgetContainer(
         self,
-        container: Any,
+        container: Container,
         widgets: dict[str, Any],
         spacerWhenEmpty: bool,
         leadingSpacer: bool,
     ) -> None:
-        clear = _callable_attr(container, "clear")
-        if clear is not None:
-            clear()
-        if not widgets:
+        container.clear()
+
+        if len(widgets) == 0:
             if spacerWhenEmpty:
-                add_child = _callable_attr(container, "addChild")
-                if add_child is not None:
-                    add_child(Spacer(1))
+                container.addChild(Spacer(1))
             return
 
-        add_child = _callable_attr(container, "addChild")
-        if add_child is None:
-            return
         if leadingSpacer:
-            add_child(Spacer(1))
+            container.addChild(Spacer(1))
         for component in widgets.values():
-            add_child(component)
-
-    def renderWidgets(self) -> None:
-        self.renderWidgetContainer(self.widgetContainerAbove, self.extensionWidgetsAbove, True, True)
-        self.renderWidgetContainer(self.widgetContainerBelow, self.extensionWidgetsBelow, False, False)
-        self._request_render()
+            container.addChild(component)
 
     def setExtensionFooter(self, factory: Any) -> None:
-        dispose = _callable_attr(self.customFooter, "dispose")
-        if dispose is not None:
+        """Set a custom footer component, or restore the built-in footer."""
+        # Dispose existing custom footer
+        dispose = getattr(self.customFooter, "dispose", None)
+        if callable(dispose):
             dispose()
 
-        remove_child = _callable_attr(self.ui, "removeChild")
-        if remove_child is not None:
-            if self.customFooter is not None:
-                remove_child(self.customFooter)
-            else:
-                remove_child(self.footer)
-
-        if factory is not None:
-            self.customFooter = factory(self.ui, interactive_theme.theme, self.footerDataProvider)
-            add_child = _callable_attr(self.ui, "addChild")
-            if add_child is not None:
-                add_child(self.customFooter)
+        self.footerContainer.clear()
+        if factory:
+            # Create and add custom footer, passing the data provider
+            self.customFooter = factory(self.ui, theme, self.footerDataProvider)
+            self.footerContainer.addChild(self.customFooter)
         else:
+            # Restore built-in footer
             self.customFooter = None
-            add_child = _callable_attr(self.ui, "addChild")
-            if add_child is not None:
-                add_child(self.footer)
-        self._request_render()
+            self.footerContainer.addChild(self.footer)
+
+        self.ui.requestRender()
 
     def setExtensionHeader(self, factory: Any) -> None:
-        if self.builtInHeader is None:
+        """Set a custom header component, or restore the built-in header."""
+        # Header may not be initialized yet if called during early initialization
+        if not self.builtInHeader:
             return
 
-        dispose = _callable_attr(self.customHeader, "dispose")
-        if dispose is not None:
+        # Dispose existing custom header
+        dispose = getattr(self.customHeader, "dispose", None)
+        if callable(dispose):
             dispose()
 
-        current_header = self.customHeader or self.builtInHeader
-        children = getattr(self.headerContainer, "children", [])
-        try:
-            index = children.index(current_header)
-        except ValueError:
-            index = -1
+        # Find the index of the current header in the header container
+        currentHeader = self.customHeader or self.builtInHeader
+        index = next(
+            (position for position, child in enumerate(self.headerContainer.children) if child is currentHeader), -1
+        )
 
-        if factory is not None:
-            self.customHeader = factory(self.ui, interactive_theme.theme)
-            set_expanded = _callable_attr(self.customHeader, "setExpanded")
-            if set_expanded is not None:
-                set_expanded(self.toolOutputExpanded)
-            if index >= 0:
-                children[index] = self.customHeader
+        if factory:
+            # Create and add custom header
+            self.customHeader = factory(self.ui, theme)
+            customHeader = self.customHeader
+            if isExpandable(customHeader):
+                customHeader.setExpanded(self.toolOutputExpanded)
+            if index != -1:
+                self.headerContainer.children[index] = self.customHeader
             else:
-                children.insert(0, self.customHeader)
+                # If not found (e.g. builtInHeader was never added), add at the top
+                self.headerContainer.children.insert(0, self.customHeader)
         else:
+            # Restore built-in header
             self.customHeader = None
-            set_expanded = _callable_attr(self.builtInHeader, "setExpanded")
-            if set_expanded is not None:
-                set_expanded(self.toolOutputExpanded)
-            if index >= 0:
-                children[index] = self.builtInHeader
+            builtInHeader = self.builtInHeader
+            if isExpandable(builtInHeader):
+                builtInHeader.setExpanded(self.toolOutputExpanded)
+            if index != -1:
+                self.headerContainer.children[index] = self.builtInHeader
 
-        self._request_render()
+        self.ui.requestRender()
 
     def addExtensionTerminalInputListener(self, handler: Any) -> Callable[[], None]:
-        add_input_listener = _callable_attr(self.ui, "addInputListener")
-        if add_input_listener is None:
-            return lambda: None
-        unsubscribe = add_input_listener(handler)
-        if callable(unsubscribe):
-            self.extensionTerminalInputUnsubscribers.add(unsubscribe)
+        subscription = {"handler": handler, "unsubscribe": self.ui.addInputListener(handler)}
+        self.extensionTerminalInputSubscriptions.append(subscription)
 
-            def _wrapped_unsubscribe() -> None:
-                unsubscribe()
-                self.extensionTerminalInputUnsubscribers.discard(unsubscribe)
+        def unsubscribe() -> None:
+            subscription["unsubscribe"]()
+            if subscription in self.extensionTerminalInputSubscriptions:
+                self.extensionTerminalInputSubscriptions.remove(subscription)
 
-            return _wrapped_unsubscribe
-        return lambda: None
+        return unsubscribe
+
+    # MISAKA fork (D1): no `rebindExtensionTerminalInputListeners`; the renderer is never replaced.
 
     def clearExtensionTerminalInputListeners(self) -> None:
-        for unsubscribe in list(self.extensionTerminalInputUnsubscribers):
-            unsubscribe()
-        self.extensionTerminalInputUnsubscribers.clear()
+        for subscription in self.extensionTerminalInputSubscriptions:
+            subscription["unsubscribe"]()
+        self.extensionTerminalInputSubscriptions.clear()
+
+    def createProjectTrustContext(self, cwd: str) -> ProjectTrustContext:
+        ui = self.createExtensionUIContext()
+        return {
+            "cwd": cwd,
+            "mode": "tui",
+            "hasUI": True,
+            "ui": {
+                "select": ui.select,
+                "confirm": ui.confirm,
+                "input": ui.input,
+                "notify": ui.notify,
+            },
+        }
+
+    def createExtensionUIContext(self) -> _ExtensionUIContext:
+        """Create the ExtensionUIContext for extensions."""
+        return _ExtensionUIContext(self)
+
+    # MISAKA fork: extension dialogs (selector, input, editor and custom components) run one at a time. Sisters,
+    # research and extension parts can all ask at once; pi lets a new dialog displace the open one, which strands the
+    # displaced caller's promise. Here a second dialog waits for the first, a dialog opened from inside another is
+    # refused, and resetting the extension UI cancels both the open and the waiting one.
 
     async def _acquireExtensionPrompt(self, signal: Any = None) -> object | None:
         task = asyncio.current_task()
@@ -1504,13 +2652,12 @@ class InteractiveMode(Conversation):
                 with contextlib.suppress(RuntimeError):
                     loop.call_soon_threadsafe(settle)
 
-            unregister_abort = _register_abort_handler(signal, abort)
+            unregisterAbort = _register_abort_handler(signal, abort)
             acquire = asyncio.create_task(self._extensionPromptLock.acquire())
             acquired = False
             try:
-                completed, _pending = await asyncio.wait(
-                    {acquire, aborted}, return_when=asyncio.FIRST_COMPLETED
-                )
+                waiters: set[asyncio.Future[Any]] = {acquire, aborted}
+                completed, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
                 if aborted in completed:
                     if not acquire.done():
                         acquire.cancel()
@@ -1530,7 +2677,7 @@ class InteractiveMode(Conversation):
                 raise
             finally:
                 with contextlib.suppress(Exception):
-                    unregister_abort()
+                    unregisterAbort()
         if generation != self._extensionPromptGeneration:
             self._extensionPromptLock.release()
             return None
@@ -1557,731 +2704,78 @@ class InteractiveMode(Conversation):
         if cancel is not None:
             with contextlib.suppress(Exception):
                 cancel()
-        if self.extensionSelector is not None:
-            self.hideExtensionSelector()
-        if self.extensionInput is not None:
-            self.hideExtensionInput()
-        if self.extensionEditor is not None:
-            self.hideExtensionEditor()
 
-    def resetExtensionUI(self) -> None:
-        self._resetExtensionPrompts()
-        self._clear_selector()
-        hide_overlay = _callable_attr(self.ui, "hideOverlay")
-        if hide_overlay is not None:
-            hide_overlay()
-        self.clearExtensionTerminalInputListeners()
-        self.setExtensionFooter(None)
-        self.setExtensionHeader(None)
-        self.clearExtensionWidgets()
-        clear_statuses = _callable_attr(self.footerDataProvider, "clearExtensionStatuses")
-        if clear_statuses is not None:
-            clear_statuses()
-        invalidate_footer = _callable_attr(self.footer, "invalidate")
-        if invalidate_footer is not None:
-            invalidate_footer()
-        self.autocompleteProviderWrappers = []
-        self.setCustomEditorComponent(None)
-        self.setupAutocompleteProvider()
-        self.defaultEditor.onExtensionShortcut = None
-        if self.editor is not self.defaultEditor and hasattr(self.editor, "onExtensionShortcut"):
-            self.editor.onExtensionShortcut = None
-        self.updateTerminalTitle()
-        self.workingMessage = None
-        self.setWorkingIndicator(None)
-        self.setWorkingVisible(True)
-        if self.loadingAnimation is not None:
-            set_message = _callable_attr(self.loadingAnimation, "setMessage")
-            if set_message is not None:
-                set_message(f"{self.defaultWorkingMessage} ({key_text('app.interrupt')} to interrupt)")
-        self.setHiddenThinkingLabel(None)
-
-    def setCustomEditorComponent(self, factory: Any) -> None:
-        self.editorComponentFactory = factory
-        get_text = _callable_attr(self.editor, "getText")
-        current_text = str(get_text() or "") if get_text is not None else ""
-
-        clear = _callable_attr(self.editorContainer, "clear")
-        add_child = _callable_attr(self.editorContainer, "addChild")
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if clear is not None:
-            clear()
-
-        if factory is not None:
-            new_editor = factory(self.ui, interactive_theme.get_editor_theme(), self.keybindings)
-            if hasattr(new_editor, "onSubmit"):
-                new_editor.onSubmit = self.defaultEditor.onSubmit
-            if hasattr(new_editor, "onChange"):
-                new_editor.onChange = self.defaultEditor.onChange
-            set_text = _callable_attr(new_editor, "setText")
-            if set_text is not None:
-                set_text(current_text)
-            if hasattr(new_editor, "borderColor") and hasattr(self.defaultEditor, "borderColor"):
-                new_editor.borderColor = self.defaultEditor.borderColor
-            get_default_padding = _callable_attr(self.defaultEditor, "getPaddingX")
-            default_padding = (
-                get_default_padding() if get_default_padding is not None else getattr(self.defaultEditor, "paddingX", None)
-            )
-            set_padding = _callable_attr(new_editor, "setPaddingX")
-            if set_padding is not None and default_padding is not None:
-                set_padding(int(default_padding))
-            set_provider = _callable_attr(new_editor, "setAutocompleteProvider")
-            if set_provider is not None and self.autocompleteProvider is not None:
-                set_provider(self.autocompleteProvider)
-            action_handlers = getattr(new_editor, "actionHandlers", None)
-            default_handlers = getattr(self.defaultEditor, "actionHandlers", None)
-            if isinstance(action_handlers, dict):
-                if getattr(new_editor, "onEscape", None) is None:
-                    new_editor.onEscape = lambda: self.defaultEditor.onEscape() if self.defaultEditor.onEscape else None
-                if getattr(new_editor, "onCtrlD", None) is None:
-                    new_editor.onCtrlD = lambda: self.defaultEditor.onCtrlD() if self.defaultEditor.onCtrlD else None
-                if getattr(new_editor, "onPasteImage", None) is None:
-                    new_editor.onPasteImage = (
-                        lambda: self.defaultEditor.onPasteImage() if self.defaultEditor.onPasteImage else None
-                    )
-                if getattr(new_editor, "onExtensionShortcut", None) is None:
-                    new_editor.onExtensionShortcut = (
-                        lambda data: self.defaultEditor.onExtensionShortcut(data)
-                        if self.defaultEditor.onExtensionShortcut is not None
-                        else False
-                    )
-                if isinstance(default_handlers, dict):
-                    action_handlers.update(default_handlers)
-            self.editor = new_editor
-        else:
-            default_set_text = _callable_attr(self.defaultEditor, "setText")
-            if default_set_text is not None:
-                default_set_text(current_text)
-            self.editor = self.defaultEditor
-
-        if add_child is not None:
-            add_child(self.editor)
-        if set_focus is not None:
-            set_focus(self.editor)
-        self._request_render()
-
-    async def showExtensionCustom(self, factory: Any, options: dict[str, Any] | None = None) -> Any:
-        owner = await self._acquireExtensionPrompt()
+    async def _showExtensionDialog(
+        self,
+        slot: Literal["extensionSelector", "extensionInput", "extensionEditor"],
+        create: Callable[[Callable[[Any], None]], Any],
+        blocked: BlockedStatus,
+        signal: Any = None,
+    ) -> Any:
+        """Mounts the dialog `create` builds in the editor slot and waits for its value; `None` when it is
+        cancelled, aborted or displaced by a reset."""
+        if signal_aborted(signal):
+            return None
+        owner = await self._acquireExtensionPrompt(signal)
         if owner is None:
             return None
-        saved_text = self._get_editor_text()
-        use_overlay = bool(read_field(options, "overlay", False))
+        if signal_aborted(signal):
+            self._releaseExtensionPrompt(owner)
+            return None
+
+        hide = {
+            "extensionSelector": self.hideExtensionSelector,
+            "extensionInput": self.hideExtensionInput,
+            "extensionEditor": self.hideExtensionEditor,
+        }[slot]
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-
-        def restore_editor() -> None:
-            clear = _callable_attr(self.editorContainer, "clear")
-            add_child = _callable_attr(self.editorContainer, "addChild")
-            set_focus = _callable_attr(self.ui, "setFocus")
-            if clear is not None:
-                clear()
-            if add_child is not None:
-                add_child(self.editor)
-            self._set_editor_text(saved_text)
-            if set_focus is not None:
-                set_focus(self.editor)
-            self._request_render()
-
         component: Any = None
-        overlay_handle: Any = None
-        mounted = False
+        unregisterAbort: Callable[[], None] = lambda: None
         closed = False
-        factory_task: asyncio.Future[Any] | None = None
 
-        def done(result: Any) -> None:
+        def finish(value: Any) -> None:
             nonlocal closed
             if closed:
                 return
             closed = True
+            with contextlib.suppress(Exception):
+                unregisterAbort()
             if self._extensionPromptOwner is owner:
-                if overlay_handle is not None:
-                    hide_overlay = _callable_attr(overlay_handle, "hide")
-                    if hide_overlay is not None:
-                        with contextlib.suppress(Exception):
-                            hide_overlay()
-                elif mounted:
-                    with contextlib.suppress(Exception):
-                        restore_editor()
-                self._extensionPromptOwner = None
-                self._extensionPromptTask = None
+                if component is not None and getattr(self, slot) is component:
+                    hide()
                 self._extensionPromptCancel = None
-            dispose = _callable_attr(component, "dispose")
-            if dispose is not None:
-                with contextlib.suppress(Exception):
-                    dispose()
             if not future.done():
-                future.set_result(result)
+                future.set_result(value)
 
-        self._extensionPromptCancel = lambda: done(None)
         try:
-            factory_result = factory(self.ui, interactive_theme.theme, self.keybindings, done)
-            if inspect.isawaitable(factory_result):
-                factory_task = asyncio.ensure_future(factory_result)
-                completed, _pending = await asyncio.wait(
-                    {factory_task, future}, return_when=asyncio.FIRST_COMPLETED
-                )
-                if future in completed and factory_task not in completed:
-                    factory_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await factory_task
-                    return await future
-                component = factory_task.result()
-            else:
-                component = factory_result
-            if closed:
-                dispose = _callable_attr(component, "dispose")
-                if dispose is not None:
-                    with contextlib.suppress(Exception):
-                        dispose()
-                return await future
-            if use_overlay:
-                overlay_options = read_field(options, "overlayOptions")
-                resolved_options = overlay_options() if callable(overlay_options) else overlay_options
-                if resolved_options is None:
-                    width = getattr(component, "width", None)
-                    resolved_options = {"width": width} if width else None
-                overlay_handle = self.ui.showOverlay(component, resolved_options)
-                on_handle = read_field(options, "onHandle")
-                if callable(on_handle):
-                    on_handle(overlay_handle)
-            else:
-                mounted = True
-                self._mountExtensionComponent(component)
+            self._extensionPromptCancel = lambda: finish(None)
+            unregisterAbort = _register_abort_handler(signal, lambda: finish(None))
+            if not closed:
+                component = create(finish)
+                setattr(self, slot, component)
+                self.disposeActiveSelector()
+                self.editorContainer.clear()
+                self.editorContainer.addChild(component)
+                self.ui.setFocus(component)
+                # Extension dialogs share the editor slot: opening one replaces the status of a displaced one.
+                self.programStatus.setBlocked("extension-dialog", blocked)
+                self.ui.requestRender()
             return await future
         finally:
-            if factory_task is not None and not factory_task.done():
-                factory_task.cancel()
-            done(None)
+            finish(None)
             self._releaseExtensionPrompt(owner)
-
-    async def maybeWarnAboutAnthropicSubscriptionAuth(self, model: Any | None = None) -> None:
-        warnings = {}
-        get_warnings = _callable_attr(self.settingsManager, "getWarnings")
-        if get_warnings is not None:
-            warnings = dict(get_warnings() or {})
-        if warnings.get("anthropicExtraUsage") is False:
-            return
-        if self.anthropicSubscriptionWarningShown:
-            return
-
-        resolved_model = model if model is not None else getattr(self.session, "model", None)
-        if read_field(resolved_model, "provider") != "anthropic":
-            return
-
-        model_registry = getattr(self.session, "modelRegistry", None)
-        auth_storage = getattr(model_registry, "authStorage", None)
-        stored_credential = None
-        get_auth = _callable_attr(auth_storage, "get")
-        if get_auth is not None:
-            stored_credential = get_auth("anthropic")
-        if read_field(stored_credential, "type") == "oauth":
-            self.anthropicSubscriptionWarningShown = True
-            self.showWarning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING)
-            return
-
-        get_api_key = _callable_attr(model_registry, "getApiKeyForProvider")
-        if get_api_key is None:
-            return
-        try:
-            api_key = await maybe_await(get_api_key("anthropic"))
-        except Exception:  # noqa: BLE001 - no key means no warning
-            return
-        if not is_anthropic_subscription_auth_key(api_key):
-            return
-        self.anthropicSubscriptionWarningShown = True
-        self.showWarning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING)
-
-    def handleCtrlZ(self) -> None:
-        if sys.platform == "win32":
-            self.showStatus("Suspend to background is not supported on Windows")
-            return
-
-        keep_alive = threading.Timer(2**30, lambda: None)
-        keep_alive.start()
-
-        previous_sigint = signal.getsignal(signal.SIGINT)
-        previous_sigcont = signal.getsignal(signal.SIGCONT)
-
-        def ignore_sigint(_signum: int, _frame: Any) -> None:
-            return None
-
-        def resume(_signum: int, _frame: Any) -> None:
-            keep_alive.cancel()
-            signal.signal(signal.SIGINT, previous_sigint)
-            signal.signal(signal.SIGCONT, previous_sigcont)
-            start = _callable_attr(self.ui, "start")
-            if start is not None:
-                start()
-            self._request_render(True)
-
-        signal.signal(signal.SIGINT, ignore_sigint)
-        signal.signal(signal.SIGCONT, resume)
-
-        try:
-            stop = _callable_attr(self.ui, "stop")
-            if stop is not None:
-                stop()
-            from misaka.utils import loop_watchdog
-            loop_watchdog.suspend()        # a stopped process is not a stalled one
-            os.kill(0, signal.SIGTSTP)
-        except Exception:
-            keep_alive.cancel()
-            signal.signal(signal.SIGINT, previous_sigint)
-            signal.signal(signal.SIGCONT, previous_sigcont)
-            raise
-
-    def getPathCommandArgument(self, text: str, command: str) -> str | None:
-        if text == command:
-            return None
-        if not text.startswith(f"{command} "):
-            return None
-
-        args_string = text[len(command) + 1 :].lstrip()
-        if not args_string:
-            return None
-
-        first_char = args_string[0]
-        if first_char in {'"', "'"}:
-            closing_quote_index = args_string.find(first_char, 1)
-            if closing_quote_index < 0:
-                return None
-            return args_string[1:closing_quote_index]
-
-        for index, char in enumerate(args_string):
-            if char.isspace():
-                return args_string[:index]
-        return args_string
-
-    def formatDisplayPath(self, path: str) -> str:
-        cwd = self.sessionManager.getCwd()
-        try:
-            relative = os.path.relpath(path, cwd)
-        except ValueError:
-            relative = path
-        if relative == ".":
-            return "."
-        if not relative.startswith(f"..{os.sep}") and relative != "..":
-            return relative
-        user_home = os.path.expanduser("~")
-        if path.startswith(f"{user_home}{os.sep}"):
-            return f"~/{os.path.relpath(path, user_home)}"
-        return path
-
-    def formatContextPath(self, path: str) -> str:
-        return os.path.basename(path) or self.formatDisplayPath(path)
-
-    def formatExtensionDisplayPath(self, path: str) -> str:
-        return self.formatDisplayPath(path)
-
-    def getShortPath(self, path: str, sourceInfo: Any = None) -> str:
-        base_dir = read_field(sourceInfo, "baseDir")
-        if base_dir:
-            try:
-                relative = os.path.relpath(path, str(base_dir))
-            except ValueError:
-                relative = path
-            if relative != "." and not relative.startswith(f"..{os.sep}") and relative != "..":
-                return relative
-        return self.formatDisplayPath(path)
-
-    def _display_source_label(self, sourceInfo: Any = None) -> str:
-        source = str(read_field(sourceInfo, "source", "local"))
-        scope = str(read_field(sourceInfo, "scope", "project"))
-        if source == "local":
-            if scope == "user":
-                return "user"
-            if scope == "project":
-                return "project"
-            return "path"
-        if source == "cli":
-            return "path"
-        if scope in {"user", "project", "temporary"}:
-            scope_label = "temp" if scope == "temporary" else scope
-            return f"{source} ({scope_label})"
-        return source
-
-    def _scope_group(self, sourceInfo: Any = None) -> str:
-        source = str(read_field(sourceInfo, "source", "local"))
-        scope = str(read_field(sourceInfo, "scope", "project"))
-        if source == "cli" or scope == "temporary":
-            return "path"
-        if scope == "user":
-            return "user"
-        if scope == "project":
-            return "project"
-        return "path"
-
-
-    def getCompactExtensionLabels(self, extensions: list[dict[str, Any]]) -> list[str]:
-        counts: dict[str, int] = {}
-        base_labels: list[str] = []
-        for extension in extensions:
-            path = str(read_field(extension, "path", ""))
-            label = Path(path).stem
-            if label == "index":
-                label = Path(path).parent.name or label
-            counts[label] = counts.get(label, 0) + 1
-            base_labels.append(label)
-
-        labels: list[str] = []
-        for extension, label in zip(extensions, base_labels, strict=False):
-            if counts.get(label, 0) > 1:
-                labels.append(self.formatExtensionDisplayPath(str(read_field(extension, "path", ""))))
-            else:
-                labels.append(label)
-        return labels
-
-    def buildScopeGroups(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        groups = {
-            "project": {"scope": "project", "paths": []},
-            "user": {"scope": "user", "paths": []},
-            "path": {"scope": "path", "paths": []},
-        }
-        for item in items:
-            groups[self._scope_group(read_field(item, "sourceInfo"))]["paths"].append(item)
-        return [group for group in (groups["project"], groups["user"], groups["path"]) if group["paths"]]
-
-    def formatScopeGroups(self, groups: list[dict[str, Any]], options: dict[str, Any]) -> str:
-        lines: list[str] = []
-        format_path = options["formatPath"]
-        for group in groups:
-            lines.append(f"  {interactive_theme.theme.fg('accent', group['scope'])}")
-            for item in sorted(group["paths"], key=lambda entry: str(read_field(entry, "path", ""))):
-                lines.append(interactive_theme.theme.fg("dim", f"    {format_path(item)}"))
-        return "\n".join(lines)
-
-    def findSourceInfoForPath(self, path: str, sourceInfos: dict[str, Any]) -> Any:
-        exact = sourceInfos.get(path)
-        if exact is not None:
-            return exact
-        current = path
-        while "/" in current:
-            current = current.rsplit("/", 1)[0]
-            parent = sourceInfos.get(current)
-            if parent is not None:
-                return parent
-        return None
-
-    def formatPathWithSource(self, path: str, sourceInfo: Any = None) -> str:
-        if sourceInfo is None:
-            return self.formatDisplayPath(path)
-        return f"{self._display_source_label(sourceInfo)} {self.getShortPath(path, sourceInfo)}"
-
-    def formatDiagnostics(self, diagnostics: list[Any], sourceInfos: dict[str, Any]) -> str:
-        lines: list[str] = []
-        collisions: dict[str, list[Any]] = {}
-        other_diagnostics: list[Any] = []
-
-        for diagnostic in diagnostics:
-            collision = read_field(diagnostic, "collision")
-            if read_field(diagnostic, "type") == "collision" and collision is not None:
-                name = str(read_field(collision, "name", read_field(diagnostic, "message", "collision")))
-                collisions.setdefault(name, []).append(diagnostic)
-            else:
-                other_diagnostics.append(diagnostic)
-
-        for name, entries in collisions.items():
-            first_collision = read_field(entries[0], "collision")
-            if first_collision is None:
-                continue
-            winner_path = str(read_field(first_collision, "winnerPath", ""))
-            lines.append(interactive_theme.theme.fg("warning", f'  "{name}" collision:'))
-            lines.append(
-                interactive_theme.theme.fg(
-                    "dim",
-                    f"    {interactive_theme.theme.fg('accent', 'winner')} "
-                    f"{self.formatPathWithSource(winner_path, self.findSourceInfoForPath(winner_path, sourceInfos))}",
-                )
-            )
-            for diagnostic in entries:
-                collision = read_field(diagnostic, "collision")
-                loser_path = str(read_field(collision, "loserPath", ""))
-                lines.append(
-                    interactive_theme.theme.fg(
-                        "dim",
-                        f"    {interactive_theme.theme.fg('warning', 'skipped')} "
-                        f"{self.formatPathWithSource(loser_path, self.findSourceInfoForPath(loser_path, sourceInfos))}",
-                    )
-                )
-
-        for diagnostic in other_diagnostics:
-            path = read_field(diagnostic, "path")
-            color = "error" if read_field(diagnostic, "type") == "error" else "warning"
-            if path:
-                formatted_path = self.formatPathWithSource(str(path), self.findSourceInfoForPath(str(path), sourceInfos))
-                lines.append(interactive_theme.theme.fg(color, f"  {formatted_path}"))
-                lines.append(interactive_theme.theme.fg(color, f"    {read_field(diagnostic, 'message', '')}"))
-            else:
-                lines.append(interactive_theme.theme.fg(color, f"  {read_field(diagnostic, 'message', '')}"))
-        return "\n".join(lines)
-
-    def showLoadedResources(self, options: dict[str, Any] | None = None) -> None:
-        show_listing = bool(
-            read_field(options, "force", False) or self.options.verbose or not _safe_call_bool(self.settingsManager, "getQuietStartup")
-        )
-        show_diagnostics = show_listing or bool(read_field(options, "showDiagnosticsWhenQuiet", False))
-        if not show_listing and not show_diagnostics:
-            return
-
-        resource_loader = getattr(self.session, "resourceLoader", None)
-        if resource_loader is None:
-            return
-
-        get_prompts = _callable_attr(resource_loader, "getPrompts")
-        get_themes = _callable_attr(resource_loader, "getThemes")
-        get_agents_files = _callable_attr(resource_loader, "getAgentsFiles")
-        get_extensions = _callable_attr(resource_loader, "getExtensions")
-        get_system_prompt_source = _callable_attr(resource_loader, "getSystemPromptSource")
-        get_append_system_prompt_sources = _callable_attr(resource_loader, "getAppendSystemPromptSources")
-
-        prompts_result = get_prompts() if get_prompts is not None else {"prompts": [], "diagnostics": []}
-        themes_result = get_themes() if get_themes is not None else {"themes": [], "diagnostics": []}
-        extensions_result = (
-            get_extensions() if get_extensions is not None else SimpleNamespace(extensions=[], errors=[])
-        )
-        extensions = read_field(options, "extensions")
-        if extensions is None:
-            extensions = [
-                {"path": read_field(extension, "path"), "sourceInfo": read_field(extension, "sourceInfo")}
-                for extension in read_field(extensions_result, "extensions", []) or []
-                if not read_field(extension, "hidden")
-            ]
-
-        source_infos: dict[str, Any] = {}
-        for extension in extensions:
-            source_info = read_field(extension, "sourceInfo")
-            path = read_field(extension, "path")
-            if source_info is not None and path:
-                source_infos[str(path)] = source_info
-        for prompt in read_field(prompts_result, "prompts", []) or []:
-            source_infos[str(read_field(prompt, "filePath", ""))] = read_field(prompt, "sourceInfo")
-        for loaded_theme in read_field(themes_result, "themes", []) or []:
-            source_path = read_field(loaded_theme, "sourcePath")
-            source_info = read_field(loaded_theme, "sourceInfo")
-            if source_path and source_info is not None:
-                source_infos[str(source_path)] = source_info
-
-        def add_loaded_section(name: str, collapsed_body, expanded_body=None) -> None:
-            body = expanded_body or collapsed_body
-            _r = startup_sections.resolve   # Accepts a str or a callable (evaluated on every render).
-
-            def _title() -> str:
-                # Startup-screen section titles use the dedicated sectionTitle slot; fall back to accent if the theme lacks it.
-                try:
-                    return interactive_theme.theme.fg("sectionTitle", f"[{name}]")
-                except KeyError:
-                    return interactive_theme.theme.fg("accent", f"[{name}]")
-
-            section = ExpandableText(
-                lambda: f"{_title()}\n{_r(collapsed_body)}",
-                lambda: f"{_title()}\n{_r(body)}",
-                self.getStartupExpansionState(),
-                0,
-                0,
-            )
-            self.chatContainer.addChild(section)
-            self.chatContainer.addChild(Spacer(1))
-
-        if show_listing:
-            context_files: list[Any] = []
-            system_prompt_source = get_system_prompt_source() if get_system_prompt_source is not None else None
-            if system_prompt_source is not None and read_field(system_prompt_source, "path"):
-                context_files.append(system_prompt_source)
-            if get_append_system_prompt_sources is not None:
-                context_files.extend(
-                    source for source in (get_append_system_prompt_sources() or []) if read_field(source, "path")
-                )
-            context_files.extend(
-                read_field(get_agents_files() if get_agents_files is not None else {}, "agentsFiles", []) or []
-            )
-            if context_files:
-                add_loaded_section(
-                    "Context",
-                    interactive_theme.theme.fg(
-                        "dim",
-                        "  " + ", ".join(self.formatContextPath(str(read_field(item, "path", ""))) for item in context_files),
-                    ),
-                    "\n".join(
-                        interactive_theme.theme.fg("dim", f"  {self.formatDisplayPath(str(read_field(item, 'path', '')))}")
-                        for item in context_files
-                    ),
-                )
-
-            templates = list(getattr(self.session, "promptTemplates", []) or [])
-            if templates:
-                template_by_path = {str(read_field(template, "filePath", "")): template for template in templates}
-                prompt_items = [
-                    {"path": str(read_field(template, "filePath", "")), "sourceInfo": read_field(template, "sourceInfo")}
-                    for template in templates
-                ]
-                add_loaded_section(
-                    "Prompts",
-                    interactive_theme.theme.fg(
-                        "dim",
-                        "  " + ", ".join(sorted(f"/{read_field(template, 'name', '')}" for template in templates)),
-                    ),
-                    self.formatScopeGroups(
-                        self.buildScopeGroups(prompt_items),
-                        {
-                            "formatPath": lambda item: f"/{read_field(template_by_path.get(str(read_field(item, 'path', ''))), 'name', Path(str(read_field(item, 'path', ''))).stem)}",
-                        },
-                    ),
-                )
-
-            if extensions:
-                add_loaded_section(
-                    "Extensions",
-                    interactive_theme.theme.fg("dim", "  " + ", ".join(sorted(self.getCompactExtensionLabels(extensions)))),
-                    self.formatScopeGroups(
-                        self.buildScopeGroups(list(extensions)),
-                        {
-                            "formatPath": lambda item: self.formatExtensionDisplayPath(str(read_field(item, "path", ""))),
-                        },
-                    ),
-                )
-
-            custom_themes = [
-                item for item in (read_field(themes_result, "themes", []) or []) if read_field(item, "sourcePath")
-            ]
-            if custom_themes:
-                theme_items = [
-                    {"path": str(read_field(item, "sourcePath", "")), "sourceInfo": read_field(item, "sourceInfo")}
-                    for item in custom_themes
-                ]
-                add_loaded_section(
-                    "Themes",
-                    interactive_theme.theme.fg(
-                        "dim",
-                        "  "
-                        + ", ".join(
-                            sorted(
-                                str(read_field(item, "name", Path(str(read_field(item, "sourcePath", ""))).stem))
-                                for item in custom_themes
-                            )
-                        ),
-                    ),
-                    self.formatScopeGroups(
-                        self.buildScopeGroups(theme_items),
-                        {
-                            "formatPath": lambda item: self.formatDisplayPath(str(read_field(item, "path", ""))),
-                        },
-                    ),
-                )
-
-            # Startup-screen sections registered by extensions, rendered the same way as [Skills]/[Extensions].
-            # Text may be a callable, evaluated on every render, so an async resource moves from
-            # "connecting" to the real list on its own.
-            for _sec in list(startup_sections.SECTIONS):
-                _name = str(_sec.get("name") or "")
-                if not _name:
-                    continue
-                add_loaded_section(
-                    _name,
-                    (lambda sec=_sec: startup_sections.resolve(sec.get("collapsed"))),
-                    (lambda sec=_sec: startup_sections.resolve(
-                        sec.get("expanded") or sec.get("collapsed"))),
-                )
-
-        if show_diagnostics:
-            diagnostic_sections = [
-                ("Prompt conflicts", read_field(prompts_result, "diagnostics", []) or []),
-            ]
-
-            extension_diagnostics: list[Any] = []
-            for error in read_field(extensions_result, "errors", []) or []:
-                extension_diagnostics.append(
-                    SimpleNamespace(type="error", path=read_field(error, "path"), message=read_field(error, "error"))
-                )
-            get_command_diagnostics = _callable_attr(self.session.extensionRunner, "get_command_diagnostics") or _callable_attr(
-                self.session.extensionRunner, "getCommandDiagnostics"
-            )
-            if get_command_diagnostics is not None:
-                extension_diagnostics.extend(get_command_diagnostics() or [])
-            get_shortcut_diagnostics = _callable_attr(
-                self.session.extensionRunner, "get_shortcut_diagnostics"
-            ) or _callable_attr(self.session.extensionRunner, "getShortcutDiagnostics")
-            if get_shortcut_diagnostics is not None:
-                extension_diagnostics.extend(get_shortcut_diagnostics() or [])
-            diagnostic_sections.append(("Extension issues", extension_diagnostics))
-            diagnostic_sections.append(("Theme conflicts", read_field(themes_result, "diagnostics", []) or []))
-
-            for title, diagnostics in diagnostic_sections:
-                if not diagnostics:
-                    continue
-                formatted = self.formatDiagnostics(list(diagnostics), source_infos)
-                if not formatted:
-                    continue
-                self.chatContainer.addChild(
-                    Text(f"{interactive_theme.theme.fg('warning', f'[{title}]')}\n{formatted}", 0, 0)
-                )
-                self.chatContainer.addChild(Spacer(1))
-
-
-    async def checkTmuxKeyboardSetup(self) -> str | None:
-        if not os.environ.get("TMUX"):
-            return None
-
-        async def _run_tmux_show(option: str) -> str | None:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "show",
-                    "-gv",
-                    option,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-            except Exception:  # noqa: BLE001 - detection failed; keep the dark default
-                return None
-
-            try:
-                stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=2)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-                return None
-
-            if proc.returncode != 0:
-                return None
-            return stdout.decode("utf-8", errors="replace").strip()
-
-        extended_keys, extended_keys_format = await asyncio.gather(
-            _run_tmux_show("extended-keys"),
-            _run_tmux_show("extended-keys-format"),
-        )
-
-        if extended_keys is None:
-            return None
-        if extended_keys not in {"on", "always"}:
-            return (
-                "tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` "
-                "to ~/.tmux.conf and restart tmux."
-            )
-        if extended_keys_format == "xterm":
-            return (
-                "tmux extended-keys-format is xterm. MISAKA works best with csi-u. "
-                "Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux."
-            )
-        return None
-
-    async def promptForMissingSessionCwd(self, error: MissingSessionCwdError) -> str | None:
-        confirmed = await maybe_await(
-            self.showExtensionConfirm(
-                "Session cwd not found",
-                format_missing_session_cwd_prompt(error.issue),
-            )
-        )
-        return error.issue.fallbackCwd if confirmed else None
 
     async def showExtensionSelector(
         self,
         title: str,
         options: list[str],
-        opts: dict[str, Any] | None = None,
+        opts: Any = None,
+        blocked: BlockedStatus | None = None,
     ) -> str | None:
-        return await self._showExtensionComponent(
+        """Show a selector for extensions."""
+        if blocked is None:
+            blocked = {"kind": "question", "message": title}
+        return await self._showExtensionDialog(
             "extensionSelector",
             lambda finish: ExtensionSelectorComponent(
                 title,
@@ -2291,122 +2785,40 @@ class InteractiveMode(Conversation):
                 {
                     "tui": self.ui,
                     "timeout": read_field(opts, "timeout"),
-                    "onToggleToolsExpanded": self.toggleToolOutputExpansion,
+                    "onToggleToolsExpanded": lambda: self.toggleToolOutputExpansion(),
                 },
             ),
-            None,
+            blocked,
             read_field(opts, "signal"),
         )
 
-    async def _showExtensionComponent(
-        self,
-        slot: str,
-        factory: Callable[[Callable[[Any], None]], Any],
-        cancelled_value: Any,
-        signal: Any = None,
-    ) -> Any:
-        if signal_aborted(signal):
-            return cancelled_value
-        owner = await self._acquireExtensionPrompt(signal)
-        if owner is None:
-            return cancelled_value
-        if signal_aborted(signal):
-            self._releaseExtensionPrompt(owner)
-            return cancelled_value
+    def hideExtensionSelector(self) -> None:
+        """Hide the extension selector."""
+        if self.extensionSelector is not None:
+            self.extensionSelector.dispose()
+        self.editorContainer.clear()
+        self.editorContainer.addChild(self.editor)
+        self.extensionSelector = None
+        self.programStatus.setBlocked("extension-dialog", None)
+        self.ui.setFocus(self.editor)
+        self.ui.requestRender()
 
-        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        component: Any = None
-        unregister_abort: Callable[[], None] = lambda: None
-        closed = False
-
-        def finish(value: Any) -> None:
-            nonlocal closed
-            if closed:
-                return
-            closed = True
-            with contextlib.suppress(Exception):
-                unregister_abort()
-            if self._extensionPromptOwner is owner:
-                if component is not None:
-                    with contextlib.suppress(Exception):
-                        self._hideExtensionComponent(slot, component)
-                self._extensionPromptOwner = None
-                self._extensionPromptTask = None
-                self._extensionPromptCancel = None
-            if not future.done():
-                future.set_result(value)
-
-        try:
-            self._extensionPromptCancel = lambda: finish(cancelled_value)
-            unregister_abort = _register_abort_handler(signal, self._extensionPromptCancel)
-            if closed:
-                with contextlib.suppress(Exception):
-                    unregister_abort()
-            if not closed:
-                component = factory(finish)
-                if closed:
-                    dispose = _callable_attr(component, "dispose")
-                    if dispose is not None:
-                        with contextlib.suppress(Exception):
-                            dispose()
-                else:
-                    setattr(self, slot, component)
-                    self._mountExtensionComponent(component)
-            return await future
-        finally:
-            finish(cancelled_value)
-            self._releaseExtensionPrompt(owner)
-
-    def _mountExtensionComponent(self, component: Any) -> None:
-        clear = _callable_attr(self.editorContainer, "clear")
-        if clear is not None:
-            clear()
-        add_child = _callable_attr(self.editorContainer, "addChild")
-        if add_child is not None:
-            add_child(component)
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if set_focus is not None:
-            set_focus(component)
-        self._request_render()
-
-    def _hideExtensionComponent(self, slot: str, expected: Any | None = None) -> None:
-        component = getattr(self, slot, None)
-        if expected is not None and component is not expected:
-            return
-        dispose = _callable_attr(component, "dispose")
-        if dispose is not None:
-            dispose()
-        clear = _callable_attr(self.editorContainer, "clear")
-        if clear is not None:
-            clear()
-        add_child = _callable_attr(self.editorContainer, "addChild")
-        if add_child is not None:
-            add_child(self.editor)
-        setattr(self, slot, None)
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if set_focus is not None:
-            set_focus(self.editor)
-        self._request_render()
-
-    def hideExtensionSelector(self, expected: Any | None = None) -> None:
-        self._hideExtensionComponent("extensionSelector", expected)
-
-    async def showExtensionConfirm(
-        self,
-        title: str,
-        message: str,
-        opts: dict[str, Any] | None = None,
-    ) -> bool:
-        result = await self.showExtensionSelector(f"{title}\n{message}", ["Yes", "No"], opts)
+    async def showExtensionConfirm(self, title: str, message: str, opts: Any = None) -> bool:
+        """Show a confirmation dialog for extensions."""
+        result = await self.showExtensionSelector(
+            f"{title}\n{message}", ["Yes", "No"], opts, {"kind": "permission", "message": title}
+        )
         return result == "Yes"
 
-    async def showExtensionInput(
-        self,
-        title: str,
-        placeholder: str | None = None,
-        opts: dict[str, Any] | None = None,
-    ) -> str | None:
-        return await self._showExtensionComponent(
+    async def promptForMissingSessionCwd(self, error: MissingSessionCwdError) -> str | None:
+        confirmed = await self.showExtensionConfirm(
+            "Session cwd not found", formatMissingSessionCwdPrompt(error.issue)
+        )
+        return error.issue.fallbackCwd if confirmed else None
+
+    async def showExtensionInput(self, title: str, placeholder: str | None = None, opts: Any = None) -> str | None:
+        """Show a text input for extensions."""
+        return await self._showExtensionDialog(
             "extensionInput",
             lambda finish: ExtensionInputComponent(
                 title,
@@ -2415,15 +2827,24 @@ class InteractiveMode(Conversation):
                 lambda: finish(None),
                 {"tui": self.ui, "timeout": read_field(opts, "timeout")},
             ),
-            None,
+            {"kind": "question", "message": title},
             read_field(opts, "signal"),
         )
 
-    def hideExtensionInput(self, expected: Any | None = None) -> None:
-        self._hideExtensionComponent("extensionInput", expected)
+    def hideExtensionInput(self) -> None:
+        """Hide the extension input."""
+        if self.extensionInput is not None:
+            self.extensionInput.dispose()
+        self.editorContainer.clear()
+        self.editorContainer.addChild(self.editor)
+        self.extensionInput = None
+        self.programStatus.setBlocked("extension-dialog", None)
+        self.ui.setFocus(self.editor)
+        self.ui.requestRender()
 
     async def showExtensionEditor(self, title: str, prefill: str | None = None) -> str | None:
-        return await self._showExtensionComponent(
+        """Show a multi-line editor for extensions (with Ctrl+G support)."""
+        return await self._showExtensionDialog(
             "extensionEditor",
             lambda finish: ExtensionEditorComponent(
                 self.ui,
@@ -2432,104 +2853,1352 @@ class InteractiveMode(Conversation):
                 prefill,
                 finish,
                 lambda: finish(None),
+                None,
+                self.settingsManager.getExternalEditorCommand(),
             ),
-            None,
+            {"kind": "question", "message": title},
         )
 
-    def hideExtensionEditor(self, expected: Any | None = None) -> None:
-        self._hideExtensionComponent("extensionEditor", expected)
+    def hideExtensionEditor(self) -> None:
+        """Hide the extension editor."""
+        self.editorContainer.clear()
+        self.editorContainer.addChild(self.editor)
+        self.extensionEditor = None
+        self.programStatus.setBlocked("extension-dialog", None)
+        self.ui.setFocus(self.editor)
+        self.ui.requestRender()
 
-    async def handleFatalRuntimeError(self, prefix: str, error: Exception | BaseException | Any) -> None:
-        message = str(error) if error is not None else "Unknown error"
-        self.showError(f"{prefix}: {message}")
-        stop_theme_watcher = getattr(interactive_theme, "stop_theme_watcher", None)
-        if callable(stop_theme_watcher):
-            stop_theme_watcher()
-        self.stop()
-        raise SystemExit(1)
+    def setCustomEditorComponent(self, factory: Any) -> None:
+        """Set a custom editor component from an extension.
+        Pass undefined to restore the default editor.
+        """
+        self.editorComponentFactory = factory
 
-    def _renderSessionItems(self, items: list[Any], options: dict[str, Any] | None = None) -> None:
-        rendered_pending_tools: dict[str, ToolExecutionComponent] = {}
-        self._toolComponentsById = {}
+        # Save text from current editor before switching
+        currentText = self.editor.getText()
 
-        if bool(read_field(options, "updateFooter", False)):
-            invalidate_footer = _callable_attr(self.footer, "invalidate")
-            if invalidate_footer is not None:
-                invalidate_footer()
+        self.disposeActiveSelector()
+        self.editorContainer.clear()
+
+        if factory:
+            # Create the custom editor with tui, theme, and keybindings
+            newEditor = factory(self.ui, getEditorTheme(), self.keybindings)
+
+            # Wire up callbacks from the default editor
+            newEditor.onSubmit = self.defaultEditor.onSubmit
+            newEditor.onChange = self.defaultEditor.onChange
+
+            # Copy text from previous editor
+            newEditor.setText(currentText)
+
+            # Copy appearance settings if supported
+            if getattr(newEditor, "borderColor", None) is not None:
+                newEditor.borderColor = self.defaultEditor.borderColor
+            if getattr(newEditor, "setPaddingX", None) is not None:
+                newEditor.setPaddingX(self.defaultEditor.getPaddingX())
+            if getattr(newEditor, "setAutocompleteMaxVisible", None) is not None:
+                newEditor.setAutocompleteMaxVisible(self.defaultEditor.getAutocompleteMaxVisible())
+
+            # Set autocomplete if supported
+            if getattr(newEditor, "setAutocompleteProvider", None) and self.autocompleteProvider:
+                newEditor.setAutocompleteProvider(self.autocompleteProvider)
+
+            # If extending CustomEditor, copy app-level handlers
+            # Use duck typing since instanceof fails across jiti module boundaries
+            customEditor = newEditor
+            if isinstance(getattr(customEditor, "actionHandlers", None), dict):
+                if not getattr(customEditor, "onEscape", None):
+                    customEditor.onEscape = lambda: self.defaultEditor.onEscape and self.defaultEditor.onEscape()
+                if not getattr(customEditor, "onCtrlD", None):
+                    customEditor.onCtrlD = lambda: self.defaultEditor.onCtrlD and self.defaultEditor.onCtrlD()
+                if not getattr(customEditor, "onPasteImage", None):
+                    customEditor.onPasteImage = (
+                        lambda: self.defaultEditor.onPasteImage and self.defaultEditor.onPasteImage()
+                    )
+                if not getattr(customEditor, "onExtensionShortcut", None):
+                    customEditor.onExtensionShortcut = (
+                        lambda data: self.defaultEditor.onExtensionShortcut is not None
+                        and self.defaultEditor.onExtensionShortcut(data)
+                    )
+                # Copy action handlers (clear, suspend, model switching, etc.)
+                for action, handler in self.defaultEditor.actionHandlers.items():
+                    customEditor.actionHandlers[action] = handler
+
+            self.editor = newEditor
+        else:
+            # Restore default editor with text from custom editor
+            self.defaultEditor.setText(currentText)
+            self.editor = self.defaultEditor
+
+        self.editorContainer.addChild(self.editor)
+        if self.activeStatusIndicator:
+            self.statusContainer.clear()
+            self.activeWorkingIndicatorEmbedded = self.setEditorWorkingStatusIndicator(self.activeStatusIndicator)
+            if not self.activeWorkingIndicatorEmbedded:
+                self.statusContainer.addChild(self.activeStatusIndicator)
+        self.ui.setFocus(self.editor)
+        self.ui.requestRender()
+
+    def showExtensionNotify(self, message: str, type: str | None = None) -> None:
+        """Show a notification for extensions."""
+        if type == "error":
+            self.showError(message)
+        elif type == "warning":
+            self.showWarning(message)
+        else:
+            self.showStatus(message)
+
+    async def showExtensionCustom(self, factory: Any, options: Any = None) -> Any:
+        """Show a custom component with keyboard focus. Overlay mode renders on top of existing content."""
+        # MISAKA fork: one extension dialog at a time (see `_acquireExtensionPrompt`).
+        owner = await self._acquireExtensionPrompt()
+        if owner is None:
+            return None
+        try:
+            return await self._showExtensionCustom(owner, factory, options)
+        finally:
+            self._releaseExtensionPrompt(owner)
+
+    async def _showExtensionCustom(self, owner: object, factory: Any, options: Any) -> Any:
+        savedText = self.editor.getText()
+        isOverlay = read_field(options, "overlay") or False
+        # MISAKA fork: a component may name the dialog status to report while it waits (AskUserQuestion does).
+        blocked: BlockedStatus | None = read_field(options, "blocked")
+
+        def restoreEditor() -> None:
+            self.editorContainer.clear()
+            self.editorContainer.addChild(self.editor)
+            self.editor.setText(savedText)
+            self.ui.setFocus(self.editor)
+            self.ui.requestRender()
+
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        component: Any = None
+        handle: Any = None
+        closed = False
+
+        def close(result: Any) -> None:
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            # MISAKA fork: the overlay is hidden through its own handle; pi hides the topmost overlay, which is another
+            # one when the component closes before its overlay opens.
+            if isOverlay:
+                if handle is not None:
+                    handle.hide()
+            else:
+                restoreEditor()
+            # Note: both branches above already call requestRender
+            if blocked:
+                self.programStatus.setBlocked("extension-dialog", None)
+            if self._extensionPromptOwner is owner:
+                self._extensionPromptCancel = None
+            if not future.done():
+                future.set_result(result)
+            try:
+                dispose = getattr(component, "dispose", None)
+                if callable(dispose):
+                    dispose()
+            except Exception:  # noqa: BLE001, S110 - ignore dispose errors
+                pass
+
+        self._extensionPromptCancel = lambda: close(None)
+        factoryTask: asyncio.Future[Any] | None = None
+        try:
+            try:
+                created = factory(self.ui, theme, self.keybindings, close)
+                if inspect.isawaitable(created):
+                    factoryTask = asyncio.ensure_future(created)
+                    completed, _pending = await asyncio.wait({factoryTask, future}, return_when=asyncio.FIRST_COMPLETED)
+                    if factoryTask not in completed:
+                        # MISAKA fork: closed before its component was built, so the build is cancelled.
+                        return await future
+                    c = factoryTask.result()
+                else:
+                    c = created
+            except Exception:
+                if closed:
+                    return await future
+                closed = True
+                if not isOverlay:
+                    restoreEditor()
+                raise
+            if closed:
+                return await future
+            component = c
+            if isOverlay:
+                # Resolve overlay options - can be static or dynamic function
+                def resolveOptions() -> Any:
+                    overlayOptions = read_field(options, "overlayOptions")
+                    if overlayOptions:
+                        return overlayOptions() if callable(overlayOptions) else overlayOptions
+                    # Fallback: use component's width property if available
+                    w = getattr(component, "width", None)
+                    return {"width": w} if w else None
+
+                handle = self.ui.showOverlay(component, resolveOptions())
+                # Expose handle to caller for visibility control
+                onHandle = read_field(options, "onHandle")
+                if onHandle:
+                    onHandle(handle)
+            else:
+                self.disposeActiveSelector()
+                self.editorContainer.clear()
+                self.editorContainer.addChild(component)
+                self.ui.setFocus(component)
+                self.ui.requestRender()
+            if blocked:
+                self.programStatus.setBlocked("extension-dialog", blocked)
+            return await future
+        finally:
+            if factoryTask is not None and not factoryTask.done():
+                factoryTask.cancel()
+            # MISAKA fork: a caller that stops waiting (its task is cancelled) closes the component, so the editor
+            # is not left behind it.
+            close(None)
+
+    def showExtensionError(self, extensionPath: str, error: str, stack: str | None = None) -> None:
+        """Show an extension error in the UI."""
+        errorMsg = f'Extension "{extensionPath}" error: {error}'
+        errorText = ThemedText(lambda: theme.fg("error", errorMsg), 1, 0)
+        self.chatContainer.addChild(errorText)
+        if stack:
+            # Show stack trace in dim color, indented
+            stackLines = stack.split("\n")[1:]  # Skip first line (duplicates error message)
+            if len(stackLines) > 0:
+
+                def renderStack() -> str:
+                    return "\n".join(theme.fg("dim", f"  {jsTrim(line)}") for line in stackLines)
+
+                self.chatContainer.addChild(ThemedText(renderStack, 1, 0))
+        self.ui.requestRender()
+
+    # =========================================================================
+    # Key Handlers
+    # =========================================================================
+
+    def setupKeyHandlers(self) -> None:
+        # Set up handlers on defaultEditor - they use this.editor for text access
+        # so they work correctly regardless of which editor is active
+        def onEscape() -> None:
+            if self.session.isStreaming:
+                self.restoreQueuedMessagesToEditor({"abort": True})
+            elif self.session.isBashRunning:
+                self.session.abortBash()
+            elif self.isBashMode:
+                self.editor.setText("")
+                self.isBashMode = False
+                self.updateEditorBorderColor()
+            elif not jsTrim(self.editor.getText()):
+                # Double-escape with empty editor triggers /tree, /fork, or nothing based on setting
+                action = self.settingsManager.getDoubleEscapeAction()
+                if action != "none":
+                    now = time.time() * 1000
+                    if now - self.lastEscapeTime < 500:
+                        if action == "tree":
+                            self.showTreeSelector()
+                        else:
+                            self.showUserMessageSelector()
+                        self.lastEscapeTime = 0
+                    else:
+                        self.lastEscapeTime = now
+
+        self.defaultEditor.onEscape = onEscape
+
+        # Register app action handlers
+        self.defaultEditor.onAction("app.clear", lambda: self.handleCtrlC())
+        self.defaultEditor.onCtrlD = lambda: self.handleCtrlD()
+        self.defaultEditor.onAction("app.suspend", lambda: self.handleCtrlZ())
+        self.defaultEditor.onAction("app.thinking.cycle", lambda: self.cycleThinkingLevel())
+        self.defaultEditor.onAction("app.model.cycleForward", lambda: self._schedule_task(self.cycleModel("forward")))
+        self.defaultEditor.onAction(
+            "app.model.cycleBackward", lambda: self._schedule_task(self.cycleModel("backward"))
+        )
+
+        # MISAKA fork: no global debug key; the TUI does not port Shift+Ctrl+D (`/debug` writes the same log).
+        self.defaultEditor.onAction("app.model.select", lambda: self.showModelSelector())
+        self.defaultEditor.onAction("app.tools.expand", lambda: self.toggleToolOutputExpansion())
+        self.defaultEditor.onAction("app.thinking.toggle", lambda: self.toggleThinkingBlockVisibility())
+        self.defaultEditor.onAction("app.editor.external", lambda: self._schedule_task(self.handleOpenExternalEditor()))
+        self.defaultEditor.onAction(
+            "app.message.copy",
+            lambda: self._schedule_task(self.handleCopyCommand({"flashConfirmation": True, "preferSelection": True})),
+        )
+        self.defaultEditor.onAction("app.message.followUp", lambda: self._schedule_task(self.handleFollowUp()))
+        self.defaultEditor.onAction("app.message.dequeue", lambda: self.handleDequeue())
+        self.defaultEditor.onAction("app.session.new", lambda: self._schedule_task(self.handleClearCommand()))
+        self.defaultEditor.onAction("app.session.tree", lambda: self.showTreeSelector())
+        self.defaultEditor.onAction("app.session.fork", lambda: self.showUserMessageSelector())
+        self.defaultEditor.onAction("app.session.resume", lambda: self.showSessionSelector())
+
+        def onChange(text: str) -> None:
+            wasBashMode = self.isBashMode
+            self.isBashMode = jsTrimStart(text).startswith("!")
+            if wasBashMode != self.isBashMode:
+                self.updateEditorBorderColor()
+
+        self.defaultEditor.onChange = onChange
+
+        # Handle clipboard paste (triggered on Ctrl+V). Copied files use their original paths,
+        # images are attached via temporary files, and plain text is the final fallback.
+        self.defaultEditor.onPasteImage = lambda: self._schedule_task(self.handleClipboardPaste())
+
+    # MISAKA fork (D1): no `handleRightClickPaste` (right-click paste is a fullscreen feature).
+
+    async def handleClipboardPaste(self) -> None:
+        insertTextAtCursor = getattr(self.editor, "insertTextAtCursor", None)
+        try:
+            filePaths = await readClipboardFilePaths()
+            if filePaths:
+                if any(unicodedata.category(character) == "Cc" for filePath in filePaths for character in filePath):
+                    raise RuntimeError("Clipboard file path contains control characters")
+                paths = " ".join(quoteIfNeeded(filePath) for filePath in filePaths) if self.isBashMode else "\n".join(
+                    filePaths
+                )
+                getCursor = getattr(self.editor, "getCursor", None)
+                cursor = getCursor() if callable(getCursor) else None
+                currentLine = (jsIndex(self.editor.getText().split("\n"), cursor["line"]) or "") if cursor else ""
+                characterBeforeCursor = jsIndex(currentLine, cursor["col"] - 1) if cursor and cursor["col"] > 0 else ""
+                characterAfterCursor = jsIndex(currentLine, cursor["col"]) if cursor else ""
+                leadingSpace = (
+                    " " if characterBeforeCursor and _JS_WHITESPACE.match(characterBeforeCursor) is None else ""
+                )
+                trailingSpace = " " if characterAfterCursor and _JS_WHITESPACE.match(characterAfterCursor) is None else ""
+                if callable(insertTextAtCursor):
+                    insertTextAtCursor(f"{leadingSpace}{paths}{trailingSpace}")
+                self.ui.requestRender()
+                return
+
+            image = await readClipboardImage()
+            if image:
+                tmpDir = tempfile.gettempdir()
+                ext = extensionForImageMimeType(image.mimeType) or "png"
+                # MISAKA fork: the product name in the file name.
+                fileName = f"misaka-clipboard-{uuid.uuid4()}.{ext}"
+                filePath = os.path.join(tmpDir, fileName)
+                with open(filePath, "wb") as file:  # noqa: ASYNC230 - upstream writes synchronously
+                    file.write(bytes(image.bytes))
+
+                if callable(insertTextAtCursor):
+                    insertTextAtCursor(filePath)
+                self.ui.requestRender()
+                return
+
+            text = await readClipboardText()
+            if text:
+                if callable(insertTextAtCursor):
+                    insertTextAtCursor(text)
+                self.ui.requestRender()
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.showError(f"Failed to paste from clipboard: {errorMessage(error)}")
+
+    def handleStartupSubmit(self, text: str) -> None:
+        self.editor.setText(text)
+        self.showStatus("Startup is still in progress")
+
+    def setupEditorSubmitHandler(self) -> None:
+        async def onSubmit(text: str) -> None:
+            text = jsTrim(text)
+            if not text:
+                return
+
+            # Handle commands
+            if text == "/settings":
+                self.showSettingsSelector()
+                self.editor.setText("")
+                return
+            if text == "/scoped-models":
+                self.editor.setText("")
+                self.showModelsSelector()
+                return
+            if text == "/model" or text.startswith("/model "):
+                searchTerm = jsTrim(text[7:]) if text.startswith("/model ") else None
+                self.editor.setText("")
+                await self.handleModelCommand(searchTerm)
+                return
+            if text == "/thinking" or text.startswith("/thinking "):
+                searchTerm = jsTrim(text[10:]) if text.startswith("/thinking ") else None
+                self.editor.setText("")
+                self.handleThinkingCommand(searchTerm)
+                return
+            if text == "/export" or text.startswith("/export "):
+                await self.handleExportCommand(text)
+                self.editor.setText("")
+                return
+            if text == "/import" or text.startswith("/import "):
+                await self.handleImportCommand(text)
+                self.editor.setText("")
+                return
+            if text == "/share":
+                await self.handleShareCommand()
+                self.editor.setText("")
+                return
+            # MISAKA fork: no `/bug` (pi's reports go to the Pi developers).
+            if text == "/copy":
+                await self.handleCopyCommand()
+                self.editor.setText("")
+                return
+            if text == "/name" or text.startswith("/name "):
+                self.handleNameCommand(text)
+                self.editor.setText("")
+                return
+            if text == "/session":
+                self.handleSessionCommand()
+                self.editor.setText("")
+                return
+            # MISAKA fork: no `/changelog` (no changelog ships).
+            if text == "/hotkeys":
+                self.handleHotkeysCommand()
+                self.editor.setText("")
+                return
+            if text == "/fork":
+                self.showUserMessageSelector()
+                self.editor.setText("")
+                return
+            if text == "/clone":
+                self.editor.setText("")
+                await self.handleCloneCommand()
+                return
+            if text == "/tree":
+                self.showTreeSelector()
+                self.editor.setText("")
+                return
+            if text == "/trust":
+                self.showTrustSelector()
+                self.editor.setText("")
+                return
+            if text == "/login" or text.startswith("/login "):
+                providerRef = jsTrim(text[7:]) if text.startswith("/login ") else None
+                self.editor.setText("")
+                await self.handleLoginCommand(providerRef)
+                return
+            if text == "/logout":
+                self._schedule_task(self.showOAuthSelector("logout"))
+                self.editor.setText("")
+                return
+            # MISAKA fork: `/new --carry` hands the context to the new session through the context engine.
+            if text == "/new" or text == "/new --carry":
+                self.editor.setText("")
+                await self.handleClearCommand(carry=text == "/new --carry")
+                return
+            # MISAKA fork: `/clear` empties the chat and the context; `/board` opens the team board.
+            if text == "/clear":
+                self.editor.setText("")
+                await self.handleTrueClearCommand()
+                return
+            if text == "/board":
+                self.editor.setText("")
+                await self.handleBoardCommand()
+                return
+            if text == "/compact" or text.startswith("/compact "):
+                customInstructions = jsTrim(text[9:]) if text.startswith("/compact ") else None
+                self.editor.setText("")
+                await self.handleCompactCommand(customInstructions)
+                return
+            if text == "/reload":
+                self.editor.setText("")
+                await self.handleReloadCommand()
+                return
+            if text == "/debug":
+                self.handleDebugCommand()
+                self.editor.setText("")
+                return
+            # MISAKA fork: no `/arminsayshi` or `/dementedelves` (easter eggs).
+            if text == "/resume":
+                self.showSessionSelector()
+                self.editor.setText("")
+                return
+            if text == "/quit":
+                self.editor.setText("")
+                await self.shutdown()
+                return
+
+            # MISAKA fork: an unknown slash command fails loudly instead of going to the model as text, which showed
+            # only the working indicator and looked as though the command had run. Prompt templates, extension
+            # commands and core commands pass through; `//name` sends the text as is.
+            if (
+                text.startswith("/")
+                and not text.startswith("//")
+                and not self.isExtensionCommand(text)
+                and not self.isCorePromptCommand(text)
+                and not self.isPromptTemplate(text)
+            ):
+                name = text[1:].split(" ", 1)[0]
+                if name and not name[0].isdigit():
+                    self.showError(
+                        f"Unknown command /{name}. Type / to list commands, or //{name} to send it as plain text."
+                    )
+                    return
+
+            # Handle bash command (! for normal, !! for excluded from context)
+            if text.startswith("!"):
+                isExcluded = text.startswith("!!")
+                command = jsTrim(text[2:]) if isExcluded else jsTrim(text[1:])
+                if command:
+                    if self.session.isBashRunning:
+                        self.showWarning("A bash command is already running. Press Esc to cancel it first.")
+                        self.editor.setText(text)
+                        return
+                    addToHistory = getattr(self.editor, "addToHistory", None)
+                    if callable(addToHistory):
+                        addToHistory(text)
+                    await self.handleBashCommand(command, isExcluded)
+                    self.isBashMode = False
+                    self.updateEditorBorderColor()
+                    return
+
+            # Queue input during compaction (extension commands execute immediately)
+            if self.session.isCompacting:
+                if self.isExtensionCommand(text):
+                    addToHistory = getattr(self.editor, "addToHistory", None)
+                    if callable(addToHistory):
+                        addToHistory(text)
+                    self.editor.setText("")
+                    await self.session.prompt(text)
+                else:
+                    self.queueCompactionMessage(text, "steer")
+                return
+
+            # If streaming, use prompt() with steer behavior
+            # This handles extension commands (execute immediately), prompt template expansion, and queueing
+            if self.session.isStreaming:
+                addToHistory = getattr(self.editor, "addToHistory", None)
+                if callable(addToHistory):
+                    addToHistory(text)
+                self.editor.setText("")
+                await self.session.prompt(text, {"streamingBehavior": "steer"})
+                self.updatePendingMessagesDisplay()
+                self.ui.requestRender()
+                return
+
+            # Normal message submission
+            # First, move any pending bash components to chat
+            self.flushPendingBashComponents()
+
+            if self.onInputCallback:
+                self.onInputCallback(text)
+            else:
+                self.pendingUserInputs.append(text)
+            addToHistory = getattr(self.editor, "addToHistory", None)
+            if callable(addToHistory):
+                addToHistory(text)
+
+        # MISAKA fork: the editor calls `onSubmit` synchronously, so the handler runs as a task.
+        self.defaultEditor.onSubmit = lambda text: self._schedule_task(onSubmit(text))
+
+    def subscribeToAgent(self) -> None:
+        def listener(event: Any) -> None:
+            # MISAKA fork: the session calls listeners synchronously; the handler starts at once, as a JavaScript
+            # async listener runs up to its first await, so compaction-end queue delivery can beat the agent loop's
+            # post-compaction steering poll.
+            self._schedule_task(self.handleEvent(event))
+
+        self.unsubscribe = self.session.subscribe(listener)
+
+    async def handleEvent(self, event: Any) -> None:
+        if not self.isInitialized:
+            await self.init()
+
+        self.footer.invalidate()
+        self.programStatus.handleEvent(event)
+
+        match read_field(event, "type"):
+            case "agent_start":
+                self.pendingTools.clear()
+                # Restore main escape handler if retry handler is still active
+                # (retry success event fires later, but we need main handler now)
+                if self.retryEscapeHandler:
+                    self.defaultEditor.onEscape = self.retryEscapeHandler
+                    self.retryEscapeHandler = None
+
+            case "turn_start":
+                if self.settingsManager.getShowTerminalProgress():
+                    self.ui.terminal.setProgress(True)
+                if self.workingVisible:
+                    if (self.activeStatusIndicator.kind if self.activeStatusIndicator else None) != "working":
+                        self.showWorkingStatusIndicator()
+                else:
+                    self.clearStatusIndicator()
+                self.ui.requestRender()
+
+            case "queue_update":
+                self.updatePendingMessagesDisplay()
+                self.ui.requestRender()
+
+            case "entry_appended":
+                entry = read_field(event, "entry")
+                entryId = read_field(entry, "id")
+                if entryId in self.entriesRenderedByBoundaryCompaction:
+                    self.entriesRenderedByBoundaryCompaction.discard(entryId)
+                    return
+                entryType = read_field(entry, "type")
+                if entryType == "custom":
+                    self.addCustomEntryToChat(entry)
+                    self.ui.requestRender()
+                elif entryType == "usage" and read_field(entry, "kind") == "cache_warm":
+                    self.addCacheWarmingUsage(entry)
+                    self.ui.requestRender()
+                elif entryType == "custom_message" and read_field(entry, "display"):
+                    self.addMessageToChat(
+                        createCustomMessage(
+                            read_field(entry, "customType"),
+                            read_field(entry, "content"),
+                            read_field(entry, "display"),
+                            read_field(entry, "details"),
+                            read_field(entry, "timestamp"),
+                        )
+                    )
+                    self.ui.requestRender()
+                elif entryType == "compaction":
+                    entries = self.sessionManager.buildContextEntries()
+                    if read_field(jsIndex(entries, 0), "id") != entryId:
+                        return
+                    self.chatContainer.clear()
+                    branch = self.sessionManager.getBranch()
+                    compactionIndex = next(
+                        (index for index, branchEntry in enumerate(branch) if read_field(branchEntry, "id") == entryId),
+                        -1,
+                    )
+                    entriesAfterCompaction = {read_field(branchEntry, "id") for branchEntry in branch[compactionIndex + 1 :]}
+                    retainedEntries = entries[1:]
+                    if read_field(entry, "contextMessages") is not None:
+                        # MISAKA fork: a context engine's compaction carries the context it keeps, which is drawn in
+                        # context order in place of the summary.
+                        self.renderSessionEntries(entries)
+                    else:
+                        self.renderSessionEntries(
+                            [retained for retained in retainedEntries if read_field(retained, "id") not in entriesAfterCompaction]
+                        )
+                        self.addMessageToChat(
+                            createCompactionSummaryMessage(
+                                read_field(entry, "summary"), read_field(entry, "tokensBefore"), read_field(entry, "timestamp")
+                            )
+                        )
+                        if read_field(entry, "usage"):
+                            self.addCompactionCostNotice(
+                                {"type": "compaction_cost", "kind": "compaction", "usage": read_field(entry, "usage")}
+                            )
+                        self.renderSessionEntries(
+                            [retained for retained in retainedEntries if read_field(retained, "id") in entriesAfterCompaction]
+                        )
+                    for afterId in entriesAfterCompaction:
+                        self.entriesRenderedByBoundaryCompaction.add(afterId)
+                    self.footer.invalidate()
+                    self.ui.requestRender()
+
+            case "session_info_changed":
+                self.updateTerminalTitle()
+                self.footer.invalidate()
+                self.ui.requestRender()
+
+            case "thinking_level_changed":
+                self.footer.invalidate()
+                self.updateEditorBorderColor()
+
+            case "message_start":
+                message = read_field(event, "message")
+                role = read_field(message, "role")
+                if role == "custom":
+                    self.addMessageToChat(message)
+                    self.ui.requestRender()
+                elif role == "user":
+                    self.addMessageToChat(message)
+                    self.updatePendingMessagesDisplay()
+                    self.ui.requestRender()
+                elif role == "assistant":
+                    self.streamingComponent = AssistantMessageComponent(
+                        None,
+                        self.hideThinkingBlock,
+                        self.getMarkdownThemeWithSettings(),
+                        self.hiddenThinkingLabel,
+                        self.outputPad,
+                        self.getMarkdownTransformers(),
+                    )
+                    self.streamingMessage = message
+                    self.chatContainer.addChild(self.streamingComponent)
+                    self.streamingComponent.updateContent(self.streamingMessage, True)
+                    self.ui.requestRender()
+
+            case "message_update":
+                message = read_field(event, "message")
+                if self.streamingComponent and read_field(message, "role") == "assistant":
+                    self.streamingMessage = message
+                    self.streamingComponent.updateContent(self.streamingMessage, True)
+
+                    for content in read_field(self.streamingMessage, "content", []):
+                        if read_field(content, "type") == "toolCall":
+                            contentId = read_field(content, "id")
+                            if contentId not in self.pendingTools:
+                                newComponent = ToolExecutionComponent(
+                                    read_field(content, "name"),
+                                    contentId,
+                                    read_field(content, "arguments"),
+                                    {
+                                        "showImages": self.settingsManager.getShowImages(),
+                                        "imageWidthCells": self.settingsManager.getImageWidthCells(),
+                                        "outputPad": self.outputPad,
+                                    },
+                                    self.getRegisteredToolDefinition(read_field(content, "name")),
+                                    self.ui,
+                                    self.sessionManager.getCwd(),
+                                )
+                                newComponent.setExpanded(self.toolOutputExpanded)
+                                self.chatContainer.addChild(newComponent)
+                                self.pendingTools[contentId] = newComponent
+                            else:
+                                existing = self.pendingTools.get(contentId)
+                                if existing:
+                                    existing.updateArgs(read_field(content, "arguments"))
+                    self.ui.requestRender()
+
+            case "message_end":
+                message = read_field(event, "message")
+                role = read_field(message, "role")
+                if role == "user":
+                    return
+                if self.streamingComponent and role == "assistant":
+                    self.streamingMessage = message
+                    errorMessage: str | None = None
+                    if read_field(self.streamingMessage, "stopReason") == "aborted":
+                        retryAttempt = self.session.retryAttempt
+                        errorMessage = (
+                            f"Aborted after {retryAttempt} retry attempt{'s' if retryAttempt > 1 else ''}"
+                            if retryAttempt > 0
+                            else "Operation aborted"
+                        )
+                        _set_field(self.streamingMessage, "errorMessage", errorMessage)
+                    self.streamingComponent.updateContent(self.streamingMessage, False)
+
+                    if read_field(self.streamingMessage, "stopReason") in ("aborted", "error"):
+                        if not errorMessage:
+                            errorMessage = read_field(self.streamingMessage, "errorMessage") or "Error"
+                        for pendingComponent in self.pendingTools.values():
+                            pendingComponent.updateResult(
+                                {"content": [{"type": "text", "text": errorMessage}], "isError": True}
+                            )
+                        self.pendingTools.clear()
+                        self.maybeSuggestBugReport(self.streamingMessage)
+                    else:
+                        # Args are now complete - trigger diff computation for edit tools
+                        for pendingComponent in self.pendingTools.values():
+                            pendingComponent.setArgsComplete()
+                        self.maybeShowThinkingDropNotice(self.streamingMessage)
+                        self.maybeShowCacheMissNotice(self.streamingMessage)
+                    self.streamingComponent = None
+                    self.streamingMessage = None
+                    self.footer.invalidate()
+                elif role == "custom" and self._customMessageIsInTranscript(message):
+                    # MISAKA fork: a custom message the session defers until its entry exists is placed by redrawing
+                    # the session (see `_customMessageIsInTranscript`).
+                    self.renderCurrentSessionState()
+                self.ui.requestRender()
+
+            case "bash_execution_update":
+                # The bash execution callback handles TUI output rendering.
+                pass
+
+            case "tool_execution_start":
+                # Nested calls (from codemode scripts) are shown inside their parent's row.
+                if read_field(event, "parentToolCallId"):
+                    return
+                toolCallId = read_field(event, "toolCallId")
+                component = self.pendingTools.get(toolCallId)
+                if not component:
+                    component = ToolExecutionComponent(
+                        read_field(event, "toolName"),
+                        toolCallId,
+                        read_field(event, "args"),
+                        {
+                            "showImages": self.settingsManager.getShowImages(),
+                            "imageWidthCells": self.settingsManager.getImageWidthCells(),
+                            "outputPad": self.outputPad,
+                        },
+                        self.getRegisteredToolDefinition(read_field(event, "toolName")),
+                        self.ui,
+                        self.sessionManager.getCwd(),
+                    )
+                    component.setExpanded(self.toolOutputExpanded)
+                    self.chatContainer.addChild(component)
+                    self.pendingTools[toolCallId] = component
+                component.markExecutionStarted()
+                self.ui.requestRender()
+
+            case "tool_execution_update":
+                component = self.pendingTools.get(read_field(event, "toolCallId"))
+                if component:
+                    component.updateResult(_spread_tool_result(read_field(event, "partialResult"), False), True)
+                    self.ui.requestRender()
+
+            case "tool_execution_end":
+                if read_field(event, "isError"):
+                    self.maybeShowInstallChangeWarning()
+                toolCallId = read_field(event, "toolCallId")
+                component = self.pendingTools.get(toolCallId)
+                if component:
+                    component.updateResult(
+                        _spread_tool_result(
+                            read_field(event, "result"), read_field(event, "isError"), read_field(event, "durationMs")
+                        )
+                    )
+                    self.pendingTools.pop(toolCallId, None)
+                    self.ui.requestRender()
+
+            case "agent_end":
+                if self.settingsManager.getShowTerminalProgress():
+                    self.ui.terminal.setProgress(False)
+                self.clearStatusIndicator("working")
+                if self.streamingComponent:
+                    self.chatContainer.removeChild(self.streamingComponent)
+                    self.streamingComponent = None
+                    self.streamingMessage = None
+                self.pendingTools.clear()
+
+                self.ui.requestRender()
+
+            case "agent_settled":
+                await self.checkShutdownRequested()
+
+            case "compaction_start":
+                if self.settingsManager.getShowTerminalProgress():
+                    self.ui.terminal.setProgress(True)
+                # Keep editor active; submissions are queued during compaction.
+                self.autoCompactionEscapeHandler = self.defaultEditor.onEscape
+                self.defaultEditor.onEscape = lambda: self.session.abortCompaction()
+                self.showStatusIndicator(CompactionStatusIndicator(self.ui, read_field(event, "reason")))
+                self.ui.requestRender()
+
+            case "compaction_end":
+                if self.settingsManager.getShowTerminalProgress():
+                    self.ui.terminal.setProgress(False)
+                if self.autoCompactionEscapeHandler:
+                    self.defaultEditor.onEscape = self.autoCompactionEscapeHandler
+                    self.autoCompactionEscapeHandler = None
+                self.clearStatusIndicator("compaction")
+                result = read_field(event, "result")
+                if read_field(event, "aborted"):
+                    if read_field(event, "reason") == "manual":
+                        self.showError("Compaction cancelled")
+                    else:
+                        self.showStatus("Auto-compaction cancelled")
+                elif result:
+                    entries = self.sessionManager.buildContextEntries()
+                    if read_field(jsIndex(entries, 0), "type") != "compaction":
+                        raise RuntimeError("Completed compaction is missing from the session context")
+                    self.chatContainer.clear()
+                    if read_field(entries[0], "contextMessages") is not None:
+                        # MISAKA fork: a context engine's compaction carries the context it keeps, which is drawn in
+                        # place of the summary.
+                        self.renderSessionEntries(entries)
+                    else:
+                        # The latest compaction is prepended for model context; append it below at its chronological
+                        # position.
+                        self.renderSessionEntries(entries[1:])
+                        self.addMessageToChat(
+                            createCompactionSummaryMessage(
+                                read_field(result, "summary"),
+                                read_field(result, "tokensBefore"),
+                                datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                            )
+                        )
+                        if read_field(result, "usage"):
+                            self.addCompactionCostNotice(
+                                {"type": "compaction_cost", "kind": "compaction", "usage": read_field(result, "usage")}
+                            )
+                    self.footer.invalidate()
+                elif read_field(event, "errorMessage"):
+                    if read_field(event, "reason") == "manual":
+                        self.showError(read_field(event, "errorMessage"))
+                    else:
+                        self.chatContainer.addChild(Spacer(1))
+                        compactionError = read_field(event, "errorMessage")
+                        self.chatContainer.addChild(ThemedText(lambda: theme.fg("error", compactionError), 1, 0))
+                self._schedule_task(self.flushCompactionQueue({"willRetry": read_field(event, "willRetry")}))
+                self.ui.requestRender()
+
+            case "auto_retry_start":
+                # Set up escape to abort retry
+                self.retryEscapeHandler = self.defaultEditor.onEscape
+                self.defaultEditor.onEscape = lambda: self.session.abortRetry()
+                self.showStatusIndicator(
+                    RetryStatusIndicator(
+                        self.ui, read_field(event, "attempt"), read_field(event, "maxAttempts"), read_field(event, "delayMs")
+                    )
+                )
+                self.ui.requestRender()
+
+            case "auto_retry_end":
+                # Restore escape handler
+                if self.retryEscapeHandler:
+                    self.defaultEditor.onEscape = self.retryEscapeHandler
+                    self.retryEscapeHandler = None
+                self.clearStatusIndicator("retry")
+                # Show error only on final failure (success shows normal response)
+                if not read_field(event, "success"):
+                    self.showError(
+                        f"Retry failed after {read_field(event, 'attempt')} attempts: "
+                        f"{read_field(event, 'finalError') or 'Unknown error'}"
+                    )
+                self.ui.requestRender()
+
+            case "summarization_retry_scheduled":
+                self.showError(read_field(event, "errorMessage"))
+                self.showStatusIndicator(
+                    RetryStatusIndicator(
+                        self.ui, read_field(event, "attempt"), read_field(event, "maxAttempts"), read_field(event, "delayMs")
+                    )
+                )
+                self.ui.requestRender()
+
+            case "summarization_retry_attempt_start":
+                self.clearStatusIndicator("retry")
+                if read_field(event, "source") == "branchSummary":
+                    self.showStatusIndicator(BranchSummaryStatusIndicator(self.ui))
+                else:
+                    self.showStatusIndicator(CompactionStatusIndicator(self.ui, read_field(event, "reason")))
+                self.ui.requestRender()
+
+            case "summarization_retry_finished":
+                self.clearStatusIndicator("retry")
+                self.ui.requestRender()
+
+    def _customMessageIsInTranscript(self, message: Any) -> bool:
+        """MISAKA fork: has the custom message just announced already been written to the session?
+
+        The session emits ``message_end`` before it persists the message, so a custom message delivered by the agent
+        loop (``followUp``/``steer``/``prompt``, which is how a Sisters task notification reaches the chat) is announced
+        while the transcript still lacks its entry, and redrawing from it would erase the card ``message_start`` drew.
+        Counting rather than looking for a match keeps two identical cards apart: the second is unpersisted exactly
+        when the chat shows more copies than the transcript holds.
+        """
+        customType = read_field(message, "customType")
+        content = read_field(message, "content")
+
+        def matches(item: Any) -> bool:
+            return read_field(item, "customType") == customType and read_field(item, "content") == content
+
+        persisted = sum(
+            1
+            for entry in self.sessionManager.buildContextEntries()
+            if read_field(entry, "type") in ("custom_message", "custom") and matches(entry)
+        )
+        if persisted == 0:
+            return False
+        drawn = sum(
+            1
+            for child in self.chatContainer.children
+            if isinstance(child, CustomMessageComponent) and matches(child.message)
+        )
+        return persisted >= drawn
+
+    def getUserMessageText(self, message: Any) -> str:
+        """Extract text content from a user message"""
+        if read_field(message, "role") != "user":
+            return ""
+        content = read_field(message, "content")
+        textBlocks = (
+            [{"type": "text", "text": content}]
+            if isinstance(content, str)
+            else [c for c in content or [] if read_field(c, "type") == "text"]
+        )
+        return "".join(read_field(c, "text") for c in textBlocks)
+
+    # MISAKA fork: no `showManagedToolStatus` (fd and rg are never downloaded at runtime).
+
+    def showStatus(self, message: str) -> None:
+        """Show a status message in the chat.
+
+        If multiple status messages are emitted back-to-back (without anything else being added to the chat),
+        we update the previous status line instead of appending new ones to avoid log spam.
+        """
+        children = self.chatContainer.children
+        last = children[-1] if len(children) > 0 else None
+        secondLast = children[-2] if len(children) > 1 else None
+
+        if last and secondLast and last is self.lastStatusText and secondLast is self.lastStatusSpacer:
+            self.lastStatusMessage = message
+            self.lastStatusText.invalidate()
+            self.ui.requestRender()
+            return
+
+        spacer = Spacer(1)
+        self.lastStatusMessage = message
+        text = ThemedText(lambda: theme.fg("dim", self.lastStatusMessage), 1, 0)
+        self.chatContainer.addChild(spacer)
+        self.chatContainer.addChild(text)
+        self.lastStatusSpacer = spacer
+        self.lastStatusText = text
+        self.ui.requestRender()
+
+    def addCustomEntryToChat(self, entry: Any) -> None:
+        renderer = self.session.extensionRunner.getEntryRenderer(read_field(entry, "customType"))
+        if not renderer:
+            return
+        component = CustomEntryComponent(entry, renderer, self.outputPad)
+        component.setExpanded(self.toolOutputExpanded)
+        if not component.hasContent():
+            return
+
+        if self.streamingComponent:
+            streamingIndex = next(
+                (index for index, child in enumerate(self.chatContainer.children) if child is self.streamingComponent),
+                -1,
+            )
+            if streamingIndex >= 0:
+                self.chatContainer.children.insert(streamingIndex, component)
+                return
+
+        self.chatContainer.addChild(component)
+
+    def addMessageToChat(self, message: Any, options: dict[str, Any] | None = None) -> None:
+        match read_field(message, "role"):
+            case "bashExecution":
+                bashComponent = BashExecutionComponent(
+                    read_field(message, "command"),
+                    self.ui,
+                    read_field(message, "excludeFromContext"),
+                    self.outputPad,
+                )
+                output = read_field(message, "output")
+                if output:
+                    bashComponent.appendOutput(output)
+                bashComponent.setComplete(
+                    read_field(message, "exitCode"),
+                    read_field(message, "cancelled"),
+                    _make_bash_truncation_result(output or "") if read_field(message, "truncated") else None,
+                    read_field(message, "fullOutputPath"),
+                )
+                self.chatContainer.addChild(bashComponent)
+            case "custom":
+                if read_field(message, "display"):
+                    renderer = self.session.extensionRunner.getMessageRenderer(read_field(message, "customType"))
+                    customComponent = CustomMessageComponent(
+                        message,
+                        renderer,
+                        self.getMarkdownThemeWithSettings(),
+                        self.outputPad,
+                    )
+                    customComponent.setExpanded(self.toolOutputExpanded)
+                    self.chatContainer.addChild(customComponent)
+            case "compactionSummary":
+                self.chatContainer.addChild(Spacer(1))
+                compactionComponent = CompactionSummaryMessageComponent(
+                    message,
+                    self.getMarkdownThemeWithSettings(),
+                    self.outputPad,
+                )
+                compactionComponent.setExpanded(self.toolOutputExpanded)
+                self.chatContainer.addChild(compactionComponent)
+            case "branchSummary":
+                self.chatContainer.addChild(Spacer(1))
+                branchComponent = BranchSummaryMessageComponent(
+                    message,
+                    self.getMarkdownThemeWithSettings(),
+                    self.outputPad,
+                )
+                branchComponent.setExpanded(self.toolOutputExpanded)
+                self.chatContainer.addChild(branchComponent)
+            case "system":
+                pass
+            case "user":
+                textContent = self.getUserMessageText(message)
+                if textContent:
+                    if len(self.chatContainer.children) > 0:
+                        self.chatContainer.addChild(Spacer(1))
+                    skillBlock = parseSkillBlock(textContent)
+                    if skillBlock:
+                        # Render skill block (collapsible)
+                        skillComponent = SkillInvocationMessageComponent(
+                            skillBlock,
+                            self.getMarkdownThemeWithSettings(),
+                            self.outputPad,
+                        )
+                        skillComponent.setExpanded(self.toolOutputExpanded)
+                        self.chatContainer.addChild(skillComponent)
+                        # Render user message separately if present
+                        if read_field(skillBlock, "userMessage"):
+                            self.chatContainer.addChild(Spacer(1))
+                            self.chatContainer.addChild(
+                                UserMessageComponent(
+                                    read_field(skillBlock, "userMessage"),
+                                    self.getMarkdownThemeWithSettings(),
+                                    self.outputPad,
+                                    self.getMarkdownTransformers(),
+                                )
+                            )
+                    else:
+                        self.chatContainer.addChild(
+                            UserMessageComponent(
+                                textContent,
+                                self.getMarkdownThemeWithSettings(),
+                                self.outputPad,
+                                self.getMarkdownTransformers(),
+                            )
+                        )
+                    # MISAKA fork: pi's editor history lives in memory, so every render of a session refills it from
+                    # the transcript. An editor whose history is a file already holds what was typed, and refilling it
+                    # appended the whole session again on every open, resume and reload.
+                    if read_field(options, "populateHistory") and not getattr(self.editor, "historyFile", None):
+                        addToHistory = getattr(self.editor, "addToHistory", None)
+                        if callable(addToHistory):
+                            addToHistory(textContent)
+            case "assistant":
+                self.chatContainer.addChild(
+                    AssistantMessageComponent(
+                        message,
+                        self.hideThinkingBlock,
+                        self.getMarkdownThemeWithSettings(),
+                        self.hiddenThinkingLabel,
+                        self.outputPad,
+                        self.getMarkdownTransformers(),
+                    )
+                )
+            case "toolResult":
+                # Tool results are rendered inline with tool calls, handled separately
+                pass
+
+    def renderSessionItems(self, items: list[Any], options: dict[str, Any] | None = None) -> None:
+        if options is None:
+            options = {}
+        self.pendingTools.clear()
+        renderedPendingTools: dict[str, ToolExecutionComponent] = {}
+        # Cache misses are not persisted, unlike successful cache-warming usage.
+        # Re-derive them and inject them after the assistant messages that paid for them.
+        cacheMisses: dict[int, CacheMiss] = (
+            collectCacheMisses(self.sessionManager.getEntries(), self.session.modelRuntime)
+            if self.settingsManager.getShowCacheMissNotices()
+            else {}
+        )
+
+        if options.get("updateFooter"):
+            self.footer.invalidate()
             self.updateEditorBorderColor()
 
-        renderer = self._transcriptRenderer()
-        for message in items:
-            if read_field(message, "type") == "custom" and _message_role(message) is None:
-                self.addCustomEntryToChat(message)
+        for item in items:
+            if isCustomSessionEntry(item):
+                self.addCustomEntryToChat(item)
                 continue
-            if read_field(message, "type") == "usage" and _message_role(message) is None:
-                self.addCacheWarmingUsage(message)
+            if isUsageSessionEntry(item):
+                self.addCacheWarmingUsage(item)
                 continue
-            renderer.appendItem(self.chatContainer, message, rendered_pending_tools)
-            self._rememberUserMessage(message, options)
+            if isCompactionCostNotice(item):
+                self.addCompactionCostNotice(item)
+                continue
 
-        self._toolComponentsById = rendered_pending_tools
-        self._request_render()
+            message = item
+            role = read_field(message, "role")
+            stopReason = read_field(message, "stopReason")
+            # Assistant messages need special handling for tool calls
+            if role == "assistant":
+                self.addMessageToChat(message)
+                # Render tool call components
+                for content in read_field(message, "content", []):
+                    if read_field(content, "type") == "toolCall":
+                        toolComponent = ToolExecutionComponent(
+                            read_field(content, "name"),
+                            read_field(content, "id"),
+                            read_field(content, "arguments"),
+                            {
+                                "showImages": self.settingsManager.getShowImages(),
+                                "imageWidthCells": self.settingsManager.getImageWidthCells(),
+                                "outputPad": self.outputPad,
+                            },
+                            self.getRegisteredToolDefinition(read_field(content, "name")),
+                            self.ui,
+                            self.sessionManager.getCwd(),
+                        )
+                        toolComponent.setExpanded(self.toolOutputExpanded)
+                        self.chatContainer.addChild(toolComponent)
 
-    def renderSessionContext(self, sessionContext: Any, options: dict[str, Any] | None = None) -> None:
-        messages = list(
-            read_field(sessionContext, "messages", getattr(self.session.state, "messages", [])) or []
-        )
-        self._renderSessionItems(messages, options)
+                        if stopReason == "aborted" or stopReason == "error":
+                            if stopReason == "aborted":
+                                retryAttempt = self.session.retryAttempt
+                                errorMessage = (
+                                    f"Aborted after {retryAttempt} retry attempt{'s' if retryAttempt > 1 else ''}"
+                                    if retryAttempt > 0
+                                    else "Operation aborted"
+                                )
+                            else:
+                                errorMessage = read_field(message, "errorMessage") or "Error"
+                            toolComponent.updateResult(
+                                {"content": [{"type": "text", "text": errorMessage}], "isError": True}
+                            )
+                        else:
+                            renderedPendingTools[read_field(content, "id")] = toolComponent
+                if stopReason != "aborted" and stopReason != "error":
+                    miss = cacheMisses.get(id(message))
+                    if miss:
+                        self.addCacheMissNotice(miss)
+            elif role == "toolResult":
+                # Match tool results to pending tool components
+                toolCallId = read_field(message, "toolCallId")
+                component = renderedPendingTools.get(toolCallId)
+                if component:
+                    component.updateResult(message)
+                    renderedPendingTools.pop(toolCallId, None)
+            else:
+                # All other messages use standard rendering
+                self.addMessageToChat(message, options)
 
-    def renderSessionEntries(self, entries: list[dict[str, Any]], options: dict[str, Any] | None = None) -> None:
-        items = [
-            item
-            for entry in entries
-            for item in (
-                [entry] if read_field(entry, "type") in {"custom", "usage"} else session_entry_to_display_messages(entry)
-            )
-        ]
-        self._renderSessionItems(items, options)
+        for toolCallId, component in renderedPendingTools.items():
+            self.pendingTools[toolCallId] = component
+        self.ui.requestRender()
+
+    def renderSessionEntries(self, entries: list[Any], options: dict[str, Any] | None = None) -> None:
+        """Render session entries to chat. Used for initial load and rebuild after compaction.
+        @param entries Compaction-aware session entries to render
+        @param options.updateFooter Update footer state
+        @param options.populateHistory Add user messages to editor history
+        """
+        # MISAKA fork (D1): no text selection to reset (`TuiAltScreen.resetTextSelection`).
+        items: list[Any] = []
+        for entry in entries:
+            entryType = read_field(entry, "type")
+            if entryType == "custom" or (entryType == "usage" and read_field(entry, "kind") == "cache_warm"):
+                items.append(entry)
+                continue
+            # MISAKA fork: a context engine's compaction shows its summaries as compaction summaries, never as
+            # user turns (`session_entry_to_display_messages`).
+            messages = session_entry_to_display_messages(entry)
+            if entryType in ("compaction", "branch_summary") and read_field(entry, "usage") and len(messages) > 0:
+                items.extend([*messages, {"type": "compaction_cost", "kind": entryType, "usage": read_field(entry, "usage")}])
+                continue
+            items.extend(messages)
+        self.renderSessionItems(items, options)
 
     def addCacheWarmingUsage(self, entry: Any) -> None:
-        """Successful cache-warming usage is persisted, unlike cache misses; show it in place."""
-        show = _callable_attr(self.settingsManager, "getShowCacheMissNotices")
-        if show is not None and not show():
-            return
-        if read_field(entry, "kind") != "cache_warm":
+        if not self.settingsManager.getShowCacheMissNotices():
             return
         self.chatContainer.addChild(Spacer(1))
+        usage = formatCacheWarmingUsage(entry)
+        self.chatContainer.addChild(ThemedText(lambda: theme.fg("dim", usage), 1, 0))
+
+    def addCompactionCostNotice(self, notice: CompactionCostNotice) -> None:
+        """Render billing usage for a compaction or branch summary. The notice is derived
+        from persisted summary usage and is not stored as a separate session entry.
+        """
+        if not self.settingsManager.getShowCacheMissNotices():
+            return
+
+        usage = notice["usage"]
+        tokens = (
+            read_field(usage, "input")
+            + read_field(usage, "output")
+            + read_field(usage, "cacheRead")
+            + read_field(usage, "cacheWrite")
+        )
+        total = read_field(read_field(usage, "cost"), "total")
+        cost = f" (~${toFixed(total, 2)})" if total >= 0.01 else ""
+        label = "Compaction" if notice["kind"] == "compaction" else "Branch summary"
+        self.chatContainer.addChild(Spacer(1))
         self.chatContainer.addChild(
-            Text(interactive_theme.theme.fg("dim", format_cache_warming_usage(entry)), 1, 0)
+            ThemedText(lambda: theme.fg("warning", f"{label}: {formatTokens(tokens)} tokens billed{cost}"), 1, 0)
         )
 
-    def renderInitialMessages(self) -> None:
-        self.renderSessionEntries(
-            self.sessionManager.buildContextEntries(),
-            {"updateFooter": True, "populateHistory": True},
+    @staticmethod
+    def countDroppedThinkingBlocks(message: Any) -> int:
+        count = 0
+        for diagnostic in read_field(message, "diagnostics") or []:
+            if read_field(diagnostic, "type") != "anthropic_input_transformations":
+                continue
+            transformations = read_field(read_field(diagnostic, "details"), "transformations")
+            if not isinstance(transformations, list):
+                continue
+            count += len(
+                [
+                    transformation
+                    for transformation in transformations
+                    if isinstance(transformation, dict) and transformation.get("type") == "thinking_dropped"
+                ]
+            )
+        return count
+
+    def maybeShowThinkingDropNotice(self, message: Any) -> None:
+        if not self.settingsManager.getShowCacheMissNotices():
+            return
+
+        droppedCount = InteractiveMode.countDroppedThinkingBlocks(message)
+        if droppedCount == 0:
+            return
+
+        previousDroppedCount = 0
+        # message_end reaches the UI before the current message is persisted,
+        # so the branch's last assistant message is the previous response.
+        branch = self.sessionManager.getBranch()
+        for entry in reversed(branch):
+            if read_field(entry, "type") == "message" and read_field(read_field(entry, "message"), "role") == "assistant":
+                previousDroppedCount = InteractiveMode.countDroppedThinkingBlocks(read_field(entry, "message"))
+                break
+        if droppedCount <= previousDroppedCount:
+            return
+
+        noun = "thinking block" if droppedCount == 1 else "thinking blocks"
+        self.chatContainer.addChild(Spacer(1))
+        self.chatContainer.addChild(
+            ThemedText(
+                lambda: theme.fg("warning", f"Anthropic dropped {droppedCount} {noun} (details in session)"),
+                1,
+                0,
+            )
         )
+
+    def maybeShowCacheMissNotice(self, message: Any) -> None:
+        """Show a transcript notice when a completed assistant message paid for a
+        significant cache miss. Only states observable facts: the miss itself,
+        a model switch, or an idle gap past the cache TTL.
+        """
+        if not self.settingsManager.getShowCacheMissNotices():
+            return
+
+        # Entries don't contain `message` yet: message_end fires before persistence.
+        miss = detectCacheMiss(self.sessionManager.getEntries(), message, self.session.modelRuntime)
+        if miss:
+            self.addCacheMissNotice(miss)
+
+    def addCacheMissNotice(self, miss: CacheMiss) -> None:
+        if miss.missedTokens < 20_000 and miss.missedCost < 0.1:
+            return
+
+        cost = f" (~${toFixed(miss.missedCost, 2)})" if miss.missedCost >= 0.01 else ""
+        reBilled = f"{formatTokens(miss.missedTokens)} tokens re-billed{cost}"
+        label = "Cache miss"
+        if miss.modelChanged:
+            label = "Cache miss after model switch"
+        elif miss.idleMs >= CACHE_TTL_MS:
+            label = f"Cache miss after {jsRound(miss.idleMs / 60_000)}m idle"
+        self.chatContainer.addChild(Spacer(1))
+        self.chatContainer.addChild(ThemedText(lambda: theme.fg("warning", f"{label}: {reBilled}"), 1, 0))
+
+    def renderInitialMessages(self) -> None:
+        entries = self.sessionManager.buildContextEntries()
+        self.renderSessionEntries(entries, {"updateFooter": True, "populateHistory": True})
         self.renderProjectTrustWarningIfNeeded()
-        get_entries = _callable_attr(self.sessionManager, "getEntries")
-        all_entries = list(get_entries() or []) if get_entries is not None else []
-        compaction_count = sum(1 for entry in all_entries if read_field(entry, "type") == "compaction")
-        if compaction_count > 0:
-            times = "1 time" if compaction_count == 1 else f"{compaction_count} times"
+
+        # Show compaction info if session was compacted
+        allEntries = self.sessionManager.getEntries()
+        compactionCount = len([e for e in allEntries if read_field(e, "type") == "compaction"])
+        if compactionCount > 0:
+            times = "1 time" if compactionCount == 1 else f"{compactionCount} times"
             self.showStatus(f"Session compacted {times}")
 
     def renderProjectTrustWarningIfNeeded(self) -> None:
-        cwd = str(self.sessionManager.getCwd())
-        if _safe_call_bool(self.settingsManager, "isProjectTrusted", True):
-            return
-        if not has_trust_requiring_project_resources(cwd):
+        if self.settingsManager.isProjectTrusted() or not hasTrustRequiringProjectResources(
+            self.sessionManager.getCwd()
+        ):
             return
 
-        if getattr(self.chatContainer, "children", []):
+        if len(self.chatContainer.children) > 0:
             self.chatContainer.addChild(Spacer(1))
+        # MISAKA fork: names what an untrusted project loses in MISAKA (settings, prompts, themes and Sisters agent
+        # definitions) and the product to restart.
         self.chatContainer.addChild(
-            Text(
-                interactive_theme.theme.fg(
+            ThemedText(
+                lambda: theme.fg(
                     "warning",
-                    f"This project is not trusted. Project {home.DIR_NAME}/settings.json, "
-                    f"{home.DIR_NAME}/prompts, {home.DIR_NAME}/themes, and Sisters project "
-                    f"agent definitions in {home.DIR_NAME}/{home.SUBAGENTS_DIR} are ignored. "
-                    f"Use /trust to save a trust decision, then restart {APP_NAME}.",
+                    f"This project is not trusted. Project {home.DIR_NAME}/settings.json, {home.DIR_NAME}/prompts, "
+                    f"{home.DIR_NAME}/themes, and Sisters project agent definitions in "
+                    f"{home.DIR_NAME}/{home.SUBAGENTS_DIR} are ignored. Use /trust to save a trust decision, then "
+                    f"restart {APP_NAME}.",
                 ),
                 1,
                 0,
@@ -2537,459 +4206,2564 @@ class InteractiveMode(Conversation):
         )
 
     async def getUserInput(self) -> str:
-        if self.deferredInputMessages:
-            # Submitted while the loop was busy elsewhere -- send it now rather than make the
-            # user retype it. Every retry outcome (success, cancelled, exhausted) ends with the
-            # loop asking for input again, so nothing strands here.
-            text = self.deferredInputMessages.pop(0)
-            self.updatePendingMessagesDisplay()
-            self._request_render()
-            return text
+        if self.pendingUserInputs:
+            return self.pendingUserInputs.pop(0)
 
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[str] = loop.create_future()
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        # MISAKA fork: `shutdown` cancels the waiting input, since the process is not exited from inside.
         self._pendingUserInputFuture = future
 
-        def _resolve(text: str) -> None:
-            if self.onInputCallback is _resolve:
-                self.onInputCallback = None
-            if self._pendingUserInputFuture is future:
-                self._pendingUserInputFuture = None
+        def onInputCallback(text: str) -> None:
+            self.onInputCallback = None
             if not future.done():
                 future.set_result(text)
 
-        self.onInputCallback = _resolve
+        self.onInputCallback = onInputCallback
         try:
             return await future
         finally:
-            if self.onInputCallback is _resolve:
+            if self.onInputCallback is onInputCallback:
                 self.onInputCallback = None
             if self._pendingUserInputFuture is future:
                 self._pendingUserInputFuture = None
 
     def rebuildChatFromMessages(self) -> None:
-        clear = _callable_attr(self.chatContainer, "clear")
-        if clear is not None:
-            clear()
+        self.chatContainer.clear()
         self.renderSessionEntries(self.sessionManager.buildContextEntries())
 
-    def _customMessageIsInTranscript(self, message: Any) -> bool:
-        """Has the custom message just announced already been written to the session?
+    # =========================================================================
+    # Key handlers
+    # =========================================================================
 
-        ``AgentSession._handle_agent_event`` emits ``message_end`` *before* it calls
-        ``_persist_message``, and the TUI listener runs synchronously up to that point, so
-        a custom message delivered by the agent loop -- ``followUp``/``steer``/``prompt``,
-        which is how a Sisters task notification reaches the chat -- is announced while the
-        transcript still lacks its entry. Rebuilding from ``buildContextEntries()`` there
-        erases the card ``message_start`` just drew, and with tool results no longer
-        rebuilding it never comes back.
+    def handleCtrlC(self) -> None:
+        now = time.time() * 1000
+        if now - self.lastSigintTime < 500:
+            self._schedule_task(self.shutdown())
+            return
+        self.lastSigintTime = now
+        # MISAKA fork: Ctrl+C while busy interrupts through the same abort path as Escape (pi only clears the line);
+        # a double press still exits and an idle press still clears.
+        if self.session.isStreaming:
+            self.restoreQueuedMessagesToEditor({"abort": True})
+            return
+        if self.session.isBashRunning:
+            self.session.abortBash()
+            return
+        self.clearEditor()
 
-        Counting rather than merely looking for a match keeps two identical cards apart:
-        the second one is unpersisted exactly when the chat already shows more copies than
-        the transcript holds.
+    def handleCtrlD(self) -> None:
+        # Only called when editor is empty (enforced by CustomEditor)
+        self._schedule_task(self.shutdown())
+
+    async def shutdown(self, options: dict[str, Any] | None = None) -> int:
+        """Gracefully shutdown the agent.
+        Stops the TUI before emitting shutdown events so extension UI cleanup cannot
+        repaint the final frame while the process is exiting.
+
+        MISAKA fork: returns the exit code, which `run` hands to the engine, instead of exiting the process.
         """
-        custom_type = str(read_field(message, "customType", ""))
-        content = read_field(message, "content")
+        if self.isShuttingDown:
+            return await asyncio.shield(self._shutdownFuture) if self._shutdownFuture is not None else 0
+        self.isShuttingDown = True
+        # Keep signal handlers registered until terminal cleanup has completed.
 
-        def _matches(item: Any) -> bool:
-            return (
-                str(read_field(item, "customType", "")) == custom_type
-                and read_field(item, "content") == content
+        # MISAKA fork: the input loop stops waiting for input.
+        if self._pendingUserInputFuture is not None and not self._pendingUserInputFuture.done():
+            self._pendingUserInputFuture.cancel()
+        self.onInputCallback = None
+
+        if read_field(options, "fromSignal"):
+            # Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
+            # (session_shutdown) BEFORE touching the terminal. Extension teardown
+            # such as removing sockets does not write to the tty, so it must not be
+            # skipped if a later terminal-restore write fails on a dead or stalled
+            # terminal.
+            await self.runtimeHost.dispose()
+            # MISAKA fork (D11): no theme auto-sync to disable.
+            await self.ui.terminal.drainInput(1000)
+            self.stop()
+            return self._finishShutdown()
+
+        # Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
+        # TUI before emitting shutdown events so extension UI cleanup cannot repaint
+        # the final frame while the process is exiting.
+        # Drain any in-flight Kitty key release events before stopping.
+        # This prevents escape sequences from leaking to the parent shell over slow SSH.
+        await self.ui.terminal.drainInput(1000)
+
+        self.stop()
+        await self.runtimeHost.dispose()
+
+        resumeCommand = formatResumeCommand(self.sessionManager)
+        if resumeCommand:
+            sys.stdout.write(f"{chalk.dim('To resume this session:')} {resumeCommand}\n")
+
+        return self._finishShutdown()
+
+    def _finishShutdown(self) -> int:
+        """MISAKA fork: `process.exit(0)` resolves the exit-code future `run` waits on."""
+        if self._shutdownFuture is not None and not self._shutdownFuture.done():
+            self._shutdownFuture.set_result(0)
+        return 0
+
+    def emergencyTerminalExit(self) -> NoReturn:
+        self.isShuttingDown = True
+        self.unregisterSignalHandlers()
+        killTrackedDetachedChildren()
+        # The terminal is gone. Do not run normal shutdown because TUI and
+        # extension cleanup can write restore sequences and re-trigger EIO.
+        # MISAKA fork: `SystemExit` in place of `process.exit(129)`.
+        raise SystemExit(129)
+
+    def uncaughtCrash(self, error: BaseException) -> NoReturn:
+        """Last-resort handler for uncaught exceptions. The TUI puts stdin into raw
+        mode and hides the cursor; without this handler, an uncaught throw from
+        anywhere (e.g. an extension callback) tears down the process while leaving
+        the terminal in raw mode with no cursor, requiring `stty sane && reset` to
+        recover.
+
+        Unlike emergencyTerminalExit, the terminal is still alive here, so we
+        call ui.stop() to restore cooked mode, the cursor, and disable bracketed
+        paste / Kitty / modifyOtherKeys sequences.
+        """
+        # A dead terminal is not a crash. Do not try to restore it.
+        if isDeadTerminalError(error):
+            self.emergencyTerminalExit()
+        if self.isShuttingDown:
+            raise SystemExit(1)
+        self.isShuttingDown = True
+        with contextlib.suppress(Exception):
+            self.unregisterSignalHandlers()
+        with contextlib.suppress(Exception):
+            killTrackedDetachedChildren()
+        with contextlib.suppress(Exception):
+            self.ui.stop()
+        print(f"{APP_NAME} exiting due to uncaughtException:", file=sys.stderr)
+        traceback.print_exception(error, file=sys.stderr)
+        extensionHint = self.getCrashExtensionHint(error)
+        if extensionHint:
+            print(f"\n{extensionHint}", file=sys.stderr)
+        # MISAKA fork: no crash record or `/bug` instructions (MISAKA has no `/bug`).
+        raise SystemExit(1)
+
+    async def checkShutdownRequested(self) -> None:
+        """Check if shutdown was requested and perform shutdown if so."""
+        if not self.shutdownRequested:
+            return
+        await self.shutdown()
+
+    def registerSignalHandlers(self) -> None:
+        self.unregisterSignalHandlers()
+
+        signals = [signal.SIGTERM]
+        if sys.platform != "win32":
+            signals.append(signal.SIGHUP)  # windows-footgun: ok - guarded above
+
+        for signum in signals:
+
+            def handler(_signum: int, _frame: Any) -> None:
+                # SIGHUP no longer hard-exits: graceful shutdown emits session_shutdown
+                # first, then attempts terminal restore. A genuinely dead terminal
+                # surfaces as an EIO on the restore writes, which ends in
+                # emergencyTerminalExit.
+                killTrackedDetachedChildren()
+                self._schedule_task(self.shutdown({"fromSignal": True}))
+
+            try:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, handler)
+            except (AttributeError, ValueError):
+                continue
+
+            def restore(signum: signal.Signals = signum, previous: Any = previous) -> None:
+                signal.signal(signum, previous)
+
+            self.signalCleanupHandlers.append(restore)
+
+        # MISAKA fork: pi also listens for stream errors on stdin/stdout/stderr and turns a dead terminal's EIO/ENOTTY
+        # into emergencyTerminalExit. Python's standard streams have no error events; a dead terminal's OSError
+        # reaches `uncaughtCrash` below, which exits the same way.
+
+        # Restore the terminal before the process dies on any uncaught throw.
+        # Without this, an unhandled exception from extension code (or anywhere
+        # in the app) leaves the terminal in raw mode with no cursor.
+        previousExcepthook = sys.excepthook
+
+        def uncaughtExceptionHandler(_type: type[BaseException], error: BaseException, _traceback: Any) -> None:
+            self.uncaughtCrash(error)
+
+        sys.excepthook = uncaughtExceptionHandler
+        self.signalCleanupHandlers.append(lambda: setattr(sys, "excepthook", previousExcepthook))
+
+        # MISAKA fork: an exception that escapes a helper thread is handled on the UI thread, which owns the terminal
+        # and the signal handlers (Node has one thread).
+        previousThreadingExcepthook = threading.excepthook
+        try:
+            ownerLoop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            ownerLoop = None
+
+        def threadingExcepthook(args: Any) -> None:
+            if isinstance(args.exc_value, BaseException) and ownerLoop is not None and not ownerLoop.is_closed():
+                try:
+                    ownerLoop.call_soon_threadsafe(self.uncaughtCrash, args.exc_value)
+                    return
+                except RuntimeError:
+                    pass
+            previousThreadingExcepthook(args)
+
+        threading.excepthook = threadingExcepthook
+        self.signalCleanupHandlers.append(lambda: setattr(threading, "excepthook", previousThreadingExcepthook))
+
+    def unregisterSignalHandlers(self) -> None:
+        for cleanup in self.signalCleanupHandlers:
+            cleanup()
+        self.signalCleanupHandlers = []
+
+    def handleCtrlZ(self) -> None:
+        if sys.platform == "win32":
+            self.showStatus("Suspend to background is not supported on Windows")
+            return
+
+        # MISAKA fork: Python keeps running while suspended, so no keep-alive timer is needed.
+
+        # Ignore SIGINT while suspended so Ctrl+C in the terminal does not
+        # kill the backgrounded process. The handler is removed on resume.
+        previousSigint = signal.getsignal(signal.SIGINT)
+        previousSigcont = signal.getsignal(signal.SIGCONT)  # windows-footgun: ok - guarded above
+
+        def ignoreSigint(_signum: int, _frame: Any) -> None:
+            return None
+
+        # Set up handler to restore TUI when resumed
+        def onSigcont(_signum: int, _frame: Any) -> None:
+            signal.signal(signal.SIGCONT, previousSigcont)  # windows-footgun: ok - guarded above
+            signal.signal(signal.SIGINT, previousSigint)
+            self.ui.start()
+            self.ui.requestRender(True)
+
+        signal.signal(signal.SIGINT, ignoreSigint)
+        signal.signal(signal.SIGCONT, onSigcont)  # windows-footgun: ok - guarded above
+
+        try:
+            # Stop the TUI (restore terminal to normal mode)
+            self.ui.stop()
+
+            # MISAKA fork: a stopped process is not a stalled event loop.
+            loop_watchdog.suspend()
+            # Send SIGTSTP to process group (pid=0 means all processes in group)
+            os.kill(0, signal.SIGTSTP)  # windows-footgun: ok - guarded above
+        except BaseException:
+            signal.signal(signal.SIGINT, previousSigint)
+            signal.signal(signal.SIGCONT, previousSigcont)  # windows-footgun: ok - guarded above
+            raise
+
+    async def handleFollowUp(self) -> None:
+        text = jsTrim(self.getEditorExpandedText())
+        if not text:
+            return
+
+        # Queue input during compaction (extension commands execute immediately)
+        if self.session.isCompacting:
+            if self.isExtensionCommand(text):
+                addToHistory = getattr(self.editor, "addToHistory", None)
+                if callable(addToHistory):
+                    addToHistory(text)
+                self.editor.setText("")
+                await self.session.prompt(text)
+            else:
+                self.queueCompactionMessage(text, "followUp")
+            return
+
+        # Alt+Enter queues a follow-up message (waits until agent finishes)
+        # This handles extension commands (execute immediately), prompt template expansion, and queueing
+        if self.session.isStreaming:
+            addToHistory = getattr(self.editor, "addToHistory", None)
+            if callable(addToHistory):
+                addToHistory(text)
+            self.editor.setText("")
+            await self.session.prompt(text, {"streamingBehavior": "followUp"})
+            self.updatePendingMessagesDisplay()
+            self.ui.requestRender()
+        # If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
+        elif self.editor.onSubmit:
+            self.editor.setText("")
+            self.editor.onSubmit(text)
+
+    def getEditorExpandedText(self) -> str:
+        """MISAKA fork: ``this.editor.getExpandedText?.() ?? this.editor.getText()``."""
+        getExpandedText = getattr(self.editor, "getExpandedText", None)
+        return getExpandedText() if callable(getExpandedText) else self.editor.getText()
+
+    def handleDequeue(self) -> None:
+        restored = self.restoreQueuedMessagesToEditor()
+        if restored == 0:
+            self.showStatus("No queued messages to restore")
+        else:
+            self.showStatus(f"Restored {restored} queued message{'s' if restored > 1 else ''} to editor")
+
+    def updateEditorBorderColor(self) -> None:
+        if self.isBashMode:
+            self.editor.borderColor = theme.getBashModeBorderColor()
+        else:
+            level: ThinkingLevel = self.session.thinkingLevel or "off"
+            self.editor.borderColor = theme.getThinkingBorderColor(level)
+        if self.activeStatusIndicator is not None:
+            self.activeStatusIndicator.invalidate()
+        self.ui.requestRender()
+
+    def _refuseSwitchDuringCompaction(self, what: str) -> bool:
+        """MISAKA fork: pi lets the model or thinking level change while a compaction runs, and the session then
+        discards the compaction when it lands. A context engine's compaction can take minutes (a 1.19M-token Sister
+        lost a five-minute one to three switches and overflowed), so the switch waits, as `/reload` does."""
+        if self.session.isCompacting:
+            self.showWarning(f"Wait for compaction to finish before changing the {what}.")
+            return True
+        return False
+
+    def cycleThinkingLevel(self) -> None:
+        if self._refuseSwitchDuringCompaction("thinking level"):
+            return
+        newLevel = self.session.cycleThinkingLevel()
+        if newLevel is None:
+            self.showStatus("Current model does not support thinking")
+        else:
+            self.footer.invalidate()
+            self.updateEditorBorderColor()
+            self.showStatus(f"Thinking level: {newLevel}")
+
+    async def cycleModel(self, direction: Literal["forward", "backward"]) -> None:
+        if self._refuseSwitchDuringCompaction("model"):
+            return
+        try:
+            result = await self.session.cycleModel(direction)
+            if result is None:
+                msg = "Only one model in scope" if len(self.session.scopedModels) > 0 else "Only one model available"
+                self.showStatus(msg)
+            else:
+                self.footer.invalidate()
+                self.updateEditorBorderColor()
+                model = read_field(result, "model")
+                thinkingLevel = read_field(result, "thinkingLevel")
+                thinkingStr = (
+                    f" (thinking: {thinkingLevel})" if read_field(model, "reasoning") and thinkingLevel != "off" else ""
+                )
+                self.showStatus(f"Switched to {read_field(model, 'name') or read_field(model, 'id')}{thinkingStr}")
+                self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(model))
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.showError(errorMessage(error))
+
+    def toggleToolOutputExpansion(self) -> None:
+        self.setToolsExpanded(not self.toolOutputExpanded)
+
+    def setToolsExpanded(self, expanded: bool) -> None:
+        if expanded == self.toolOutputExpanded:
+            return
+
+        self.toolOutputExpanded = expanded
+        activeHeader = self.customHeader if self.customHeader is not None else self.builtInHeader
+        if isExpandable(activeHeader):
+            activeHeader.setExpanded(expanded)
+        for container in (self.loadedResourcesContainer, self.chatContainer):
+            for child in container.children:
+                if isExpandable(child):
+                    child.setExpanded(expanded)
+        self.showStatus(f"Tool output: {'expanded' if expanded else 'collapsed'}")
+
+    def updateThinkingBlockVisibility(self) -> None:
+        """Update rendered assistant messages without rebuilding live tool components."""
+        for child in self.chatContainer.children:
+            if isinstance(child, AssistantMessageComponent):
+                child.setHideThinkingBlock(self.hideThinkingBlock)
+        self.ui.requestRender()
+
+    def toggleThinkingBlockVisibility(self) -> None:
+        self.hideThinkingBlock = not self.hideThinkingBlock
+        self.settingsManager.setHideThinkingBlock(self.hideThinkingBlock)
+        self.updateThinkingBlockVisibility()
+        self.showStatus(f"Thinking blocks: {'hidden' if self.hideThinkingBlock else 'visible'}")
+
+    async def handleOpenExternalEditor(self) -> None:
+        editorCmd = self.settingsManager.getExternalEditorCommand()
+        content = self.getEditorExpandedText()
+        self.ui.stop()
+        try:
+            result = await editInExternalEditor({"command": editorCmd, "content": content})
+            if result["status"] == "complete":
+                self.editor.setText(result["content"])
+        finally:
+            self.ui.start()
+            self.ui.requestRender(True)
+
+    # =========================================================================
+    # UI helpers
+    # =========================================================================
+
+    def clearEditor(self) -> None:
+        self.editor.setText("")
+        self.ui.requestRender()
+
+    def showError(self, errorMessage: str) -> None:
+        self.chatContainer.addChild(Spacer(1))
+        self.chatContainer.addChild(ThemedText(lambda: theme.fg("error", f"Error: {errorMessage}"), self.outputPad, 0))
+        self.ui.requestRender()
+
+    def showWarning(self, warningMessage: str) -> None:
+        self.chatContainer.addChild(Spacer(1))
+        self.chatContainer.addChild(ThemedText(lambda: theme.fg("warning", f"Warning: {warningMessage}"), 1, 0))
+        self.ui.requestRender()
+
+    # MISAKA fork: no `showNewVersionNotification` or `showPackageUpdateNotification` (no pi version check and no
+    # package sources).
+
+    def getAllQueuedMessages(self) -> dict[str, list[str]]:
+        """Get all queued messages (read-only).
+        Combines session queue and compaction queue.
+        """
+        return {
+            "steering": [
+                *self.session.getSteeringMessages(),
+                *[msg["text"] for msg in self.compactionQueuedMessages if msg["mode"] == "steer"],
+            ],
+            "followUp": [
+                *self.session.getFollowUpMessages(),
+                *[msg["text"] for msg in self.compactionQueuedMessages if msg["mode"] == "followUp"],
+            ],
+        }
+
+    def clearAllQueues(self) -> dict[str, list[str]]:
+        """Clear all queued messages and return their contents.
+        Clears both session queue and compaction queue.
+        """
+        cleared = self.session.clearQueue()
+        steering = read_field(cleared, "steering")
+        followUp = read_field(cleared, "followUp")
+        compactionSteering = [msg["text"] for msg in self.compactionQueuedMessages if msg["mode"] == "steer"]
+        compactionFollowUp = [msg["text"] for msg in self.compactionQueuedMessages if msg["mode"] == "followUp"]
+        self.compactionQueuedMessages = []
+        return {
+            "steering": [*steering, *compactionSteering],
+            "followUp": [*followUp, *compactionFollowUp],
+        }
+
+    def updatePendingMessagesDisplay(self) -> None:
+        self.pendingMessagesContainer.clear()
+        queued = self.getAllQueuedMessages()
+        steeringMessages = queued["steering"]
+        followUpMessages = queued["followUp"]
+        if len(steeringMessages) > 0 or len(followUpMessages) > 0:
+            self.pendingMessagesContainer.addChild(Spacer(1))
+            for message in steeringMessages:
+                text = theme.fg("dim", f"Steering: {message}")
+                self.pendingMessagesContainer.addChild(TruncatedText(text, 1, 0))
+            for message in followUpMessages:
+                text = theme.fg("dim", f"Follow-up: {message}")
+                self.pendingMessagesContainer.addChild(TruncatedText(text, 1, 0))
+            dequeueHint = self.getAppKeyDisplay("app.message.dequeue")
+            hintText = theme.fg("dim", f"↳ {dequeueHint} to edit all queued messages")
+            self.pendingMessagesContainer.addChild(TruncatedText(hintText, 1, 0))
+
+    def restoreQueuedMessagesToEditor(self, options: dict[str, Any] | None = None) -> int:
+        cleared = self.clearAllQueues()
+        allQueued = [*cleared["steering"], *cleared["followUp"]]
+        if len(allQueued) == 0:
+            self.updatePendingMessagesDisplay()
+            if read_field(options, "abort"):
+                self._schedule_task(self.session.abort())
+            return 0
+        queuedText = "\n\n".join(allQueued)
+        currentText = read_field(options, "currentText")
+        if currentText is None:
+            currentText = self.editor.getText()
+        combinedText = "\n\n".join(t for t in (queuedText, currentText) if jsTrim(t))
+        self.editor.setText(combinedText)
+        self.updatePendingMessagesDisplay()
+        if read_field(options, "abort"):
+            self._schedule_task(self.session.abort())
+        return len(allQueued)
+
+    def queueCompactionMessage(self, text: str, mode: Literal["steer", "followUp"]) -> None:
+        self.compactionQueuedMessages.append({"text": text, "mode": mode})
+        addToHistory = getattr(self.editor, "addToHistory", None)
+        if callable(addToHistory):
+            addToHistory(text)
+        self.editor.setText("")
+        self.updatePendingMessagesDisplay()
+        self.showStatus("Queued message for after compaction")
+
+    def isExtensionCommand(self, text: str) -> bool:
+        if not text.startswith("/"):
+            return False
+        # MISAKA fork: a core prompt command (a skill) is prepared and sent as a prompt, not run as a command.
+        if self.isCorePromptCommand(text):
+            return False
+
+        extensionRunner = self.session.extensionRunner
+
+        spaceIndex = text.find(" ")
+        commandName = text[1:] if spaceIndex == -1 else text[1:spaceIndex]
+        # MISAKA fork: a core part's command runs the same way as an extension's.
+        return bool(extensionRunner.getCommand(commandName)) or self.session.moments.command(commandName) is not None
+
+    def isCorePromptCommand(self, text: str) -> bool:
+        """MISAKA fork: whether the text invokes a core prompt command (a skill)."""
+        return self.session.getCorePromptCommand(text) is not None
+
+    def isPromptTemplate(self, text: str) -> bool:
+        """MISAKA fork: whether the text names a prompt template, which the menu offers and `prompt()` expands."""
+        invocation = parse_prompt_template_invocation(text)
+        if invocation is None:
+            return False
+        name, _args = invocation
+        return any(template.name == name for template in self.session.promptTemplates)
+
+    async def flushCompactionQueue(self, options: dict[str, Any] | None = None) -> None:
+        if len(self.compactionQueuedMessages) == 0:
+            return
+
+        queuedMessages = list(self.compactionQueuedMessages)
+        self.compactionQueuedMessages = []
+        self.updatePendingMessagesDisplay()
+
+        # MISAKA fork: a skill's preparation can outlast even a compaction retry, so a failure restores only the
+        # messages the session has not accepted yet: already accepted steering and follow-ups are never cleared, and
+        # a prompt that reached its preflight acceptance is never sent twice. pi clears the session queue and restores
+        # every message.
+        pending = list(queuedMessages)
+        restored = False
+        promptTask: asyncio.Task[Any] | None = None
+
+        def accepted(message: CompactionQueuedMessage) -> None:
+            pending[:] = [item for item in pending if item is not message]
+            if restored:
+                self.compactionQueuedMessages = [item for item in self.compactionQueuedMessages if item is not message]
+                self.updatePendingMessagesDisplay()
+
+        def restoreQueue(error: Any) -> None:
+            nonlocal restored
+            if restored:
+                return
+            restored = True
+            self.compactionQueuedMessages = [*pending, *self.compactionQueuedMessages]
+            self.updatePendingMessagesDisplay()
+            self.showError(f"Failed to send queued message{'s' if len(pending) > 1 else ''}: {errorMessage(error)}")
+
+        async def dispatch(message: CompactionQueuedMessage, forceQueue: bool = False) -> None:
+            if restored:
+                return
+            if self.isExtensionCommand(message["text"]):
+                await self.session.prompt(message["text"])
+            elif self.isCorePromptCommand(message["text"]) or (not forceQueue and not self.session.isStreaming):
+                # MISAKA fork: prompt() decides whether to queue or start once the skill is prepared.
+                await self.session.prompt(
+                    message["text"],
+                    {"streamingBehavior": message["mode"], "preflightResult": lambda _disposition: accepted(message)},
+                )
+            elif message["mode"] == "followUp":
+                await self.session.followUp(message["text"])
+            else:
+                await self.session.steer(message["text"])
+            accepted(message)
+
+        try:
+            if read_field(options, "willRetry"):
+                # When retry is pending, queue messages for the retry turn
+                for message in queuedMessages:
+                    await dispatch(message, True)
+                self.updatePendingMessagesDisplay()
+                return
+
+            # Find first non-extension-command message to use as prompt
+            firstPromptIndex = next(
+                (index for index, message in enumerate(queuedMessages) if not self.isExtensionCommand(message["text"])),
+                -1,
+            )
+            if firstPromptIndex == -1:
+                # All extension commands - execute them all
+                for message in queuedMessages:
+                    await dispatch(message)
+                return
+
+            # Execute any extension commands before the first prompt
+            preCommands = queuedMessages[:firstPromptIndex]
+            firstPrompt = queuedMessages[firstPromptIndex]
+            rest = queuedMessages[firstPromptIndex + 1 :]
+
+            for message in preCommands:
+                await dispatch(message)
+
+            # Start a prompt when idle, or queue it into a run still finishing compaction.
+            preflight: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+            def reportPreflight(success: bool) -> None:
+                if success:
+                    accepted(firstPrompt)
+                if not preflight.done():
+                    preflight.set_result(success)
+
+            async def promptFirst() -> None:
+                try:
+                    await self.session.prompt(
+                        firstPrompt["text"],
+                        {
+                            "streamingBehavior": firstPrompt["mode"],
+                            "preflightResult": lambda _disposition: reportPreflight(True),
+                        },
+                    )
+                except asyncio.CancelledError:
+                    if any(item is firstPrompt for item in pending):
+                        restoreQueue("Queued prompt cancelled before submission")
+                    raise
+                except Exception as error:  # noqa: BLE001 - upstream `.catch(restoreQueue)`
+                    restoreQueue(error)
+                else:
+                    reportPreflight(True)
+                finally:
+                    if not preflight.done():
+                        preflight.set_result(False)
+
+            promptTask = spawn(promptFirst(), self._backgroundTasks)
+            # MISAKA fork: later messages wait until the first prompt is accepted, so its failure cannot restore
+            # messages they already sent.
+            if not await asyncio.shield(preflight):
+                return
+
+            # Queue remaining messages
+            for message in rest:
+                await dispatch(message)
+            self.updatePendingMessagesDisplay()
+        except asyncio.CancelledError:
+            if promptTask is not None and not promptTask.done():
+                promptTask.cancel()
+                await asyncio.gather(promptTask, return_exceptions=True)
+            restoreQueue("Queued submission cancelled")
+            raise
+        except Exception as error:  # noqa: BLE001 - restored and shown
+            restoreQueue(error)
+
+    def flushPendingBashComponents(self) -> None:
+        """Move pending bash components from pending area to chat"""
+        for component in self.pendingBashComponents:
+            self.pendingMessagesContainer.removeChild(component)
+            self.chatContainer.addChild(component)
+        self.pendingBashComponents = []
+
+    # =========================================================================
+    # Selectors
+    # =========================================================================
+
+    def disposeActiveSelector(self) -> None:
+        dispose = self.activeSelectorDispose
+        self.activeSelectorToken = None
+        self.activeSelectorDispose = None
+        if dispose:
+            dispose()
+
+    def showSelector(self, create: Callable[[Callable[[], None]], dict[str, Any]]) -> None:
+        """Shows a selector component in place of the editor.
+        @param create Factory that receives a `done` callback and returns the component and focus target
+        """
+        token = object()
+        dispose: Callable[[], None] | None = None
+
+        def done() -> None:
+            if dispose:
+                dispose()
+            if self.activeSelectorToken is not token:
+                return
+            self.activeSelectorToken = None
+            self.activeSelectorDispose = None
+            self.editorContainer.clear()
+            self.editorContainer.addChild(self.editor)
+            self.ui.setFocus(self.editor)
+
+        created = create(done)
+        dispose = created.get("dispose")
+        self.disposeActiveSelector()
+        self.activeSelectorToken = token
+        self.activeSelectorDispose = dispose
+        self.editorContainer.clear()
+        self.editorContainer.addChild(created["component"])
+        self.ui.setFocus(created["focus"])
+        self.ui.requestRender()
+
+    def showSettingsSelector(self) -> None:
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            defaultProvider = self.settingsManager.getDefaultProvider()
+            defaultModelId = self.settingsManager.getDefaultModel()
+            defaultModel = f"{defaultProvider}/{defaultModelId}" if defaultProvider and defaultModelId else "not set"
+
+            def onAutoCompactChange(enabled: bool) -> None:
+                self.session.setAutoCompactionEnabled(enabled)
+                self.footer.setAutoCompactEnabled(enabled)
+
+            def onShowImagesChange(enabled: bool) -> None:
+                self.settingsManager.setShowImages(enabled)
+                for child in self.chatContainer.children:
+                    if isinstance(child, ToolExecutionComponent):
+                        child.setShowImages(enabled)
+
+            def onImageWidthCellsChange(width: int) -> None:
+                self.settingsManager.setImageWidthCells(width)
+                for child in self.chatContainer.children:
+                    if isinstance(child, ToolExecutionComponent):
+                        child.setImageWidthCells(width)
+
+            def onEnableSkillCommandsChange(enabled: bool) -> None:
+                self.settingsManager.setEnableSkillCommands(enabled)
+                self.setupAutocompleteProvider()
+
+            def onTransportChange(transport: Any) -> None:
+                self.settingsManager.setTransport(transport)
+                self.session.agent.transport = transport
+
+            def onHttpIdleTimeoutMsChange(timeoutMs: int) -> None:
+                self.settingsManager.setHttpIdleTimeoutMs(timeoutMs)
+                configureHttpDispatcher(timeoutMs)
+                self.showStatus(f"HTTP idle timeout: {formatHttpIdleTimeoutMs(timeoutMs)}")
+
+            def onCacheWarmingModeChange(mode: Any) -> None:
+                self.session.setCacheWarmingMode(mode)
+                self.showStatus(f"Cache warming: {mode}")
+
+            def onModelThinkingLevelChange(provider: str, modelId: str, level: ThinkingLevel) -> None:
+                self.settingsManager.setModelThinkingLevel(provider, modelId, level)
+                # If the override is for the current model, apply it to the session too
+                current = self.session.model
+                if current and current.provider == provider and current.id == modelId:
+                    self.session.setThinkingLevel(level)
+                    self.footer.invalidate()
+                    self.updateEditorBorderColor()
+
+            def onModelThinkingLevelRemove(provider: str, modelId: str) -> None:
+                self.settingsManager.removeModelThinkingLevel(provider, modelId)
+                # If the override was for the current model, revert to global default
+                current = self.session.model
+                if current and current.provider == provider and current.id == modelId:
+                    globalDefault = self.settingsManager.getDefaultThinkingLevel() or DEFAULT_THINKING_LEVEL
+                    self.session.setThinkingLevel(globalDefault)
+                    self.footer.invalidate()
+                    self.updateEditorBorderColor()
+
+            def onThemeChange(themeSetting: str) -> None:
+                self.settingsManager.setTheme(themeSetting)
+                self.themeController.setThemeSetting(themeSetting)
+
+            def onHideThinkingBlockChange(hidden: bool) -> None:
+                self.hideThinkingBlock = hidden
+                self.settingsManager.setHideThinkingBlock(hidden)
+                self.updateThinkingBlockVisibility()
+
+            def onShowCacheMissNoticesChange(shown: bool) -> None:
+                self.settingsManager.setShowCacheMissNotices(shown)
+                self.rebuildChatFromMessages()
+
+            def onShowHardwareCursorChange(enabled: bool) -> None:
+                self.settingsManager.setShowHardwareCursor(enabled)
+                self.ui.setShowHardwareCursor(enabled)
+
+            def onEditorPaddingXChange(padding: int) -> None:
+                self.settingsManager.setEditorPaddingX(padding)
+                self.defaultEditor.setPaddingX(padding)
+                if self.editor is not self.defaultEditor and getattr(self.editor, "setPaddingX", None) is not None:
+                    self.editor.setPaddingX(padding)
+
+            def onOutputPadChange(padding: Literal[0, 1]) -> None:
+                self.settingsManager.setOutputPad(padding)
+                self.outputPad = padding
+                for container in (self.chatContainer, self.pendingMessagesContainer):
+                    for child in container.children:
+                        setOutputPad = getattr(child, "setOutputPad", None)
+                        if callable(setOutputPad):
+                            setOutputPad(padding)
+                self.ui.requestRender()
+
+            def onAutocompleteMaxVisibleChange(maxVisible: int) -> None:
+                self.settingsManager.setAutocompleteMaxVisible(maxVisible)
+                self.defaultEditor.setAutocompleteMaxVisible(maxVisible)
+                if (
+                    self.editor is not self.defaultEditor
+                    and getattr(self.editor, "setAutocompleteMaxVisible", None) is not None
+                ):
+                    self.editor.setAutocompleteMaxVisible(maxVisible)
+
+            def onClearOnShrinkChange(enabled: bool) -> None:
+                self.settingsManager.setClearOnShrink(enabled)
+                self.ui.setClearOnShrink(enabled)
+                if not enabled and not self.activeStatusIndicator:
+                    self.statusContainer.clear()
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            selector = SettingsSelectorComponent(
+                SettingsConfig(
+                    autoCompact=self.session.autoCompactionEnabled,
+                    defaultModel=defaultModel,
+                    currentModel=self.session.model,
+                    availableDefaultModels=self.session.modelRuntime.getAvailableSnapshot(),
+                    showImages=self.settingsManager.getShowImages(),
+                    imageWidthCells=self.settingsManager.getImageWidthCells(),
+                    autoResizeImages=self.settingsManager.getImageAutoResize(),
+                    blockImages=self.settingsManager.getBlockImages(),
+                    enableSkillCommands=self.settingsManager.getEnableSkillCommands(),
+                    steeringMode=self.session.steeringMode,
+                    followUpMode=self.session.followUpMode,
+                    transport=self.settingsManager.getTransport(),
+                    httpIdleTimeoutMs=self.settingsManager.getHttpIdleTimeoutMs(),
+                    cacheWarmingMode=self.settingsManager.getCacheWarmingMode(),
+                    thinkingLevel=self.settingsManager.getDefaultThinkingLevel() or DEFAULT_THINKING_LEVEL,
+                    availableThinkingLevels=[*THINKING_LEVEL_OPTIONS],
+                    modelThinkingLevels=self.settingsManager.getAllModelThinkingLevels(),
+                    # MISAKA fork (D11): without a saved selection, the built-in theme matching the terminal.
+                    currentTheme=self.themeController.getThemeSelection() or self.themeController.resolveThemeName(),
+                    terminalTheme=self.themeController.getTerminalTheme(),
+                    availableThemes=getAvailableThemes(),
+                    hideThinkingBlock=self.hideThinkingBlock,
+                    # MISAKA fork: no `mermaidRenderingMode` (Mermaid rendering is not ported).
+                    collapseChangelog=self.settingsManager.getCollapseChangelog(),
+                    enableInstallTelemetry=self.settingsManager.getEnableInstallTelemetry(),
+                    doubleEscapeAction=self.settingsManager.getDoubleEscapeAction(),
+                    treeFilterMode=self.settingsManager.getTreeFilterMode(),
+                    showHardwareCursor=self.settingsManager.getShowHardwareCursor(),
+                    showCacheMissNotices=self.settingsManager.getShowCacheMissNotices(),
+                    defaultProjectTrust=self.settingsManager.getDefaultProjectTrust(),
+                    editorPaddingX=self.settingsManager.getEditorPaddingX(),
+                    outputPad=self.settingsManager.getOutputPad(),
+                    autocompleteMaxVisible=self.settingsManager.getAutocompleteMaxVisible(),
+                    quietStartup=self.settingsManager.getQuietStartup(),
+                    clearOnShrink=self.settingsManager.getClearOnShrink(),
+                    showTerminalProgress=self.settingsManager.getShowTerminalProgress(),
+                    # MISAKA fork (D1): no `tuiMode` or fullscreen settings.
+                    warnings=self.settingsManager.getWarnings(),
+                ),
+                SettingsCallbacks(
+                    onAutoCompactChange=onAutoCompactChange,
+                    onShowImagesChange=onShowImagesChange,
+                    onImageWidthCellsChange=onImageWidthCellsChange,
+                    onAutoResizeImagesChange=lambda enabled: self.settingsManager.setImageAutoResize(enabled),
+                    onBlockImagesChange=lambda blocked: self.settingsManager.setBlockImages(blocked),
+                    onEnableSkillCommandsChange=onEnableSkillCommandsChange,
+                    onSteeringModeChange=lambda mode: self.session.setSteeringMode(mode),
+                    onFollowUpModeChange=lambda mode: self.session.setFollowUpMode(mode),
+                    onTransportChange=onTransportChange,
+                    onHttpIdleTimeoutMsChange=onHttpIdleTimeoutMsChange,
+                    onCacheWarmingModeChange=onCacheWarmingModeChange,
+                    # MISAKA fork: the panel's thinking level row saves the default (this agent's own in a Last Order
+                    # or Sister window), like every other row of the panel.
+                    onThinkingLevelChange=lambda level: self.selectThinkingLevel(level, True),
+                    onModelThinkingLevelChange=onModelThinkingLevelChange,
+                    onModelThinkingLevelRemove=onModelThinkingLevelRemove,
+                    onThemeChange=onThemeChange,
+                    onThemePreview=lambda themeName: self.themeController.preview(themeName),
+                    onHideThinkingBlockChange=onHideThinkingBlockChange,
+                    onShowCacheMissNoticesChange=onShowCacheMissNoticesChange,
+                    onCollapseChangelogChange=lambda collapsed: self.settingsManager.setCollapseChangelog(collapsed),
+                    onEnableInstallTelemetryChange=lambda enabled: self.settingsManager.setEnableInstallTelemetry(
+                        enabled
+                    ),
+                    onQuietStartupChange=lambda quiet: self.settingsManager.setQuietStartup(quiet),
+                    onDefaultProjectTrustChange=lambda defaultProjectTrust: self.settingsManager.setDefaultProjectTrust(
+                        defaultProjectTrust
+                    ),
+                    onDoubleEscapeActionChange=lambda action: self.settingsManager.setDoubleEscapeAction(action),
+                    onTreeFilterModeChange=lambda mode: self.settingsManager.setTreeFilterMode(mode),
+                    onShowHardwareCursorChange=onShowHardwareCursorChange,
+                    onEditorPaddingXChange=onEditorPaddingXChange,
+                    onOutputPadChange=onOutputPadChange,
+                    onAutocompleteMaxVisibleChange=onAutocompleteMaxVisibleChange,
+                    onClearOnShrinkChange=onClearOnShrinkChange,
+                    onShowTerminalProgressChange=lambda enabled: self.settingsManager.setShowTerminalProgress(enabled),
+                    onWarningsChange=lambda warnings: self.settingsManager.setWarnings(warnings),
+                    onCancel=onCancel,
+                ),
+            )
+            return {"component": selector, "focus": selector.getSettingsList()}
+
+        self.showSelector(create)
+
+    def handleThinkingCommand(self, searchTerm: str | None = None) -> None:
+        # MISAKA fork: a model or thinking level switch waits for a running compaction.
+        if self._refuseSwitchDuringCompaction("thinking level"):
+            return
+        # MISAKA fork: `/thinking --default [level]` also saves the level as the startup default (and `--default`
+        # alone opens the selector in that mode).
+        parsed = parse_default_flag_args("thinking", searchTerm)
+        if parsed.error:
+            self.showError(parsed.error)
+            return
+        searchTerm = parsed.searchTerm
+        availableLevels = self.session.getAvailableThinkingLevels()
+        if not searchTerm:
+            self.showThinkingSelector(parsed.persist)
+            return
+
+        normalized = jsTrim(searchTerm).lower()
+        level = next((candidate for candidate in availableLevels if candidate.lower() == normalized), None)
+        if not level:
+            self.showError(f'Unknown thinking level "{searchTerm}". Available levels: {", ".join(availableLevels)}.')
+            return
+
+        self.selectThinkingLevel(level, parsed.persist)
+
+    def selectThinkingLevel(self, level: ThinkingLevel, persist: bool) -> None:
+        try:
+            # MISAKA fork: the default is saved through the settings first, which in a Last Order or Sister window
+            # is the agent's own role file; a role file that refuses the write leaves the session level as it was.
+            if persist:
+                try:
+                    self.settingsManager.setDefaultThinkingLevel(level)
+                except (OSError, ValueError) as error:
+                    self.showError(f"Thinking level not saved: {errorMessage(error)}")
+                    return
+            self.session.setThinkingLevel(level)
+            self.footer.invalidate()
+            self.updateEditorBorderColor()
+            # MISAKA fork: an agent's own default names itself.
+            whose = " for this agent" if self.settingsManager.getModelProfile() else ""
+            self.showStatus(f"Default thinking level{whose}: {level}" if persist else f"Thinking level: {level}")
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.showError(errorMessage(error))
+
+    def showThinkingSelector(self, persist: bool = False) -> None:
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            def selectLevel(level: ThinkingLevel, persistLevel: bool) -> None:
+                self.selectThinkingLevel(level, persistLevel)
+                done()
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            selector = ThinkingSelectorComponent(
+                self.session.thinkingLevel or DEFAULT_THINKING_LEVEL,
+                self.session.getAvailableThinkingLevels(),
+                # MISAKA fork: `/thinking --default` opens the selector in save-as-default mode.
+                lambda level: selectLevel(level, persist),
+                onCancel,
+                lambda level: selectLevel(level, True),
+                self.settingsManager.getDefaultThinkingLevel() or DEFAULT_THINKING_LEVEL,
+            )
+            return {"component": selector, "focus": selector}
+
+        self.showSelector(create)
+
+    async def handleModelCommand(self, searchTerm: str | None = None) -> None:
+        # MISAKA fork: a model or thinking level switch waits for a running compaction.
+        if self._refuseSwitchDuringCompaction("model"):
+            return
+        if not searchTerm:
+            self.showModelSelector()
+            return
+
+        model = await self.findExactModelMatch(searchTerm)
+        if model:
+            try:
+                await self.session.setModel(model, {"persist": False})
+                self.footer.invalidate()
+                self.updateEditorBorderColor()
+                self.showStatus(f"Model: {model.id}")
+                self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(model))
+            except Exception as error:  # noqa: BLE001 - shown to the user
+                self.showError(errorMessage(error))
+            return
+
+        self.showModelSelector(searchTerm)
+
+    async def findExactModelMatch(self, searchTerm: str) -> Model | None:
+        cachedModels = (
+            [read_field(scoped, "model") for scoped in self.session.scopedModels]
+            if len(self.session.scopedModels) > 0
+            else [*self.session.modelRuntime.getAvailableSnapshot()]
+        )
+        cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels)
+        if cachedMatch or len(self.session.scopedModels) > 0:
+            return cachedMatch
+
+        self.showStatus("Refreshing model catalogs…")
+        controller = AbortController()
+        timedOut = False
+
+        def onTimeout() -> None:
+            nonlocal timedOut
+            timedOut = True
+            controller.abort()
+
+        timeout = setTimeout(onTimeout, 15_000)
+        try:
+            result = await refreshModelCatalogs(self.session.modelRuntime, controller.signal)
+            if result.aborted and timedOut:
+                self.showWarning("Model refresh timed out; searching cached models.")
+            elif len(result.errors) > 0:
+                self.showWarning(f"Could not refresh {', '.join(result.errors.keys())}; searching cached models.")
+        except Exception as error:  # noqa: BLE001 - a failed refresh falls back to the cached models
+            self.showWarning(
+                "Model refresh timed out; searching cached models."
+                if timedOut
+                else f"Could not refresh model catalogs: {errorMessage(error)}"
+            )
+        finally:
+            clearTimeout(timeout)
+        return findExactModelReferenceMatch(searchTerm, [*self.session.modelRuntime.getAvailableSnapshot()])
+
+    def updateAvailableProviderCount(self) -> None:
+        """Update the footer's available provider count from the current snapshot without refreshing catalogs."""
+        models = (
+            [read_field(scoped, "model") for scoped in self.session.scopedModels]
+            if len(self.session.scopedModels) > 0
+            else self.session.modelRuntime.getAvailableSnapshot()
+        )
+        uniqueProviders = {model.provider for model in models}
+        self.footerDataProvider.setAvailableProviderCount(len(uniqueProviders))
+
+    async def maybeWarnAboutAnthropicSubscriptionAuth(self, model: Any = UNDEFINED) -> None:
+        if model is UNDEFINED:
+            model = self.session.model
+        if self.settingsManager.getWarnings().get("anthropicExtraUsage") is False:
+            return
+        if self.anthropicSubscriptionWarningShown:
+            return
+        if not model or model.provider != "anthropic":
+            return
+
+        try:
+            if read_field(await self.session.modelRuntime.checkAuth("anthropic"), "type") == "oauth":
+                self.anthropicSubscriptionWarningShown = True
+                self.showWarning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING)
+                return
+            resolution = await self.session.modelRuntime.getAuth(model.provider)
+            apiKey = resolution.auth.apiKey if resolution else None
+            if not isAnthropicSubscriptionAuthKey(apiKey):
+                return
+            self.anthropicSubscriptionWarningShown = True
+            self.showWarning(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING)
+        except Exception:  # noqa: BLE001, S110 - Ignore auth lookup failures for warning-only checks.
+            pass
+
+    def maybeSaveImplicitProjectTrustAfterReload(self) -> bool:
+        cwd = self.sessionManager.getCwd()
+        if self.autoTrustOnReloadCwd != cwd:
+            return False
+        if not self.settingsManager.isProjectTrusted() or not hasTrustRequiringProjectResources(cwd):
+            return False
+
+        trustStore = ProjectTrustStore(self.runtimeHost.services.agentDir)
+        try:
+            if trustStore.get(cwd) is not None:
+                self.autoTrustOnReloadCwd = None
+                return False
+            trustStore.set(cwd, True)
+            self.autoTrustOnReloadCwd = None
+            return True
+        except Exception as error:  # noqa: BLE001 - warned; retried on the next reload
+            self.showWarning(f"Could not save project trust after reload: {errorMessage(error)}")
+            return False
+
+    def showTrustSelector(self) -> None:
+        cwd = self.sessionManager.getCwd()
+        trustStore = ProjectTrustStore(self.runtimeHost.services.agentDir)
+        savedDecision = trustStore.get_entry(cwd)
+
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            def onSelect(selection: Any) -> None:
+                trustStore.set_many(selection.updates)
+                done()
+                self.showStatus(
+                    f"Saved trust decision: {'trusted' if selection.trusted else 'untrusted'}. "
+                    f"Restart {APP_NAME} for this to take effect."
+                )
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            selector = TrustSelectorComponent(
+                TrustSelectorOptions(
+                    cwd=cwd,
+                    savedDecision=savedDecision,
+                    projectTrusted=self.settingsManager.isProjectTrusted(),
+                    onSelect=onSelect,
+                    onCancel=onCancel,
+                )
+            )
+            return {"component": selector, "focus": selector}
+
+        self.showSelector(create)
+
+    def showModelSelector(self, initialSearchInput: str | None = None) -> None:
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            async def selectModel(model: Model, persist: bool) -> None:
+                try:
+                    await self.session.setModel(model, {"persist": persist})
+                    self.updateAvailableProviderCount()
+                    self.footer.invalidate()
+                    self.updateEditorBorderColor()
+                    done()
+                    self.showStatus(f"Default model: {model.provider}/{model.id}" if persist else f"Model: {model.id}")
+                    self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(model))
+                except Exception as error:  # noqa: BLE001 - shown to the user
+                    done()
+                    self.showError(errorMessage(error))
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            defaultProvider = self.settingsManager.getDefaultProvider()
+            defaultModel = self.settingsManager.getDefaultModel()
+            selector = ModelSelectorComponent(
+                self.ui,
+                self.session.model,
+                self.session.modelRuntime,
+                # MISAKA fork: the session keeps its scoped models as dicts.
+                [
+                    ScopedModelItem(model=read_field(scoped, "model"), thinkingLevel=read_field(scoped, "thinkingLevel"))
+                    for scoped in self.session.scopedModels
+                ],
+                lambda model: self._schedule_task(selectModel(model, False)),
+                onCancel,
+                initialSearchInput,
+                lambda model: self._schedule_task(selectModel(model, True)),
+                DefaultModelReference(provider=defaultProvider, id=defaultModel)
+                if defaultProvider and defaultModel
+                else None,
+            )
+            return {"component": selector, "focus": selector, "dispose": lambda: selector.dispose()}
+
+        self.showSelector(create)
+
+    def showModelsSelector(self) -> None:
+        availableModels = [*self.session.modelRuntime.getAvailableSnapshot()]
+        availableModelIds = {f"{model.provider}/{model.id}" for model in availableModels}
+        configuredPatterns = self.settingsManager.getEnabledModels()
+        sessionScopedModels = self.session.scopedModels
+
+        def configuredEnabledIds(models: list[Model]) -> list[str] | None:
+            if not configuredPatterns:
+                return None
+            resolved = resolveModelScopeFromModels(configuredPatterns, models)
+            ids = [f"{scoped.model.provider}/{scoped.model.id}" for scoped in resolved.scopedModels]
+            for diagnostic in resolved.diagnostics:
+                if diagnostic.code == "no-match" and diagnostic.pattern not in ids:
+                    ids.append(diagnostic.pattern)
+            return ids
+
+        currentEnabledIds: list[str] | None = (
+            [
+                f"{read_field(scoped, 'model').provider}/{read_field(scoped, 'model').id}"
+                for scoped in sessionScopedModels
+            ]
+            if len(sessionScopedModels) > 0
+            else configuredEnabledIds(availableModels)
+        )
+        selectionChanged = False
+
+        def updateSessionModels(enabledIds: list[str] | None) -> None:
+            nonlocal currentEnabledIds
+            currentEnabledIds = None if enabledIds is None else [*enabledIds]
+            hasEnabledAvailableModel = any(id in availableModelIds for id in enabledIds) if enabledIds else False
+            allAvailableModelsEnabled = enabledIds is not None and all(id in enabledIds for id in availableModelIds)
+            if enabledIds and hasEnabledAvailableModel and not allAvailableModelsEnabled:
+                newScopedModels = resolveModelScopeFromModels(enabledIds, availableModels).scopedModels
+                self.session.setScopedModels(
+                    [{"model": scoped.model, "thinkingLevel": scoped.thinkingLevel} for scoped in newScopedModels]
+                )
+            else:
+                self.session.setScopedModels([])
+            self.updateAvailableProviderCount()
+            self.ui.requestRender()
+
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            disposed = False
+            timedOut = False
+            controller = AbortController()
+
+            def onTimeout() -> None:
+                nonlocal timedOut
+                timedOut = True
+                controller.abort()
+
+            timeout = setTimeout(onTimeout, 15_000)
+
+            def onChange(enabledIds: list[str] | None) -> None:
+                nonlocal selectionChanged
+                selectionChanged = True
+                updateSessionModels(enabledIds)
+
+            def onPersist(enabledIds: list[str] | None) -> None:
+                allEnabled = (
+                    enabledIds is not None
+                    and len(enabledIds) == len(availableModels)
+                    and all(id in availableModelIds for id in enabledIds)
+                )
+                newPatterns = None if enabledIds is None or allEnabled else enabledIds
+                self.settingsManager.setEnabledModels([*newPatterns] if newPatterns else None)
+                self.showStatus("Model selection saved to settings")
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            selector = ScopedModelsSelectorComponent(
+                ModelsConfig(
+                    allModels=availableModels,
+                    enabledModelIds=currentEnabledIds,
+                    refreshStatus="Refreshing model catalogs…",
+                ),
+                ModelsCallbacks(onChange=onChange, onPersist=onPersist, onCancel=onCancel),
             )
 
-        persisted = sum(
-            1
-            for entry in (self.sessionManager.buildContextEntries() or [])
-            if read_field(entry, "type") in {"custom_message", "custom"} and _matches(entry)
-        )
-        if persisted == 0:
-            return False
-        drawn = sum(
-            1
-            for child in getattr(self.chatContainer, "children", [])
-            if isinstance(child, CustomMessageComponent) and _matches(child.message)
-        )
-        return persisted >= drawn
+            async def refresh() -> None:
+                nonlocal availableModels, availableModelIds, currentEnabledIds
+                try:
+                    result = await refreshModelCatalogs(self.session.modelRuntime, controller.signal)
+                    if disposed:
+                        return
+                    availableModels = [*self.session.modelRuntime.getAvailableSnapshot()]
+                    availableModelIds = {f"{model.provider}/{model.id}" for model in availableModels}
+                    if not selectionChanged and len(sessionScopedModels) == 0:
+                        currentEnabledIds = configuredEnabledIds(availableModels)
+                        selector.updateModels(availableModels, currentEnabledIds)
+                    else:
+                        selector.updateModels(availableModels)
+                    if currentEnabledIds is not None:
+                        updateSessionModels(currentEnabledIds)
+                    if result.aborted and timedOut:
+                        selector.setRefreshStatus("Model refresh timed out; showing cached models.", "warning")
+                    elif len(result.errors) > 0:
+                        selector.setRefreshStatus(
+                            f"Could not refresh {', '.join(result.errors.keys())}; showing cached models.",
+                            "warning",
+                        )
+                    else:
+                        selector.setRefreshStatus("Model catalogs refreshed.", "success")
+                    self.ui.requestRender()
+                except Exception as error:  # noqa: BLE001 - reported on the selector
+                    if disposed:
+                        return
+                    selector.setRefreshStatus(
+                        "Model refresh timed out; showing cached models."
+                        if timedOut
+                        else f"Could not refresh model catalogs: {errorMessage(error)}",
+                        "warning",
+                    )
+                    self.ui.requestRender()
+                finally:
+                    clearTimeout(timeout)
 
-    def renderCurrentSessionState(self) -> None:
-        clear = _callable_attr(self.chatContainer, "clear")
-        if clear is not None:
-            clear()
-        clear_pending = _callable_attr(self.pendingMessagesContainer, "clear")
-        if clear_pending is not None:
-            clear_pending()
-        self.compactionQueuedMessages = []
-        # The bash blocks parked in pendingMessagesContainer went with that clear(). Whether
-        # they can be forgotten depends on who still owns the matching messages.
-        #
-        # A block is parked only while the session is streaming, and `recordBashResult` parks
-        # its message in `_pendingBashMessages` under exactly the same condition -- so it is
-        # NOT in the transcript this method redraws from. Forgetting the component there loses
-        # the output for good: `/reload` and the turn_end custom-message flush both reach this
-        # method mid-run, and the block would be detached with nothing left to re-add it.
-        # Re-attach instead, and let the session's own flush place it when the run settles.
-        #
-        # Once the session has nothing pending, the identity really did change (`/new`,
-        # `/resume`, fork) and keeping the references would re-add the previous session's
-        # output to a new chat, so they go.
-        # A property on AgentSession, not a method -- `_safe_call_bool` would call it and
-        # fall back to its default, silently taking the forget path every time.
-        if bool(getattr(self.session, "hasPendingBashMessages", False)):
-            add_pending = _callable_attr(self.pendingMessagesContainer, "addChild")
-            if add_pending is not None:
-                for component in self.pendingBashComponents:
-                    add_pending(component)
-        else:
-            self.pendingBashComponents = []
-        self.streamingComponent = None
-        self.streamingMessage = None
-        self._toolComponentsById = {}
-        self.lastStatusSpacer = None
-        self.lastStatusText = None
-        self.renderInitialMessages()
-        self._request_render()
+            self._schedule_task(refresh())
 
-    def getMarkdownTransformers(self) -> list[Any]:
-        return self.session.extensionRunner.get_markdown_transformers()
+            def dispose() -> None:
+                nonlocal disposed
+                disposed = True
+                clearTimeout(timeout)
+                controller.abort()
 
-    def addCustomEntryToChat(self, entry: dict[str, Any]) -> None:
-        component = self._transcriptRenderer().customEntry(entry)
-        if component is None:
+            return {"component": selector, "focus": selector, "dispose": dispose}
+
+        self.showSelector(create)
+
+    def showUserMessageSelector(self) -> None:
+        userMessages = self.session.getUserMessagesForForking()
+
+        if len(userMessages) == 0:
+            self.showStatus("No messages to fork from")
             return
-        if self.streamingComponent is not None:
-            try:
-                streaming_index = self.chatContainer.children.index(self.streamingComponent)
-            except ValueError:
-                pass
-            else:
-                self.chatContainer.children.insert(streaming_index, component)
+
+        initialSelectedId = read_field(jsIndex(userMessages, len(userMessages) - 1), "entryId")
+
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            async def onSelect(entryId: str) -> None:
+                done()
+                try:
+                    result = await self.runtimeHost.fork(entryId)
+                    if read_field(result, "cancelled"):
+                        self.ui.requestRender()
+                        return
+
+                    self.editor.setText(read_field(result, "selectedText") or "")
+                    self.showStatus("Forked to new session")
+                except Exception as error:  # noqa: BLE001 - shown to the user
+                    self.showError(errorMessage(error))
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            selector = UserMessageSelectorComponent(
+                [UserMessageItem(id=read_field(m, "entryId"), text=read_field(m, "text")) for m in userMessages],
+                lambda entryId: self._schedule_task(onSelect(entryId)),
+                onCancel,
+                initialSelectedId,
+            )
+            return {"component": selector, "focus": selector.getMessageList()}
+
+        self.showSelector(create)
+
+    async def handleCloneCommand(self) -> None:
+        leafId = self.sessionManager.getLeafId()
+        if not leafId:
+            self.showStatus("Nothing to clone yet")
+            return
+
+        try:
+            result = await self.runtimeHost.fork(leafId, {"position": "at"})
+            if read_field(result, "cancelled"):
+                self.ui.requestRender()
                 return
-        self.chatContainer.addChild(component)
 
-    def _transcriptRenderer(self) -> TranscriptRenderer:
-        renderer = super()._transcriptRenderer()
-        renderer.cwd = self.sessionManager.getCwd()
-        renderer.markdownTransformers = self.getMarkdownTransformers()
-        renderer.extensionRunner = getattr(self.session, "extensionRunner", None)
-        renderer.toolDefinition = lambda name: _tool_definition(self.session, name)
-        renderer.retryAttempt = int(read_field(self.session, "retryAttempt", 0) or 0)
-        return renderer
+            self.editor.setText("")
+            self.showStatus("Cloned to new session")
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.showError(errorMessage(error))
 
-    def _rememberUserMessage(self, message: Any, options: dict[str, Any] | None) -> None:
-        # MISAKA fork: pi's editor history lives in memory, so every render of a session refills it
-        # from the transcript. Here it is a file that already holds what was typed; refilling it
-        # appended the whole session again on every open, resume and reload (one role's history
-        # ended up as the same four prompts twenty times over, and a compaction replay that was
-        # never typed at all), so a history that persists is left to what the user submits.
-        if getattr(self.editor, "historyFile", None):
+    def showTreeSelector(self, initialSelectedId: str | None = None) -> None:
+        tree = self.sessionManager.getTree()
+        realLeafId = self.sessionManager.getLeafId()
+        initialFilterMode = self.settingsManager.getTreeFilterMode()
+
+        if len(tree) == 0:
+            self.showStatus("No entries in session")
             return
-        if _message_role(message) == "user" and read_field(options, "populateHistory", False):
-            add_history = _callable_attr(self.editor, "addToHistory")
-            text = user_text(message)
-            if add_history is not None and text:
-                add_history(text)
 
-    def addMessageToChat(self, message: Any, options: dict[str, Any] | None = None) -> None:
-        self._transcriptRenderer().addMessage(self.chatContainer, message)
-        self._rememberUserMessage(message, options)
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            async def onSelect(entryId: str) -> None:
+                # Selecting the current leaf is a no-op (already there)
+                if entryId == self.sessionManager.getLeafId():
+                    done()
+                    self.showStatus("Already at this point")
+                    return
+
+                # Ask about summarization
+                done()  # Close selector first
+
+                # Loop until user makes a complete choice or cancels to tree
+                wantsSummary = False
+                customInstructions: str | None = None
+
+                # Check if we should skip the prompt (user preference to always default to no summary)
+                if not self.settingsManager.getBranchSummarySkipPrompt():
+                    while True:
+                        summaryChoice = await self.showExtensionSelector(
+                            "Summarize branch?",
+                            ["No summary", "Summarize", "Summarize with custom prompt"],
+                        )
+
+                        if summaryChoice is None:
+                            # User pressed escape - re-show tree selector with same selection
+                            self.showTreeSelector(entryId)
+                            return
+
+                        wantsSummary = summaryChoice != "No summary"
+
+                        if summaryChoice == "Summarize with custom prompt":
+                            customInstructions = await self.showExtensionEditor("Custom summarization instructions")
+                            if customInstructions is None:
+                                # User cancelled - loop back to summary selector
+                                continue
+
+                        # User made a complete choice
+                        break
+
+                # The user committed to navigating: stop the active response first.
+                if self.session.isStreaming:
+                    self.restoreQueuedMessagesToEditor()
+                    await self.session.abort()
+
+                # Recheck after the dialogs and streaming abort, before replacing another operation's UI.
+                if self.session.isCompacting:
+                    self.showError(
+                        "Wait for the current compaction or tree navigation to finish before navigating the session tree."
+                    )
+                    return
+
+                # Set up escape handler and status indicator if summarizing
+                showingSummaryIndicator = False
+                originalOnEscape = self.defaultEditor.onEscape
+
+                if wantsSummary:
+                    self.defaultEditor.onEscape = lambda: self.session.abortBranchSummary()
+                    self.chatContainer.addChild(Spacer(1))
+                    self.showStatusIndicator(BranchSummaryStatusIndicator(self.ui))
+                    showingSummaryIndicator = True
+                    self.ui.requestRender()
+
+                try:
+                    result = await self.session.navigateTree(
+                        entryId, {"summarize": wantsSummary, "customInstructions": customInstructions}
+                    )
+
+                    if read_field(result, "aborted"):
+                        # Summarization aborted - re-show tree selector with same selection
+                        self.showStatus("Branch summarization cancelled")
+                        self.showTreeSelector(entryId)
+                        return
+                    if read_field(result, "cancelled"):
+                        self.showStatus("Navigation cancelled")
+                        return
+
+                    # Update UI
+                    self.chatContainer.clear()
+                    self.renderInitialMessages()
+                    editorText = read_field(result, "editorText")
+                    if editorText and not jsTrim(self.editor.getText()):
+                        self.editor.setText(editorText)
+                    self.showStatus("Navigated to selected point")
+                    self._schedule_task(self.flushCompactionQueue({"willRetry": False}))
+                except Exception as error:  # noqa: BLE001 - shown to the user
+                    self.showError(errorMessage(error))
+                finally:
+                    if showingSummaryIndicator:
+                        self.clearStatusIndicator("branchSummary")
+                    self.defaultEditor.onEscape = originalOnEscape
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            def onLabelChange(entryId: str, label: str | None) -> None:
+                self.sessionManager.appendLabelChange(entryId, label)
+                self.ui.requestRender()
+
+            selector = TreeSelectorComponent(
+                tree,
+                realLeafId,
+                self.ui.terminal.rows,
+                lambda entryId: self._schedule_task(onSelect(entryId)),
+                onCancel,
+                onLabelChange,
+                initialSelectedId,
+                initialFilterMode,
+            )
+
+            async def onCopy(text: str | None) -> None:
+                if not text:
+                    self.showError("Selected entry has no text to copy")
+                    return
+                try:
+                    await copyToClipboard(text)
+                    self.showStatus("Copied selected message to clipboard")
+                except Exception as error:  # noqa: BLE001 - shown to the user
+                    self.showError(errorMessage(error))
+
+            selector.onCopy = lambda text: self._schedule_task(onCopy(text))
+            return {"component": selector, "focus": selector}
+
+        self.showSelector(create)
+
+    def showSessionSelector(self) -> None:
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            async def onSelect(sessionPath: str) -> None:
+                done()
+                await self.handleResumeSession(sessionPath)
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            async def renameSession(sessionFilePath: str, nextName: str | None) -> None:
+                next = jsTrim(nextName if nextName is not None else "")
+                if not next:
+                    return
+                mgr = SessionManager.open(sessionFilePath)
+                mgr.appendSessionInfo(next)
+
+            def currentSessionsLoader(onProgress: Any = None, signal: Any = None) -> Any:
+                return SessionManager.list(
+                    self.sessionManager.getCwd(),
+                    self.sessionManager.getSessionDir(),
+                    onProgress,
+                    signal,
+                )
+
+            # MISAKA fork: every window keeps its sessions in a store of its own (Last Order's, a Sister's, a DM's),
+            # so the all-sessions tab lists that store's root, as `misaka chat -r` does; the engine's default root
+            # would show another window's sessions or none.
+            def allSessionsLoader(onProgress: Any = None, signal: Any = None) -> Any:
+                return SessionManager.listAll(sessions_root_of(self.sessionManager.getSessionDir()), onProgress, signal)
+
+            selector = SessionSelectorComponent(
+                currentSessionsLoader,
+                allSessionsLoader,
+                lambda sessionPath: self._schedule_task(onSelect(sessionPath)),
+                onCancel,
+                lambda: self._schedule_task(self.shutdown()),
+                lambda: self.ui.requestRender(),
+                {
+                    "renameSession": renameSession,
+                    "showRenameHint": True,
+                    "keybindings": self.keybindings,
+                },
+                self.sessionManager.getSessionFile(),
+            )
+            return {"component": selector, "focus": selector}
+
+        self.showSelector(create)
+
+    async def handleResumeSession(self, sessionPath: str, options: Any = None) -> dict[str, bool]:
+        self.clearStatusIndicator()
+        try:
+            result = await self.runtimeHost.switchSession(
+                sessionPath,
+                {
+                    "withSession": read_field(options, "withSession"),
+                    "projectTrustContextFactory": lambda cwd: self.createProjectTrustContext(cwd),
+                },
+            )
+            if read_field(result, "cancelled"):
+                return result
+            self.showStatus("Resumed session")
+            return result
+        except MissingSessionCwdError as error:
+            selectedCwd = await self.promptForMissingSessionCwd(error)
+            if not selectedCwd:
+                self.showStatus("Resume cancelled")
+                return {"cancelled": True}
+            result = await self.runtimeHost.switchSession(
+                sessionPath,
+                {
+                    "cwdOverride": selectedCwd,
+                    "withSession": read_field(options, "withSession"),
+                    "projectTrustContextFactory": lambda cwd: self.createProjectTrustContext(cwd),
+                },
+            )
+            if read_field(result, "cancelled"):
+                return result
+            self.showStatus("Resumed session in current cwd")
+            return result
+        except Exception as error:  # noqa: BLE001 - fatal, as upstream
+            return await self.handleFatalRuntimeError("Failed to resume session", error)
+
+    def getLoginProviderOptions(self, authType: Literal["oauth", "api_key"] | None = None) -> list[AuthSelectorProvider]:
+        options: list[AuthSelectorProvider] = []
+        for provider in self.session.modelRuntime.getProviders():
+            authStatus = self.session.modelRuntime.getProviderAuthStatus(provider.id)
+            status = (
+                AuthCheck(
+                    type="oauth" if self.session.modelRuntime.isUsingOAuth(provider.id) else "api_key",
+                    source=authStatus.label if authStatus.label is not None else authStatus.source,
+                )
+                if authStatus.configured
+                else None
+            )
+            subscription = getattr(provider.auth.oauth, "isSubscription", None) is True
+            if (not authType or authType == "oauth") and provider.auth.oauth:
+                options.append(
+                    AuthSelectorProvider(
+                        id=provider.id,
+                        name=provider.name,
+                        authType="oauth",
+                        method=provider.auth.oauth,
+                        status=status,
+                        subscription=subscription,
+                    )
+                )
+            if (not authType or authType == "api_key") and provider.auth.apiKey:
+                options.append(
+                    AuthSelectorProvider(
+                        id=provider.id,
+                        name=provider.name,
+                        authType="api_key",
+                        method=provider.auth.apiKey,
+                        status=status,
+                        subscription=subscription,
+                    )
+                )
+        return sorted(options, key=functools.cmp_to_key(_byProviderName))
+
+    async def getLogoutProviderOptions(self) -> list[AuthSelectorProvider]:
+        options: list[AuthSelectorProvider] = []
+        for credential in await self.session.modelRuntime.listCredentials(
+            AuthOperationOptions(signal=TimeoutAbortSignal(15_000))
+        ):
+            provider = self.session.modelRuntime.getProvider(credential.providerId)
+            options.append(
+                AuthSelectorProvider(
+                    id=credential.providerId,
+                    name=provider.name if provider else credential.providerId,
+                    authType=credential.type,
+                    status=AuthCheck(type=credential.type, source="stored credential"),
+                    subscription=getattr(provider.auth.oauth, "isSubscription", None) is True if provider else False,
+                )
+            )
+        return sorted(options, key=functools.cmp_to_key(_byProviderName))
+
+    def findLoginProviderOptions(self, providerRef: str) -> list[AuthSelectorProvider]:
+        normalizedProviderRef = jsTrim(providerRef).lower()
+        if not normalizedProviderRef:
+            return []
+
+        return [
+            provider
+            for provider in self.getLoginProviderOptions()
+            if provider.id.lower() == normalizedProviderRef or provider.name.lower() == normalizedProviderRef
+        ]
+
+    # MISAKA fork: `/login PROVIDER --account NAME` stores a named credential record, so the login methods below
+    # carry the account through to `loginProvider`.
+
+    async def handleLoginCommand(self, providerRef: str | None = None) -> None:
+        if not providerRef:
+            self.showLoginAuthTypeSelector()
+            return
+
+        account: str | None = None
+        if "--account" in providerRef:
+            try:
+                args = shlex.split(providerRef)
+                if len(args) < 3 or args[-2] != "--account" or "--account" in args[:-2]:
+                    raise ValueError("Usage: /login PROVIDER --account NAME")
+                providerRef, account = " ".join(args[:-2]), args[-1]
+                oauth_account_key(providerRef, account)
+            except ValueError as error:
+                self.showError(errorMessage(error))
+                return
+
+        providerOptions = self.findLoginProviderOptions(providerRef)
+        if len(providerOptions) == 1:
+            await self.startProviderLogin(providerOptions[0], account=account)
+            return
+
+        if len(providerOptions) > 1:
+            providerIds = {provider.id for provider in providerOptions}
+            if len(providerIds) == 1:
+                self.showLoginAuthTypeSelector(providerOptions, account=account)
+                return
+
+        self.showLoginProviderSelector(None, providerRef, account=account)
+
+    async def startProviderLogin(
+        self,
+        providerOption: AuthSelectorProvider,
+        onBack: Callable[[], None] | None = None,
+        *,
+        account: str | None = None,
+    ) -> None:
+        """`onBack` reopens the selector the login was started from when the user cancels it."""
+        if providerOption.authType == "oauth":
+            await self.showLoginDialog(providerOption.id, providerOption.name, onBack, account=account)
+        elif getattr(providerOption.method, "login", None):
+            await self.showApiKeyLoginDialog(providerOption.id, providerOption.name, onBack, account=account)
+        else:
+            self.showAmbientAuthDialog(providerOption, onBack)
+
+    def showLoginAuthTypeSelector(
+        self, providerOptions: list[AuthSelectorProvider] | None = None, *, account: str | None = None
+    ) -> None:
+        # The top-level selector offers Radius directly, as its last option.
+        radiusOption = (
+            None
+            if providerOptions
+            else next(
+                (provider for provider in self.getLoginProviderOptions("oauth") if provider.id == RADIUS_PROVIDER_ID),
+                None,
+            )
+        )
+        radiusText = f"Sign in with {radiusOption.name}" if radiusOption else None
+        radiusLabel = f"{radiusText}{formatAuthSelectorProviderStatus(radiusOption)}" if radiusOption else None
+        oauthProvider = next((provider for provider in providerOptions or [] if provider.authType == "oauth"), None)
+        oauthLoginLabel = getattr(oauthProvider.method, "loginLabel", None) if oauthProvider else None
+        subscriptionLabel = oauthLoginLabel if oauthLoginLabel is not None else "Sign in with an account"
+        apiKeyLabel = "Sign in with an API key"
+        availableAuthTypes = (
+            {provider.authType for provider in providerOptions} if providerOptions else {"oauth", "api_key"}
+        )
+        options: list[str] = []
+        if "oauth" in availableAuthTypes:
+            options.append(subscriptionLabel)
+        if "api_key" in availableAuthTypes:
+            options.append(apiKeyLabel)
+        if radiusLabel:
+            options.append(radiusLabel)
+
+        if len(options) == 0:
+            self.showStatus("No login methods available.")
+            return
+
+        if providerOptions and len(options) == 1:
+            providerOption = jsIndex(providerOptions, 0)
+            if providerOption:
+                self._schedule_task(self.startProviderLogin(providerOption, account=account))
+            return
+
+        title = (
+            f"Select authentication method for {providerOptions[0].name}:"
+            if providerOptions
+            else "Select authentication method:"
+        )
+
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            def onSelect(option: str) -> None:
+                done()
+                if radiusOption and option == radiusLabel:
+                    self._schedule_task(
+                        self.startProviderLogin(
+                            radiusOption, lambda: self.showLoginAuthTypeSelector(account=account), account=account
+                        )
+                    )
+                    return
+                authType: Literal["oauth", "api_key"] = "oauth" if option == subscriptionLabel else "api_key"
+                if providerOptions:
+                    providerOption = next(
+                        (provider for provider in providerOptions if provider.authType == authType), None
+                    )
+                    if providerOption:
+                        self._schedule_task(
+                            self.startProviderLogin(
+                                providerOption,
+                                lambda: self.showLoginAuthTypeSelector(providerOptions, account=account),
+                                account=account,
+                            )
+                        )
+                    return
+                self.showLoginProviderSelector(authType, account=account)
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            selector = (
+                createLoginMenuSelector(
+                    self.ui,
+                    title,
+                    options,
+                    RadiusOption(label=radiusLabel, text=radiusText),
+                    onSelect,
+                    onCancel,
+                )
+                if radiusLabel and radiusText
+                else ExtensionSelectorComponent(title, options, onSelect, onCancel)
+            )
+            return {"component": selector, "focus": selector, "dispose": lambda: selector.dispose()}
+
+        self.showSelector(create)
+
+    def showLoginProviderSelector(
+        self,
+        authType: Literal["oauth", "api_key"] | None = None,
+        initialSearchInput: str | None = None,
+        *,
+        account: str | None = None,
+    ) -> None:
+        providerOptions = self.getLoginProviderOptions(authType)
+        if len(providerOptions) == 0:
+            message = (
+                "No account providers available."
+                if authType == "oauth"
+                else "No API key providers available."
+                if authType == "api_key"
+                else "No login providers available."
+            )
+            self.showStatus(message)
+            return
+
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            async def onSelect(providerId: str, selectedAuthType: str) -> None:
+                done()
+
+                providerOption = next(
+                    (
+                        provider
+                        for provider in providerOptions
+                        if provider.id == providerId and provider.authType == selectedAuthType
+                    ),
+                    None,
+                )
+                if not providerOption:
+                    return
+
+                await self.startProviderLogin(
+                    providerOption,
+                    lambda: self.showLoginProviderSelector(authType, initialSearchInput, account=account),
+                    account=account,
+                )
+
+            def onCancel() -> None:
+                done()
+                if authType:
+                    self.showLoginAuthTypeSelector(account=account)
+                else:
+                    self.ui.requestRender()
+
+            selector = OAuthSelectorComponent(
+                "login",
+                providerOptions,
+                lambda providerId, selectedAuthType: self._schedule_task(onSelect(providerId, selectedAuthType)),
+                onCancel,
+                initialSearchInput,
+            )
+            return {"component": selector, "focus": selector}
+
+        self.showSelector(create)
+
+    async def showOAuthSelector(self, mode: Literal["login", "logout"]) -> None:
+        if mode == "login":
+            self.showLoginAuthTypeSelector()
+            return
+
+        try:
+            providerOptions = await self.getLogoutProviderOptions()
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.showError(f"Could not read stored credentials: {errorMessage(error)}")
+            return
+        if len(providerOptions) == 0:
+            self.showStatus(
+                "No stored credentials to remove. /logout only removes credentials saved by /login; environment "
+                "variables and models.json config are unchanged."
+            )
+            return
+
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            async def onSelect(providerId: str) -> None:
+                done()
+
+                providerOption = next((provider for provider in providerOptions if provider.id == providerId), None)
+                if not providerOption:
+                    return
+
+                try:
+                    await self.session.modelRuntime.logout(
+                        providerOption.id, AuthOperationOptions(signal=TimeoutAbortSignal(15_000))
+                    )
+                    self.updateAvailableProviderCount()
+                    message = (
+                        f"Logged out of {providerOption.name}"
+                        if providerOption.authType == "oauth"
+                        else f"Removed stored API key for {providerOption.name}. Environment variables and "
+                        "models.json config are unchanged."
+                    )
+                    self.showStatus(message)
+                except Exception as error:  # noqa: BLE001 - shown to the user
+                    message = errorMessage(error)
+                    self.showError(
+                        f"Credentials removed for {providerOption.name}, but local model state could not be "
+                        f"synchronized: {message}"
+                        if isinstance(error, CredentialSynchronizationError)
+                        else f"Logout failed: {message}"
+                    )
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            def onLogoutSelect(providerId: str, _authType: Any = None) -> None:
+                self._schedule_task(onSelect(providerId))
+
+            selector = OAuthSelectorComponent(mode, providerOptions, onLogoutSelect, onCancel)
+            return {"component": selector, "focus": selector}
+
+        self.showSelector(create)
+
+    async def completeProviderAuthentication(
+        self,
+        providerId: str,
+        providerName: str,
+        authType: Literal["oauth", "api_key"],
+        previousModel: Model | None,
+        *,
+        account: str | None = None,
+    ) -> None:
+        actionLabel = f"Logged in to {providerName}" if authType == "oauth" else f"Saved API key for {providerName}"
+
+        # MISAKA fork: a named account record leaves the main-model credentials and the session model alone.
+        if account is not None:
+            self.showStatus(
+                f"{actionLabel} (account: {account}). Saved to {get_auth_path()}; main-model credentials unchanged."
+            )
+            return
+
+        session = self.session
+        # MISAKA fork: pi adopts the new provider's model only on the `unknown/unknown` sentinel, its one modelless
+        # state. A MISAKA session without a saved default starts on a catalogue pair nothing can call, so a session
+        # whose model is not available counts as modelless too.
+        needsModel = isUnknownModel(previousModel) or not any(
+            model.provider == read_field(previousModel, "provider") and model.id == read_field(previousModel, "id")
+            for model in session.modelRuntime.getAvailableSnapshot()
+        )
+        # Dynamic catalogs may be empty until the first authenticated network refresh.
+        deferSelection = (
+            needsModel
+            and hasDefaultModelProvider(providerId)
+            and not any(
+                model.provider == providerId and model.id == defaultModelPerProvider[providerId]
+                for model in session.modelRuntime.getAvailableSnapshot()
+            )
+        )
+
+        async def finishAuthentication() -> None:
+            selectedModel: Model | None = None
+            selectionError: str | None = None
+            if needsModel:
+                availableModels = self.session.modelRuntime.getAvailableSnapshot()
+                providerModels = [model for model in availableModels if model.provider == providerId]
+                # Matches LLAMA_PROVIDER_ID from extensions/llama/provider.py; kept inline to avoid coupling interactive
+                # mode to the built-in extension.
+                if providerId == "llama.cpp":
+                    selectionError = llamaCppPostLoginGuidance(actionLabel, len(providerModels))
+                # MISAKA fork: a provider defined in models.json has no built-in default, and its first available
+                # model serves the person who just configured their own gateway better than an error.
+                elif len(providerModels) == 0:
+                    selectionError = (
+                        f"{actionLabel}, but no models are available for that provider. Use /model to select a model."
+                    )
+                else:
+                    defaultModelId = defaultModelPerProvider.get(providerId)
+                    # Radius catalogs vary by account; prefer balanced, then use catalog order.
+                    selectedModel = next((model for model in providerModels if model.id == defaultModelId), None) or (
+                        providerModels[0] if defaultModelId is None or providerId == "radius" else None
+                    )
+                    if not selectedModel:
+                        selectionError = (
+                            f'{actionLabel}, but its default model "{defaultModelId}" is not available. Use /model '
+                            "to select a model."
+                        )
+                    else:
+                        try:
+                            await self.session.setModel(selectedModel, {"persist": True})
+                        except Exception as error:  # noqa: BLE001 - reported below
+                            selectedModel = None
+                            selectionError = (
+                                f"{actionLabel}, but selecting its default model failed: {errorMessage(error)}. Use "
+                                "/model to select a model."
+                            )
+
+            self.updateAvailableProviderCount()
+            self.footer.invalidate()
+            self.updateEditorBorderColor()
+            if selectedModel:
+                self.showStatus(f"{actionLabel}. Selected {selectedModel.id}. Credentials saved to {get_auth_path()}")
+                self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel))
+            else:
+                self.showStatus(f"{actionLabel}. Credentials saved to {get_auth_path()}")
+                if selectionError:
+                    self.showError(selectionError)
+                else:
+                    self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth())
+
+        if deferSelection:
+            self.showStatus(f"{actionLabel}. Credentials saved to {get_auth_path()}. Refreshing model catalog…")
+        else:
+            await finishAuthentication()
+
+        controller = AbortController()
+        timeout = setTimeout(lambda: controller.abort(), 15_000)
+
+        async def refresh() -> None:
+            try:
+                result = await session.modelRuntime.refresh(
+                    ModelsRefreshOptions(providers=[providerId], signal=controller.signal)
+                )
+                if result.aborted:
+                    self.showWarning(f"{actionLabel}, but its model catalog refresh timed out; using cached models.")
+                elif len(result.errors) > 0:
+                    self.showWarning(f"{actionLabel}, but its model catalog could not be refreshed; using cached models.")
+                # Do not replace a model or session selected while the refresh was running.
+                if deferSelection and self.session is session and session.model is previousModel:
+                    await finishAuthentication()
+                self.updateAvailableProviderCount()
+                self.footer.invalidate()
+                self.ui.requestRender()
+            except Exception as error:  # noqa: BLE001 - warned
+                self.showWarning(
+                    f"{actionLabel}, but its model catalog could not be refreshed: {errorMessage(error)}"
+                )
+            finally:
+                clearTimeout(timeout)
+
+        self._schedule_task(refresh())
+
+    def showAmbientAuthDialog(self, providerOption: AuthSelectorProvider, onBack: Callable[[], None] | None = None) -> None:
+        def restoreEditor() -> None:
+            self.editorContainer.clear()
+            self.editorContainer.addChild(self.editor)
+            self.ui.setFocus(self.editor)
+            self.ui.requestRender()
+
+        def onComplete(_success: bool, _message: str | None) -> None:
+            restoreEditor()
+            if onBack:
+                onBack()
+
+        dialog = LoginDialogComponent(
+            self.ui,
+            providerOption.id,
+            onComplete,
+            providerOption.name,
+            f"{providerOption.name} setup",
+        )
+        methodName = getattr(providerOption.method, "name", None)
+        dialog.showInfo(f"{methodName if methodName is not None else 'Authentication'} is configured outside {APP_NAME}.", [], True)
+
+        self.editorContainer.clear()
+        self.editorContainer.addChild(dialog)
+        self.ui.setFocus(dialog)
+        self.ui.requestRender()
+
+    async def showApiKeyLoginDialog(
+        self,
+        providerId: str,
+        providerName: str,
+        onBack: Callable[[], None] | None = None,
+        *,
+        account: str | None = None,
+    ) -> None:
+        # MISAKA fork: Bedrock signs in through AWS profiles, which have no named records.
+        if providerId == "amazon-bedrock" and account is not None:
+            self.showError("Bedrock uses AWS profiles rather than named API-key records")
+            return
+        previousModel = self.session.model
+
+        def onComplete(_success: bool, _message: str | None) -> None:
+            # Completion handled below
+            pass
+
+        dialog = LoginDialogComponent(self.ui, providerId, onComplete, providerName)
+
+        if providerId == "amazon-bedrock":
+            # MISAKA fork: no "See: providers.md" lines (MISAKA ships no providers.md).
+            dialog.showDetails(
+                [theme.fg("text", "You can also use an AWS profile, IAM keys, or role-based credentials.")]
+            )
+
+        self.editorContainer.clear()
+        self.editorContainer.addChild(dialog)
+        self.ui.setFocus(dialog)
+        self.ui.requestRender()
+
+        def restoreEditor() -> None:
+            self.editorContainer.clear()
+            self.editorContainer.addChild(self.editor)
+            self.ui.setFocus(self.editor)
+            self.ui.requestRender()
+
+        try:
+            await self.loginProvider(dialog, providerId, providerName, "api_key", account=account)
+            restoreEditor()
+            await self.completeProviderAuthentication(providerId, providerName, "api_key", previousModel, account=account)
+        except Exception as error:  # noqa: BLE001 - reported below
+            restoreEditor()
+            errorMsg = errorMessage(error)
+            if isinstance(error, CredentialSynchronizationError):
+                self.showError(f"Saved API key for {providerName}, but local model state could not be synchronized: {errorMsg}")
+            elif errorMsg == "Login cancelled":
+                if onBack:
+                    onBack()
+            else:
+                self.showError(f"Failed to save API key for {providerName}: {errorMsg}")
+
+    def showAuthSelect(self, dialog: LoginDialogComponent, prompt: Any, providerId: str) -> asyncio.Future[str]:
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+        def restoreDialog() -> None:
+            self.editorContainer.clear()
+            self.editorContainer.addChild(dialog)
+            self.ui.setFocus(dialog)
+            self.ui.requestRender()
+
+        promptOptions = read_field(prompt, "options")
+        labels = [read_field(option, "label") for option in promptOptions]
+
+        def onSelect(optionLabel: str) -> None:
+            restoreDialog()
+            id = next(
+                (read_field(option, "id") for option in promptOptions if read_field(option, "label") == optionLabel), None
+            )
+            if future.done():
+                return
+            if id:
+                future.set_result(id)
+            else:
+                future.set_exception(RuntimeError("Login cancelled"))
+
+        def onCancel() -> None:
+            restoreDialog()
+            if not future.done():
+                future.set_exception(RuntimeError("Login cancelled"))
+
+        selector = ExtensionSelectorComponent(
+            read_field(prompt, "message"),
+            labels,
+            onSelect,
+            onCancel,
+            {"description": RADIUS_LOGIN_INTRO if providerId == RADIUS_PROVIDER_ID else None},
+        )
+        self.editorContainer.clear()
+        self.editorContainer.addChild(selector)
+        self.ui.setFocus(selector)
+        self.ui.requestRender()
+        return future
+
+    async def showAuthPrompt(self, dialog: LoginDialogComponent, prompt: Any, providerId: str) -> str:
+        promptType = read_field(prompt, "type")
+        if promptType == "select":
+            response: Awaitable[str] = self.showAuthSelect(dialog, prompt, providerId)
+        elif promptType == "manual_code":
+            response = dialog.showManualInput(read_field(prompt, "message"))
+        else:
+            response = dialog.showPrompt(read_field(prompt, "message"), read_field(prompt, "placeholder"))
+        signal = read_field(prompt, "signal")
+        if not signal:
+            return await response
+        if signal_aborted(signal):
+            raise RuntimeError("Login cancelled")
+        # MISAKA fork: `raceWithAbortSignal` stands in for the race against an abort listener.
+        try:
+            return await raceWithAbortSignal(response, signal)
+        except RuntimeError as error:
+            if signal_aborted(signal):
+                raise RuntimeError("Login cancelled") from error
+            raise
+
+    def notifyAuthDialog(self, dialog: LoginDialogComponent, event: Any) -> None:
+        eventType = read_field(event, "type")
+        if eventType == "auth_url":
+            dialog.showAuth(read_field(event, "url"), read_field(event, "instructions"))
+        elif eventType == "device_code":
+            dialog.showDeviceCode(event)
+            dialog.showWaiting("Waiting for authentication...")
+        elif eventType == "info":
+            dialog.showInfo(read_field(event, "message"), read_field(event, "links"))
+        else:
+            dialog.showProgress(read_field(event, "message"))
+
+    async def loginProvider(
+        self,
+        dialog: LoginDialogComponent,
+        providerId: str,
+        providerName: str,
+        method: Literal["api_key", "oauth"],
+        *,
+        account: str | None = None,
+    ) -> None:
+        self.programStatus.setBlocked("login", {"kind": "auth", "message": f"Log in to {providerName}"})
+        try:
+            await self.session.modelRuntime.login(
+                providerId,
+                method,
+                SimpleNamespace(
+                    signal=dialog.signal,
+                    prompt=lambda prompt: self.showAuthPrompt(dialog, prompt, providerId),
+                    notify=lambda event: self.notifyAuthDialog(dialog, event),
+                ),
+                # MISAKA fork: MISAKA introduces itself by its own name (OpenAI's agent name hint, Codex originator).
+                LoginOptions(getDeviceId=lambda: self.settingsManager.getOrCreateDeviceId(), agentName=CLIENT_NAME),
+                credentialId=oauth_account_key(providerId, account) if account is not None else None,
+            )
+        finally:
+            self.programStatus.setBlocked("login", None)
+
+    async def showLoginDialog(
+        self,
+        providerId: str,
+        providerName: str,
+        onBack: Callable[[], None] | None = None,
+        *,
+        account: str | None = None,
+    ) -> None:
+        previousModel = self.session.model
+        dialog = LoginDialogComponent(self.ui, providerId, lambda _success, _message: None, providerName)
+        self.editorContainer.clear()
+        self.editorContainer.addChild(dialog)
+        self.ui.setFocus(dialog)
+        self.ui.requestRender()
+
+        def restoreEditor() -> None:
+            self.editorContainer.clear()
+            self.editorContainer.addChild(self.editor)
+            self.ui.setFocus(self.editor)
+            self.ui.requestRender()
+
+        try:
+            await self.loginProvider(dialog, providerId, providerName, "oauth", account=account)
+            restoreEditor()
+            await self.completeProviderAuthentication(providerId, providerName, "oauth", previousModel, account=account)
+        except Exception as error:  # noqa: BLE001 - reported below
+            restoreEditor()
+            errorMsg = errorMessage(error)
+            if isinstance(error, CredentialSynchronizationError):
+                self.showError(f"Logged in to {providerName}, but local model state could not be synchronized: {errorMsg}")
+            elif errorMsg == "Login cancelled":
+                if onBack:
+                    onBack()
+            else:
+                self.showError(f"Failed to login to {providerName}: {errorMsg}")
+
+    # MISAKA fork: no `offerRadiusMcpServer`. It writes the MCP extension's `mcp.json` through that extension's own
+    # module, and bundled extensions are pluggable: nothing outside them imports one (owner's rule, 2026-09-29).
+
+    # =========================================================================
+    # Command handlers
+    # =========================================================================
+
+    async def handleReloadCommand(self) -> None:
+        if self.session.isStreaming:
+            self.showWarning("Wait for the current response to finish before reloading.")
+            return
+        if self.session.isCompacting:
+            self.showWarning("Wait for compaction to finish before reloading.")
+            return
+
+        self.resetExtensionUI()
+
+        reloadBox = Container()
+
+        def borderColor(s: str) -> str:
+            return theme.fg("border", s)
+
+        reloadBox.addChild(DynamicBorder(borderColor))
+        reloadBox.addChild(Spacer(1))
+        reloadBox.addChild(
+            ThemedText(
+                lambda: theme.fg("muted", "Reloading keybindings, extensions, skills, prompts, themes, and context files..."),
+                1,
+                0,
+            )
+        )
+        reloadBox.addChild(Spacer(1))
+        reloadBox.addChild(DynamicBorder(borderColor))
+
+        previousEditor = self.editor
+        self.editorContainer.clear()
+        self.editorContainer.addChild(reloadBox)
+        self.ui.setFocus(reloadBox)
+        self.ui.requestRender(True)
+        # MISAKA fork: one turn of the event loop stands in for `process.nextTick`.
+        await asyncio.sleep(0)
+
+        def dismissReloadBox(editor: Any) -> None:
+            self.editorContainer.clear()
+            self.editorContainer.addChild(editor)
+            self.ui.setFocus(editor)
+            self.ui.requestRender()
+
+        chatRestoredBeforeSessionStart = False
+        reloadBoxDismissed = False
+
+        def restoreChatBeforeSessionStart() -> None:
+            nonlocal chatRestoredBeforeSessionStart
+            if chatRestoredBeforeSessionStart:
+                return
+            self.hideThinkingBlock = self.settingsManager.getHideThinkingBlock()
+            self.outputPad = self.settingsManager.getOutputPad()
+            self.rebuildChatFromMessages()
+            chatRestoredBeforeSessionStart = True
+
+        try:
+            await self.session.reload({"beforeSessionStart": restoreChatBeforeSessionStart})
+            restoreChatBeforeSessionStart()
+            self.keybindings.reload()
+            activeHeader = self.customHeader if self.customHeader is not None else self.builtInHeader
+            if isExpandable(activeHeader):
+                activeHeader.setExpanded(self.toolOutputExpanded)
+            setRegisteredThemes(read_field(self.session.resourceLoader.getThemes(), "themes", []))
+            self.applyRuntimeSettings()
+            self.themeController.applyFromSettings()
+            self.setupAutocompleteProvider()
+            runner = self.session.extensionRunner
+            self.setupExtensionShortcuts(runner)
+            self.showLoadedResources({"force": False, "showDiagnosticsWhenQuiet": True})
+            savedImplicitProjectTrust = self.maybeSaveImplicitProjectTrustAfterReload()
+            modelsJsonError = self.session.modelRuntime.getError()
+            if modelsJsonError:
+                self.showError(f"models.json error: {modelsJsonError}")
+            self.showStatus(
+                "Reloaded keybindings, extensions, skills, prompts, themes, and context files; saved project trust"
+                if savedImplicitProjectTrust
+                else "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
+            )
+            dismissReloadBox(self.editor)
+            reloadBoxDismissed = True
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            if not reloadBoxDismissed:
+                dismissReloadBox(previousEditor)
+            self.showError(f"Reload failed: {errorMessage(error)}")
+
+    async def handleExportCommand(self, text: str) -> None:
+        outputPath = self.getPathCommandArgument(text, "/export")
+
+        try:
+            if outputPath and outputPath.endswith(".jsonl"):
+                filePath = self.session.exportToJsonl(outputPath)
+                self.showStatus(f"Session exported to: {filePath}")
+            else:
+                filePath = await self.session.exportToHtml(outputPath, {"themeName": theme.name})
+                self.showStatus(f"Session exported to: {filePath}")
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.showError(f"Failed to export session: {str(error) or 'Unknown error'}")
+
+    def getPathCommandArgument(self, text: str, command: Literal["/export", "/import"]) -> str | None:
+        if text == command:
+            return None
+        if not text.startswith(f"{command} "):
+            return None
+
+        argsString = jsTrimStart(text[len(command) + 1 :])
+        if not argsString:
+            return None
+
+        firstChar = argsString[0]
+        if firstChar == '"' or firstChar == "'":
+            closingQuoteIndex = argsString.find(firstChar, 1)
+            if closingQuoteIndex < 0:
+                return None
+            return argsString[1:closingQuoteIndex]
+
+        firstWhitespace = _JS_WHITESPACE.search(argsString)
+        if firstWhitespace is None:
+            return argsString
+        return argsString[: firstWhitespace.start()]
 
     async def handleImportCommand(self, text: str) -> None:
-        input_path = self.getPathCommandArgument(text, "/import")
-        if not input_path:
+        inputPath = self.getPathCommandArgument(text, "/import")
+        if not inputPath:
             self.showError("Usage: /import <path.jsonl>")
             return
 
-        confirmed = await maybe_await(
-            self.showExtensionConfirm("Import session", f"Replace current session with {input_path}?")
-        )
+        confirmed = await self.showExtensionConfirm("Import session", f"Replace current session with {inputPath}?")
         if not confirmed:
             self.showStatus("Import cancelled")
             return
 
         try:
-            if self.loadingAnimation is not None:
-                stop = _callable_attr(self.loadingAnimation, "stop")
-                if stop is not None:
-                    stop()
-                self.loadingAnimation = None
-            clear = _callable_attr(self.statusContainer, "clear")
-            if clear is not None:
-                clear()
-            result = await self.runtimeHost.importFromJsonl(input_path)
-            if read_field(result, "cancelled", False):
+            self.clearStatusIndicator()
+            result = await self.runtimeHost.importFromJsonl(inputPath)
+            if read_field(result, "cancelled"):
                 self.showStatus("Import cancelled")
                 return
-            self.renderCurrentSessionState()
-            self.showStatus(f"Session imported from: {input_path}")
+            self.showStatus(f"Session imported from: {inputPath}")
         except MissingSessionCwdError as error:
-            selected_cwd = await maybe_await(self.promptForMissingSessionCwd(error))
-            if not selected_cwd:
+            selectedCwd = await self.promptForMissingSessionCwd(error)
+            if not selectedCwd:
                 self.showStatus("Import cancelled")
                 return
-            result = await self.runtimeHost.importFromJsonl(input_path, selected_cwd)
-            if read_field(result, "cancelled", False):
+            result = await self.runtimeHost.importFromJsonl(inputPath, selectedCwd)
+            if read_field(result, "cancelled"):
                 self.showStatus("Import cancelled")
                 return
-            self.renderCurrentSessionState()
-            self.showStatus(f"Session imported from: {input_path}")
+            self.showStatus(f"Session imported from: {inputPath}")
+        # MISAKA fork: a file that is not a session is reported like a missing one, not as a fatal error.
         except (SessionImportFileNotFoundError, InvalidSessionFileError) as error:
-            self.showError(f"Failed to import session: {error}")
-        except Exception as error:  # noqa: BLE001
+            self.showError(f"Failed to import session: {errorMessage(error)}")
+        except Exception as error:  # noqa: BLE001 - fatal, as upstream
             await self.handleFatalRuntimeError("Failed to import session", error)
 
-    async def handleCloneCommand(self) -> None:
-        leaf_id = None
-        get_leaf_id = _callable_attr(self.sessionManager, "getLeafId")
-        if get_leaf_id is not None:
-            leaf_id = get_leaf_id()
-        if not leaf_id:
-            self.showStatus("Nothing to clone yet")
-            return
-
-        try:
-            result = await self.runtimeHost.fork(leaf_id, {"position": "at"})
-            if read_field(result, "cancelled", False):
-                self._request_render()
-                return
-            self.renderCurrentSessionState()
-            set_text = _callable_attr(self.editor, "setText")
-            if set_text is not None:
-                set_text("")
-            self.showStatus("Cloned to new session")
-        except Exception as error:  # noqa: BLE001
-            self.showError(str(error))
-
-
     async def handleShareCommand(self) -> None:
-        gh_path = shutil.which("gh")
-        if gh_path is None:
-            self.showError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/")
-            return
-
-        try:
-            auth_result = await asyncio.to_thread(
-                subprocess.run,
-                [gh_path, "auth", "status"],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
+        await shareSession(
+            SessionShareContext(
+                session=self.session,
+                ui=self.ui,
+                editorContainer=self.editorContainer,
+                editor=self.editor,
+                showStatus=lambda message: self.showStatus(message),
+                showError=lambda message: self.showError(message),
             )
-        except Exception as error:  # noqa: BLE001
-            self.showError(f"Failed to check GitHub CLI auth: {error}")
-            return
-        if auth_result.returncode != 0:
-            self.showError("GitHub CLI is not logged in. Run 'gh auth login' first.")
-            return
+        )
 
-        tmp_path = ""
-        try:
-            with tempfile.NamedTemporaryFile(prefix="session-", suffix=".html", delete=False) as handle:
-                tmp_path = handle.name
-            await self.session.exportToHtml(
-                tmp_path, {"themeName": interactive_theme.theme.name}
-            )
-            self.showStatus("Creating gist...")
-            result = await asyncio.to_thread(
-                subprocess.run,
-                [gh_path, "gist", "create", "--public=false", tmp_path],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-            if result.returncode != 0:
-                message = (result.stderr or "Unknown error").strip()
-                self.showError(f"Failed to create gist: {message}")
-                return
-            gist_url = (result.stdout or "").strip()
-            gist_id = gist_url.rsplit("/", 1)[-1] if gist_url else ""
-            if not gist_id:
-                self.showError("Failed to parse gist ID from gh output")
-                return
-            self.showStatus(f"Gist: {gist_url}")
-        except Exception as error:  # noqa: BLE001
-            self.showError(f"Failed to create gist: {error}")
-        finally:
-            if tmp_path:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
+    # MISAKA fork: no `handleBugCommand` (no `/bug`).
 
-    async def _handle_tree_copy(self, text: Any) -> None:
+    async def handleCopyCommand(self, options: dict[str, Any] | None = None) -> None:
+        # MISAKA fork (D1): copying the selection and flashing the confirmation belong to the fullscreen renderer.
+        text = self.session.getLastAssistantText()
         if not text:
-            self.showError("Selected entry has no text to copy")
-            return
-        try:
-            await copy_to_clipboard(str(text))
-            self.showStatus("Copied selected message to clipboard")
-        except Exception as error:  # noqa: BLE001
-            self.showError(str(error))
-
-    async def handleCopyCommand(self) -> None:
-        get_last_assistant_text = _callable_attr(self.session, "getLastAssistantText")
-        text = get_last_assistant_text() if get_last_assistant_text is not None else None
-        if not isinstance(text, str) or not text:
             self.showError("No agent messages to copy yet.")
             return
+
         try:
-            await copy_to_clipboard(text)
+            await copyToClipboard(text)
             self.showStatus("Copied last agent message to clipboard")
-        except Exception as error:  # noqa: BLE001
-            self.showError(str(error))
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            self.showError(errorMessage(error))
 
     def handleNameCommand(self, text: str) -> None:
-        name = re.sub(r"^/name\s*", "", text).strip()
+        name = jsTrim(re.sub(r"^/name\s*", "", text))
         if not name:
-            current_name = self.sessionManager.getSessionName()
-            if current_name:
+            currentName = self.sessionManager.getSessionName()
+            if currentName:
                 self.chatContainer.addChild(Spacer(1))
-                self.chatContainer.addChild(
-                    Text(interactive_theme.theme.fg("dim", f"Session name: {current_name}"), 1, 0)
-                )
-                self._request_render()
-                return
-            self.showWarning("Usage: /name <name>")
+                self.chatContainer.addChild(ThemedText(lambda: theme.fg("dim", f"Session name: {currentName}"), 1, 0))
+            else:
+                self.showWarning("Usage: /name <name>")
+            self.ui.requestRender()
             return
 
         self.session.setSessionName(name)
+        sessionName = self.sessionManager.getSessionName()
+        if sessionName != name:
+            self.showWarning(f"Session name was normalized from {jsonStringify(name)} to {jsonStringify(sessionName)}")
         self.chatContainer.addChild(Spacer(1))
-        self.chatContainer.addChild(Text(interactive_theme.theme.fg("dim", f"Session name set: {name}"), 1, 0))
-        self._request_render()
+        displayName = sessionName if sessionName is not None else name
+        self.chatContainer.addChild(ThemedText(lambda: theme.fg("dim", f"Session name set: {displayName}"), 1, 0))
+        self.ui.requestRender()
 
     def handleSessionCommand(self) -> None:
         stats = self.session.getSessionStats()
-        usage_breakdown = getUsageCostBreakdown(self.sessionManager.getEntries())
-        lines = [interactive_theme.theme.bold("Session Info"), ""]
-        session_name = self.sessionManager.getSessionName()
-        if session_name:
-            lines.append(f"{interactive_theme.theme.fg('dim', 'Name:')} {session_name}")
-        lines.extend(
-            [
-                f"{interactive_theme.theme.fg('dim', 'File:')} {stats.sessionFile or 'In-memory'}",
-                f"{interactive_theme.theme.fg('dim', 'ID:')} {stats.sessionId}",
-                "",
-                interactive_theme.theme.bold("Messages"),
-                f"{interactive_theme.theme.fg('dim', 'User:')} {stats.userMessages}",
-                f"{interactive_theme.theme.fg('dim', 'Assistant:')} {stats.assistantMessages}",
-                f"{interactive_theme.theme.fg('dim', 'Tool Calls:')} {stats.toolCalls}",
-                f"{interactive_theme.theme.fg('dim', 'Tool Results:')} {stats.toolResults}",
-                f"{interactive_theme.theme.fg('dim', 'Total:')} {stats.totalMessages}",
-                "",
-                interactive_theme.theme.bold("Tokens"),
-                f"{interactive_theme.theme.fg('dim', 'Input:')} {stats.tokens.input:,}",
-                f"{interactive_theme.theme.fg('dim', 'Output:')} {stats.tokens.output:,}",
-            ]
-        )
-        if stats.tokens.cacheRead > 0:
-            lines.append(f"{interactive_theme.theme.fg('dim', 'Cache Read:')} {stats.tokens.cacheRead:,}")
-        if stats.tokens.cacheWrite > 0:
-            lines.append(f"{interactive_theme.theme.fg('dim', 'Cache Write:')} {stats.tokens.cacheWrite:,}")
-        lines.append(f"{interactive_theme.theme.fg('dim', 'Total:')} {stats.tokens.total:,}")
-        cache_warming_status = getattr(self.session, "cacheWarmingStatus", None)
-        get_mode = _callable_attr(self.settingsManager, "getCacheWarmingMode")
-        lines.extend(
-            [
-                "",
-                interactive_theme.theme.bold("Cache Warming"),
-                f"{interactive_theme.theme.fg('dim', 'Mode:')} {get_mode() if get_mode is not None else 'streaming'}",
-                f"{interactive_theme.theme.fg('dim', 'Status:')} "
-                + (
-                    format_cache_warming_status(cache_warming_status)
-                    if cache_warming_status is not None
-                    else "Inactive (cache warming unavailable)"
-                ),
-            ]
-        )
-        decision = getattr(cache_warming_status, "decision", None)
-        if decision is not None and decision.economicsAvailable:
-            lines.append(f"{interactive_theme.theme.fg('dim', 'Cache miss penalty:')} ${decision.missCost:.3f}")
-            lines.append(f"{interactive_theme.theme.fg('dim', 'Refresh cost:')} ${decision.warmCost:.3f}")
-        if stats.cost > 0:
-            lines.extend(
-                [
-                    "",
-                    interactive_theme.theme.bold("Cost"),
-                    f"{interactive_theme.theme.fg('dim', 'Total:')} {stats.cost:.4f}",
-                ]
+        sessionName = self.sessionManager.getSessionName()
+        entries = self.sessionManager.getEntries()
+        cacheWaste = computeCacheWaste(entries, self.session.modelRuntime)
+
+        # Cost/token totals per provider/model actually used (e.g. OpenRouter `auto`
+        # resolves to a concrete responseModel). Usage without model attribution is
+        # grouped separately so the breakdown reconciles with the session total.
+        usageBreakdown = getUsageCostBreakdown(entries)
+
+        # Snapshot the stats; the text is built on demand so it follows theme changes.
+        cacheWarmingStatus = self.session.cacheWarmingStatus
+        cacheWarmingMode = self.settingsManager.getCacheWarmingMode()
+        model = self.session.model
+        selectedModelKey = f"{read_field(model, 'provider')}/{read_field(model, 'id')}"
+
+        def localeString(value: float) -> str:
+            # MISAKA fork: `toLocaleString()` in the en-US form: digits grouped, at most three decimals.
+            return f"{value:,.3f}".rstrip("0").rstrip(".")
+
+        def renderInfo() -> str:
+            info = f"{theme.bold('Session Info')}\n\n"
+            if sessionName:
+                info += f"{theme.fg('dim', 'Name:')} {sessionName}\n"
+            info += f"{theme.fg('dim', 'File:')} {stats.sessionFile if stats.sessionFile is not None else 'In-memory'}\n"
+            info += f"{theme.fg('dim', 'ID:')} {stats.sessionId}\n\n"
+            info += f"{theme.bold('Messages')}\n"
+            info += f"{theme.fg('dim', 'Total:')} {stats.totalMessages}\n"
+            info += f"{theme.fg('dim', 'User:')} {stats.userMessages}\n"
+            info += f"{theme.fg('dim', 'Assistant:')} {stats.assistantMessages}\n"
+            info += f"{theme.fg('dim', 'Tools:')} {stats.toolCalls} calls, {stats.toolResults} results\n\n"
+            info += f"{theme.bold('Tokens')}\n"
+            # "Input" is the full prompt volume. With cache activity, split it into
+            # cached (served from cache) vs uncached (everything else) - the only
+            # provider-independent split. Cache writes, where reported, are a detail
+            # of the uncached portion.
+            input = stats.tokens.input
+            cacheRead = stats.tokens.cacheRead
+            cacheWrite = stats.tokens.cacheWrite
+            promptTokens = input + cacheRead + cacheWrite
+            info += f"{theme.fg('dim', 'Input:')} {localeString(promptTokens)}\n"
+            if promptTokens > 0 and (cacheRead > 0 or cacheWrite > 0):
+                hitRate = theme.fg("dim", f"({toFixed((cacheRead / promptTokens) * 100, 1)}%)")
+                info += f"  {theme.fg('dim', 'Cached:')} {localeString(cacheRead)} {hitRate}\n"
+                written = (
+                    f" {theme.fg('dim', f'({localeString(cacheWrite)} written to cache)')}" if cacheWrite > 0 else ""
+                )
+                info += f"  {theme.fg('dim', 'Uncached:')} {localeString(input + cacheWrite)}{written}\n"
+            info += f"{theme.fg('dim', 'Output:')} {localeString(stats.tokens.output)}\n"
+            info += f"{theme.fg('dim', 'Total:')} {localeString(stats.tokens.total)}\n"
+
+            info += f"\n{theme.bold('Cache Warming')}\n"
+            info += f"{theme.fg('dim', 'Mode:')} {cacheWarmingMode}\n"
+            status = (
+                formatCacheWarmingStatus(cacheWarmingStatus)
+                if cacheWarmingStatus
+                else "Inactive (cache warming unavailable)"
             )
-            if len(usage_breakdown) > 1:
-                for entry in usage_breakdown:
-                    lines.append(
-                        f"  {interactive_theme.theme.fg('dim', f'{entry.key}:')} ${entry.cost:.3f} "
-                        f"{interactive_theme.theme.fg('dim', f'({format_tokens(entry.tokens)} tokens)')}"
+            info += f"{theme.fg('dim', 'Status:')} {status}\n"
+            decision = read_field(cacheWarmingStatus, "decision")
+            if read_field(decision, "economicsAvailable"):
+                info += f"{theme.fg('dim', 'Cache miss penalty:')} ${toFixed(decision.missCost, 3)}\n"
+                info += f"{theme.fg('dim', 'Refresh cost:')} ${toFixed(decision.warmCost, 3)}\n"
+
+            if stats.cost > 0 or cacheWaste.missedTokens > 0:
+                info += f"\n{theme.bold('Cost')}\n"
+                info += f"{theme.fg('dim', 'Total:')} ${toFixed(stats.cost, 3)}"
+                # A single entry repeats the total, unless it names a model other than the selected one.
+                if len(usageBreakdown) > 1 or read_field(jsIndex(usageBreakdown, 0), "key") != selectedModelKey:
+                    for entry in usageBreakdown:
+                        info += (
+                            f"\n  {theme.fg('dim', f'{entry.key}:')} ${toFixed(entry.cost, 3)} "
+                            f"{theme.fg('dim', f'({formatTokens(entry.tokens)} tokens)')}"
+                        )
+                if cacheWaste.missedTokens > 0:
+                    missLabel = "1 miss" if cacheWaste.missCount == 1 else f"{cacheWaste.missCount} misses"
+                    detail = f"{localeString(cacheWaste.missedTokens)} tokens, {missLabel}"
+                    info += (
+                        f"\n{theme.fg('dim', 'Cache Re-billed:')} ${toFixed(cacheWaste.missedCost, 3)} {theme.fg('dim', f'({detail})')}"
+                        if cacheWaste.missedCost >= 0.0001
+                        else f"\n{theme.fg('dim', 'Cache Re-billed:')} {detail}"
                     )
+            return info
 
         self.chatContainer.addChild(Spacer(1))
-        self.chatContainer.addChild(Text("\n".join(lines), 1, 0))
-        self._request_render()
+        self.chatContainer.addChild(ThemedText(renderInfo, 1, 0))
+        self.ui.requestRender()
+
+    # MISAKA fork: no `handleChangelogCommand` (no changelog ships).
+
+    def getAppKeyDisplay(self, action: str) -> str:
+        """Get capitalized display string for an app keybinding action."""
+        return keyDisplayText(action)
 
     def getEditorKeyDisplay(self, action: str) -> str:
-        return key_display_text(action)
+        """Get capitalized display string for an editor keybinding action."""
+        return keyDisplayText(action)
 
     def handleHotkeysCommand(self) -> None:
-        cursor_up = self.getEditorKeyDisplay("tui.editor.cursorUp")
-        cursor_down = self.getEditorKeyDisplay("tui.editor.cursorDown")
-        cursor_left = self.getEditorKeyDisplay("tui.editor.cursorLeft")
-        cursor_right = self.getEditorKeyDisplay("tui.editor.cursorRight")
-        cursor_word_left = self.getEditorKeyDisplay("tui.editor.cursorWordLeft")
-        cursor_word_right = self.getEditorKeyDisplay("tui.editor.cursorWordRight")
-        cursor_line_start = self.getEditorKeyDisplay("tui.editor.cursorLineStart")
-        cursor_line_end = self.getEditorKeyDisplay("tui.editor.cursorLineEnd")
-        jump_forward = self.getEditorKeyDisplay("tui.editor.jumpForward")
-        jump_backward = self.getEditorKeyDisplay("tui.editor.jumpBackward")
-        page_up = self.getEditorKeyDisplay("tui.editor.pageUp")
-        page_down = self.getEditorKeyDisplay("tui.editor.pageDown")
+        # Navigation keybindings
+        cursorUp = self.getEditorKeyDisplay("tui.editor.cursorUp")
+        cursorDown = self.getEditorKeyDisplay("tui.editor.cursorDown")
+        cursorLeft = self.getEditorKeyDisplay("tui.editor.cursorLeft")
+        cursorRight = self.getEditorKeyDisplay("tui.editor.cursorRight")
+        cursorWordLeft = self.getEditorKeyDisplay("tui.editor.cursorWordLeft")
+        cursorWordRight = self.getEditorKeyDisplay("tui.editor.cursorWordRight")
+        cursorLineStart = self.getEditorKeyDisplay("tui.editor.cursorLineStart")
+        cursorLineEnd = self.getEditorKeyDisplay("tui.editor.cursorLineEnd")
+        jumpForward = self.getEditorKeyDisplay("tui.editor.jumpForward")
+        jumpBackward = self.getEditorKeyDisplay("tui.editor.jumpBackward")
+        pageUp = self.getEditorKeyDisplay("tui.editor.pageUp")
+        pageDown = self.getEditorKeyDisplay("tui.editor.pageDown")
 
+        # Editing keybindings
         submit = self.getEditorKeyDisplay("tui.input.submit")
-        new_line = self.getEditorKeyDisplay("tui.input.newLine")
-        delete_word_backward = self.getEditorKeyDisplay("tui.editor.deleteWordBackward")
-        delete_word_forward = self.getEditorKeyDisplay("tui.editor.deleteWordForward")
-        delete_to_line_start = self.getEditorKeyDisplay("tui.editor.deleteToLineStart")
-        delete_to_line_end = self.getEditorKeyDisplay("tui.editor.deleteToLineEnd")
+        newLine = self.getEditorKeyDisplay("tui.input.newLine")
+        deleteWordBackward = self.getEditorKeyDisplay("tui.editor.deleteWordBackward")
+        deleteWordForward = self.getEditorKeyDisplay("tui.editor.deleteWordForward")
+        deleteToLineStart = self.getEditorKeyDisplay("tui.editor.deleteToLineStart")
+        deleteToLineEnd = self.getEditorKeyDisplay("tui.editor.deleteToLineEnd")
         yank = self.getEditorKeyDisplay("tui.editor.yank")
-        yank_pop = self.getEditorKeyDisplay("tui.editor.yankPop")
+        yankPop = self.getEditorKeyDisplay("tui.editor.yankPop")
         undo = self.getEditorKeyDisplay("tui.editor.undo")
         tab = self.getEditorKeyDisplay("tui.input.tab")
 
+        # App keybindings
         interrupt = self.getAppKeyDisplay("app.interrupt")
         clear = self.getAppKeyDisplay("app.clear")
-        exit_key = self.getAppKeyDisplay("app.exit")
+        exit = self.getAppKeyDisplay("app.exit")
         suspend = self.getAppKeyDisplay("app.suspend")
-        cycle_thinking_level = self.getAppKeyDisplay("app.thinking.cycle")
-        cycle_model_forward = self.getAppKeyDisplay("app.model.cycleForward")
-        cycle_model_backward = self.getAppKeyDisplay("app.model.cycleBackward")
-        select_model = self.getAppKeyDisplay("app.model.select")
-        expand_tools = self.getAppKeyDisplay("app.tools.expand")
-        toggle_thinking = self.getAppKeyDisplay("app.thinking.toggle")
-        external_editor = self.getAppKeyDisplay("app.editor.external")
-        copy_message = self.getAppKeyDisplay("app.message.copy")
-        follow_up = self.getAppKeyDisplay("app.message.followUp")
+        cycleThinkingLevel = self.getAppKeyDisplay("app.thinking.cycle")
+        cycleModelForward = self.getAppKeyDisplay("app.model.cycleForward")
+        selectModel = self.getAppKeyDisplay("app.model.select")
+        expandTools = self.getAppKeyDisplay("app.tools.expand")
+        toggleThinking = self.getAppKeyDisplay("app.thinking.toggle")
+        externalEditor = self.getAppKeyDisplay("app.editor.external")
+        cycleModelBackward = self.getAppKeyDisplay("app.model.cycleBackward")
+        copyMessage = self.getAppKeyDisplay("app.message.copy")
+        followUp = self.getAppKeyDisplay("app.message.followUp")
         dequeue = self.getAppKeyDisplay("app.message.dequeue")
-        paste_image = self.getAppKeyDisplay("app.clipboard.pasteImage")
+        pasteImage = self.getAppKeyDisplay("app.clipboard.pasteImage")
 
+        # MISAKA fork: "Copy last assistant message" (selections belong to the fullscreen renderer, D1), and copied
+        # files paste on Windows as well.
         hotkeys = f"""
 **Navigation**
 | Key | Action |
 |-----|--------|
-| `{cursor_up}` / `{cursor_down}` / `{cursor_left}` / `{cursor_right}` | Move cursor / browse history (Up when empty) |
-| `{cursor_word_left}` / `{cursor_word_right}` | Move by word |
-| `{cursor_line_start}` | Start of line |
-| `{cursor_line_end}` | End of line |
-| `{jump_forward}` | Jump forward to character |
-| `{jump_backward}` | Jump backward to character |
-| `{page_up}` / `{page_down}` | Scroll by page |
+| `{cursorUp}` / `{cursorDown}` / `{cursorLeft}` / `{cursorRight}` | Move cursor / browse history |
+| `{cursorWordLeft}` / `{cursorWordRight}` | Move by word |
+| `{cursorLineStart}` | Start of line |
+| `{cursorLineEnd}` | End of line |
+| `{jumpForward}` | Jump forward to character |
+| `{jumpBackward}` | Jump backward to character |
+| `{pageUp}` / `{pageDown}` | Scroll by page |
 
 **Editing**
 | Key | Action |
 |-----|--------|
 | `{submit}` | Send message |
-| `{new_line}` | New line{" (Ctrl+Enter on Windows Terminal)" if sys.platform == "win32" else ""} |
-| `{delete_word_backward}` | Delete word backwards |
-| `{delete_word_forward}` | Delete word forwards |
-| `{delete_to_line_start}` | Delete to start of line |
-| `{delete_to_line_end}` | Delete to end of line |
+| `{newLine}` | New line{" (Ctrl+Enter on Windows Terminal)" if sys.platform == "win32" else ""} |
+| `{deleteWordBackward}` | Delete word backwards |
+| `{deleteWordForward}` | Delete word forwards |
+| `{deleteToLineStart}` | Delete to start of line |
+| `{deleteToLineEnd}` | Delete to end of line |
 | `{yank}` | Paste the most-recently-deleted text |
-| `{yank_pop}` | Cycle through the deleted text after pasting |
+| `{yankPop}` | Cycle through the deleted text after pasting |
 | `{undo}` | Undo |
 
 **Other**
@@ -2998,274 +6772,170 @@ class InteractiveMode(Conversation):
 | `{tab}` | Path completion / accept autocomplete |
 | `{interrupt}` | Cancel autocomplete / abort streaming |
 | `{clear}` | Clear editor (first) / exit (second) |
-| `{exit_key}` | Exit (when editor is empty) |
+| `{exit}` | Exit (when editor is empty) |
 | `{suspend}` | Suspend to background |
-| `{cycle_thinking_level}` | Cycle thinking level |
-| `{cycle_model_forward}` / `{cycle_model_backward}` | Cycle models |
-| `{select_model}` | Open model selector |
-| `{expand_tools}` | Toggle tool output expansion |
-| `{toggle_thinking}` | Toggle thinking block visibility |
-| `{external_editor}` | Edit message in external editor |
-| `{copy_message}` | Copy last assistant message |
-| `{follow_up}` | Queue follow-up message |
+| `{cycleThinkingLevel}` | Cycle thinking level |
+| `{cycleModelForward}` / `{cycleModelBackward}` | Cycle models |
+| `{selectModel}` | Open model selector |
+| `{expandTools}` | Toggle tool output expansion |
+| `{toggleThinking}` | Toggle thinking block visibility |
+| `{externalEditor}` | Edit message in external editor |
+| `{copyMessage}` | Copy last assistant message |
+| `{followUp}` | Queue follow-up message |
 | `{dequeue}` | Restore queued messages |
-| `{paste_image}` | Paste image from clipboard |
+| `{pasteImage}` | Paste files on macOS and Windows, images, or text from clipboard |
 | `/` | Slash commands |
 | `!` | Run bash command |
 | `!!` | Run bash command (excluded from context) |
 """
 
-        extension_runner = getattr(self.session, "extensionRunner", None)
-        get_shortcuts = _callable_attr(extension_runner, "getShortcuts") or _callable_attr(
-            extension_runner, "get_shortcuts"
-        )
-        shortcuts = (
-            dict(get_shortcuts(self.keybindings.getEffectiveConfig()) or {})
-            if get_shortcuts is not None
-            else {}
-        )
-        if shortcuts:
+        # Add extension-registered shortcuts
+        extensionRunner = self.session.extensionRunner
+        shortcuts = extensionRunner.getShortcuts(self.keybindings.getEffectiveConfig())
+        if len(shortcuts) > 0:
             hotkeys += """
 **Extensions**
 | Key | Action |
 |-----|--------|
 """
             for key, shortcut in shortcuts.items():
-                description = read_field(shortcut, "description") or read_field(shortcut, "extensionPath")
-                key_display = format_key_text(str(key), KeyTextFormatOptions(capitalize=True))
-                hotkeys += f"| `{key_display}` | {description} |\n"
+                description = shortcut.description if shortcut.description is not None else shortcut.extensionPath
+                keyDisplay = formatKeyText(key, KeyTextFormatOptions(capitalize=True))
+                hotkeys += f"| `{keyDisplay}` | {description} |\n"
 
         self.chatContainer.addChild(Spacer(1))
         self.chatContainer.addChild(DynamicBorder())
-        self.chatContainer.addChild(
-            Text(interactive_theme.theme.bold(interactive_theme.theme.fg("accent", "Keyboard Shortcuts")), 1, 0)
-        )
+        self.chatContainer.addChild(ThemedText(lambda: theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0))
         self.chatContainer.addChild(Spacer(1))
-        self.chatContainer.addChild(Markdown(hotkeys.strip(), 1, 1, self.getMarkdownThemeWithSettings()))
+        self.chatContainer.addChild(Markdown(jsTrim(hotkeys), 1, 1, self.getMarkdownThemeWithSettings()))
         self.chatContainer.addChild(DynamicBorder())
-        self._request_render()
+        self.ui.requestRender()
+
+    async def handleClearCommand(self, notice: str = "✓ New session started", *, carry: bool = False) -> bool:
+        """MISAKA fork: `notice` is the confirmation shown (`/clear` shows its own), `carry` hands the context to the
+        new session (`/new --carry`), and the result says whether a new session started."""
+        self.clearStatusIndicator()
+        try:
+            result = await self.runtimeHost.newSession({"carryOverContext": True} if carry else None)
+            if read_field(result, "cancelled"):
+                return False
+            self.chatContainer.addChild(Spacer(1))
+            self.chatContainer.addChild(ThemedText(lambda: theme.fg("accent", notice), 1, 1))
+            self.ui.requestRender()
+            return True
+        except ContextCarryUnsupportedError as error:
+            # MISAKA fork: the context engine refused the carry-over; the current session is intact.
+            self.showError(errorMessage(error))
+            return False
+        except Exception as error:  # noqa: BLE001 - fatal, as upstream
+            await self.handleFatalRuntimeError("Failed to create session", error)
+
+    async def handleTrueClearCommand(self) -> None:
+        """MISAKA fork: `/clear` wipes the current session in place. It runs the full `/new` reset for a clean state,
+        then adopts the old id and file (truncated to its header line) and deletes the freshly allocated empty session
+        file, so the conversation keeps writing into the cleared session under the same identity."""
+        oldId = self.sessionManager.getSessionId()
+        oldFile = self.sessionManager.getSessionFile()
+        if not await self.handleClearCommand("✓ Session cleared (same session, history wiped)"):
+            return
+        sm = self.sessionManager
+        if not oldId:
+            return
+        newFile = sm.getSessionFile()
+        if newFile and oldFile and newFile != oldFile:
+            with contextlib.suppress(OSError):
+                if os.path.exists(newFile):
+                    os.unlink(newFile)
+        sm.sessionId = oldId
+        entries = sm.fileEntries
+        if entries and isinstance(entries[0], dict) and entries[0].get("type") == "session":
+            entries[0]["id"] = oldId
+        if oldFile:
+            sm.sessionFile = oldFile
+            sm.rewrite_file()
+            sm.flushed = True
+
+    async def handleBoardCommand(self) -> None:
+        """MISAKA fork: `/board` shows the team's task board (read-only)."""
+        from misaka.core.network import board
+
+        cwd = self.session.extensionRunner.cwd
+        # The board reads SQLite, which stays off the event loop.
+        text = await asyncio.to_thread(board.board_for, cwd)
+        self.showExtensionNotify(text or "(No task cards on the board.)", "info")
 
     def handleDebugCommand(self) -> None:
-        """/debug: the one diagnostic exit, replacing five undocumented environment switches.
+        width = self.ui.terminal.columns
+        height = self.ui.terminal.rows
+        allLines = self.ui.render(width)
 
-        It writes the rendered screen and the conversation to a file the user is told about,
-        rather than to a path only a developer reading the source would know to look at.
-        """
-        width = int(getattr(self.ui.terminal, "columns", 0) or 0)
-        height = int(getattr(self.ui.terminal, "rows", 0) or 0)
-        render = _callable_attr(self.ui, "render")
-        all_lines = list(render(width) if render is not None else [])
-        messages = list(getattr(self.session, "messages", []) or [])
-
-        def _json_default(value: Any) -> Any:
-            if is_dataclass(value):
+        def jsonDefault(value: Any) -> Any:
+            # MISAKA fork: messages are dataclasses, which `json.dumps` cannot write by itself.
+            if is_dataclass(value) and not isinstance(value, type):
                 return asdict(value)
-            value_dict = getattr(value, "__dict__", None)
-            if isinstance(value_dict, dict):
-                return value_dict
-            slots = getattr(type(value), "__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            slot_values = {
-                slot: getattr(value, slot)
-                for slot in slots
-                if slot not in {"__dict__", "__weakref__"} and hasattr(value, slot)
-            }
-            if slot_values:
-                return slot_values
-            return str(value)
+            return getattr(value, "__dict__", None) or str(value)
 
-        timestamp = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-        debug_data = "\n".join(
+        debugLogPath = get_debug_log_path()
+        debugData = "\n".join(
             [
-                f"Debug output at {timestamp}",
+                f"Debug output at {datetime.now(UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z')}",
                 f"Terminal: {width}x{height}",
-                f"Total lines: {len(all_lines)}",
+                f"Total lines: {len(allLines)}",
                 "",
                 "=== All rendered lines with visible widths ===",
-                *[
-                    f"[{idx}] (w={visibleWidth(line)}) {json.dumps(line)}"
-                    for idx, line in enumerate(all_lines)
-                ],
+                *[f"[{idx}] (w={visibleWidth(line)}) {jsonStringify(line)}" for idx, line in enumerate(allLines)],
                 "",
                 "=== Agent messages (JSONL) ===",
-                *[json.dumps(message, default=_json_default) for message in messages],
+                *[json.dumps(msg, default=jsonDefault, ensure_ascii=False) for msg in self.session.messages],
                 "",
             ]
         )
 
-        # The dump carries the whole conversation, so it is written the way auth.json is.
-        debug_log_path = Path(get_debug_log_path())
-        debug_log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        debug_log_path.write_text(debug_data, encoding="utf-8")
+        # MISAKA fork: the dump carries the whole conversation, so it is written the way auth.json is.
+        os.makedirs(os.path.dirname(debugLogPath), mode=0o700, exist_ok=True)
+        with open(debugLogPath, "w", encoding="utf-8") as file:
+            file.write(debugData)
         with contextlib.suppress(OSError):
-            debug_log_path.chmod(0o600)
+            os.chmod(debugLogPath, 0o600)
 
         self.chatContainer.addChild(Spacer(1))
         self.chatContainer.addChild(
-            Text(
-                f"{interactive_theme.theme.fg('accent', '✓ Debug log written')}\n"
-                f"{interactive_theme.theme.fg('muted', str(debug_log_path))}",
-                1,
-                1,
-            )
+            ThemedText(lambda: f"{theme.fg('accent', '✓ Debug log written')}\n{theme.fg('muted', debugLogPath)}", 1, 1)
         )
-        self._request_render()
+        self.ui.requestRender()
 
-
-    async def handleResumeSession(
-        self,
-        sessionPath: str,
-        options: dict[str, Any] | None = None,
-    ) -> dict[str, bool]:
-        if self.loadingAnimation is not None:
-            stop = _callable_attr(self.loadingAnimation, "stop")
-            if stop is not None:
-                stop()
-            self.loadingAnimation = None
-        clear = _callable_attr(self.statusContainer, "clear")
-        if clear is not None:
-            clear()
-        try:
-            result = await self.runtimeHost.switchSession(
-                sessionPath,
-                {
-                    "withSession": read_field(options, "withSession"),
-                    "projectTrustContextFactory": self.createProjectTrustContext,
-                },
-            )
-            if read_field(result, "cancelled", False):
-                return result
-            self.renderCurrentSessionState()
-            self.showStatus("Resumed session")
-            return result
-        except MissingSessionCwdError as error:
-            selected_cwd = await self.promptForMissingSessionCwd(error)
-            if not selected_cwd:
-                self.showStatus("Resume cancelled")
-                return {"cancelled": True}
-            result = await self.runtimeHost.switchSession(
-                sessionPath,
-                {
-                    "cwdOverride": selected_cwd,
-                    "withSession": read_field(options, "withSession"),
-                    "projectTrustContextFactory": self.createProjectTrustContext,
-                },
-            )
-            if read_field(result, "cancelled", False):
-                return result
-            self.renderCurrentSessionState()
-            self.showStatus("Resumed session in current cwd")
-            return result
-        except Exception as error:  # noqa: BLE001
-            await self.handleFatalRuntimeError("Failed to resume session", error)
-            return {"cancelled": True}
-
-    async def handleNewSession(self) -> dict[str, bool]:
-        try:
-            result = await self.runtimeHost.newSession()
-            if read_field(result, "cancelled", False):
-                return result
-            self.renderCurrentSessionState()
-            self.showStatus("Started new session")
-            return result
-        except Exception as error:  # noqa: BLE001
-            await self.handleFatalRuntimeError("Failed to start new session", error)
-            return {"cancelled": True}
-
-    async def handleBoardCommand(self) -> None:
-        # MISAKA: /board is a built-in like /clear; the board itself is core/network's.
-        from misaka.core.network import board
-
-        cwd = getattr(self.session.extensionRunner, "cwd", None)
-        text = await asyncio.to_thread(board.board_for, cwd)  # sqlite stays off the loop
-        self.showExtensionNotify(text or "(No task cards on the board.)", "info")
-
-    async def handleClearCommand(self, notice: str = "✓ New session started", *, carry: bool = False) -> bool:
-        if self.loadingAnimation is not None:
-            stop = _callable_attr(self.loadingAnimation, "stop")
-            if stop is not None:
-                stop()
-            self.loadingAnimation = None
-        clear = _callable_attr(self.statusContainer, "clear")
-        if clear is not None:
-            clear()
-        try:
-            result = await self.runtimeHost.newSession({"carryOverContext": True}) if carry else await self.runtimeHost.newSession()
-            if read_field(result, "cancelled", False):
-                return False
-            self.renderCurrentSessionState()
-            self.chatContainer.addChild(Spacer(1))
-            self.chatContainer.addChild(
-                Text(f"{interactive_theme.theme.fg('accent', notice)}", 1, 1)
-            )
-            self._request_render()
-            return True
-        except ContextCarryUnsupportedError as error:
-            self.showError(str(error))
-            return False
-        except Exception as error:  # noqa: BLE001
-            await self.handleFatalRuntimeError("Failed to create session", error)
-            return False
-
-    async def handleTrueClearCommand(self) -> None:
-        """/clear: wipe the current session in place. Runs the full /new reset for a clean state,
-        then adopts the old id and file (truncated to its header line) and deletes the freshly
-        allocated empty session file. The only difference from /new is identity: id and file
-        stay the same, and the conversation keeps writing into this cleared session."""
-        sm = self.sessionManager
-        old_id = str(_safe_call_str(sm, "getSessionId", "") or "") if sm is not None else ""
-        get_file = _callable_attr(sm, "getSessionFile")
-        old_file = get_file() if get_file is not None else None
-        if not await self.handleClearCommand("✓ Session cleared (same session, history wiped)"):
-            return
-        sm = self.sessionManager
-        if sm is None or not old_id:
-            return
-        get_file = _callable_attr(sm, "getSessionFile")
-        new_file = get_file() if get_file is not None else None
-        if new_file and old_file and new_file != old_file:
-            with contextlib.suppress(OSError):
-                if os.path.exists(new_file):
-                    os.unlink(new_file)
-        sm.sessionId = old_id
-        entries = getattr(sm, "fileEntries", None)
-        if entries and isinstance(entries[0], dict) and entries[0].get("type") == "session":
-            entries[0]["id"] = old_id
-        if old_file:
-            sm.sessionFile = old_file
-            sm.rewrite_file()
-            sm.flushed = True
+    # MISAKA fork: no `handleArminSaysHi` or `handleDementedDelves` (easter eggs).
 
     async def handleBashCommand(self, command: str, excludeFromContext: bool = False) -> None:
-        extension_runner = getattr(self.session, "extensionRunner", None)
-        emit_user_bash = _callable_attr(extension_runner, "emit_user_bash") or _callable_attr(
-            extension_runner, "emitUserBash"
-        )
-        event_result = (
-            await maybe_await(
-                emit_user_bash(
-                    {
-                        "type": "user_bash",
-                        "command": command,
-                        "excludeFromContext": excludeFromContext,
-                        "cwd": self.sessionManager.getCwd(),
-                    }
-                )
+        extensionRunner = self.session.extensionRunner
+
+        # Emit user_bash event to let extensions intercept
+        try:
+            eventResult = await extensionRunner.emitUserBash(
+                {
+                    "type": "user_bash",
+                    "command": command,
+                    "excludeFromContext": excludeFromContext,
+                    "cwd": self.sessionManager.getCwd(),
+                }
             )
-            if emit_user_bash is not None
-            else None
-        )
-        direct_result = read_field(event_result, "result")
-        if direct_result:
-            result = _coerce_bash_result(direct_result)
-            self.bashComponent = BashExecutionComponent(command, self.ui, excludeFromContext)
-            if bool(getattr(self.session, "isStreaming", False)):
+        except Exception:  # noqa: BLE001 - reported by the runner
+            # The extension runner already reported the error. Do not fall back to local execution.
+            return
+
+        # If extension returned a full result, use it directly
+        if read_field(eventResult, "result"):
+            result = _coerce_bash_result(read_field(eventResult, "result"))
+
+            # Create UI component for display
+            self.bashComponent = BashExecutionComponent(command, self.ui, excludeFromContext, self.outputPad)
+            if self.session.isStreaming:
                 self.pendingMessagesContainer.addChild(self.bashComponent)
                 self.pendingBashComponents.append(self.bashComponent)
             else:
                 self.chatContainer.addChild(self.bashComponent)
+
+            # Show output and complete
             if result.output:
                 self.bashComponent.appendOutput(result.output)
             self.bashComponent.setComplete(
@@ -3274,3356 +6944,103 @@ class InteractiveMode(Conversation):
                 _make_bash_truncation_result(result.output) if result.truncated else None,
                 result.fullOutputPath,
             )
-            record_bash_result = _callable_attr(self.session, "recordBashResult") or _callable_attr(
-                self.session, "record_bash_result"
-            )
-            if record_bash_result is not None:
-                record_bash_result(command, result, {"excludeFromContext": excludeFromContext})
+
+            # Record the result in session
+            self.session.recordBashResult(command, result, {"excludeFromContext": excludeFromContext})
             self.bashComponent = None
-            self._request_render()
+            self.ui.requestRender()
             return
 
-        is_deferred = bool(getattr(self.session, "isStreaming", False))
-        self.bashComponent = BashExecutionComponent(command, self.ui, excludeFromContext)
-        if is_deferred:
+        # Normal execution path (possibly with custom operations)
+        isDeferred = self.session.isStreaming
+        self.bashComponent = BashExecutionComponent(command, self.ui, excludeFromContext, self.outputPad)
+
+        if isDeferred:
+            # Show in pending area when agent is streaming
             self.pendingMessagesContainer.addChild(self.bashComponent)
             self.pendingBashComponents.append(self.bashComponent)
         else:
+            # Show in chat immediately when agent is idle
             self.chatContainer.addChild(self.bashComponent)
-        self._request_render()
+        self.ui.requestRender()
 
-        def _on_chunk(chunk: str) -> None:
-            if self.bashComponent is not None:
+        def onChunk(chunk: str) -> None:
+            if self.bashComponent:
                 self.bashComponent.appendOutput(chunk)
-                self._request_render()
+                self.ui.requestRender()
 
         try:
-            result = await self.session.executeBash(
-                command,
-                _on_chunk,
-                {"excludeFromContext": excludeFromContext, "operations": read_field(event_result, "operations")},
+            result = _coerce_bash_result(
+                await self.session.executeBash(
+                    command,
+                    onChunk,
+                    {"excludeFromContext": excludeFromContext, "operations": read_field(eventResult, "operations")},
+                )
             )
-            result = _coerce_bash_result(result)
-            if self.bashComponent is not None:
+
+            if self.bashComponent:
                 self.bashComponent.setComplete(
                     result.exitCode,
                     result.cancelled,
                     _make_bash_truncation_result(result.output) if result.truncated else None,
                     result.fullOutputPath,
                 )
-        except Exception as error:  # noqa: BLE001
-            if self.bashComponent is not None:
+        except Exception as error:  # noqa: BLE001 - shown to the user
+            if self.bashComponent:
                 self.bashComponent.setComplete(None, False)
             self.showError(f"Bash command failed: {str(error) or 'Unknown error'}")
 
         self.bashComponent = None
-        self._request_render()
-
-    async def handleSubmittedText(self, text: str) -> None:
-        text = text.strip()
-        if not text:
-            return
-
-        if text == "/resume":
-            self._set_editor_text("")
-            self.showSessionSelector()
-            return
-        if text == "/model" or text.startswith("/model "):
-            search_term = text[7:].strip() if text.startswith("/model ") else None
-            self._set_editor_text("")
-            await self.handleModelCommand(search_term or None)
-            return
-        if text == "/thinking" or text.startswith("/thinking "):
-            argument = text[10:].strip() if text.startswith("/thinking ") else ""
-            self._set_editor_text("")
-            self.handleThinkingCommand(argument)
-            return
-        if text == "/scoped-models":
-            self._set_editor_text("")
-            await self.showModelsSelector()
-            return
-        if text == "/settings":
-            self._set_editor_text("")
-            self.showSettingsSelector()
-            return
-        if text == "/export" or text.startswith("/export "):
-            self._set_editor_text("")
-            await self.handleExportCommand(text)
-            return
-        if text == "/import" or text.startswith("/import "):
-            await self.handleImportCommand(text)
-            self._set_editor_text("")
-            return
-        if text == "/clone":
-            self._set_editor_text("")
-            await self.handleCloneCommand()
-            return
-        if text == "/share":
-            self._set_editor_text("")
-            await self.handleShareCommand()
-            return
-        if text == "/copy":
-            self._set_editor_text("")
-            await self.handleCopyCommand()
-            return
-        if text == "/name" or text.startswith("/name "):
-            self._set_editor_text("")
-            self.handleNameCommand(text)
-            return
-        if text == "/session":
-            self._set_editor_text("")
-            self.handleSessionCommand()
-            return
-        if text == "/hotkeys":
-            self._set_editor_text("")
-            self.handleHotkeysCommand()
-            return
-        if text == "/fork":
-            self._set_editor_text("")
-            self.showUserMessageSelector()
-            return
-        if text == "/tree":
-            self._set_editor_text("")
-            self.showTreeSelector()
-            return
-        if text == "/trust":
-            self._set_editor_text("")
-            self.showTrustSelector()
-            return
-        if text == "/login" or text.startswith("/login "):
-            self._set_editor_text("")
-            provider_ref = text[7:].strip() if text.startswith("/login ") else None
-            await self.handleLoginCommand(provider_ref or None)
-            return
-        if text == "/logout":
-            self._set_editor_text("")
-            await self.showOAuthSelector("logout")
-            return
-        if text == "/new" or text == "/new --carry":
-            self._set_editor_text("")
-            await self.handleClearCommand(carry=text == "/new --carry")
-            return
-        if text == "/clear":
-            self._set_editor_text("")
-            await self.handleTrueClearCommand()
-            return
-        if text == "/board":
-            self._set_editor_text("")
-            await self.handleBoardCommand()
-            return
-        if text == "/compact" or text.startswith("/compact "):
-            custom_instructions = text[9:].strip() if text.startswith("/compact ") else None
-            self._set_editor_text("")
-            await self.handleCompactCommand(custom_instructions or None)
-            return
-        if text == "/reload":
-            self._set_editor_text("")
-            await self.handleReloadCommand()
-            return
-        if text == "/debug":
-            self._set_editor_text("")
-            self.handleDebugCommand()
-            return
-        if text == "/quit":
-            self._set_editor_text("")
-            await self.shutdown()
-            return
-
-        # Unknown slash commands fail loudly instead of being sent to the model as text:
-        # silently falling through showed only "Working..." and made it look as though the
-        # command had taken effect. A prompt template is not unknown -- the menu offers it
-        # and AgentSession.prompt expands it -- so it passes through to the model path.
-        if (text.startswith("/") and not text.startswith("//")
-                and not self.isExtensionCommand(text) and not self.isCorePromptCommand(text)
-                and not self.isPromptTemplate(text)):
-            name = text[1:].split(" ", 1)[0]
-            if name and not name[0].isdigit():
-                self._set_editor_text("")
-                self.showError(
-                    f"Unknown command /{name}. Type / to list commands, or //{name} to send it as plain text."
-                )
-                return
-
-        if text.startswith("!"):
-            is_excluded = text.startswith("!!")
-            command = text[2:].strip() if is_excluded else text[1:].strip()
-            if command:
-                if bool(getattr(self.session, "isBashRunning", False)):
-                    self.showWarning("A bash command is already running. Press Esc to cancel it first.")
-                    self._set_editor_text(text)
-                    return
-                add_history = _callable_attr(self.editor, "addToHistory")
-                if add_history is not None:
-                    add_history(text)
-                self._set_editor_text("")
-                await self.handleBashCommand(command, is_excluded)
-                self.isBashMode = False
-                self.updateEditorBorderColor()
-            return
-
-        if bool(getattr(self.session, "isCompacting", False)):
-            if self.isExtensionCommand(text):
-                add_history = _callable_attr(self.editor, "addToHistory")
-                if add_history is not None:
-                    add_history(text)
-                self._set_editor_text("")
-                await self.session.prompt(text)
-            else:
-                self.queueCompactionMessage(text, "steer")
-            return
-
-        if bool(getattr(self.session, "isStreaming", False)):
-            add_history = _callable_attr(self.editor, "addToHistory")
-            if add_history is not None:
-                add_history(text)
-            self._set_editor_text("")
-            await self.session.prompt(text, {"streamingBehavior": "steer"})
-            self.updatePendingMessagesDisplay()
-            self._request_render()
-            return
-
-        self.flushPendingBashComponents()
-        if self.onInputCallback is None:
-            self.queueDeferredInputMessage(text)
-            return
-        self.onInputCallback(text)
-        add_history = _callable_attr(self.editor, "addToHistory")
-        if add_history is not None:
-            add_history(text)
-
-    async def handleReloadCommand(self) -> None:
-        if bool(getattr(self.session, "isStreaming", False)):
-            self.showWarning("Wait for the current response to finish before reloading.")
-            return
-        if bool(getattr(self.session, "isCompacting", False)):
-            self.showWarning("Wait for compaction to finish before reloading.")
-            return
-
-        self.resetExtensionUI()
-
-        previous_editor = self.editor
-        reload_box = Container()
-        border_color = lambda text: interactive_theme.theme.fg("border", text)
-        reload_box.addChild(DynamicBorder(border_color))
-        reload_box.addChild(Spacer(1))
-        reload_box.addChild(
-            Text(
-                interactive_theme.theme.fg(
-                    "muted",
-                    "Reloading keybindings, extensions, skills, prompts, themes...",
-                ),
-                1,
-                0,
-            )
-        )
-        reload_box.addChild(Spacer(1))
-        reload_box.addChild(DynamicBorder(border_color))
-
-        self.editorContainer.clear()
-        self.editorContainer.addChild(reload_box)
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if set_focus is not None:
-            set_focus(reload_box)
-        self._request_render(True)
-        await asyncio.sleep(0)
-
-        def dismiss(editor: Any) -> None:
-            self.editorContainer.clear()
-            self.editorContainer.addChild(editor)
-            if set_focus is not None:
-                set_focus(editor)
-            self._request_render()
-
-        chat_restored_before_session_start = False
-
-        def restore_chat_before_session_start() -> None:
-            nonlocal chat_restored_before_session_start
-            if chat_restored_before_session_start:
-                return
-            self.hideThinkingBlock = _safe_call_bool(
-                self.settingsManager,
-                "getHideThinkingBlock",
-                self.hideThinkingBlock,
-            )
-            self.outputPad = _safe_call_int(
-                self.settingsManager,
-                "getOutputPad",
-                self.outputPad,
-            )
-            self.rebuildChatFromMessages()
-            chat_restored_before_session_start = True
-
-        try:
-            await self.session.reload(
-                {"beforeSessionStart": restore_chat_before_session_start}
-            )
-            restore_chat_before_session_start()
-            setCapabilityOverrides(getattr(self.settingsManager, "getTerminalCapabilityOverrides", dict)())
-            self.keybindings.reload()
-            active_header = self.customHeader or self.builtInHeader
-            set_expanded = _callable_attr(active_header, "setExpanded")
-            if set_expanded is not None:
-                set_expanded(self.toolOutputExpanded)
-            resource_loader = getattr(self.session, "resourceLoader", None)
-            get_themes = _callable_attr(resource_loader, "getThemes")
-            themes_result = get_themes() if get_themes is not None else {}
-            interactive_theme.set_registered_themes(read_field(themes_result, "themes", []))
-            theme_name = _safe_call_str(self.settingsManager, "getTheme")
-            theme_result = (
-                interactive_theme.set_theme(theme_name, True)
-                if theme_name
-                else {"success": True}
-            )
-            if not bool(read_field(theme_result, "success", False)):
-                self.showError(
-                    f'Failed to load theme "{theme_name}": {read_field(theme_result, "error")}\nFell back to dark theme.'
-                )
-            editor_padding_x = _safe_call_int(self.settingsManager, "getEditorPaddingX", 0)
-            autocomplete_max_visible = _safe_call_int(self.settingsManager, "getAutocompleteMaxVisible", 5)
-            set_default_padding = _callable_attr(self.defaultEditor, "setPaddingX")
-            if set_default_padding is not None:
-                set_default_padding(editor_padding_x)
-            set_default_autocomplete = _callable_attr(self.defaultEditor, "setAutocompleteMaxVisible")
-            if set_default_autocomplete is not None:
-                set_default_autocomplete(autocomplete_max_visible)
-            if self.editor is not self.defaultEditor:
-                set_padding = _callable_attr(self.editor, "setPaddingX")
-                if set_padding is not None:
-                    set_padding(editor_padding_x)
-                set_autocomplete = _callable_attr(self.editor, "setAutocompleteMaxVisible")
-                if set_autocomplete is not None:
-                    set_autocomplete(autocomplete_max_visible)
-            set_show_hardware_cursor = _callable_attr(self.ui, "setShowHardwareCursor")
-            if set_show_hardware_cursor is not None:
-                set_show_hardware_cursor(_safe_call_bool(self.settingsManager, "getShowHardwareCursor", False))
-            set_clear_on_shrink = _callable_attr(self.ui, "setClearOnShrink")
-            if set_clear_on_shrink is not None:
-                set_clear_on_shrink(_safe_call_bool(self.settingsManager, "getClearOnShrink", False))
-            self.setupAutocompleteProvider()
-            self.setupExtensionShortcuts(self.session.extensionRunner)
-            dismiss(self.editor)
-            self.showLoadedResources({"force": False, "showDiagnosticsWhenQuiet": True})
-            saved_implicit_project_trust = self.maybeSaveImplicitProjectTrustAfterReload()
-            get_model_error = _callable_attr(getattr(self.session, "modelRegistry", None), "getError")
-            models_json_error = get_model_error() if get_model_error is not None else None
-            if models_json_error:
-                self.showError(f"models.json error: {models_json_error}")
-            self.showStatus(
-                "Reloaded keybindings, extensions, skills, prompts, themes; saved project trust"
-                if saved_implicit_project_trust
-                else "Reloaded keybindings, extensions, skills, prompts, themes"
-            )
-        except Exception as error:  # noqa: BLE001
-            dismiss(previous_editor)
-            self.showError(f"Reload failed: {error}")
-
-    async def handleExportCommand(self, text: str) -> None:
-        output_path = self.getPathCommandArgument(text, "/export")
-        try:
-            if output_path and output_path.endswith(".jsonl"):
-                file_path = self.session.exportToJsonl(output_path)
-            else:
-                file_path = await self.session.exportToHtml(
-                    output_path,
-                    {"themeName": interactive_theme.theme.name},
-                )
-            self.showStatus(f"Session exported to: {file_path}")
-        except Exception as error:  # noqa: BLE001
-            self.showError(f"Failed to export session: {error}")
-
-    async def handleLoginCommand(self, providerRef: str | None = None) -> None:
-        if not providerRef:
-            await self.showOAuthSelector("login")
-            return
-        await self.session.modelRegistry.authStorage.readLatestData()
-        account = None
-        if "--account" in providerRef:
-            import shlex
-
-            from misaka.core.auth_storage import oauth_account_key
-            try:
-                args = shlex.split(providerRef)
-                if len(args) < 3 or args[-2] != "--account" or "--account" in args[:-2]:
-                    raise ValueError("Usage: /login PROVIDER --account NAME")
-                providerRef, account = " ".join(args[:-2]), args[-1]
-                oauth_account_key(providerRef, account)
-            except ValueError as error:
-                self.showError(str(error))
-                return
-        normalized = providerRef.casefold()
-        matches = [
-            provider
-            for provider in self.getLoginProviderOptions()
-            if provider.id.casefold() == normalized or provider.name.casefold() == normalized
-        ]
-        if len(matches) == 1:
-            await self._handle_login_provider_select(
-                matches, matches[0].id, lambda: None, account=account
-            )
-            return
-        if len(matches) > 1 and len({provider.id for provider in matches}) == 1:
-            labels = [
-                "Use a subscription"
-                if provider.authType == "oauth"
-                else "Use an API key"
-                for provider in matches
-            ]
-
-            def build(done: Callable[[], None]) -> dict[str, Any]:
-                selector = ExtensionSelectorComponent(
-                    f"Select authentication method for {matches[0].name}:",
-                    labels,
-                    lambda label: (
-                        done(),
-                        self._schedule_task(
-                            self._handle_login_provider_select(
-                                [matches[labels.index(label)]],
-                                matches[labels.index(label)].id,
-                                lambda: None, account=account,
-                            )
-                        ),
-                    ),
-                    lambda: (done(), self._request_render()),
-                )
-                return {"component": selector, "focus": selector}
-
-            self.showSelector(build)
-            return
-        self.showStatus(f'Unknown login provider: "{providerRef}"')
-
-    def getLoginProviderOptions(self, authType: str | None = None) -> list[AuthSelectorProvider]:
-        oauth_providers = list(self.session.modelRegistry.getOAuthProviders())
-        oauth_provider_ids = {provider.id for provider in oauth_providers}
-        options = [
-            AuthSelectorProvider(id=str(provider.id), name=str(provider.name), authType="oauth")
-            for provider in oauth_providers
-        ]
-
-        get_all = _callable_attr(self.session.modelRegistry, "getAll")
-        model_providers = {
-            str(read_field(model, "provider", ""))
-            for model in (get_all() or [])
-            if read_field(model, "provider", "")
-        }
-        for provider_id in model_providers:
-            if not isApiKeyLoginProvider(provider_id, oauth_provider_ids):
-                continue
-            options.append(
-                AuthSelectorProvider(
-                    id=provider_id,
-                    name=self.session.modelRegistry.getProviderDisplayName(provider_id),
-                    authType="api_key",
-                )
-            )
-
-        get_native = _callable_attr(self.session.modelRegistry, "getNativeProviders")
-        for provider in (get_native() if get_native is not None else []):
-            auth = getattr(provider, "auth", None)
-            if getattr(auth, "oauth", None) is not None:
-                options.append(
-                    AuthSelectorProvider(
-                        id=str(provider.id),
-                        name=str(provider.name),
-                        authType="oauth",
-                    )
-                )
-            if getattr(auth, "apiKey", None) is not None:
-                options.append(
-                    AuthSelectorProvider(
-                        id=str(provider.id),
-                        name=str(provider.name),
-                        authType="api_key",
-                    )
-                )
-
-        deduplicated = {
-            (option.id, option.authType): option
-            for option in options
-            if authType is None or option.authType == authType
-        }
-        filtered = list(deduplicated.values())
-        return sorted(filtered, key=lambda option: option.name)
-
-    def getLogoutProviderOptions(self) -> list[AuthSelectorProvider]:
-        auth_storage = self.session.modelRegistry.authStorage
-        options: list[AuthSelectorProvider] = []
-        for provider_id in auth_storage.list():
-            credential = auth_storage.get(provider_id)
-            if not credential:
-                continue
-            options.append(
-                AuthSelectorProvider(
-                    id=provider_id,
-                    name=self.session.modelRegistry.getProviderDisplayName(provider_id),
-                    authType=str(read_field(credential, "type", "api_key")),
-                )
-            )
-        return sorted(options, key=lambda option: option.name)
-
-    def showLoginAuthTypeSelector(self) -> None:
-        subscription_label = "Use a subscription"
-        api_key_label = "Use an API key"
-        def _build_auth_type_selector(done: Callable[[], None]) -> dict[str, Any]:
-            selector = ExtensionSelectorComponent(
-                "Select authentication method:",
-                [subscription_label, api_key_label],
-                lambda option: (
-                    done(),
-                    self.showLoginProviderSelector("oauth" if option == subscription_label else "api_key"),
-                ),
-                lambda: (done(), self._request_render()),
-            )
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(_build_auth_type_selector)
-
-    def showLoginProviderSelector(self, authType: str) -> None:
-        provider_options = self.getLoginProviderOptions(authType)
-        if not provider_options:
-            self.showStatus(
-                "No subscription providers available."
-                if authType == "oauth"
-                else "No API key providers available."
-            )
-            return
-
-        def _build_login_provider_selector(done: Callable[[], None]) -> dict[str, Any]:
-            selector = OAuthSelectorComponent(
-                "login",
-                self.session.modelRegistry.authStorage,
-                provider_options,
-                lambda provider_id: self._schedule_task(
-                    self._handle_login_provider_select(provider_options, provider_id, done)
-                ),
-                lambda: (done(), self.showLoginAuthTypeSelector()),
-                lambda provider_id: self.session.modelRegistry.getProviderAuthStatus(provider_id),
-            )
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(_build_login_provider_selector)
-
-    async def _handle_login_provider_select(
-        self,
-        provider_options: list[AuthSelectorProvider],
-        provider_id: str,
-        done: Callable[[], None],
-        *, account: str | None = None,
-    ) -> None:
-        done()
-        provider = next((item for item in provider_options if item.id == provider_id), None)
-        if provider is None:
-            return
-        if provider.authType == "oauth":
-            await self.showLoginDialog(provider.id, provider.name, account=account)
-            return
-        if provider.id == _BEDROCK_PROVIDER_ID:
-            if account is not None:
-                self.showError("Bedrock uses AWS profiles rather than named API-key records")
-                return
-            self.showBedrockSetupDialog(provider.id, provider.name)
-            return
-        await self.showApiKeyLoginDialog(provider.id, provider.name, account=account)
-
-    async def showOAuthSelector(self, mode: str) -> None:
-        await self.session.modelRegistry.authStorage.readLatestData()
-        if mode == "login":
-            self.showLoginAuthTypeSelector()
-            return
-
-        provider_options = self.getLogoutProviderOptions()
-        if not provider_options:
-            self.showStatus(
-                "No stored credentials to remove. /logout only removes credentials saved by /login; "
-                "environment variables and models.json config are unchanged."
-            )
-            return
-
-        def _build_logout_selector(done: Callable[[], None]) -> dict[str, Any]:
-            selector = OAuthSelectorComponent(
-                mode,
-                self.session.modelRegistry.authStorage,
-                provider_options,
-                lambda provider_id: self._schedule_task(
-                    self._handle_logout_provider_select(provider_options, provider_id, done)
-                ),
-                lambda: (done(), self._request_render()),
-            )
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(_build_logout_selector)
-
-    async def _handle_logout_provider_select(
-        self,
-        provider_options: list[AuthSelectorProvider],
-        provider_id: str,
-        done: Callable[[], None],
-    ) -> None:
-        done()
-        provider = next((item for item in provider_options if item.id == provider_id), None)
-        if provider is None:
-            return
-        try:
-            self.session.modelRegistry.authStorage.logout(provider.id)
-            await self.session.modelRegistry.refresh()
-            await maybe_await(self.updateAvailableProviderCount())
-            message = (
-                f"Logged out of {provider.name}"
-                if provider.authType == "oauth"
-                else (
-                    f"Removed stored API key for {provider.name}. Environment variables and models.json config are "
-                    "unchanged."
-                )
-            )
-            self.showStatus(message)
-        except Exception as error:  # noqa: BLE001
-            self.showError(f"Logout failed: {error}")
-
-    async def completeProviderAuthentication(
-        self,
-        provider_id: str,
-        provider_name: str,
-        auth_type: str,
-        previous_model: Any = None,
-        *, account: str | None = None,
-    ) -> None:
-        await self.session.modelRegistry.refresh()
-        action_label = f"Logged in to {provider_name}" if auth_type == "oauth" else f"Saved API key for {provider_name}"
-
-        if account is not None:
-            self.showStatus(f"{action_label} (account: {account}). Saved to {get_auth_path()}; main-model credentials unchanged.")
-            return
-
-        selected_model = None
-        selection_error: str | None = None
-        available_models = list(await maybe_await(self.session.modelRegistry.getAvailable()))
-        # MISAKA fork: pi only adopts the new provider's model when the session is on the
-        # `unknown/unknown` sentinel, because that is the only modelless state pi can be in.
-        # MISAKA can be in another one: with no saved default, `config.product` starts a
-        # session on a hardcoded catalogue pair (anthropic/claude-sonnet-4-5), which is a
-        # perfectly *known* model that nothing can call. Logging in then changed nothing --
-        # the key was saved, the session stayed on the model it could not use, and the next
-        # message failed with "No API key found for anthropic". A session whose model is not
-        # in `getAvailable()` has no usable model, whatever its name says.
-        if not _is_unknown_model(previous_model) and previous_model is not None:
-            unusable = not any(
-                read_field(model, "provider") == read_field(previous_model, "provider")
-                and read_field(model, "id") == read_field(previous_model, "id")
-                for model in available_models
-            )
-        else:
-            unusable = True
-        if unusable:
-            provider_models = [model for model in available_models if read_field(model, "provider") == provider_id]
-            if not provider_models:
-                selection_error = (
-                    f"{action_label}, but no models are available for that provider. "
-                    "Use /model to select a model."
-                )
-            else:
-                # A provider defined in models.json is in no built-in default map, and
-                # refusing to pick for it would strand exactly the person who just
-                # configured their own gateway: its first available model is a better
-                # answer than an error telling them to go do it by hand.
-                default_model_id = defaultModelPerProvider.get(provider_id)
-                selected_model = next(
-                    (model for model in provider_models if read_field(model, "id") == default_model_id),
-                    None,
-                ) or (provider_models[0] if default_model_id is None else None)
-                if selected_model is None:
-                    selection_error = (
-                        f'{action_label}, but its default model "{default_model_id}" is not available. '
-                        "Use /model to select a model."
-                    )
-                else:
-                    try:
-                        # Finishing a login and adopting that provider's default model is
-                        # the one interactive path pi persists (interactive-mode.ts:5665
-                        # `{ persist: true }`).
-                        await maybe_await(self.session.setModel(selected_model, persist=True))
-                    except Exception as error:  # noqa: BLE001
-                        selected_model = None
-                        selection_error = (
-                            f"{action_label}, but selecting its default model failed: {error}. "
-                            "Use /model to select a model."
-                        )
-
-        await maybe_await(self.updateAvailableProviderCount())
-        self.footer.invalidate()
-        self.updateEditorBorderColor()
-        if selected_model is not None:
-            self.showStatus(
-                f"{action_label}. Selected {read_field(selected_model, 'id')}. Credentials saved to {get_auth_path()}"
-            )
-            self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(selected_model))
-            return
-
-        self.showStatus(f"{action_label}. Credentials saved to {get_auth_path()}")
-        if selection_error is not None:
-            self.showError(selection_error)
-        else:
-            self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth())
-
-    def showBedrockSetupDialog(self, providerId: str, providerName: str) -> None:
-        set_focus = _callable_attr(self.ui, "setFocus")
-
-        def restore_editor() -> None:
-            self.editorContainer.clear()
-            self.editorContainer.addChild(self.editor)
-            if set_focus is not None:
-                set_focus(self.editor)
-            self._request_render()
-
-        dialog = LoginDialogComponent(
-            self.ui,
-            providerId,
-            lambda _success, _message: restore_editor(),
-            providerName,
-            "Amazon Bedrock setup",
-        )
-        dialog.showInfo(
-            [
-                interactive_theme.theme.fg(
-                    "text", "Amazon Bedrock uses AWS credentials instead of a single API key."
-                ),
-                interactive_theme.theme.fg(
-                    "text", "Configure an AWS profile, IAM keys, bearer token, or role-based credentials."
-                ),
-            ]
-        )
-
-        self.editorContainer.clear()
-        self.editorContainer.addChild(dialog)
-        if set_focus is not None:
-            set_focus(dialog)
-        self._request_render()
-
-    async def showApiKeyLoginDialog(self, providerId: str, providerName: str, *, account: str | None = None) -> None:
-        previous_model = getattr(self.session, "model", None)
-        dialog = LoginDialogComponent(self.ui, providerId, lambda _success, _message: None, providerName)
-        self.editorContainer.clear()
-        self.editorContainer.addChild(dialog)
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if set_focus is not None:
-            set_focus(dialog)
-        self._request_render()
-
-        def restore_editor() -> None:
-            self.editorContainer.clear()
-            self.editorContainer.addChild(self.editor)
-            if set_focus is not None:
-                set_focus(self.editor)
-            self._request_render()
-
-        try:
-            native_provider = next(
-                (
-                    provider
-                    for provider in self.session.modelRegistry.getNativeProviders()
-                    if provider.id == providerId
-                ),
-                None,
-            )
-            if native_provider is not None:
-                async def prompt_auth(prompt: Any) -> str:
-                    prompt_type = str(read_field(prompt, "type", "text"))
-                    if prompt_type == "select":
-                        selected = await self.showOAuthLoginSelect(dialog, prompt)
-                        if selected is None:
-                            raise RuntimeError("Login cancelled")
-                        return selected
-                    if prompt_type == "manual_code":
-                        return str(
-                            await dialog.showManualInput(
-                                str(read_field(prompt, "message", ""))
-                            )
-                        )
-                    return str(
-                        await dialog.showPrompt(
-                            str(read_field(prompt, "message", "")),
-                            read_field(prompt, "placeholder"),
-                        )
-                    )
-
-                def notify_auth(event: Any) -> None:
-                    event_type = str(read_field(event, "type", ""))
-                    if event_type == "auth_url":
-                        dialog.showAuth(
-                            str(read_field(event, "url", "")),
-                            read_field(event, "instructions"),
-                        )
-                    elif event_type == "device_code":
-                        dialog.showDeviceCode(event)
-                    elif event_type == "info":
-                        dialog.showInfo([str(read_field(event, "message", ""))])
-                    elif event_type == "progress":
-                        dialog.showProgress(str(read_field(event, "message", "")))
-
-                await self.session.modelRegistry.login(
-                    providerId,
-                    "api_key",
-                    SimpleNamespace(
-                        signal=dialog.signal,
-                        prompt=prompt_auth,
-                        notify=notify_auth,
-                    ),
-                    account=account,
-                )
-            else:
-                api_key = str((await dialog.showPrompt("Enter API key:")).strip())
-                if not api_key:
-                    raise RuntimeError("API key cannot be empty.")
-                from misaka.core.auth_storage import oauth_account_key
-                self.session.modelRegistry.authStorage.set(
-                    oauth_account_key(providerId, account), {"type": "api_key", "key": api_key}
-                )
-            restore_editor()
-            await self.completeProviderAuthentication(providerId, providerName, "api_key", previous_model, account=account)
-        except Exception as error:  # noqa: BLE001
-            restore_editor()
-            if str(error) != "Login cancelled":
-                self.showError(f"Failed to save API key for {providerName}: {error}")
-
-    def showOAuthLoginSelect(self, dialog: LoginDialogComponent, prompt: Any) -> Awaitable[str | None]:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[str | None] = loop.create_future()
-
-        def restore_dialog() -> None:
-            self.editorContainer.clear()
-            self.editorContainer.addChild(dialog)
-            set_focus = _callable_attr(self.ui, "setFocus")
-            if set_focus is not None:
-                set_focus(dialog)
-            self._request_render()
-
-        labels = [str(read_field(option, "label", "")) for option in read_field(prompt, "options", []) or []]
-        selector = ExtensionSelectorComponent(
-            str(read_field(prompt, "message", "")),
-            labels,
-            lambda option_label: (
-                restore_dialog(),
-                future.set_result(
-                    next(
-                        (
-                            str(read_field(option, "id"))
-                            for option in read_field(prompt, "options", []) or []
-                            if str(read_field(option, "label", "")) == option_label
-                        ),
-                        None,
-                    )
-                ),
-            ),
-            lambda: (restore_dialog(), future.set_result(None)),
-        )
-        self.editorContainer.clear()
-        self.editorContainer.addChild(selector)
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if set_focus is not None:
-            set_focus(selector)
-        self._request_render()
-        return future
-
-    async def showLoginDialog(self, providerId: str, providerName: str, *, account: str | None = None) -> None:
-        previous_model = getattr(self.session, "model", None)
-        dialog = LoginDialogComponent(self.ui, providerId, lambda _success, _message: None, providerName)
-        self.editorContainer.clear()
-        self.editorContainer.addChild(dialog)
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if set_focus is not None:
-            set_focus(dialog)
-        self._request_render()
-
-        def restore_editor() -> None:
-            self.editorContainer.clear()
-            self.editorContainer.addChild(self.editor)
-            if set_focus is not None:
-                set_focus(self.editor)
-            self._request_render()
-
-        try:
-            # The paste box belongs to the flow that asks for it, not to this handler:
-            # upstream draws it when the provider sends its `manual_code` prompt
-            # (`showAuthPrompt` in pi's interactive mode), which is also what lets the flow
-            # word it and retire it. Drawing it here off the `auth_url` event instead meant
-            # the box outlived the login it belonged to, and its wording was this file's
-            # rather than the provider's.
-            def _handle_auth(info: Any) -> None:
-                dialog.showAuth(
-                    str(read_field(info, "url", "")),
-                    read_field(info, "instructions"),
-                )
-
-            def _handle_device_code(info: Any) -> None:
-                dialog.showDeviceCode(info)
-                dialog.showWaiting("Waiting for authentication...")
-
-            registry_owned = (
-                self.session.modelRegistry.getRegisteredProviderConfig(providerId)
-                is not None
-                or self.session.modelRegistry.getRegisteredNativeProvider(providerId)
-                is not None
-            )
-            if registry_owned:
-                async def prompt_auth(prompt: Any) -> str:
-                    prompt_type = str(read_field(prompt, "type", "text"))
-                    if prompt_type == "select":
-                        selected = await self.showOAuthLoginSelect(dialog, prompt)
-                        if selected is None:
-                            raise RuntimeError("Login cancelled")
-                        return selected
-                    if prompt_type == "manual_code":
-                        return str(
-                            await dialog.showManualInput(
-                                str(read_field(prompt, "message", ""))
-                            )
-                        )
-                    return str(
-                        await dialog.showPrompt(
-                            str(read_field(prompt, "message", "")),
-                            read_field(prompt, "placeholder"),
-                        )
-                    )
-
-                def notify_auth(event: Any) -> None:
-                    event_type = str(read_field(event, "type", ""))
-                    if event_type == "auth_url":
-                        _handle_auth(event)
-                    elif event_type == "device_code":
-                        _handle_device_code(event)
-                    elif event_type == "info":
-                        dialog.showInfo([str(read_field(event, "message", ""))])
-                    elif event_type == "progress":
-                        dialog.showProgress(str(read_field(event, "message", "")))
-
-                await self.session.modelRegistry.login(
-                    providerId,
-                    "oauth",
-                    SimpleNamespace(
-                        signal=dialog.signal,
-                        prompt=prompt_auth,
-                        notify=notify_auth,
-                    ),
-                    account=account,
-                )
-            else:
-                await self.session.modelRegistry.authStorage.login(
-                    providerId,
-                    SimpleNamespace(
-                        onAuth=_handle_auth,
-                        onDeviceCode=_handle_device_code,
-                        onPrompt=lambda prompt: dialog.showPrompt(
-                            str(read_field(prompt, "message", "")),
-                            read_field(prompt, "placeholder"),
-                        ),
-                        onProgress=dialog.showProgress,
-                        onSelect=lambda prompt: self.showOAuthLoginSelect(dialog, prompt),
-                        onManualCodeInput=lambda prompt: dialog.showManualInput(
-                            str(read_field(prompt, "message", ""))
-                        ),
-                        signal=dialog.signal,
-                    ),
-                    account=account,
-                )
-            restore_editor()
-            await self.completeProviderAuthentication(providerId, providerName, "oauth", previous_model, account=account)
-        except Exception as error:  # noqa: BLE001
-            restore_editor()
-            if str(error) != "Login cancelled":
-                self.showError(f"Failed to login to {providerName}: {error}")
+        self.ui.requestRender()
 
     async def handleCompactCommand(self, customInstructions: str | None = None) -> None:
-        entries = self.sessionManager.getEntries()
-        message_count = sum(1 for entry in entries if entry.get("type") == "message")
-        if message_count < 2:
-            self.showWarning("Nothing to compact (no messages yet)")
-            return
-        if self.loadingAnimation is not None:
-            stop = _callable_attr(self.loadingAnimation, "stop")
-            if stop is not None:
-                stop()
-            self.loadingAnimation = None
-        clear_status = _callable_attr(self.statusContainer, "clear")
-        if clear_status is not None:
-            clear_status()
+        self.clearStatusIndicator()
+
         try:
             await self.session.compact(customInstructions)
-        except Exception:  # noqa: BLE001 - compaction reports its own failure
-            return
-
-    async def checkShutdownRequested(self) -> None:
-        if not self.shutdownRequested:
-            return
-        await self.shutdown()
-
-    def _clear_retry_status(self) -> None:
-        had_retry_status = self.retryCountdown is not None or self.retryLoader is not None
-        if self.retryCountdown is not None:
-            dispose = _callable_attr(self.retryCountdown, "dispose")
-            if dispose is not None:
-                dispose()
-            self.retryCountdown = None
-        if self.retryLoader is not None:
-            stop = _callable_attr(self.retryLoader, "stop")
-            if stop is not None:
-                stop()
-            self.retryLoader = None
-        if had_retry_status:
-            clear_status = _callable_attr(self.statusContainer, "clear")
-            if clear_status is not None:
-                clear_status()
-
-    def _show_retry_status(self, event: dict[str, Any] | Any) -> None:
-        if self.autoCompactionLoader is not None:
-            stop = _callable_attr(self.autoCompactionLoader, "stop")
-            if stop is not None:
-                stop()
-            self.autoCompactionLoader = None
-        self._clear_branch_summary_status()
-        self._clear_retry_status()
-        clear_status = _callable_attr(self.statusContainer, "clear")
-        if clear_status is not None:
-            clear_status()
-
-        def retry_message(seconds: int) -> str:
-            return (
-                f"Retrying ({int(read_field(event, 'attempt', 0))}/"
-                f"{int(read_field(event, 'maxAttempts', 0))}) in {seconds}s... "
-                f"({key_text('app.interrupt')} to cancel)"
-            )
-
-        self.retryLoader = Loader(
-            self.ui,
-            lambda spinner: interactive_theme.theme.fg("warning", spinner),
-            lambda text: interactive_theme.theme.fg("muted", text),
-            retry_message(int((read_field(event, "delayMs", 0) + 999) // 1000)),
-        )
-        self.retryCountdown = CountdownTimer(
-            int(read_field(event, "delayMs", 0)),
-            self.ui,
-            lambda seconds: self.retryLoader.setMessage(retry_message(seconds))
-            if self.retryLoader is not None
-            else None,
-            lambda: setattr(self, "retryCountdown", None),
-        )
-        add_child = _callable_attr(self.statusContainer, "addChild")
-        if add_child is not None:
-            add_child(self.retryLoader)
-
-    def _show_compaction_status(self, reason: str) -> None:
-        self.stopWorkingLoader()
-        if self.autoCompactionLoader is not None:
-            stop = _callable_attr(self.autoCompactionLoader, "stop")
-            if stop is not None:
-                stop()
-        clear_status = _callable_attr(self.statusContainer, "clear")
-        if clear_status is not None:
-            clear_status()
-        cancel_hint = f"({key_text('app.interrupt')} to cancel)"
-        label = (
-            f"Compacting context... {cancel_hint}"
-            if reason == "manual"
-            else f"{'Context overflow detected, ' if reason == 'overflow' else ''}Auto-compacting... {cancel_hint}"
-        )
-        self.autoCompactionLoader = Loader(
-            self.ui,
-            lambda spinner: interactive_theme.theme.fg("accent", spinner),
-            lambda text: interactive_theme.theme.fg("muted", text),
-            label,
-        )
-        add_child = _callable_attr(self.statusContainer, "addChild")
-        if add_child is not None:
-            add_child(self.autoCompactionLoader)
-
-    def _clear_branch_summary_status(self) -> None:
-        if self.branchSummaryLoader is None:
-            return
-        stop = _callable_attr(self.branchSummaryLoader, "stop")
-        if stop is not None:
-            stop()
-        self.branchSummaryLoader = None
-        clear_status = _callable_attr(self.statusContainer, "clear")
-        if clear_status is not None:
-            clear_status()
-
-    def _show_branch_summary_status(self) -> None:
-        self._clear_branch_summary_status()
-        clear_status = _callable_attr(self.statusContainer, "clear")
-        if clear_status is not None:
-            clear_status()
-        self.branchSummaryLoader = Loader(
-            self.ui,
-            lambda spinner: interactive_theme.theme.fg("accent", spinner),
-            lambda text: interactive_theme.theme.fg("muted", text),
-            f"Summarizing branch... ({key_text('app.interrupt')} to cancel)",
-        )
-        add_child = _callable_attr(self.statusContainer, "addChild")
-        if add_child is not None:
-            add_child(self.branchSummaryLoader)
-
-    async def handleEvent(self, event: dict[str, Any] | Any) -> None:
-        if not self.isInitialized:
-            await self.init()
-
-        event_type = read_field(event, "type")
-        if event_type == "agent_start":
-            self._toolComponentsById.clear()
-            if self.retryEscapeHandler is not None:
-                self.defaultEditor.onEscape = self.retryEscapeHandler
-                self.retryEscapeHandler = None
-            if self.retryCountdown is not None:
-                dispose = _callable_attr(self.retryCountdown, "dispose")
-                if dispose is not None:
-                    dispose()
-                self.retryCountdown = None
-            if self.retryLoader is not None:
-                stop = _callable_attr(self.retryLoader, "stop")
-                if stop is not None:
-                    stop()
-                self.retryLoader = None
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "turn_start":
-            get_progress = _callable_attr(self.settingsManager, "getShowTerminalProgress")
-            terminal = getattr(self.ui, "terminal", None)
-            set_progress = _callable_attr(terminal, "setProgress")
-            if get_progress is not None and bool(get_progress()) and set_progress is not None:
-                set_progress(True)
-            if self.workingVisible:
-                self._show_working_loader()
-            else:
-                self.stopWorkingLoader()
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "queue_update":
-            self.updatePendingMessagesDisplay()
-            self._request_render()
-            return
-        if event_type == "entry_appended":
-            entry = read_field(event, "entry")
-            if read_field(entry, "type") == "custom":
-                self.addCustomEntryToChat(entry)
-                self._request_render()
-            elif read_field(entry, "type") == "usage" and read_field(entry, "kind") == "cache_warm":
-                self.addCacheWarmingUsage(entry)
-                self._request_render()
-            elif read_field(entry, "type") == "custom_message" and read_field(entry, "display"):
-                self.addMessageToChat(
-                    createCustomMessage(
-                        read_field(entry, "customType"),
-                        read_field(entry, "content"),
-                        bool(read_field(entry, "display")),
-                        read_field(entry, "details"),
-                        read_field(entry, "timestamp"),
-                    )
-                )
-                self._request_render()
-            return
-        if event_type == "compaction_start":
-            get_progress = _callable_attr(self.settingsManager, "getShowTerminalProgress")
-            terminal = getattr(self.ui, "terminal", None)
-            set_progress = _callable_attr(terminal, "setProgress")
-            if get_progress is not None and bool(get_progress()) and set_progress is not None:
-                set_progress(True)
-
-            self.autoCompactionEscapeHandler = getattr(self.defaultEditor, "onEscape", None)
-            self.defaultEditor.onEscape = lambda: _callable_attr(self.session, "abortCompaction") and self.session.abortCompaction()
-            reason = str(read_field(event, "reason", "manual"))
-            self._show_compaction_status(reason)
-            self._request_render()
-            return
-        if event_type == "message_start":
-            message = read_field(event, "message")
-            role = _message_role(message)
-            if role == "custom":
-                self.addMessageToChat(message)
-                self.footer.invalidate()
-                self._request_render()
-                return
-            if role == "user":
-                self.addMessageToChat(message)
-                self.updatePendingMessagesDisplay()
-                self.footer.invalidate()
-                self._request_render()
-                return
-            if role == "assistant":
-                self.streamingComponent = AssistantMessageComponent(
-                    None,
-                    self.hideThinkingBlock,
-                    self.getMarkdownThemeWithSettings(),
-                    self.hiddenThinkingLabel,
-                    self.outputPad,
-                    self.getMarkdownTransformers(),
-                )
-                self.streamingMessage = message
-                self.chatContainer.addChild(self.streamingComponent)
-                self.streamingComponent.updateContent(message, True)
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "message_update":
-            message = read_field(event, "message")
-            if self.streamingComponent is not None and _message_role(message) == "assistant":
-                self.streamingMessage = message
-                self.streamingComponent.updateContent(message, True)
-
-                for content in list(read_field(message, "content", []) or []):
-                    if read_field(content, "type") != "toolCall":
-                        continue
-                    tool_call_id = str(read_field(content, "id", ""))
-                    component = self._toolComponentsById.get(tool_call_id)
-                    if component is None:
-                        component = ToolExecutionComponent(
-                            str(read_field(content, "name", "")),
-                            tool_call_id,
-                            read_field(content, "arguments", {}),
-                            {
-                                "showImages": _safe_call_bool(self.settingsManager, "getShowImages", True),
-                                "imageWidthCells": _safe_call_int(self.settingsManager, "getImageWidthCells", 56),
-                            },
-                            _tool_definition(self.session, str(read_field(content, "name", ""))),
-                            self.ui,
-                            self.sessionManager.getCwd(),
-                        )
-                        component.setExpanded(self.toolOutputExpanded)
-                        self.chatContainer.addChild(component)
-                        self._toolComponentsById[tool_call_id] = component
-                    else:
-                        component.updateArgs(read_field(content, "arguments", {}))
-                self.footer.invalidate()
-                self._request_render()
-            return
-        if event_type == "message_end":
-            message = read_field(event, "message")
-            if _message_role(message) == "user":
-                return
-            if self.loadingAnimation is not None:
-                self.stopWorkingLoader()
-            if self.streamingComponent is not None and _message_role(message) == "assistant":
-                self.streamingMessage = message
-                error_message: str | None = None
-                if read_field(message, "stopReason") == "aborted":
-                    retry_attempt = int(getattr(self.session, "retryAttempt", 0) or 0)
-                    error_message = (
-                        f"Aborted after {retry_attempt} retry attempt{'s' if retry_attempt > 1 else ''}"
-                        if retry_attempt > 0
-                        else "Operation aborted"
-                    )
-                    if isinstance(message, dict):
-                        message["errorMessage"] = error_message
-                    else:
-                        message.errorMessage = error_message
-                self.streamingComponent.updateContent(message, False)
-
-                if read_field(message, "stopReason") in {"aborted", "error"}:
-                    final_error = error_message or str(read_field(message, "errorMessage", "") or "Error")
-                    for component in list(self._toolComponentsById.values()):
-                        component.updateResult(
-                            {"content": [{"type": "text", "text": final_error}], "isError": True}
-                        )
-                    self._toolComponentsById.clear()
-                else:
-                    for component in list(self._toolComponentsById.values()):
-                        component.setArgsComplete()
-                self.streamingComponent = None
-                self.streamingMessage = None
-                self.footer.invalidate()
-                self._request_render()
-                return
-            if _message_role(message) == "custom":
-                # The rebuild belongs to custom messages alone: nothing else puts one at
-                # its transcript position, so agent_session defers announcing it until the
-                # entry exists and lets this redraw place it (agent_session.py
-                # _flush_pending_custom_messages). Every other role falls through to a
-                # plain render like pi does -- emit_tool_result_message sends a
-                # message_end per tool result, and rebuilding there cleared the transient
-                # notices, the compaction queue and the live tool components on every
-                # single tool call.
-                #
-                # ...but only once the entry is really there. A custom message delivered
-                # through the agent loop (followUp / steer / prompt) arrives here before
-                # agent_session._persist_message has written it, so the rebuild would read
-                # a transcript without it and clear the component message_start just drew.
-                if self._customMessageIsInTranscript(message):
-                    self.renderCurrentSessionState()
-                else:
-                    self._request_render()
-                return
-            self._request_render()
-            return
-        if event_type == "bash_execution_update":
-            return
-        if event_type == "tool_execution_start":
-            tool_call_id = str(read_field(event, "toolCallId", ""))
-            component = self._toolComponentsById.get(tool_call_id)
-            if component is None:
-                tool_name = str(read_field(event, "toolName", ""))
-                component = ToolExecutionComponent(
-                    tool_name,
-                    tool_call_id,
-                    read_field(event, "args", {}),
-                    {
-                        "showImages": _safe_call_bool(self.settingsManager, "getShowImages", True),
-                        "imageWidthCells": _safe_call_int(self.settingsManager, "getImageWidthCells", 56),
-                    },
-                    _tool_definition(self.session, tool_name),
-                    self.ui,
-                    self.sessionManager.getCwd(),
-                )
-                component.setExpanded(self.toolOutputExpanded)
-                self.chatContainer.addChild(component)
-                self._toolComponentsById[tool_call_id] = component
-            component.markExecutionStarted()
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "tool_execution_update":
-            component = self._toolComponentsById.get(str(read_field(event, "toolCallId", "")))
-            if component is not None:
-                component.updateResult(_spread_tool_result(read_field(event, "partialResult"), False), True)
-                self.footer.invalidate()
-                self._request_render()
-            return
-        if event_type == "tool_execution_end":
-            tool_call_id = str(read_field(event, "toolCallId", ""))
-            component = self._toolComponentsById.get(tool_call_id)
-            if component is not None:
-                component.updateResult(
-                    _spread_tool_result(read_field(event, "result"), bool(read_field(event, "isError", False)))
-                )
-                self._toolComponentsById.pop(tool_call_id, None)
-                self.footer.invalidate()
-                self._request_render()
-            return
-        if event_type == "agent_end":
-            get_progress = _callable_attr(self.settingsManager, "getShowTerminalProgress")
-            terminal = getattr(self.ui, "terminal", None)
-            set_progress = _callable_attr(terminal, "setProgress")
-            if get_progress is not None and bool(get_progress()) and set_progress is not None:
-                set_progress(False)
-            if self.loadingAnimation is not None:
-                self.stopWorkingLoader()
-            if self.streamingComponent is not None:
-                remove_child = _callable_attr(self.chatContainer, "removeChild")
-                if remove_child is not None:
-                    remove_child(self.streamingComponent)
-                self.streamingComponent = None
-                self.streamingMessage = None
-            self._toolComponentsById.clear()
-            await self.checkShutdownRequested()
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "session_info_changed":
-            self.updateTerminalTitle()
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "thinking_level_changed":
-            self.updateEditorBorderColor()
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "auto_retry_start":
-            self.retryEscapeHandler = getattr(self.defaultEditor, "onEscape", None)
-            self.defaultEditor.onEscape = lambda: _callable_attr(self.session, "abortRetry") and self.session.abortRetry()
-            self._show_retry_status(event)
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "auto_retry_end":
-            if self.retryEscapeHandler is not None:
-                self.defaultEditor.onEscape = self.retryEscapeHandler
-                self.retryEscapeHandler = None
-            self._clear_retry_status()
-            if not bool(read_field(event, "success", False)):
-                self.showError(
-                    f"Retry failed after {int(read_field(event, 'attempt', 0))} attempts: "
-                    f"{read_field(event, 'finalError', None) or 'Unknown error'}"
-                )
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "summarization_retry_scheduled":
-            self.showError(str(read_field(event, "errorMessage", "")))
-            self._show_retry_status(event)
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "summarization_retry_attempt_start":
-            self._clear_retry_status()
-            if read_field(event, "source") == "branchSummary":
-                self._show_branch_summary_status()
-            else:
-                self._show_compaction_status(str(read_field(event, "reason", "manual")))
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type == "summarization_retry_finished":
-            self._clear_retry_status()
-            self.footer.invalidate()
-            self._request_render()
-            return
-        if event_type != "compaction_end":
-            self.footer.invalidate()
-            self._request_render()
-            return
-
-        get_progress = _callable_attr(self.settingsManager, "getShowTerminalProgress")
-        terminal = getattr(self.ui, "terminal", None)
-        set_progress = _callable_attr(terminal, "setProgress")
-        if get_progress is not None and bool(get_progress()) and set_progress is not None:
-            set_progress(False)
-
-        if self.autoCompactionEscapeHandler is not None:
-            self.defaultEditor.onEscape = self.autoCompactionEscapeHandler
-            self.autoCompactionEscapeHandler = None
-        if self.autoCompactionLoader is not None:
-            stop = _callable_attr(self.autoCompactionLoader, "stop")
-            if stop is not None:
-                stop()
-            self.autoCompactionLoader = None
-            clear_status = _callable_attr(self.statusContainer, "clear")
-            if clear_status is not None:
-                clear_status()
-
-        if bool(read_field(event, "aborted")):
-            if read_field(event, "reason") == "manual":
-                self.showError("Compaction cancelled")
-            else:
-                self.showStatus("Auto-compaction cancelled")
-        else:
-            result = read_field(event, "result")
-            if result is not None:
-                entries = self.sessionManager.buildContextEntries()
-                if not entries or read_field(entries[0], "type") != "compaction":
-                    raise RuntimeError("Completed compaction is missing from the session context")
-                clear_chat = _callable_attr(self.chatContainer, "clear")
-                if clear_chat is not None:
-                    clear_chat()
-                if read_field(entries[0], "contextMessages") is not None:
-                    self.renderSessionEntries(entries)
-                else:
-                    self.renderSessionEntries(entries[1:])
-                    self.addMessageToChat(
-                        createCompactionSummaryMessage(
-                            str(read_field(result, "summary", "")),
-                            int(read_field(result, "tokensBefore", 0)),
-                            datetime.now(UTC).isoformat(),
-                        )
-                    )
-                invalidate_footer = _callable_attr(self.footer, "invalidate")
-                if invalidate_footer is not None:
-                    invalidate_footer()
-            elif read_field(event, "errorMessage"):
-                if read_field(event, "reason") == "manual":
-                    self.showError(str(read_field(event, "errorMessage")))
-                else:
-                    self.chatContainer.addChild(Spacer(1))
-                    self.chatContainer.addChild(
-                        Text(
-                            interactive_theme.theme.fg("error", str(read_field(event, "errorMessage"))),
-                            1,
-                            0,
-                        )
-                    )
-
-        flush_queue = _callable_attr(self, "flushCompactionQueue")
-        if flush_queue is not None:
-            self._schedule_task(
-                maybe_await(
-                    flush_queue(
-                        {"willRetry": bool(read_field(event, "willRetry", False))}
-                    )
-                ),
-                eager_start=True,
-            )
-        self._request_render()
-
-    def applyRuntimeSettings(self) -> None:
-        self.footer.setSession(self.session)
-        set_auto_compact_enabled = _callable_attr(self.footer, "setAutoCompactEnabled")
-        if set_auto_compact_enabled is not None:
-            set_auto_compact_enabled(bool(getattr(self.session, "autoCompactionEnabled", False)))
-        set_cwd = _callable_attr(self.footerDataProvider, "setCwd")
-        if set_cwd is not None:
-            set_cwd(self.sessionManager.getCwd())
-        self.hideThinkingBlock = _safe_call_bool(
-            self.settingsManager,
-            "getHideThinkingBlock",
-            self.hideThinkingBlock,
-        )
-        self.outputPad = _safe_call_int(
-            self.settingsManager,
-            "getOutputPad",
-            self.outputPad,
-        )
-        set_show_hardware_cursor = _callable_attr(self.ui, "setShowHardwareCursor")
-        if set_show_hardware_cursor is not None:
-            set_show_hardware_cursor(_safe_call_bool(self.settingsManager, "getShowHardwareCursor", False))
-        set_clear_on_shrink = _callable_attr(self.ui, "setClearOnShrink")
-        if set_clear_on_shrink is not None:
-            set_clear_on_shrink(_safe_call_bool(self.settingsManager, "getClearOnShrink", False))
-        editor_padding_x = _safe_call_int(self.settingsManager, "getEditorPaddingX", 0)
-        autocomplete_max_visible = _safe_call_int(self.settingsManager, "getAutocompleteMaxVisible", 5)
-        set_default_padding = _callable_attr(self.defaultEditor, "setPaddingX")
-        if set_default_padding is not None:
-            set_default_padding(editor_padding_x)
-        set_default_autocomplete = _callable_attr(self.defaultEditor, "setAutocompleteMaxVisible")
-        if set_default_autocomplete is not None:
-            set_default_autocomplete(autocomplete_max_visible)
-        if self.editor is not self.defaultEditor:
-            set_padding = _callable_attr(self.editor, "setPaddingX")
-            if set_padding is not None:
-                set_padding(editor_padding_x)
-            set_autocomplete = _callable_attr(self.editor, "setAutocompleteMaxVisible")
-            if set_autocomplete is not None:
-                set_autocomplete(autocomplete_max_visible)
-
-    async def bindCurrentSessionExtensions(self) -> None:
-        await self.session.bindExtensions(
-            {
-                "uiContext": self.createExtensionUIContext(),
-                "mode": "tui",
-                "abortHandler": lambda: self.restoreQueuedMessagesToEditor({"abort": True}),
-                "commandContextActions": self._build_command_context_actions(),
-                "shutdownHandler": self.requestShutdown,
-                "onError": lambda error: self.showExtensionError(
-                    str(read_field(error, "extensionPath", "<extension>")),
-                    str(read_field(error, "error", error)),
-                    read_field(error, "stack"),
-                ),
-            }
-        )
-
-        resource_loader = getattr(self.session, "resourceLoader", None)
-        get_themes = _callable_attr(resource_loader, "getThemes")
-        themes_result = get_themes() if get_themes is not None else {}
-        interactive_theme.set_registered_themes(read_field(themes_result, "themes", []))
-        self.setupAutocompleteProvider()
-        self.setupExtensionShortcuts(self.session.extensionRunner)
-        self.showLoadedResources({"force": False, "showDiagnosticsWhenQuiet": True})
-
-    async def rebindCurrentSession(
-        self,
-        session: Any | None = None,
-    ) -> None:
-        if session is not None:
-            self.session = session
-        elif getattr(self.runtimeHost, "session", None) is not None:
-            self.session = self.runtimeHost.session
-
-        self.sessionManager = getattr(self.session, "sessionManager", self.sessionManager)
-        self.settingsManager = getattr(self.session, "settingsManager", self.settingsManager)
-        if self._sessionUnsubscribe is not None:
-            self._sessionUnsubscribe()
-            self._sessionUnsubscribe = None
-        self.applyRuntimeSettings()
-        await self.bindCurrentSessionExtensions()
-        self.subscribeToSession()
-        await maybe_await(self.updateAvailableProviderCount())
-        self.updateEditorBorderColor()
-        self.updateTerminalTitle()
-
-    def subscribeToSession(self) -> None:
-        if self._sessionUnsubscribe is not None:
-            self._sessionUnsubscribe()
-            self._sessionUnsubscribe = None
-        subscribe = _callable_attr(self.session, "subscribe")
-        if subscribe is None:
-            return
-
-        def _listener(event: Any) -> None:
-            # JavaScript async listeners run synchronously until their first await. Eager
-            # start preserves that ordering so compaction-end queue delivery can beat the
-            # agent loop's immediate post-compaction steering poll.
-            self._schedule_task(self.handleEvent(event), eager_start=True)
-
-        self._sessionUnsubscribe = subscribe(_listener)
-
-    def setupExtensionShortcuts(self, extensionRunner: Any) -> None:
-        get_shortcuts = _callable_attr(extensionRunner, "get_shortcuts") or _callable_attr(
-            extensionRunner, "getShortcuts"
-        )
-        if get_shortcuts is None:
-            self.defaultEditor.onExtensionShortcut = None
-            return
-
-        get_effective_config = _callable_attr(self.keybindings, "getEffectiveConfig")
-        effective_config = get_effective_config() if get_effective_config is not None else {}
-        shortcuts = get_shortcuts(effective_config) or {}
-        if not shortcuts:
-            self.defaultEditor.onExtensionShortcut = None
-            return
-
-        create_context = _callable_attr(extensionRunner, "create_context") or _callable_attr(
-            extensionRunner, "createContext"
-        )
-
-        async def _run_shortcut(handler: Any, ctx: Any) -> None:
-            try:
-                await maybe_await(handler(ctx))
-            except Exception as error:  # noqa: BLE001
-                self.showError(f"Shortcut handler error: {error}")
-
-        def _on_extension_shortcut(data: str) -> bool:
-            for shortcut_str, shortcut in shortcuts.items():
-                if not matchesKey(data, shortcut_str):
-                    continue
-                handler = read_field(shortcut, "handler")
-                if callable(handler):
-                    context = create_context() if create_context is not None else None
-                    extras = getattr(context, "_extras", None)
-                    if isinstance(extras, dict):
-                        extras["shutdown"] = lambda: setattr(self, "shutdownRequested", True)
-                    self._schedule_task(_run_shortcut(handler, context))
-                return True
-            return False
-
-        self.defaultEditor.onExtensionShortcut = _on_extension_shortcut
-        if self.editor is not self.defaultEditor and hasattr(self.editor, "onExtensionShortcut"):
-            self.editor.onExtensionShortcut = _on_extension_shortcut
-
-    def setupKeyHandlers(self) -> None:
-        def _on_escape() -> None:
-            if bool(getattr(self.session, "isStreaming", False)):
-                restore_queued = _callable_attr(self, "restoreQueuedMessagesToEditor")
-                if restore_queued is not None:
-                    restore_queued({"abort": True})
-                else:
-                    agent = getattr(self.session, "agent", None)
-                    abort = _callable_attr(agent, "abort")
-                    if abort is not None:
-                        abort()
-            elif bool(getattr(self.session, "isBashRunning", False)):
-                abort_bash = _callable_attr(self.session, "abortBash")
-                if abort_bash is not None:
-                    abort_bash()
-            elif self.isBashMode:
-                self._set_editor_text("")
-                self.isBashMode = False
-                self.updateEditorBorderColor()
-            elif not self._get_editor_text().strip():
-                action = _safe_call_str(self.settingsManager, "getDoubleEscapeAction", "none")
-                if action == "none":
-                    return
-                now = time.monotonic() * 1000
-                if now - self.lastEscapeTime < 500:
-                    if action == "tree":
-                        self.showTreeSelector()
-                    else:
-                        self.showUserMessageSelector()
-                    self.lastEscapeTime = 0
-                else:
-                    self.lastEscapeTime = now
-
-        self.defaultEditor.onEscape = _on_escape
-        if callable(_callable_attr(self.defaultEditor, "onAction")):
-            self.defaultEditor.onAction("app.clear", self.handleCtrlC)
-            self.defaultEditor.onAction("app.suspend", self.handleCtrlZ)
-            self.defaultEditor.onAction(
-                "app.thinking.cycle",
-                lambda: self._schedule_task(self._cycle_thinking_level()),
-            )
-            self.defaultEditor.onAction(
-                "app.model.cycleForward",
-                lambda: self._schedule_task(self._cycle_model("forward")),
-            )
-            self.defaultEditor.onAction(
-                "app.model.cycleBackward",
-                lambda: self._schedule_task(self._cycle_model("backward")),
-            )
-            self.defaultEditor.onAction("app.model.select", lambda: self.showModelSelector())
-            self.defaultEditor.onAction("app.tools.expand", self.toggleToolOutputExpansion)
-            self.defaultEditor.onAction("app.thinking.toggle", self.toggleThinkingBlockVisibility)
-            self.defaultEditor.onAction("app.editor.external", lambda: self._schedule_task(self.openExternalEditor()))
-            self.defaultEditor.onAction("app.message.copy", lambda: self._schedule_task(self.handleCopyCommand()))
-            self.defaultEditor.onAction("app.message.followUp", lambda: self._schedule_task(self.handleFollowUp()))
-            self.defaultEditor.onAction("app.message.dequeue", self.handleDequeue)
-            self.defaultEditor.onAction("app.session.fork", self.showUserMessageSelector)
-            self.defaultEditor.onAction("app.session.tree", self.showTreeSelector)
-            self.defaultEditor.onAction("app.session.resume", lambda: self.showSessionSelector())
-            self.defaultEditor.onAction("app.session.new", lambda: self._schedule_task(self.handleClearCommand()))
-        self.defaultEditor.onCtrlD = self.handleCtrlD
-        self.defaultEditor.onPasteImage = lambda: self._schedule_task(self.handleClipboardImagePaste())
-        self.defaultEditor.onChange = lambda text: self._on_editor_change(text)
-
-    def setupEditorSubmitHandler(self) -> None:
-        self.defaultEditor.onSubmit = lambda text: self._schedule_task(self.handleSubmittedText(text))
-
-    async def handleClipboardImagePaste(self) -> None:
-        try:
-            image = await read_clipboard_image()
-            if image is None:
-                return
-
-            tmp_dir = Path(tempfile.gettempdir())
-            extension = extension_for_image_mime_type(image.mimeType) or "png"
-            file_path = tmp_dir / f"misaka-clipboard-{uuid4()}.{extension}"
-            file_path.write_bytes(image.bytes)
-
-            insert_text_at_cursor = _callable_attr(self.editor, "insertTextAtCursor")
-            if insert_text_at_cursor is not None:
-                insert_text_at_cursor(str(file_path))
-            else:
-                set_text = _callable_attr(self.editor, "setText")
-                get_text = _callable_attr(self.editor, "getText")
-                if set_text is not None:
-                    current_text = str(get_text() or "") if get_text is not None else ""
-                    set_text(current_text + str(file_path))
-
-            self.ui.requestRender()
-        except Exception:  # noqa: BLE001 - a failed file drop is ignored
-            return
-
-    async def updateAvailableProviderCount(self) -> None:
-        models = await self.getModelCandidates()
-        providers = {
-            str(read_field(model, "provider", ""))
-            for model in models
-            if read_field(model, "provider")
-        }
-        self.footerDataProvider.setAvailableProviderCount(len(providers))
-
-    def _get_session_thinking_level(self) -> str:
-        thinking_level = getattr(self.session, "thinkingLevel", None)
-        if thinking_level is None:
-            thinking_level = read_field(getattr(self.session, "state", None), "thinkingLevel", "off")
-        return str(thinking_level or "off")
-
-    def updateEditorBorderColor(self) -> None:
-        border = (
-            interactive_theme.theme.getBashModeBorderColor()
-            if self.isBashMode
-            else interactive_theme.theme.getThinkingBorderColor(self._get_session_thinking_level())
-        )
-        if hasattr(self.editor, "borderColor"):
-            self.editor.borderColor = border
-        self._request_render()
-
-    def toggleThinkingBlockVisibility(self) -> None:
-        self.hideThinkingBlock = not self.hideThinkingBlock
-        set_hide = _callable_attr(self.settingsManager, "setHideThinkingBlock")
-        if set_hide is not None:
-            set_hide(self.hideThinkingBlock)
-        clear_chat = _callable_attr(self.chatContainer, "clear")
-        if clear_chat is not None:
-            clear_chat()
-        self.rebuildChatFromMessages()
-
-        if self.streamingComponent is not None and self.streamingMessage is not None:
-            self.streamingComponent.setHideThinkingBlock(self.hideThinkingBlock)
-            self.streamingComponent.updateContent(self.streamingMessage)
-            add_child = _callable_attr(self.chatContainer, "addChild")
-            if add_child is not None:
-                add_child(self.streamingComponent)
-
-        self.showStatus(f"Thinking blocks: {'hidden' if self.hideThinkingBlock else 'visible'}")
-
-    async def openExternalEditor(self) -> None:
-        editor_cmd = os.environ.get("VISUAL") or os.environ.get("EDITOR")
-        if not editor_cmd:
-            self.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.")
-            return
-
-        current_text = self._get_editor_text()
-        tmp_file = Path(tempfile.gettempdir()) / f"misaka-editor-{int(time.time() * 1000)}.md"
-
-        try:
-            tmp_file.write_text(current_text, encoding="utf-8")
-
-            stop = _callable_attr(self.ui, "stop")
-            if stop is not None:
-                stop()
-
-            parts = [part for part in editor_cmd.split(" ") if part]
-            editor = parts[0]
-            editor_args = parts[1:]
-            sys.stdout.write(f"Launching external editor: {editor_cmd}\nMISAKA will resume when the editor exits.\n")
-            try:
-                status = await asyncio.to_thread(
-                    subprocess.run,
-                    [editor, *editor_args, str(tmp_file)],
-                    check=False,
-                )
-            except OSError:
-                status = None
-
-            if status is not None and status.returncode == 0:
-                new_content = re.sub(r"\n$", "", tmp_file.read_text(encoding="utf-8-sig"))   # pi stripBom
-                self._set_editor_text(new_content)
-        finally:
-            with contextlib.suppress(OSError):
-                tmp_file.unlink()
-
-            start = _callable_attr(self.ui, "start")
-            if start is not None:
-                start()
-            self._request_render(True)
-
-    def clearEditor(self) -> None:
-        self._set_editor_text("")
-        self._request_render()
-
-    def handleCtrlC(self) -> None:
-        now = time.time() * 1000
-        if now - self.lastSigintTime < 500:
-            self._schedule_task(self.shutdown())
-            return
-        self.lastSigintTime = now
-        # Ctrl+C while busy interrupts (Claude Code feel), via the same abort path as Esc.
-        # Upstream pi only cleared the line; double-press to exit and idle clearing are unchanged.
-        if bool(getattr(self.session, "isStreaming", False)):
-            restore_queued = _callable_attr(self, "restoreQueuedMessagesToEditor")
-            if restore_queued is not None:
-                restore_queued({"abort": True})
-            else:
-                agent = getattr(self.session, "agent", None)
-                abort = _callable_attr(agent, "abort")
-                if abort is not None:
-                    abort()
-            return
-        if bool(getattr(self.session, "isBashRunning", False)):
-            abort_bash = _callable_attr(self.session, "abortBash")
-            if abort_bash is not None:
-                abort_bash()
-            return
-        self.clearEditor()
-
-    def handleCtrlD(self) -> None:
-        self._schedule_task(self.shutdown())
-
-    async def handleFollowUp(self) -> None:
-        text = self._get_editor_text().strip()
-        if not text:
-            return
-
-        if bool(getattr(self.session, "isCompacting", False)):
-            if self.isExtensionCommand(text):
-                add_history = _callable_attr(self.editor, "addToHistory")
-                if add_history is not None:
-                    add_history(text)
-                self._set_editor_text("")
-                await self.session.prompt(text)
-            else:
-                self.queueCompactionMessage(text, "followUp")
-            return
-
-        if bool(getattr(self.session, "isStreaming", False)):
-            add_history = _callable_attr(self.editor, "addToHistory")
-            if add_history is not None:
-                add_history(text)
-            self._set_editor_text("")
-            await self.session.prompt(text, {"streamingBehavior": "followUp"})
-            self.updatePendingMessagesDisplay()
-            self._request_render()
-            return
-
-        on_submit = getattr(self.editor, "onSubmit", None)
-        if callable(on_submit):
-            self._set_editor_text("")
-            await maybe_await(on_submit(text))
-
-    def handleDequeue(self) -> None:
-        restored = self.restoreQueuedMessagesToEditor()
-        if restored == 0:
-            self.showStatus("No queued messages to restore")
-            return
-        suffix = "s" if restored > 1 else ""
-        self.showStatus(f"Restored {restored} queued message{suffix} to editor")
-
-    def showModelSelector(self, initialSearchInput: str | None = None) -> None:
-        def build_selector(done: Callable[[], None]) -> dict[str, Any]:
-            get_pair = _callable_attr(self.settingsManager, "getDefaultModelPair")
-            default_provider, default_model = get_pair() if get_pair else (
-                _safe_call_str(self.settingsManager, "getDefaultProvider", ""),
-                _safe_call_str(self.settingsManager, "getDefaultModel", ""),
-            )
-            selector = ModelSelectorComponent(
-                self.ui,
-                getattr(self.session, "model", None),
-                self.session.modelRegistry,
-                [
-                    ScopedModelItem(
-                        model=item["model"] if isinstance(item, dict) else item.model,
-                        thinkingLevel=(item.get("thinkingLevel") if isinstance(item, dict) else item.thinkingLevel),
-                    )
-                    for item in list(getattr(self.session, "scopedModels", []) or [])
-                ],
-                lambda model: self._schedule_task(self._handle_model_select(model, done, persist=False)),
-                lambda: (done(), self._request_render()),
-                initialSearchInput,
-                onSelectAsDefault=lambda model: self._schedule_task(
-                    self._handle_model_select(model, done, persist=True)
-                ),
-                defaultModel=(default_provider, default_model) if default_provider and default_model else None,
-            )
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(build_selector)
-
-    def showSessionSelector(self) -> None:
-        def _build_session_selector(done: Callable[[], None]) -> dict[str, Any]:
-            selector = SessionSelectorComponent(
-                lambda onProgress=None: SessionManager.list(
-                    self.sessionManager.getCwd(),
-                    self.sessionManager.getSessionDir(),
-                    onProgress,
-                ),
-                # The bare `SessionManager.listAll` would take the selector's progress callback as
-                # its *root* overload (session_manager.py:1100) and list the engine default store,
-                # so `/resume`'s "all sessions" tab was a blank page under `dm` / `chat` /
-                # `card-shell`. Scope it to this run's store, exactly like `-r` (engine.py:794).
-                lambda onProgress=None: SessionManager.listAll(
-                    sessions_root_of(self.sessionManager.getSessionDir()),
-                    onProgress,
-                ),
-                lambda sessionPath: self._schedule_task(self._handle_session_select(sessionPath, done)),
-                lambda: (done(), self._request_render()),
-                lambda: self._schedule_task(self.shutdown()),
-                lambda: self._request_render(),
-                {
-                    "renameSession": lambda sessionFilePath, nextName: _rename_session_file(
-                        sessionFilePath,
-                        nextName,
-                    ),
-                    "showRenameHint": True,
-                    "keybindings": self.keybindings,
-                },
-                self.sessionManager.getSessionFile(),
-            )
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(_build_session_selector)
-
-    def showTreeSelector(self, initialSelectedId: str | None = None) -> None:
-        get_tree = _callable_attr(self.sessionManager, "getTree")
-        tree = list(get_tree() or []) if get_tree is not None else []
-        get_leaf_id = _callable_attr(self.sessionManager, "getLeafId")
-        real_leaf_id = get_leaf_id() if get_leaf_id is not None else None
-        initial_filter_mode = _safe_call_str(self.settingsManager, "getTreeFilterMode", "default") or "default"
-        if not tree:
-            self.showStatus("No entries in session")
-            return
-
-        terminal = getattr(self.ui, "terminal", None)
-        terminal_height = int(read_field(terminal, "rows", 24) or 24)
-
-        def _build_tree_selector(done: Callable[[], None]) -> dict[str, Any]:
-            selector = TreeSelectorComponent(
-                tree,
-                real_leaf_id,
-                terminal_height,
-                lambda entry_id: self._schedule_task(
-                    self._handle_tree_select(
-                        str(entry_id),
-                        done,
-                    )
-                ),
-                lambda: (done(), self._request_render()),
-                lambda entry_id, label: (
-                    _callable_attr(self.sessionManager, "appendLabelChange")
-                    and self.sessionManager.appendLabelChange(str(entry_id), label),
-                    self._request_render(),
-                ),
-                initialSelectedId,
-                initial_filter_mode,
-            )
-            selector.onCopy = lambda text: self._schedule_task(self._handle_tree_copy(text))
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(_build_tree_selector)
-
-    def showSelector(self, builder: Callable[[Callable[[], None]], dict[str, Any]]) -> None:
-        def done() -> None:
-            self._clear_selector()
-
-        built = builder(done)
-        component = built["component"]
-        focus = built.get("focus", component)
-        clear = _callable_attr(self.editorContainer, "clear")
-        add_child = _callable_attr(self.editorContainer, "addChild")
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if clear is not None:
-            clear()
-        if add_child is not None:
-            add_child(component)
-        if set_focus is not None:
-            set_focus(focus)
-        self._request_render()
-
-    def showTrustSelector(self) -> None:
-        cwd = str(self.sessionManager.getCwd())
-        services = read_field(self.runtimeHost, "services")
-        agent_dir = str(read_field(services, "agentDir") or get_agent_dir())
-        trust_store = ProjectTrustStore(agent_dir)
-        saved_decision = trust_store.get_entry(cwd)
-
-        def build(done: Callable[[], None]) -> dict[str, Any]:
-            def save(selection: Any) -> None:
-                trust_store.set_many(selection.updates)
-                done()
-                decision = "trusted" if selection.trusted else "untrusted"
-                self.showStatus(
-                    f"Saved trust decision: {decision}. "
-                    f"Restart {APP_NAME} for this to take effect."
-                )
-
-            selector = TrustSelectorComponent(
-                TrustSelectorOptions(
-                    cwd=cwd,
-                    savedDecision=saved_decision,
-                    projectTrusted=_safe_call_bool(
-                        self.settingsManager,
-                        "isProjectTrusted",
-                        True,
-                    ),
-                    onSelect=save,
-                    onCancel=lambda: (done(), self._request_render()),
-                )
-            )
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(build)
-
-    def maybeSaveImplicitProjectTrustAfterReload(self) -> bool:
-        cwd = str(self.sessionManager.getCwd())
-        if self.autoTrustOnReloadCwd != cwd:
-            return False
-        if not _safe_call_bool(self.settingsManager, "isProjectTrusted", False):
-            return False
-        if not has_trust_requiring_project_resources(cwd):
-            return False
-
-        services = read_field(self.runtimeHost, "services")
-        agent_dir = str(read_field(services, "agentDir") or get_agent_dir())
-        trust_store = ProjectTrustStore(agent_dir)
-        try:
-            if trust_store.get(cwd) is not None:
-                self.autoTrustOnReloadCwd = None
-                return False
-            trust_store.set(cwd, True)
-            self.autoTrustOnReloadCwd = None
-            return True
-        except Exception as error:  # noqa: BLE001 - warn and retry on the next reload
-            self.showWarning(f"Could not save project trust after reload: {error}")
-            return False
-
-    async def init(self) -> None:
-        if self.isInitialized:
-            return
-
-        self.registerSignalHandlers()
-        self.fdPath = find_tool("fd")
-        setKeybindings(self.keybindings)
-        themes_result = {}
-        get_themes = _callable_attr(getattr(self.session, "resourceLoader", None), "getThemes")
-        if get_themes is not None:
-            themes_result = get_themes() or {}
-        interactive_theme.set_registered_themes(read_field(themes_result, "themes", []))
-        interactive_theme.init_theme(_safe_call_str(self.settingsManager, "getTheme"), True)
-        self.updateEditorBorderColor()
-        self.setupAutocompleteProvider()
-
-        quiet_startup = _safe_call_bool(self.settingsManager, "getQuietStartup")
-        scoped_models = list(getattr(self.session, "scopedModels", []) or [])
-        if scoped_models and (self.options.verbose or not quiet_startup):
-            model_list = ", ".join(
-                f"{read_field(read_field(scoped_model, 'model'), 'id', '')}"
-                + (
-                    f":{read_field(scoped_model, 'thinkingLevel')}"
-                    if read_field(scoped_model, "thinkingLevel")
-                    else ""
-                )
-                for scoped_model in scoped_models
-            )
-            cycle_keys = list(self.keybindings.getKeys("app.model.cycleForward"))
-            cycle_hint = (
-                interactive_theme.theme.fg(
-                    "muted",
-                    f" ({format_key_text('/'.join(cycle_keys), KeyTextFormatOptions(capitalize=True))} to cycle)",
-                )
-                if cycle_keys
-                else ""
-            )
-            print(interactive_theme.theme.fg("dim", f"Model scope: {model_list}{cycle_hint}"))
-        self.headerContainer.clear()
-        if self.options.verbose or not quiet_startup:
-            _title_text = os.environ.get("MISAKA_APP_TITLE") or APP_NAME
-
-            def _logo() -> str:
-                # MISAKA_APP_TITLE overrides only the displayed title; APP_NAME stays, since it
-                # names the config directory and env prefix. The brand part keeps the accent
-                # color; the agent part adapts to the terminal background (appTitleOnLight on
-                # light, appTitle on dark/unknown), detected via OSC-11 and mode-2031
-                # notifications as in pi, with a redraw when it changes.
-                agent_slot = "appTitleOnLight" if getattr(self, "_terminalBgIsLight", False) else "appTitle"
-                if " · " in _title_text:
-                    brand, agent = _title_text.split(" · ", 1)
-                    try:
-                        agent_colored = interactive_theme.theme.fg(agent_slot, agent)
-                    except KeyError:
-                        agent_colored = interactive_theme.theme.fg("accent", agent)
-                    colored = interactive_theme.theme.fg("accent", brand + " · ") + agent_colored
-                else:
-                    colored = interactive_theme.theme.fg("accent", _title_text)
-                return interactive_theme.theme.bold(colored) + interactive_theme.theme.fg(
-                    "dim", f" v{self.version}")
-
-            logo = _logo  # Evaluated as logo() inside the header lambda below.
-            expanded_instructions = [
-                key_hint("app.interrupt", "to interrupt"),
-                key_hint("app.clear", "to clear"),
-                raw_key_hint(f"{key_text('app.clear')} twice", "to exit"),
-                key_hint("app.exit", "to exit (empty)"),
-                key_hint("app.suspend", "to suspend"),
-                key_hint("tui.editor.deleteToLineEnd", "to delete to end"),
-                key_hint("app.thinking.cycle", "to cycle thinking level"),
-                raw_key_hint(
-                    f"{key_text('app.model.cycleForward')}/{key_text('app.model.cycleBackward')}",
-                    "to cycle models",
-                ),
-                key_hint("app.model.select", "to select model"),
-                key_hint("app.tools.expand", "to expand tools"),
-                key_hint("app.thinking.toggle", "to expand thinking"),
-                key_hint("app.editor.external", "for external editor"),
-                raw_key_hint("/", "for commands"),
-                raw_key_hint("!", "to run bash"),
-                raw_key_hint("!!", "to run bash (no context)"),
-                key_hint("app.message.followUp", "to queue follow-up"),
-                key_hint("app.message.dequeue", "to edit all queued messages"),
-                key_hint("app.clipboard.pasteImage", "to paste image"),
-                raw_key_hint("drop files", "to attach"),
-            ]
-            compact_instructions = [
-                key_hint("app.interrupt", "interrupt"),
-                raw_key_hint(f"{key_text('app.clear')}/{key_text('app.exit')}", "clear/exit"),
-                raw_key_hint("/", "commands"),
-                raw_key_hint("!", "bash"),
-                key_hint("app.tools.expand", "more"),
-            ]
-            compact_onboarding = interactive_theme.theme.fg(
-                "dim",
-                f"Press {key_text('app.tools.expand')} to show full startup help and loaded resources.",
-            )
-            onboarding = interactive_theme.theme.fg(
-                "dim",
-                os.environ.get("MISAKA_TAGLINE")
-                or "MISAKA research system ready.",
-            )
-            self.builtInHeader = ExpandableText(
-                lambda: (
-                    f"{logo()}\n"
-                    + interactive_theme.theme.fg("dim", " · ".join(compact_instructions))
-                    + f"\n{compact_onboarding}\n\n{onboarding}"
-                ),
-                lambda: f"{logo()}\n" + "\n".join(expanded_instructions) + f"\n\n{onboarding}",
-                self.getStartupExpansionState(),
-                1,
-                0,
-            )
-            self.headerContainer.addChild(Spacer(1))
-            self.headerContainer.addChild(self.builtInHeader)
-            self.headerContainer.addChild(Spacer(1))
-        else:
-            self.builtInHeader = Text("", 0, 0)
-            self.headerContainer.addChild(self.builtInHeader)
-
-        self.renderWidgets()
-        self.mount()
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if set_focus is not None:
-            set_focus(self.editor)
-
-        self.setupKeyHandlers()
-        self.setupEditorSubmitHandler()
-
-        # Background adaptation (pi's OSC-11 + mode-2031): subscribe to light/dark notifications
-        # at startup, then query the real background once; the header redraws when either arrives.
-        set_notify = _callable_attr(self.ui, "setTerminalColorSchemeNotifications")
-        if set_notify is not None:
-            set_notify(True)
-
-        def _apply_bg_lightness(is_light: bool) -> None:
-            if getattr(self, "_terminalBgIsLight", None) == is_light:
-                return
-            self._terminalBgIsLight = is_light
-            self._refresh_expandables()
-            self._request_render(True)
-
-        on_scheme = _callable_attr(self.ui, "onTerminalColorSchemeChange")
-        if on_scheme is not None:
-            on_scheme(lambda scheme: _apply_bg_lightness(scheme == "light"))
-
-        start = _callable_attr(self.ui, "start")
-        if start is not None:
-            start()
-
-        async def _probe_terminal_background() -> None:
-            query = _callable_attr(self.ui, "queryTerminalBackgroundColor")
-            if query is None:
-                return
-            try:
-                rgb = await query(timeoutMs=1000)
-            except Exception:  # noqa: BLE001 - no background colour answer within the timeout
-                return
-            if rgb is None:
-                return
-            from misaka.ui.tui.terminal_colors import theme_for_rgb_color
-            _apply_bg_lightness(theme_for_rgb_color(rgb) == "light")
-
-        self._schedule_task(_probe_terminal_background())
-        self.isInitialized = True
-        await self.rebindCurrentSession()
-        self.renderInitialMessages()
-
-        on_theme_change = getattr(interactive_theme, "on_theme_change", None)
-        if callable(on_theme_change):
-            on_theme_change(
-                lambda: (
-                    _callable_attr(self.ui, "invalidate") and self.ui.invalidate(),
-                    self.updateEditorBorderColor(),
-                    self._request_render(),
-                )
-            )
-        on_branch_change = _callable_attr(self.footerDataProvider, "onBranchChange")
-        if on_branch_change is not None:
-            on_branch_change(lambda: self._request_render())
-        await maybe_await(self.updateAvailableProviderCount())
-
-
-    async def _check_tmux_keyboard_setup(self) -> None:
-        warning = await self.checkTmuxKeyboardSetup()
-        if warning:
-            self.showWarning(warning)
-
-    async def _runInputLoop(self) -> None:
-        while self._shutdownFuture is not None and not self._shutdownFuture.done():
-            try:
-                user_input = await self.getUserInput()
-            except asyncio.CancelledError:
-                return
-
-            if self._shutdownFuture is not None and self._shutdownFuture.done():
-                return
-
-            try:
-                # MISAKA fork: handleInput saw an idle agent and handed the text here, but a
-                # research driver or a notification can start a turn in this window in between
-                # (pi has no such turn starters). Without a behaviour, prompt() then raised
-                # "Agent is already processing" and the typed message was lost; steer is what
-                # Enter would have queued had the turn started a moment earlier. Idle is unchanged.
-                await self.session.prompt(user_input, {"streamingBehavior": "steer"})
-            except Exception as error:  # noqa: BLE001
-                self.showError(str(error) if error is not None else "Unknown error occurred")
-
-    async def _promptInitialMessages(self) -> None:
-        # MISAKA fork: pi sends these bare (interactive-mode.ts run()), and nothing else
-        # starts a turn during its startup. Here the network wiring flushes inbox deliveries
-        # with triggerTurn at bind, so a `card-shell --resume --say` note could arrive
-        # mid-turn; prompt() then refused it ("Agent is already processing") and the note
-        # was lost. followUp queues it behind that turn; an idle session is unchanged.
-        if self.options.initialMessage:
-            try:
-                await self.session.prompt(
-                    self.options.initialMessage,
-                    {"images": list(self.options.initialImages or []), "streamingBehavior": "followUp"},
-                )
-            except Exception as error:  # noqa: BLE001
-                self.showError(str(error) if error is not None else "Unknown error occurred")
-            else:
-                self.renderCurrentSessionState()
-        for message in list(self.options.initialMessages or []):
-            try:
-                await self.session.prompt(message, {"streamingBehavior": "followUp"})
-            except Exception as error:  # noqa: BLE001
-                self.showError(str(error) if error is not None else "Unknown error occurred")
-            else:
-                self.renderCurrentSessionState()
-
-    async def run(self) -> int:
-        await self.init()
-        self._shutdownFuture = asyncio.get_running_loop().create_future()
-
-        if self.shutdownRequested:
-            await self.checkShutdownRequested()
-            return await self._shutdownFuture
-
-        self.isShuttingDown = False
-        self._schedule_task(self._check_tmux_keyboard_setup())
-
-        get_model_registry_error = _callable_attr(getattr(self.session, "modelRegistry", None), "getError")
-        model_registry_error = get_model_registry_error() if get_model_registry_error is not None else None
-        if model_registry_error:
-            self.showError(f"models.json error: {model_registry_error}")
-        if self.options.modelFallbackMessage:
-            self.showWarning(self.options.modelFallbackMessage)
-
-        self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth())
-
-        await self._promptInitialMessages()
-
-        self._schedule_task(self._runInputLoop())
-
-        return await self._shutdownFuture
-
-    async def shutdown(self) -> int:
-        if self.isShuttingDown:
-            if self._shutdownFuture is None:
-                return 0
-            return await asyncio.shield(self._shutdownFuture)
-
-        self.isShuttingDown = True
-        self.unregisterSignalHandlers()
-
-        drain_input = _callable_attr(getattr(self.ui, "terminal", None), "drainInput")
-        if drain_input is not None:
-            await maybe_await(drain_input(1000))
-
-        if self._pendingUserInputFuture is not None and not self._pendingUserInputFuture.done():
-            self._pendingUserInputFuture.cancel()
-        self._pendingUserInputFuture = None
-        self.onInputCallback = None
-
-        self.stop()
-        dispose_runtime = _callable_attr(self.runtimeHost, "dispose")
-        if dispose_runtime is not None:
-            await maybe_await(dispose_runtime())
-
-        if self._shutdownFuture is None:
-            return 0
-        if not self._shutdownFuture.done():
-            self._shutdownFuture.set_result(0)
-        return await asyncio.shield(self._shutdownFuture)
-
-    def requestShutdown(self) -> None:
-        if self.shutdownRequested:
-            return
-        self.shutdownRequested = True
-        if self._shutdownFuture is None:
-            return
-        if not bool(getattr(self.session, "isStreaming", False)):
-            self._schedule_task(self.shutdown())
-
-    def emergencyTerminalExit(self) -> None:
-        self.isShuttingDown = True
-        self.unregisterSignalHandlers()
-        kill_tracked_detached_children()
-        raise SystemExit(129)
-
-    def uncaughtCrash(self, error: Exception | BaseException) -> None:
-        if self.isShuttingDown:
-            raise SystemExit(1)
-        self.isShuttingDown = True
-        with contextlib.suppress(Exception):
-            self.unregisterSignalHandlers()
-        with contextlib.suppress(Exception):
-            kill_tracked_detached_children()
-        stop = _callable_attr(self.ui, "stop")
-        if stop is not None:
-            with contextlib.suppress(Exception):
-                stop()
-        print("misaka exiting due to an uncaught exception:", file=sys.stderr)
-        print(error, file=sys.stderr)
-        raise SystemExit(1)
-
-    def registerSignalHandlers(self) -> None:
-        self.unregisterSignalHandlers()
-
-        signal_numbers: list[int] = [signal.SIGTERM]
-        if sys.platform != "win32" and hasattr(signal, "SIGHUP"):
-            signal_numbers.append(signal.SIGHUP)  # windows-footgun: ok - guarded above
-
-        def _install_signal(signum: int, handler: Callable[[int, Any], None]) -> None:
-            try:
-                previous = signal.getsignal(signum)
-                signal.signal(signum, handler)
-            except (AttributeError, ValueError):
-                return
-            self.signalCleanupHandlers.append(lambda: signal.signal(signum, previous))
-
-        for signum in signal_numbers:
-            def _handler(_signum: int, _frame: Any, *, signum: int = signum) -> None:
-                if hasattr(signal, "SIGHUP") and signum == signal.SIGHUP:
-                    self.emergencyTerminalExit()
-                kill_tracked_detached_children()
-                self._schedule_task(self.shutdown())
-
-            _install_signal(signum, _handler)
-
-        # pi installs a `process.stdout.on("error", ...)` handler here that turns EIO/EPIPE/
-        # ENOTCONN writes into `emergencyTerminalExit`. Python's `sys.stdout` is a
-        # `TextIOWrapper` with no `on`/`off`, so the port never registered anything; the
-        # capability would have to live at the write site (ProcessTerminal.write) instead.
-        # Dead terminal writes surface as OSError through `sys.excepthook` -> `uncaughtCrash`.
-
-        previous_excepthook = sys.excepthook
-
-        def _excepthook(exc_type: type[BaseException], error: BaseException, _traceback: Any) -> None:
-            self.uncaughtCrash(error)
-
-        sys.excepthook = _excepthook
-        self.signalCleanupHandlers.append(lambda: setattr(sys, "excepthook", previous_excepthook))
-
-        previous_threading_excepthook = getattr(threading, "excepthook", None)
-        try:
-            owner_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            owner_loop = None
-        if previous_threading_excepthook is not None:
-            def _threading_excepthook(args: Any) -> None:
-                exc_value = getattr(args, "exc_value", None)
-                # Signal restoration and terminal teardown belong to the UI thread,
-                # not the animation/helper thread whose exception is being reported.
-                if isinstance(exc_value, BaseException) and owner_loop is not None and not owner_loop.is_closed():
-                    try:
-                        owner_loop.call_soon_threadsafe(self.uncaughtCrash, exc_value)
-                        return
-                    except RuntimeError:
-                        pass
-                previous_threading_excepthook(args)
-
-            threading.excepthook = _threading_excepthook
-            self.signalCleanupHandlers.append(
-                lambda: setattr(threading, "excepthook", previous_threading_excepthook)
-            )
-
-    def unregisterSignalHandlers(self) -> None:
-        for cleanup in list(self.signalCleanupHandlers):
-            cleanup()
-        self.signalCleanupHandlers = []
+        except Exception:  # noqa: BLE001, S110 - Ignore, will be emitted as an event
+            pass
 
     def stop(self) -> None:
-        self.unregisterSignalHandlers()
+        # MISAKA fork (D1): no fullscreen exit output to choose.
+        self.disposeActiveSelector()
+        # MISAKA fork: cancels the extension dialog waiting for its turn as well.
         self._resetExtensionPrompts()
-        get_progress = _callable_attr(self.settingsManager, "getShowTerminalProgress")
-        set_progress = _callable_attr(getattr(self.ui, "terminal", None), "setProgress")
-        if get_progress is not None and bool(get_progress()) and set_progress is not None:
-            set_progress(False)
-        if self.loadingAnimation is not None:
-            stop = _callable_attr(self.loadingAnimation, "stop")
-            if stop is not None:
-                stop()
-            self.loadingAnimation = None
+        if self.settingsManager.getShowTerminalProgress():
+            self.ui.terminal.setProgress(False)
+        self.clearStatusIndicator()
+        # MISAKA fork (D11): no theme auto-sync to disable.
         self.clearExtensionTerminalInputListeners()
-        dispose_footer = _callable_attr(self.footer, "dispose")
-        if dispose_footer is not None:
-            dispose_footer()
-        dispose_footer_data = _callable_attr(self.footerDataProvider, "dispose")
-        if dispose_footer_data is not None:
-            dispose_footer_data()
-        if self._sessionUnsubscribe is not None:
-            self._sessionUnsubscribe()
-            self._sessionUnsubscribe = None
+        self.footer.dispose()
+        self.footerDataProvider.dispose()
+        if self.unsubscribe:
+            self.unsubscribe()
         if self.isInitialized:
-            stop_ui = _callable_attr(self.ui, "stop")
-            if stop_ui is not None:
-                stop_ui()
+            self.stopInteractiveTui()
             self.isInitialized = False
+        self.unregisterSignalHandlers()
 
-    def dispose(self) -> None:
-        stop_theme_watcher = getattr(interactive_theme, "stop_theme_watcher", None)
-        if callable(stop_theme_watcher):
-            stop_theme_watcher()
-        self.stop()
-        self._clear_selector()
+    # MISAKA fork: Python helpers.
 
-    def _on_editor_change(self, text: str) -> None:
-        self._handleClearCount = 0
-        was_bash_mode = self.isBashMode
-        self.isBashMode = text.lstrip().startswith("!")
-        if was_bash_mode != self.isBashMode:
-            self.updateEditorBorderColor()
+    def _schedule_task(self, awaitable: Coroutine[Any, Any, Any]) -> None:
+        """MISAKA fork: ``void promise`` -- the coroutine starts at once, as a JavaScript async call does, and is held
+        until it finishes (asyncio holds tasks weakly). A failure is shown in the chat, where Node would crash on the
+        unhandled rejection."""
+        task = spawn(awaitable, self._backgroundTasks)
+        task.add_done_callback(self._reportBackgroundFailure)
 
-    def _schedule_task(self, awaitable: Awaitable[Any], *, eager_start: bool = False) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(awaitable)
+    def _reportBackgroundFailure(self, task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
             return
-        task = (
-            asyncio.Task(awaitable, loop=loop, eager_start=True)
-            if eager_start
-            else loop.create_task(awaitable)
-        )
-        self._backgroundTasks.add(task)
-        task.add_done_callback(self._finish_background_task)
-
-    def _finish_background_task(self, task: asyncio.Task[Any]) -> None:
-        self._backgroundTasks.discard(task)
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            return
-        except Exception as error:  # noqa: BLE001
-            self.showError(str(error))
-
-    def _set_editor_text(self, text: str) -> None:
-        set_text = _callable_attr(self.editor, "setText")
-        if set_text is not None:
-            set_text(text)
-
-    def _get_editor_text(self) -> str:
-        expanded = _callable_attr(self.editor, "getExpandedText")
-        if expanded is not None:
-            return str(expanded())
-        get_text = _callable_attr(self.editor, "getText")
-        if get_text is not None:
-            return str(get_text())
-        return ""
-
-    def _clear_selector(self) -> None:
-        # `showSelector` mounts into `editorContainer`, never an overlay, so there is no
-        # handle to hide here: the only overlay handle in this file belongs to
-        # `showExtensionCustom`, and `resetExtensionUI` closes that with `ui.hideOverlay()`.
-        clear = _callable_attr(self.editorContainer, "clear")
-        add_child = _callable_attr(self.editorContainer, "addChild")
-        set_focus = _callable_attr(self.ui, "setFocus")
-        if clear is not None:
-            clear()
-        if add_child is not None:
-            add_child(self.editor)
-        if set_focus is not None:
-            set_focus(self.editor)
-
-    def getStartupExpansionState(self) -> bool:
-        return bool(self.options.verbose or self.toolOutputExpanded)
-
-    def _refuse_switch_during_compaction(self, what: str) -> bool:
-        # MISAKA fork: pi lets the model or thinking level change while a compaction runs, and
-        # `_check_compaction_source` then discards the result when it lands. With LCM a
-        # compaction can take minutes (2026-09-24: a 1.19M-token Sister lost a five-minute
-        # one to three switches and overflowed). The switch waits, as `/reload` already does.
-        if bool(getattr(self.session, "isCompacting", False)):
-            self.showWarning(f"Wait for compaction to finish before changing the {what}.")
-            return True
-        return False
-
-    async def _cycle_model(self, direction: str) -> None:
-        if self._refuse_switch_during_compaction("model"):
-            return
-        try:
-            result = await self.session.cycleModel(direction)
-            if result is None:
-                scoped_models = list(getattr(self.session, "scopedModels", []) or [])
-                self.showStatus("Only one model in scope" if scoped_models else "Only one model available")
-                return
-            self.footer.invalidate()
-            self.updateEditorBorderColor()
-            thinking_str = ""
-            if bool(read_field(result.model, "reasoning", False)) and read_field(result, "thinkingLevel") != "off":
-                thinking_str = f" (thinking: {read_field(result, 'thinkingLevel')})"
-            self.showStatus(f"Switched to {read_field(result.model, 'name', None) or result.model.id}{thinking_str}")
-            self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(result.model))
-        except Exception as error:  # noqa: BLE001
-            self.showError(str(error))
-
-    async def _cycle_thinking_level(self) -> None:
-        level = self.session.cycleThinkingLevel()
-        if level is None:
-            self.showStatus("Current model does not support thinking")
-            return
-        self.footer.invalidate()
-        self.updateEditorBorderColor()
-        self.showStatus(f"Thinking level: {level}")
-
-    async def _handle_model_select(
-        self,
-        model: Any,
-        done: Callable[[], None],
-        *,
-        persist: bool,
-    ) -> None:
-        try:
-            await self.session.setModel(model, persist=persist)
-            await maybe_await(self.updateAvailableProviderCount())
-            self.footer.invalidate()
-            self.updateEditorBorderColor()
-            done()
-            self.showStatus(
-                f"Default model: {read_field(model, 'provider')}/{read_field(model, 'id')}"
-                if persist
-                else f"Model: {read_field(model, 'id', model)}"
-            )
-            self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(model))
-        except Exception as error:  # noqa: BLE001
-            done()
-            self.showError(str(error))
-
-    async def _handle_session_select(self, sessionPath: str, done: Callable[[], None]) -> None:
-        done()
-        await self.handleResumeSession(sessionPath)
-
-    def handleThinkingCommand(self, argument: str = "") -> None:
-        """``/thinking [--default] [level]`` (pi 496185f6): no argument opens the selector, a level
-        switches directly; ``--default`` also saves it as the startup default."""
-        if self._refuse_switch_during_compaction("thinking level"):
-            return
-        parsed = parse_default_flag_args("thinking", argument)
-        if parsed.error:
-            self.showError(parsed.error)
-            return
-        level = (parsed.searchTerm or "").strip()
-        if not level:
-            self.showThinkingSelector(persist=parsed.persist)
-            return
-        available = list(self.session.getAvailableThinkingLevels())
-        if level not in available:
-            self.showError(f"Unknown thinking level \"{level}\". Available: {', '.join(available)}")
-            return
-        self._apply_thinking_level(level, persist=parsed.persist)
-
-    def _apply_thinking_level(self, level: str, *, persist: bool = False) -> None:
-        # Only explicit default actions (`--default`, selector Ctrl+S, the settings panel) save a
-        # default: this agent's own in a Last Order or Sister window, the global one elsewhere.
-        # Ordinary selection remains session scoped like pi.
-        # MISAKA fork: the default is saved before the session switches, so a role file that
-        # refuses the write leaves both as they were (pi's global write cannot fail here).
-        if persist:
-            save = _callable_attr(self.settingsManager, "setDefaultThinkingLevel")
-            if save is not None:
-                try:
-                    save(level)
-                except (OSError, ValueError) as error:
-                    self.showError(f"Thinking level not saved: {error}")
-                    return
-        self.session.setThinkingLevel(level)
-        self.footer.invalidate()
-        self.updateEditorBorderColor()
-        whose = " for this agent" if _safe_call_str(self.settingsManager, "getModelProfile", "") else ""
-        self.showStatus(f"Default thinking level{whose}: {level}" if persist else f"Thinking level: {level}")
-
-    def showThinkingSelector(self, *, persist: bool = False) -> None:
-        self.showSelector(
-            lambda done: {
-                "component": ThinkingSelectorComponent(
-                    self._get_session_thinking_level(),
-                    list(self.session.getAvailableThinkingLevels()),
-                    lambda level: (done(), self._apply_thinking_level(level, persist=persist)),
-                    lambda: (done(), self._request_render()),
-                    onSelectAsDefault=lambda level: (done(), self._apply_thinking_level(level, persist=True)),
-                    defaultThinkingLevel=(
-                        _safe_call_str(
-                            self.settingsManager,
-                            "getDefaultThinkingLevel",
-                            DEFAULT_THINKING_LEVEL,
-                        )
-                        or DEFAULT_THINKING_LEVEL
-                    ),
-                ),
-            }
-        )
-
-    async def handleModelCommand(self, searchTerm: str | None = None) -> None:
-        if self._refuse_switch_during_compaction("model"):
-            return
-        if not searchTerm:
-            self.showModelSelector()
-            return
-
-        model = await self.findExactModelMatch(searchTerm)
-        if model is None:
-            self.showModelSelector(searchTerm)
-            return
-
-        try:
-            await self.session.setModel(model)
-            self.footer.invalidate()
-            self.updateEditorBorderColor()
-            self.showStatus(f"Model: {read_field(model, 'id', model)}")
-            self._schedule_task(self.maybeWarnAboutAnthropicSubscriptionAuth(model))
-        except Exception as error:  # noqa: BLE001
-            self.showError(str(error))
-
-    async def findExactModelMatch(self, searchTerm: str) -> Any | None:
-        models = await self.getModelCandidates()
-        return findExactModelReferenceMatch(searchTerm, models)
-
-    async def getModelCandidates(self) -> list[Any]:
-        scoped_models = list(getattr(self.session, "scopedModels", []) or [])
-        if scoped_models:
-            return [read_field(item, "model", item) for item in scoped_models]
-
-        model_registry = getattr(self.session, "modelRegistry", None)
-        refresh = _callable_attr(model_registry, "refresh")
-        if refresh is not None:
-            await maybe_await(refresh())
-        get_available = _callable_attr(model_registry, "getAvailable")
-        if get_available is None:
-            return []
-        try:
-            return list((await maybe_await(get_available())) or [])
-        except Exception:  # noqa: BLE001 - a registry that cannot list models offers none
-            return []
-
-    def showSettingsSelector(self) -> None:
-        available_themes = list(interactive_theme.get_available_themes())
-        get_available_thinking_levels = _callable_attr(self.session, "getAvailableThinkingLevels")
-        get_warnings = _callable_attr(self.settingsManager, "getWarnings")
-
-        def _on_auto_compact_change(enabled: bool) -> None:
-            set_auto_compaction_enabled = _callable_attr(self.session, "setAutoCompactionEnabled")
-            if set_auto_compaction_enabled is not None:
-                set_auto_compaction_enabled(enabled)
-            set_auto_compact_enabled = _callable_attr(self.footer, "setAutoCompactEnabled")
-            if set_auto_compact_enabled is not None:
-                set_auto_compact_enabled(enabled)
-
-        def _on_theme_change(theme_name: str) -> None:
-            result = interactive_theme.set_theme(theme_name, True)
-            set_theme = _callable_attr(self.settingsManager, "setTheme")
-            if set_theme is not None:
-                set_theme(theme_name)
-            invalidate = _callable_attr(self.ui, "invalidate")
-            if invalidate is not None:
-                invalidate()
-            if not bool(read_field(result, "success", False)):
-                self.showError(
-                    f'Failed to load theme "{theme_name}": {read_field(result, "error")}\nFell back to dark theme.'
-                )
-
-        def _on_theme_preview(theme_name: str) -> None:
-            result = interactive_theme.set_theme(theme_name, True)
-            if bool(read_field(result, "success", False)):
-                invalidate = _callable_attr(self.ui, "invalidate")
-                if invalidate is not None:
-                    invalidate()
-                self._request_render()
-
-        def _on_hide_thinking_block_change(hidden: bool) -> None:
-            self.hideThinkingBlock = hidden
-            set_hide_thinking_block = _callable_attr(self.settingsManager, "setHideThinkingBlock")
-            if set_hide_thinking_block is not None:
-                set_hide_thinking_block(hidden)
-            for child in getattr(self.chatContainer, "children", []):
-                if isinstance(child, AssistantMessageComponent):
-                    set_hidden = _callable_attr(child, "setHideThinkingBlock")
-                    if set_hidden is not None:
-                        set_hidden(hidden)
-            clear_chat = _callable_attr(self.chatContainer, "clear")
-            if clear_chat is not None:
-                clear_chat()
-            self.rebuildChatFromMessages()
-
-        def _on_output_pad_change(padding: int) -> None:
-            set_output_pad = _callable_attr(self.settingsManager, "setOutputPad")
-            if set_output_pad is not None:
-                set_output_pad(padding)
-            self.outputPad = padding
-            if self.streamingComponent is not None or bool(getattr(self.session, "isStreaming", False)):
-                for child in getattr(self.chatContainer, "children", []):
-                    if isinstance(
-                        child,
-                        (
-                            AssistantMessageComponent,
-                            CustomMessageComponent,
-                            UserMessageComponent,
-                        ),
-                    ):
-                        child.setOutputPad(padding)
-                if self.streamingComponent is not None:
-                    self.streamingComponent.setOutputPad(padding)
-                self._request_render()
-                return
-            self.rebuildChatFromMessages()
-
-        def _on_show_images_change(enabled: bool) -> None:
-            set_show_images = _callable_attr(self.settingsManager, "setShowImages")
-            if set_show_images is not None:
-                set_show_images(enabled)
-            for child in getattr(self.chatContainer, "children", []):
-                if isinstance(child, ToolExecutionComponent):
-                    set_child_images = _callable_attr(child, "setShowImages")
-                    if set_child_images is not None:
-                        set_child_images(enabled)
-
-        def _on_image_width_cells_change(width: int) -> None:
-            set_image_width_cells = _callable_attr(self.settingsManager, "setImageWidthCells")
-            if set_image_width_cells is not None:
-                set_image_width_cells(width)
-            for child in getattr(self.chatContainer, "children", []):
-                if isinstance(child, ToolExecutionComponent):
-                    set_child_width = _callable_attr(child, "setImageWidthCells")
-                    if set_child_width is not None:
-                        set_child_width(width)
-
-        def _on_transport_change(transport: str) -> None:
-            set_transport = _callable_attr(self.settingsManager, "setTransport")
-            if set_transport is not None:
-                set_transport(transport)
-            agent = getattr(self.session, "agent", None)
-            if agent is not None:
-                agent.transport = transport
-
-        def _on_http_idle_timeout_ms_change(timeout_ms: int) -> None:
-            set_http_idle_timeout_ms = _callable_attr(
-                self.settingsManager,
-                "setHttpIdleTimeoutMs",
-            )
-            if set_http_idle_timeout_ms is not None:
-                set_http_idle_timeout_ms(timeout_ms)
-            self.showStatus(
-                f"HTTP idle timeout: {formatHttpIdleTimeoutMs(timeout_ms)}"
-            )
-
-        def _on_cache_warming_mode_change(mode: str) -> None:
-            set_mode = _callable_attr(self.session, "setCacheWarmingMode")
-            if set_mode is not None:
-                set_mode(mode)
-            self.showStatus(f"Cache warming: {mode}")
-
-        def _current_model() -> Any | None:
-            model = getattr(self.session, "model", None)
-            if model is not None:
-                return model
-            return read_field(getattr(self.session, "state", None), "model")
-
-        def _is_current_model(provider: str, model_id: str) -> bool:
-            current = _current_model()
-            return bool(
-                current is not None
-                and read_field(current, "provider") == provider
-                and read_field(current, "id") == model_id
-            )
-
-        def _on_model_thinking_level_change(provider: str, model_id: str, level: str) -> None:
-            setter = _callable_attr(self.settingsManager, "setModelThinkingLevel")
-            if setter is not None:
-                setter(provider, model_id, level)
-            if _is_current_model(provider, model_id):
-                self.session.setThinkingLevel(level)
-                self.footer.invalidate()
-                self.updateEditorBorderColor()
-
-        def _on_model_thinking_level_remove(provider: str, model_id: str) -> None:
-            remover = _callable_attr(self.settingsManager, "removeModelThinkingLevel")
-            if remover is not None:
-                remover(provider, model_id)
-            if _is_current_model(provider, model_id):
-                default_level = (
-                    _safe_call_str(
-                        self.settingsManager,
-                        "getDefaultThinkingLevel",
-                        DEFAULT_THINKING_LEVEL,
-                    )
-                    or DEFAULT_THINKING_LEVEL
-                )
-                self.session.setThinkingLevel(default_level)
-                self.footer.invalidate()
-                self.updateEditorBorderColor()
-
-        get_available_models = _callable_attr(getattr(self.session, "modelRegistry", None), "getAvailable")
-        try:
-            available_default_models = list(get_available_models() or []) if get_available_models is not None else []
-        except Exception:  # noqa: BLE001 - a registry that cannot list models offers none
-            available_default_models = []
-        get_model_thinking_levels = _callable_attr(self.settingsManager, "getAllModelThinkingLevels")
-        model_thinking_levels = (
-            dict(get_model_thinking_levels() or {}) if get_model_thinking_levels is not None else {}
-        )
-        global_thinking_level = (
-            _safe_call_str(
-                self.settingsManager,
-                "getDefaultThinkingLevel",
-                DEFAULT_THINKING_LEVEL,
-            )
-            or DEFAULT_THINKING_LEVEL
-        )
-        configured_project_trust = _safe_call_str(
-            self.settingsManager,
-            "getDefaultProjectTrust",
-            "ask",
-        )
-        default_project_trust = cast(
-            DefaultProjectTrust,
-            configured_project_trust
-            if configured_project_trust in {"ask", "always", "never"}
-            else "ask",
-        )
-
-        self.showSelector(
-            lambda done: {
-                "component": SettingsSelectorComponent(
-                    SettingsConfig(
-                        autoCompact=bool(getattr(self.session, "autoCompactionEnabled", False)),
-                        showImages=_safe_call_bool(self.settingsManager, "getShowImages", True),
-                        imageWidthCells=_safe_call_int(self.settingsManager, "getImageWidthCells", 40),
-                        autoResizeImages=_safe_call_bool(self.settingsManager, "getImageAutoResize", True),
-                        blockImages=_safe_call_bool(self.settingsManager, "getBlockImages", False),
-                        enableSkillCommands=_safe_call_bool(self.settingsManager, "getEnableSkillCommands", True),
-                        steeringMode=str(getattr(self.session, "steeringMode", "one-at-a-time")),
-                        followUpMode=str(getattr(self.session, "followUpMode", "one-at-a-time")),
-                        transport=str(_safe_call_str(self.settingsManager, "getTransport", "sse")),
-                        httpIdleTimeoutMs=_safe_call_int(
-                            self.settingsManager,
-                            "getHttpIdleTimeoutMs",
-                            300_000,
-                        ),
-                        cacheWarmingMode=_safe_call_str(self.settingsManager, "getCacheWarmingMode", "streaming"),
-                        thinkingLevel=global_thinking_level,
-                        availableThinkingLevels=list(get_available_thinking_levels() or [])
-                        if get_available_thinking_levels is not None
-                        else [],
-                        currentModel=_current_model(),
-                        availableDefaultModels=available_default_models,
-                        modelThinkingLevels=model_thinking_levels,
-                        currentTheme=_safe_call_str(self.settingsManager, "getTheme", "dark") or "dark",
-                        availableThemes=available_themes,
-                        hideThinkingBlock=self.hideThinkingBlock,
-                        collapseChangelog=_safe_call_bool(self.settingsManager, "getCollapseChangelog", True),
-                        doubleEscapeAction=_safe_call_str(self.settingsManager, "getDoubleEscapeAction", "tree")
-                        or "tree",
-                        treeFilterMode=_safe_call_str(self.settingsManager, "getTreeFilterMode", "default")
-                        or "default",
-                        showHardwareCursor=_safe_call_bool(self.settingsManager, "getShowHardwareCursor", False),
-                        editorPaddingX=_safe_call_int(self.settingsManager, "getEditorPaddingX", 0),
-                        outputPad=0
-                        if _safe_call_int(self.settingsManager, "getOutputPad", 1) == 0
-                        else 1,
-                        autocompleteMaxVisible=_safe_call_int(
-                            self.settingsManager,
-                            "getAutocompleteMaxVisible",
-                            5,
-                        ),
-                        quietStartup=_safe_call_bool(self.settingsManager, "getQuietStartup", False),
-                        defaultProjectTrust=default_project_trust,
-                        clearOnShrink=_safe_call_bool(self.settingsManager, "getClearOnShrink", False),
-                        showTerminalProgress=_safe_call_bool(self.settingsManager, "getShowTerminalProgress", False),
-                        enableInstallTelemetry=_safe_call_bool(
-                            self.settingsManager, "getEnableInstallTelemetry", False
-                        ),
-                        warnings=dict(get_warnings() or {}) if get_warnings is not None else {},
-                    ),
-                    SettingsCallbacks(
-                        onAutoCompactChange=_on_auto_compact_change,
-                        onShowImagesChange=_on_show_images_change,
-                        onImageWidthCellsChange=_on_image_width_cells_change,
-                        onAutoResizeImagesChange=lambda enabled: (
-                            _callable_attr(self.settingsManager, "setImageAutoResize")
-                            and self.settingsManager.setImageAutoResize(enabled)
-                        ),
-                        onBlockImagesChange=lambda blocked: (
-                            _callable_attr(self.settingsManager, "setBlockImages")
-                            and self.settingsManager.setBlockImages(blocked)
-                        ),
-                        onEnableSkillCommandsChange=lambda enabled: (
-                            _callable_attr(self.settingsManager, "setEnableSkillCommands")
-                            and self.settingsManager.setEnableSkillCommands(enabled),
-                            self.setupAutocompleteProvider(),
-                        ),
-                        onSteeringModeChange=lambda mode: (
-                            _callable_attr(self.session, "setSteeringMode") and self.session.setSteeringMode(mode)
-                        ),
-                        onFollowUpModeChange=lambda mode: (
-                            _callable_attr(self.session, "setFollowUpMode") and self.session.setFollowUpMode(mode)
-                        ),
-                        onTransportChange=_on_transport_change,
-                        onHttpIdleTimeoutMsChange=_on_http_idle_timeout_ms_change,
-                        onCacheWarmingModeChange=_on_cache_warming_mode_change,
-                        # The settings panel is the defaults panel: every other item here
-                        # writes through to settings.json (setSteeringMode, setFollowUpMode,
-                        # setTransport, ...), so this one persists too. pi has no global
-                        # thinking-level item in its panel -- its :4624/:4635 handlers are the
-                        # per-model overrides, already persisted by setModelThinkingLevel one
-                        # line above -- so the persist gate that pi puts on setThinkingLevel
-                        # says nothing about this control.
-                        onThinkingLevelChange=lambda level: self._apply_thinking_level(level, persist=True),
-                        onModelThinkingLevelChange=_on_model_thinking_level_change,
-                        onModelThinkingLevelRemove=_on_model_thinking_level_remove,
-                        onThemeChange=_on_theme_change,
-                        onThemePreview=_on_theme_preview,
-                        onHideThinkingBlockChange=_on_hide_thinking_block_change,
-                        onCollapseChangelogChange=lambda collapsed: (
-                            _callable_attr(self.settingsManager, "setCollapseChangelog")
-                            and self.settingsManager.setCollapseChangelog(collapsed)
-                        ),
-                        onDoubleEscapeActionChange=lambda action: (
-                            _callable_attr(self.settingsManager, "setDoubleEscapeAction")
-                            and self.settingsManager.setDoubleEscapeAction(action)
-                        ),
-                        onTreeFilterModeChange=lambda mode: (
-                            _callable_attr(self.settingsManager, "setTreeFilterMode")
-                            and self.settingsManager.setTreeFilterMode(mode)
-                        ),
-                        onShowHardwareCursorChange=lambda enabled: (
-                            _callable_attr(self.settingsManager, "setShowHardwareCursor")
-                            and self.settingsManager.setShowHardwareCursor(enabled),
-                            _callable_attr(self.ui, "setShowHardwareCursor")
-                            and self.ui.setShowHardwareCursor(enabled),
-                        ),
-                        onEditorPaddingXChange=lambda padding: (
-                            _callable_attr(self.settingsManager, "setEditorPaddingX")
-                            and self.settingsManager.setEditorPaddingX(padding),
-                            _callable_attr(self.defaultEditor, "setPaddingX")
-                            and self.defaultEditor.setPaddingX(padding),
-                            self.editor is not self.defaultEditor
-                            and _callable_attr(self.editor, "setPaddingX")
-                            and self.editor.setPaddingX(padding),
-                        ),
-                        onOutputPadChange=_on_output_pad_change,
-                        onAutocompleteMaxVisibleChange=lambda max_visible: (
-                            _callable_attr(self.settingsManager, "setAutocompleteMaxVisible")
-                            and self.settingsManager.setAutocompleteMaxVisible(max_visible),
-                            _callable_attr(self.defaultEditor, "setAutocompleteMaxVisible")
-                            and self.defaultEditor.setAutocompleteMaxVisible(max_visible),
-                            self.editor is not self.defaultEditor
-                            and _callable_attr(self.editor, "setAutocompleteMaxVisible")
-                            and self.editor.setAutocompleteMaxVisible(max_visible),
-                        ),
-                        onQuietStartupChange=lambda enabled: (
-                            _callable_attr(self.settingsManager, "setQuietStartup")
-                            and self.settingsManager.setQuietStartup(enabled)
-                        ),
-                        onDefaultProjectTrustChange=lambda value: (
-                            _callable_attr(self.settingsManager, "setDefaultProjectTrust")
-                            and self.settingsManager.setDefaultProjectTrust(value)
-                        ),
-                        onClearOnShrinkChange=lambda enabled: (
-                            _callable_attr(self.settingsManager, "setClearOnShrink")
-                            and self.settingsManager.setClearOnShrink(enabled),
-                            _callable_attr(self.ui, "setClearOnShrink") and self.ui.setClearOnShrink(enabled),
-                        ),
-                        onShowTerminalProgressChange=lambda enabled: (
-                            _callable_attr(self.settingsManager, "setShowTerminalProgress")
-                            and self.settingsManager.setShowTerminalProgress(enabled)
-                        ),
-                        onEnableInstallTelemetryChange=lambda enabled: (
-                            _callable_attr(self.settingsManager, "setEnableInstallTelemetry")
-                            and self.settingsManager.setEnableInstallTelemetry(enabled)
-                        ),
-                        onWarningsChange=lambda warnings: (
-                            _callable_attr(self.settingsManager, "setWarnings")
-                            and self.settingsManager.setWarnings(warnings)
-                        ),
-                        onCancel=lambda: (done(), self._request_render()),
-                    ),
-                ),
-            }
-        )
-
-    async def showModelsSelector(self) -> None:
-        model_registry = getattr(self.session, "modelRegistry", None)
-        refresh = _callable_attr(model_registry, "refresh")
-        if refresh is not None:
-            await maybe_await(refresh())
-        get_available = _callable_attr(model_registry, "getAvailable")
-        all_models = list(get_available() or []) if get_available is not None else []
-        if not all_models:
-            self.showStatus("No models available")
-            return
-
-        session_scoped_models = list(getattr(self.session, "scopedModels", []) or [])
-        if session_scoped_models:
-            current_enabled_ids: list[str] | None = [
-                f"{read_field(item, 'model').provider}/{read_field(item, 'model').id}"
-                for item in session_scoped_models
-                if read_field(item, "model") is not None
-            ]
-        else:
-            patterns = _callable_attr(self.settingsManager, "getEnabledModels")
-            enabled_patterns = list(patterns() or []) if patterns is not None else []
-            if enabled_patterns:
-                # pi interactive-mode.ts showModelsSelector -- diagnostics are data here: keep
-                # unmatched patterns in the enabled list instead of printing over the frame.
-                resolved = resolveModelScopeFromModels(enabled_patterns, all_models)
-                current_enabled_ids = [f"{item.model.provider}/{item.model.id}" for item in resolved.scopedModels]
-                current_enabled_ids += [
-                    diagnostic.pattern
-                    for diagnostic in resolved.diagnostics
-                    if diagnostic.code == "no-match" and diagnostic.pattern not in current_enabled_ids
-                ]
-            else:
-                current_enabled_ids = None
-
-        async def _update_session_models(enabled_ids: list[str] | None) -> None:
-            nonlocal current_enabled_ids
-            current_enabled_ids = None if enabled_ids is None else [*enabled_ids]
-            if enabled_ids and len(enabled_ids) < len(all_models):
-                resolved = resolveModelScopeFromModels(enabled_ids, all_models).scopedModels
-                self.session.setScopedModels(
-                    [{"model": item.model, "thinkingLevel": item.thinkingLevel} for item in resolved]
-                )
-            else:
-                self.session.setScopedModels([])
-            await maybe_await(self.updateAvailableProviderCount())
-            self._request_render()
-
-        def _build_models_selector(done: Callable[[], None]) -> dict[str, Any]:
-            selector = ScopedModelsSelectorComponent(
-                ModelsConfig(
-                    allModels=list(all_models),
-                    enabledModelIds=current_enabled_ids,
-                ),
-                ModelsCallbacks(
-                    onChange=lambda enabled_ids: _update_session_models(enabled_ids),
-                    onPersist=lambda enabled_ids: (
-                        _callable_attr(self.settingsManager, "setEnabledModels")
-                        and self.settingsManager.setEnabledModels(
-                            None
-                            if enabled_ids is None or len(enabled_ids) == len(all_models)
-                            else list(enabled_ids)
-                        ),
-                        self.showStatus("Model selection saved to settings"),
-                    ),
-                    onCancel=lambda: (done(), self._request_render()),
-                ),
-            )
-            return {"component": selector, "focus": selector}
-
-        self.showSelector(_build_models_selector)
-
-    def showUserMessageSelector(self) -> None:
-        user_messages = list(_callable_attr(self.session, "getUserMessagesForForking")() or [])
-        if not user_messages:
-            self.showStatus("No messages to fork from")
-            return
-
-        initial_selected_id = read_field(user_messages[-1], "entryId")
-        def _build_user_message_selector(done: Callable[[], None]) -> dict[str, Any]:
-            selector = UserMessageSelectorComponent(
-                [
-                    UserMessageItem(id=str(read_field(message, "entryId")), text=str(read_field(message, "text", "")))
-                    for message in user_messages
-                ],
-                lambda entry_id: self._schedule_task(self._handle_user_message_fork(entry_id, done)),
-                lambda: (done(), self._request_render()),
-                str(initial_selected_id) if initial_selected_id is not None else None,
-            )
-            return {"component": selector, "focus": selector.getMessageList()}
-
-        self.showSelector(_build_user_message_selector)
-
-    async def _handle_user_message_fork(self, entryId: str, done: Callable[[], None]) -> None:
-        try:
-            result = await self.runtimeHost.fork(entryId)
-            if read_field(result, "cancelled", False):
-                done()
-                self._request_render()
-                return
-            self.renderCurrentSessionState()
-            self._set_editor_text(str(read_field(result, "selectedText", "") or ""))
-            done()
-            self.showStatus("Forked to new session")
-        except Exception as error:  # noqa: BLE001
-            done()
-            self.showError(str(error))
-
-    async def _handle_tree_select(
-        self,
-        entryId: str,
-        done: Callable[[], None],
-    ) -> None:
-        get_leaf_id = _callable_attr(self.sessionManager, "getLeafId")
-        current_leaf_id = get_leaf_id() if get_leaf_id is not None else None
-        if entryId == current_leaf_id:
-            done()
-            self.showStatus("Already at this point")
-            return
-
-        done()
-        navigate_tree = _callable_attr(self.session, "navigateTree")
-        abort_branch_summary = _callable_attr(self.session, "abortBranchSummary")
-        if navigate_tree is None:
-            self.showError("Session tree navigation is unavailable")
-            return
-
-        wants_summary = False
-        custom_instructions: str | None = None
-        if not _safe_call_bool(self.settingsManager, "getBranchSummarySkipPrompt", False):
-            while True:
-                summary_choice = await self.showExtensionSelector(
-                    "Summarize branch?",
-                    ["No summary", "Summarize", "Summarize with custom prompt"],
-                )
-                if summary_choice is None:
-                    self.showTreeSelector(entryId)
-                    return
-
-                wants_summary = summary_choice != "No summary"
-                if summary_choice == "Summarize with custom prompt":
-                    custom_instructions = await self.showExtensionEditor("Custom summarization instructions")
-                    if custom_instructions is None:
-                        continue
-                break
-
-        if bool(getattr(self.session, "isStreaming", False)):
-            self.restoreQueuedMessagesToEditor()
-            await self.session.abort()
-
-        original_escape = getattr(self.defaultEditor, "onEscape", None)
-        showing_summary_indicator = wants_summary
-        if wants_summary:
-            self.defaultEditor.onEscape = (
-                (lambda: abort_branch_summary()) if abort_branch_summary is not None else original_escape
-            )
-            add_chat_child = _callable_attr(self.chatContainer, "addChild")
-            if add_chat_child is not None:
-                add_chat_child(Spacer(1))
-            self._show_branch_summary_status()
-            self._request_render()
-
-        try:
-            navigate_options = {
-                "summarize": wants_summary,
-                "customInstructions": custom_instructions,
-            }
-            result = await navigate_tree(entryId, navigate_options)
-            if read_field(result, "aborted", False):
-                self.showStatus("Branch summarization cancelled")
-                self.showTreeSelector(entryId)
-                return
-            if read_field(result, "cancelled", False):
-                self.showStatus("Navigation cancelled")
-                return
-            clear_chat = _callable_attr(self.chatContainer, "clear")
-            if clear_chat is not None:
-                clear_chat()
-            self.renderInitialMessages()
-            get_text = _callable_attr(self.editor, "getText")
-            current_text = str(get_text() or "") if get_text is not None else ""
-            editor_text = read_field(result, "editorText")
-            if editor_text and not current_text.strip():
-                self._set_editor_text(str(editor_text))
-            self.showStatus("Navigated to selected point")
-            flush_queue = _callable_attr(self, "flushCompactionQueue")
-            if flush_queue is not None:
-                self._schedule_task(maybe_await(flush_queue({"willRetry": False})))
-        except Exception as error:  # noqa: BLE001
-            self.showError(str(error))
-        finally:
-            self.defaultEditor.onEscape = original_escape
-            if showing_summary_indicator:
-                self._clear_branch_summary_status()
-
-    async def _new_session_from_command_context(
-        self,
-        options: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        if self.loadingAnimation is not None:
-            stop = _callable_attr(self.loadingAnimation, "stop")
-            if stop is not None:
-                stop()
-            self.loadingAnimation = None
-        clear = _callable_attr(self.statusContainer, "clear")
-        if clear is not None:
-            clear()
-        try:
-            result = await self.runtimeHost.newSession(options)
-            if not bool(read_field(result, "cancelled", False)):
-                self.renderCurrentSessionState()
-                self._request_render()
-            return result
-        except ContextCarryUnsupportedError as error:
-            self.showError(str(error))
-            return False
-        except Exception as error:  # noqa: BLE001
-            await self.handleFatalRuntimeError("Failed to create session", error)
-            return {"cancelled": True}
-
-    async def _fork_from_command_context(
-        self,
-        entryId: str,
-        options: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        try:
-            result = await self.runtimeHost.fork(entryId, options)
-            if not bool(read_field(result, "cancelled", False)):
-                self.renderCurrentSessionState()
-                self._set_editor_text(str(read_field(result, "selectedText", "") or ""))
-                self.showStatus("Forked to new session")
-            return {"cancelled": bool(read_field(result, "cancelled", False))}
-        except Exception as error:  # noqa: BLE001
-            await self.handleFatalRuntimeError("Failed to fork session", error)
-            return {"cancelled": True}
-
-    def _build_command_context_actions(self) -> dict[str, Any]:
-        return {
-            # Session-level, not agent-level: the inner loop is idle between continuations
-            # while the run is still going (pi interactive-mode.ts:1914).
-            "waitForIdle": lambda: self.session.waitForIdle(),
-            "newSession": self._new_session_from_command_context,
-            "fork": self._fork_from_command_context,
-            "navigateTree": self._navigate_tree_from_command_context,
-            "switchSession": self.handleResumeSession,
-            "reload": self.handleReloadCommand,
-        }
-
-    async def _navigate_tree_from_command_context(
-        self,
-        targetId: str,
-        options: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        navigate_tree = _callable_attr(self.session, "navigateTree")
-        if navigate_tree is None:
-            return {"cancelled": True}
-
-        result = await navigate_tree(
-            targetId,
-            {
-                "summarize": read_field(options, "summarize"),
-                "customInstructions": read_field(options, "customInstructions"),
-                "replaceInstructions": read_field(options, "replaceInstructions"),
-                "label": read_field(options, "label"),
-            },
-        )
-        if read_field(result, "cancelled", False):
-            return {"cancelled": True}
-
-        clear = _callable_attr(self.chatContainer, "clear")
-        if clear is not None:
-            clear()
-        self.renderInitialMessages()
-        get_text = _callable_attr(self.editor, "getText")
-        current_text = str(get_text() or "") if get_text is not None else ""
-        editor_text = read_field(result, "editorText")
-        if editor_text and not current_text.strip():
-            self._set_editor_text(str(editor_text))
-        self.showStatus("Navigated to selected point")
-        flush_queue = _callable_attr(self, "flushCompactionQueue")
-        if flush_queue is not None:
-            self._schedule_task(maybe_await(flush_queue({"willRetry": False})))
-        return {"cancelled": False}
-
-
-def _model_argument_completions(session: Any, prefix: str) -> list[dict[str, str]] | None:
-    model_registry = getattr(session, "modelRegistry", None)
-    get_available = _callable_attr(model_registry, "getAvailable")
-    if get_available is None:
-        return None
-    models = get_available() or []
-    if not models:
-        return None
-    items = [
-        {"id": str(read_field(model, "id", "")), "provider": str(read_field(model, "provider", "")), "model": model}
-        for model in models
-    ]
-    filtered = [
-        item
-        for item in items
-        if prefix.lower() in f"{item['id']} {item['provider']} {item['provider']}/{item['id']}".lower()
-    ]
-    if not filtered:
-        return None
-    return [
-        {
-            "value": f"{item['provider']}/{item['id']}",
-            "label": item["id"],
-            "description": item["provider"],
-        }
-        for item in filtered
-    ]
-
-
-def _rename_session_file(session_file_path: str, next_name: str | None) -> None:
-    next_value = (next_name or "").strip()
-    if not next_value:
-        return
-    manager = SessionManager.open(session_file_path)
-    manager.appendSessionInfo(next_value)
+        error = task.exception()
+        if error is not None and not isinstance(error, SystemExit):
+            self.showError(errorMessage(error))
 
 
 __all__ = [
     "InteractiveMode",
     "InteractiveModeOptions",
-    "isApiKeyLoginProvider",
+    "createInteractiveTui",
+    "formatCrashExtensionHint",
+    "formatResumeCommand",
 ]

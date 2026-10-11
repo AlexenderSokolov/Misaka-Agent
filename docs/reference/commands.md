@@ -50,6 +50,11 @@ lists them all.
 | `misaka task add TITLE --to SISTER --body-file FILE` | add a card by hand (`--body TEXT`, `--reviewer`, `--priority`, `--model`, `--needs ID`); the body needs `## acceptance criteria` |
 | `misaka task start ID` | run a ready card in this terminal |
 | `misaka task ID --delete` | delete a card and its history |
+| `misaka mcp add SERVER [-l] -- COMMAND [ARGS...]` | add a process MCP server to `~/.misaka/mcp.json` (`-l`: this project's `.misaka/mcp.json`) |
+| `misaka mcp add SERVER [-l] --url URL` | add a Streamable HTTP MCP server; `misaka mcp --help` lists the options |
+| `misaka mcp remove SERVER [-l]` | remove a server |
+| `misaka mcp list [--json]` | connect the servers of the home and project files and show their state, tools and errors; exits 1 while anything is wrong |
+| `misaka mcp login SERVER [--timeout SECONDS]` / `logout SERVER` | sign in to an OAuth server through the browser, or delete the stored sign-in |
 
 ### Documents and the web
 
@@ -142,7 +147,8 @@ Available in Last Order's window.
 | `/remove [ID]` | remove a Sister (in Last Order's window) |
 | `/board` | the task board of this project |
 | `/agents` | sub-agent types and running sub-agents (in a Sister's window) |
-| `/mcp` | MCP servers and their tools, when any are configured; `/mcp auth SERVER` signs in to one |
+| `/mcp` | manage MCP servers: sign in, reconnect, enable or disable one (everywhere or in this project only), change how the model reaches its tools |
+| `/mcp login [SERVER]` / `logout [SERVER]` / `reconnect [SERVER]` | one of those actions without the menu |
 
 ### Models
 
@@ -197,7 +203,7 @@ Available in Last Order's window.
 |---|---|
 | `/settings` | the settings menu |
 | `/hotkeys` | every keyboard shortcut |
-| `/reload` | reload keybindings, extensions, skills, prompts and themes |
+| `/reload` | reload keybindings, extensions, skills, prompts and themes, and turn on tools newly added to `defaultTools` |
 | `/debug` | write the screen and the conversation to a file, for a bug report |
 | `/lcm-settings [on\|off\|status\|check]` | turn automatic recall from earlier conversations on or off |
 | `/quit` | leave |
@@ -217,24 +223,26 @@ A message that starts with `//` is not treated as a command; it goes to the agen
 |---|---|
 | Enter | send. While the agent is working, your message steers her current turn. |
 | Shift+Enter, Ctrl+J, or `\` then Enter | new line |
-| Alt+Enter | queue a message for when the current turn ends; Alt+Up takes queued messages back |
+| Alt+Enter | queue a message for when the current turn ends; Alt+Up takes queued messages back (Ctrl+Q and Alt+Q on Windows and WSL) |
 | Esc | stop the reply |
 | Esc, Esc (empty box) | open the conversation tree |
 | Ctrl+C | stop the reply, or clear the box. Twice quickly: quit. |
 | Ctrl+D (empty box) | quit |
-| Ctrl+Z | suspend to the background (`fg` brings it back) |
+| Ctrl+Z | suspend to the background (`fg` brings it back); on Windows it undoes the last edit instead |
 | Up (empty box) | your earlier messages |
 | `/` | the command menu |
 | `@` | suggest file names |
 | Tab | complete a path, or accept the suggestion |
-| Ctrl+V | paste an image from the clipboard |
+| Ctrl+V (Alt+V on Windows and WSL) | paste from the clipboard: copied files as their paths (macOS and Windows), else an image as a temporary file, else the text |
 | Shift+Tab | cycle the thinking level |
-| Ctrl+P, Shift+Ctrl+P | next, previous model |
+| Ctrl+P, Shift+Ctrl+P | next, previous model (Shift+Ctrl+P is Alt+P on Windows and WSL) |
 | Ctrl+L | the model selector |
 | Ctrl+O | show or hide tool output |
 | Ctrl+T | show or hide the agent's thinking |
 | Ctrl+G | write the message in your own editor |
-| Ctrl+X | copy the selection, or the last reply |
+| Ctrl+X | copy the selection, or the last reply; on a sign-in screen, the sign-in address |
 
-`/hotkeys` shows the complete list, including your own changes. To change a key, edit
+Windows and WSL get the alternatives because their terminals keep Ctrl+V, Alt+Enter and Shift+Ctrl+P
+for themselves. `/hotkeys` shows the complete list as it applies on this machine, including your own
+changes. To change a key, edit
 `~/.misaka/keybindings.json` and run `/reload`.

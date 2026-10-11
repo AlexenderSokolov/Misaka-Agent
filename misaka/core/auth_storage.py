@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import copy
+import math
 import os
 import random
 import stat
@@ -13,40 +14,41 @@ import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from filelock import FileLock, Timeout
+from pydantic import ValidationError
 
 from misaka.ai.auth.types import (
     ApiKeyCredential as RuntimeApiKeyCredential,
 )
 from misaka.ai.auth.types import (
     AuthOperationOptions,
+    Credential,
     CredentialInfo,
-    CredentialValue,
 )
 from misaka.ai.auth.types import (
     OAuthCredential as RuntimeOAuthCredential,
 )
-from misaka.ai.env_api_keys import find_env_keys, get_env_api_key
-from misaka.ai.utils.abort import race_with_abort_signal
-from misaka.ai.utils.abort import sleep as abortable_sleep
-from misaka.ai.utils.oauth import (
-    OAuthCredentials,
-    _call_refresh_token,
-    getOAuthApiKey,
-    getOAuthProvider,
-    getOAuthProviders,
-    oauthCredentialsExpireSoon,
-)
+from misaka.ai.utils.sleep import sleep as abortable_sleep
 from misaka.config import get_auth_path
 from misaka.core.resolve_config_value import resolveConfigValue
 from misaka.utils import atomic
+from misaka.utils.abort import raceWithAbortSignal
+from misaka.utils.js import (
+    addAbortListener,
+    isNumber,
+    jsonParse,
+    jsonStringify,
+    startTask,
+    throwIfAborted,
+)
 from misaka.utils.paths import (
     file_revision_from_stat,
-    get_file_revision,
-    normalize_path,
+    getFileRevision,
+    normalizePath,
 )
+from misaka.utils.text import stripBom
 from misaka.utils.values import signal_aborted
 
 type ApiKeyCredential = dict[str, Any]
@@ -54,26 +56,11 @@ type OAuthCredential = dict[str, Any]
 type AuthCredential = ApiKeyCredential | OAuthCredential
 type AuthStorageData = dict[str, AuthCredential]
 type FileRevision = tuple[int, int, int, int, int]
-type AuthStatusSource = Literal[
-    "stored",
-    "runtime",
-    "environment",
-    "fallback",
-    "models_json_key",
-    "models_json_command",
-]
 
 
 def _file_revision_from_stat(value: os.stat_result) -> FileRevision:
-    # The same revision get_file_revision reads by path, or the two never match on Windows.
+    # The same revision getFileRevision reads by path, or the two never match on Windows.
     return file_revision_from_stat(value)
-
-
-@dataclass(slots=True)
-class AuthStatus:
-    configured: bool
-    source: AuthStatusSource | None = None
-    label: str | None = None
 
 
 @dataclass(slots=True)
@@ -124,7 +111,7 @@ class AuthStorageBackend:
 
 class FileAuthStorageBackend(AuthStorageBackend):
     def __init__(self, authPath: str | None = None):
-        self.authPath = normalize_path(authPath or get_auth_path())
+        self.authPath = normalizePath(authPath or get_auth_path())
         self._current_revision: FileRevision | None = None
 
     def _lock_path(self) -> str:
@@ -168,34 +155,20 @@ class FileAuthStorageBackend(AuthStorageBackend):
             os.close(fd)
             raise
 
-    def _restrict_file_mode(self, fd: int) -> None:
-        # Windows reports every file as 0o666 and its fchmod (3.13+) refuses a read-only
-        # descriptor; there the user's profile ACL keeps the store private, as for pi.
-        if os.name != "nt" and os.fstat(fd).st_mode & 0o077 and hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-
     def ensureFileExists(self) -> None:
+        # The mode applies only on creation so administrator-managed modes and ACLs remain intact.
         try:
-            fd = self._open_existing()
-        except FileNotFoundError:
-            fd = None
-        else:
-            try:
-                self._restrict_file_mode(fd)               # stores from before 0600 was enforced
-            finally:
-                os.close(fd)
+            os.close(self._open_existing())
             return
+        except FileNotFoundError:
+            pass
 
         target = self._target()
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         try:
             fd = os.open(target, flags, 0o600)
         except FileExistsError:                            # another creator won; trust it only after validation
-            fd = self._open_existing()
-            try:
-                self._restrict_file_mode(fd)
-            finally:
-                os.close(fd)
+            os.close(self._open_existing())
             return
 
         created = None
@@ -250,7 +223,7 @@ class FileAuthStorageBackend(AuthStorageBackend):
         if self._lock_signature() != expected_signature:
             raise RuntimeError("Auth storage lock was compromised")
 
-    def _acquire_lock_sync_with_retry(self) -> FileLock:
+    def acquireLockSyncWithRetry(self) -> FileLock:
         max_attempts = 10
         delay_ms = 20
         last_error: Exception | None = None
@@ -273,49 +246,42 @@ class FileAuthStorageBackend(AuthStorageBackend):
     async def _acquire_lock_async_with_retry(
         self, options: AuthOperationOptions | None = None
     ) -> FileLock:
-        retries = 10
-        factor = 2
-        min_timeout = 0.1
-        max_timeout = 10.0
-
-        last_error: Exception | None = None
-        for attempt in range(retries + 1):
+        """``acquireLockAsync``: retried with backoff until 30 s have passed, as long as another process holds it."""
+        staleMs = 30_000
+        maxDelayMs = 2_000
+        deadline = time.monotonic() * 1000 + staleMs
+        retry = 0
+        while True:
             _throw_if_aborted(options)
             lock = self._create_lock()
             try:
                 lock.acquire(timeout=0)
-                try:
-                    _throw_if_aborted(options)
-                except BaseException:
-                    lock.release()
-                    raise
-                return lock
-            except Exception as error:
+            except Timeout:
                 _throw_if_aborted(options)
-                if not isinstance(error, Timeout):
+                remainingMs = deadline - time.monotonic() * 1000
+                if remainingMs <= 0:
                     raise
-                last_error = error
-                if attempt == retries:
-                    raise
-                delay = min(min_timeout * (factor**attempt), max_timeout)
-                await abortable_sleep(
-                    delay * (1 + random.random()) * 1000,
-                    options.signal if options is not None else None,
-                )
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Failed to acquire auth storage lock")
+                baseDelayMs = min(10 * 2**retry, maxDelayMs / 2)
+                retry += 1
+                delayMs = min(round(baseDelayMs * (1 + random.random())), remainingMs)
+                await abortable_sleep(delayMs, options.signal if options is not None else None)
+                continue
+            try:
+                _throw_if_aborted(options)
+            except BaseException:
+                lock.release()
+                raise
+            return lock
 
     def withLock(self, fn: Callable[[str | None], LockResult]) -> Any:
         self.ensureParentDir()
-        lock = self._acquire_lock_sync_with_retry()
+        lock = self.acquireLockSyncWithRetry()
         try:
             self.ensureFileExists()
             current, self._current_revision = self._read_file()
             outcome = fn(current)
             if outcome.next is not None:
-                atomic.write_text(self._target(), outcome.next, mode=0o600)
+                atomic.write_text(self._target(), outcome.next)
             if outcome.publish is not None:
                 outcome.publish()
             return outcome.result
@@ -344,7 +310,7 @@ class FileAuthStorageBackend(AuthStorageBackend):
             self._assert_lock_uncompromised(expected_signature)
             _throw_if_aborted(options)
             if outcome.next is not None:
-                atomic.write_text(self._target(), outcome.next, mode=0o600)
+                atomic.write_text(self._target(), outcome.next)
             self._assert_lock_uncompromised(expected_signature)
             if outcome.publish is not None:
                 outcome.publish()
@@ -360,6 +326,7 @@ class FileAuthStorageBackend(AuthStorageBackend):
 class InMemoryAuthStorageBackend(AuthStorageBackend):
     def __init__(self) -> None:
         self.value: str | None = None
+        self._asyncChain: asyncio.Future[Any] | None = None
 
     def withLock(self, fn: Callable[[str | None], LockResult]) -> Any:
         outcome = fn(self.value)
@@ -374,7 +341,12 @@ class InMemoryAuthStorageBackend(AuthStorageBackend):
         fn: Callable[[str | None], Awaitable[LockResult]],
         options: AuthOperationOptions | None = None,
     ) -> Any:
+        previous = self._asyncChain
+
         async def operation() -> Any:
+            # `await previous.catch(() => {})`: the chain moves on whether the previous operation failed or not.
+            if previous is not None and not previous.done():
+                await asyncio.wait([previous])
             _throw_if_aborted(options)
             outcome = await fn(self.value)
             _throw_if_aborted(options)
@@ -384,10 +356,14 @@ class InMemoryAuthStorageBackend(AuthStorageBackend):
                 outcome.publish()
             return outcome.result
 
-        return await race_with_abort_signal(
-            operation(), options.signal if options is not None else None
-        )
+        task = startTask(operation())
+        self._asyncChain = task
+        _observe(task)
+        return await raceWithAbortSignal(task, options.signal if options is not None else None)
 
+
+def _observe(task: asyncio.Future[Any]) -> None:
+    task.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
 
 async def _with_lock_async(
     backend: AuthStorageBackend,
@@ -397,10 +373,6 @@ async def _with_lock_async(
     if options is None:
         return await backend.withLockAsync(fn)
     return await backend.withLockAsync(fn, options)
-
-
-def _coerce_oauth_credentials(value: dict[str, Any]) -> OAuthCredentials:
-    return OAuthCredentials.model_validate({key: item for key, item in value.items() if key != "type"})
 
 
 def _coerce_storage_object(value: Any) -> dict[str, Any]:
@@ -425,8 +397,6 @@ def oauth_account_key(provider: str, account: str | None = None) -> str:
 class AuthStorage:
     def __init__(self, storage: AuthStorageBackend):
         self.data: Any = {}
-        self.runtimeOverrides: dict[str, str] = {}
-        self.fallbackResolver: Callable[[str], str | None] | None = None
         self.loadError: Exception | None = None
         self.storage = storage
         self._auth_path = storage.authPath if isinstance(storage, FileAuthStorageBackend) else None
@@ -448,22 +418,13 @@ class AuthStorage:
     @classmethod
     def inMemory(cls, data: AuthStorageData | None = None) -> AuthStorage:
         storage = InMemoryAuthStorageBackend()
-        storage.withLock(lambda _current: LockResult(result=None, next=json.dumps(data or {}, indent=2)))
+        storage.withLock(lambda _current: LockResult(result=None, next=jsonStringify(data or {}, 2)))
         return cls.fromStorage(storage)
 
-    def setRuntimeApiKey(self, provider: str, apiKey: str) -> None:
-        self.runtimeOverrides[provider] = apiKey
-
-    def removeRuntimeApiKey(self, provider: str) -> None:
-        self.runtimeOverrides.pop(provider, None)
-
-    def setFallbackResolver(self, resolver: Callable[[str], str | None]) -> None:
-        self.fallbackResolver = resolver
-
-    def _parse_storage_data(self, content: str | None) -> AuthStorageData:
+    def parseStorageData(self, content: str | None) -> AuthStorageData:
         if not content:
             return {}
-        return json.loads(content.removeprefix("\ufeff"))
+        return jsonParse(stripBom(content))
 
     def reload(self) -> None:
         content: str | None = None
@@ -484,7 +445,7 @@ class AuthStorage:
 
         try:
             self.storage.withLock(capture)
-            data = self._parse_storage_data(content)
+            data = self.parseStorageData(content)
             if self._auth_path is None:
                 self.data = data
                 self.loadError = None
@@ -527,7 +488,7 @@ class AuthStorage:
         with self._read_state_lock:
             if generation < self._read_applied_generation:
                 return self.data
-            current_revision = get_file_revision(self._auth_path)
+            current_revision = getFileRevision(self._auth_path)
             self._read_applied_generation = generation
             if revision != current_revision:
                 if current_revision is not None and self._file_revision == current_revision:
@@ -555,11 +516,11 @@ class AuthStorage:
             self._file_revision = None
             self.loadError = None
 
-    async def _reload_from_storage_async(
+    async def reloadFromStorageAsync(
         self,
     ) -> tuple[AuthStorageData, FileRevision | None]:
         async def capture(current: str | None) -> LockResult:
-            data = self._parse_storage_data(current)
+            data = self.parseStorageData(current)
             revision = (
                 self.storage._current_revision
                 if isinstance(self.storage, FileAuthStorageBackend)
@@ -580,17 +541,21 @@ class AuthStorage:
             reloads = _auth_file_reloads.setdefault(loop, {})
             reload = reloads.get(self._auth_path)
             if reload is None:
-                reload = _AuthFileReload(loop.create_task(self._reload_from_storage_async()))
+                reload = _AuthFileReload(loop.create_task(self.reloadFromStorageAsync()))
                 reload.task.add_done_callback(
                     lambda task: task.exception() if not task.cancelled() else None
                 )
                 reloads[self._auth_path] = reload
             reload.readers += 1
 
-        cancel_reload = False
-        try:
-            return await race_with_abort_signal(asyncio.shield(reload.task), signal)
-        finally:
+        left = False
+
+        def leave() -> None:
+            nonlocal left
+            if left:
+                return
+            left = True
+            cancel_reload = False
             with _auth_file_reloads_lock:
                 reload.readers -= 1
                 reloads = _auth_file_reloads.get(loop)
@@ -602,6 +567,17 @@ class AuthStorage:
             if cancel_reload:
                 reload.task.cancel()
 
+        # MISAKA fork: pi's reader leaves in the `finally` of its await, which on an abort runs as a microtask, before
+        # any timer -- so the last reader stops the reload before its lock retry can fire again. asyncio has no
+        # microtasks; the reader leaves the moment its signal aborts instead.
+        removeAbortListener = addAbortListener(signal, leave) if signal is not None else None
+        try:
+            return await raceWithAbortSignal(asyncio.shield(reload.task), signal)
+        finally:
+            if removeAbortListener is not None:
+                removeAbortListener()
+            leave()
+
     async def readLatestData(
         self, options: AuthOperationOptions | None = None
     ) -> AuthStorageData:
@@ -611,10 +587,10 @@ class AuthStorage:
             return self.data
 
         generation = self._reserve_read_generation()
-        revision = get_file_revision(self._auth_path)
+        revision = getFileRevision(self._auth_path)
         if revision is not None:
             with self._read_state_lock:
-                if revision == self._file_revision and revision == get_file_revision(
+                if revision == self._file_revision and revision == getFileRevision(
                     self._auth_path
                 ):
                     self._read_applied_generation = max(
@@ -638,305 +614,14 @@ class AuthStorage:
         _throw_if_aborted(options)
         return data
 
-    def persistProviderChange(
-        self, provider: str, credential: AuthCredential | None
-    ) -> None:
-        """One provider's change, written through the lock. A store that could not be read is never
-        overwritten, and a failed write raises: the caller reports it instead of saying "saved"."""
-        if self.loadError is not None:
-            raise RuntimeError(f"the credential store could not be read ({self.loadError}); not overwriting it")
-
-        publish: Callable[[], None] | None = None
-
-        def persist(current: str | None) -> LockResult:
-            nonlocal publish
-            current_data = _coerce_storage_object(self._parse_storage_data(current))
-            merged = dict(current_data)
-            if credential is None:
-                merged.pop(provider, None)
-            else:
-                merged[provider] = credential
-            publish = _once_callback(lambda: self._replace_cached_data(merged))
-            return LockResult(
-                result=None,
-                next=json.dumps(merged, indent=2),
-                publish=publish,
-            )
-
-        self.storage.withLock(persist)
-        if publish is not None:
-            publish()  # Backends predating the locked publish hook still update the snapshot.
-
-    def get(self, provider: str) -> AuthCredential | None:
-        return _coerce_storage_object(self.data).get(provider)
-
-    def set(self, provider: str, credential: AuthCredential) -> None:
-        self.persistProviderChange(provider, credential)
-
-    def remove(self, provider: str) -> None:
-        self.persistProviderChange(provider, None)
-
-    def list(self) -> list[str]:
-        return [key for key in _coerce_storage_object(self.data) if key != '_credential_pools']
-
-    def has(self, provider: str) -> bool:
-        return provider in _coerce_storage_object(self.data)
-
-    def hasAuth(self, provider: str) -> bool:
-        if provider in self.runtimeOverrides:
-            return True
-        if _coerce_storage_object(self.data).get(provider):
-            return True
-        if find_env_keys(provider) or get_env_api_key(provider):
-            return True
-        return bool(self.fallbackResolver and self.fallbackResolver(provider))
-
-    def getAuthStatus(self, provider: str) -> AuthStatus:
-        # pi model-runtime.ts:561-571: every branch that finds a usable credential reports
-        # `configured: true`; only the no-credential fall-through is false. Reporting `False`
-        # alongside a `source` contradicted `hasAuth` right above and made env-var-only setups
-        # look unconfigured to extensions.
-        # The runtime override is checked first, as pi does and as `getApiKey` below already
-        # did: with both `--api-key` and a stored credential present the request uses the
-        # runtime key, so reporting "stored" named the wrong source.
-        if provider in self.runtimeOverrides:
-            return AuthStatus(configured=True, source="runtime", label="--api-key")
-        if _coerce_storage_object(self.data).get(provider):
-            return AuthStatus(configured=True, source="stored")
-        env_keys = find_env_keys(provider)
-        if env_keys and env_keys[0]:
-            return AuthStatus(configured=True, source="environment", label=env_keys[0])
-        if self.fallbackResolver and self.fallbackResolver(provider):
-            return AuthStatus(configured=True, source="fallback", label="custom provider config")
-        return AuthStatus(configured=False)
-
-    def getAll(self) -> AuthStorageData:
-        return dict(_coerce_storage_object(self.data))
-
-    async def login(self, providerId: str, callbacks: Any, *, account: str | None = None) -> None:
-        key = oauth_account_key(providerId, account)
-        provider = getOAuthProvider(providerId)
-        if provider is None:
-            raise RuntimeError(f"Unknown OAuth provider: {providerId}")
-        credentials = await provider.login(callbacks)
-        self.set(key, {"type": "oauth", **credentials.model_dump(exclude_none=False)})
-
-    def logout(self, provider: str) -> None:
-        self.remove(provider)
-
-    @staticmethod
-    def _oauthExpiresSoon(credentials: OAuthCredentials) -> bool:
-        """Whether an OAuth token is inside pi's five-minute refresh window.
-
-        pi auth/resolve.ts DEFAULT_OAUTH_MINIMUM_VALIDITY_MS: refreshing only once the
-        token has already expired hands a token to a request that may outlive it, and
-        every in-flight request then fails together. The optimistic check, the
-        authoritative one under the lock and ``getOAuthApiKey`` itself all use this one
-        window -- a narrower check anywhere in the chain would make the lock decide to
-        refresh and the refresher decline to.
-        """
-        return oauthCredentialsExpireSoon(credentials)
-
-    async def refreshOAuthTokenWithLock(
-        self,
-        providerId: str,
-        options: AuthOperationOptions | None = None,
-        *,
-        rejected_api_key: str | None = None,
-        account: str | None = None,
-    ) -> dict[str, Any] | None:
-        _throw_if_aborted(options)
-        credential_key = oauth_account_key(providerId, account)
-        provider = getOAuthProvider(providerId)
-        if provider is None:
-            return None
-        publish: Callable[[], None] | None = None
-
-        async def refresh(current: str | None) -> LockResult:
-            nonlocal publish
-            current_data_raw = self._parse_storage_data(current)
-            current_data = _coerce_storage_object(current_data_raw)
-            credential = current_data.get(credential_key)
-            if not isinstance(credential, dict) or credential.get("type") != "oauth":
-                publish = _once_callback(
-                    lambda: self._replace_cached_data(current_data_raw)
-                )
-                return LockResult(
-                    result=None,
-                    publish=publish,
-                )
-
-            oauth_credential = _coerce_oauth_credentials(credential)
-            force = (
-                rejected_api_key is not None
-                and provider.getApiKey(oauth_credential) == rejected_api_key
-            )
-            if not force and not self._oauthExpiresSoon(oauth_credential):
-                publish = _once_callback(
-                    lambda: self._replace_cached_data(current_data_raw)
-                )
-                return LockResult(
-                    result={
-                        "apiKey": provider.getApiKey(oauth_credential),
-                        "newCredentials": oauth_credential,
-                    },
-                    publish=publish,
-                )
-
-            oauth_credentials: dict[str, OAuthCredentials] = {}
-            for key, value in current_data.items():
-                if isinstance(value, dict) and value.get("type") == "oauth":
-                    oauth_credentials[key] = _coerce_oauth_credentials(value)
-
-            # A 401 refresh uses the same authoritative read/write lock as expiry.
-            # A logout or replacement login that won the lock must never be overwritten
-            # with credentials captured before the request.
-            if force or account is not None:
-                credentials = await _call_refresh_token(provider.refreshToken, oauth_credential, options.signal if options else None)
-                _throw_if_aborted(options)
-                refreshed = {"apiKey": provider.getApiKey(credentials), "newCredentials": credentials}
-            else:
-                refreshed = await getOAuthApiKey(
-                    providerId,
-                    oauth_credentials,
-                    options.signal if options is not None else None,
-                )
-            if refreshed is None:
-                publish = _once_callback(
-                    lambda: self._replace_cached_data(current_data_raw)
-                )
-                return LockResult(
-                    result=None,
-                    publish=publish,
-                )
-
-            merged = dict(current_data)
-            merged[credential_key] = {
-                "type": "oauth",
-                **refreshed["newCredentials"].model_dump(exclude_none=False),
-            }
-            publish = _once_callback(lambda: self._replace_cached_data(merged))
-            return LockResult(
-                result=refreshed,
-                next=json.dumps(merged, indent=2),
-                publish=publish,
-            )
-
-        result = await _with_lock_async(self.storage, refresh, options)
-        if publish is not None:
-            publish()
-        return result
-
-    async def getApiKey(self, providerId: str, options: dict[str, Any] | None = None) -> str | None:
-        signal = options.get("signal") if options is not None else None
-        operation_options = (
-            AuthOperationOptions(signal=signal) if signal is not None else None
-        )
-        _throw_if_aborted(operation_options)
-        runtime_key = self.runtimeOverrides.get(providerId)
-        if runtime_key:
-            return runtime_key
-
-        credential = _coerce_storage_object(
-            await self.readLatestData(operation_options)
-        ).get(providerId)
-        if isinstance(credential, dict) and credential.get("type") == "api_key":
-            key = credential.get("key")
-            return (
-                resolveConfigValue(key, credential.get("env"))
-                if isinstance(key, str)
-                else None
-            )
-
-        if isinstance(credential, dict) and credential.get("type") == "oauth":
-            provider = getOAuthProvider(providerId)
-            if provider is None:
-                return None
-
-            oauth_credential = _coerce_oauth_credentials(credential)
-            needs_refresh = self._oauthExpiresSoon(oauth_credential)
-            if needs_refresh:
-                try:
-                    refreshed = await race_with_abort_signal(
-                        self.refreshOAuthTokenWithLock(
-                            providerId, operation_options
-                        ),
-                        signal,
-                    )
-                    if refreshed is not None:
-                        return refreshed["apiKey"]
-                except Exception:  # noqa: BLE001 - another process may have refreshed it meanwhile
-                    _throw_if_aborted(operation_options)
-                    # `reload()` is the synchronous path: `time.sleep` lock retries (up to
-                    # ~200ms) plus a blocking file read, all on the event loop, and several
-                    # requests hit this together when a token expires. The async read above
-                    # (:797) is the same snapshot without blocking the loop.
-                    updated = _coerce_storage_object(
-                        await self.readLatestData(operation_options)
-                    ).get(providerId)
-                    if isinstance(updated, dict) and updated.get("type") == "oauth":
-                        updated_credentials = _coerce_oauth_credentials(updated)
-                        if not self._oauthExpiresSoon(updated_credentials):
-                            return provider.getApiKey(updated_credentials)
-                    return None
-            return provider.getApiKey(oauth_credential)
-
-        env_key = get_env_api_key(providerId)
-        if env_key:
-            return env_key
-
-        include_fallback = True
-        if options is not None and options.get("includeFallback") is False:
-            include_fallback = False
-        if include_fallback and self.fallbackResolver is not None:
-            return self.fallbackResolver(providerId) or None
-        return None
-
-    def getOAuthProviders(self) -> list[Any]:
-        return getOAuthProviders()
-
-
-def _throw_if_aborted(options: AuthOperationOptions | None) -> None:
-    if options is not None and signal_aborted(options.signal):
-        raise RuntimeError("Request was aborted")
-    task = asyncio.current_task()
-    if task is not None and task.cancelling():
-        raise asyncio.CancelledError
-
-
-def _to_runtime_credential(
-    value: Any, *, resolve_api_key: bool = True
-) -> CredentialValue | None:
-    if not isinstance(value, dict):
-        return None
-    if value.get("type") == "api_key":
-        credential = RuntimeApiKeyCredential.model_validate(value)
-        if credential.key is None or not resolve_api_key:
-            return credential
-        resolved = resolveConfigValue(credential.key, credential.env)
-        if resolved is None:
-            raise ValueError("Stored API key could not be resolved")
-        return credential.model_copy(update={"key": resolved})
-    if value.get("type") == "oauth":
-        return RuntimeOAuthCredential.model_validate(value)
-    return None
-
-
-class AuthStorageCredentialStore:
-    """Expose the legacy coding-agent store through pi-ai's CredentialStore contract."""
-
-    def __init__(self, storage: AuthStorage) -> None:
-        self._storage = storage
+    # CredentialStore.
 
     async def read(
         self, providerId: str, options: AuthOperationOptions | None = None
-    ) -> CredentialValue | None:
+    ) -> Credential | None:
         _throw_if_aborted(options)
-        runtime_key = self._storage.runtimeOverrides.get(providerId)
-        if runtime_key:
-            return RuntimeApiKeyCredential(key=runtime_key)
         credential = _to_runtime_credential(
-            _coerce_storage_object(await self._storage.readLatestData(options)).get(providerId)
+            _coerce_storage_object(await self.readLatestData(options)).get(providerId)
         )
         _throw_if_aborted(options)
         return credential
@@ -945,31 +630,28 @@ class AuthStorageCredentialStore:
         self, options: AuthOperationOptions | None = None
     ) -> list[CredentialInfo]:
         _throw_if_aborted(options)
-        latest = await self._storage.readLatestData(options)
-        entries = {
-            providerId: CredentialInfo(providerId=providerId, type=credential.type)
+        latest = await self.readLatestData(options)
+        # pi lists every record by its type, readable or not, so it can still be logged out.
+        entries = [
+            CredentialInfo(providerId=providerId, type=value["type"])
             for providerId, value in _coerce_storage_object(latest).items()
-            if (
-                credential := _to_runtime_credential(value, resolve_api_key=False)
-            ) is not None
-        }
-        for providerId in self._storage.runtimeOverrides:
-            entries[providerId] = CredentialInfo(providerId=providerId, type="api_key")
+            if isinstance(value, dict) and value.get("type") in ("api_key", "oauth")
+        ]
         _throw_if_aborted(options)
-        return list(entries.values())
+        return entries
 
     async def modify(
         self,
         providerId: str,
-        fn: Callable[[CredentialValue | None], Awaitable[CredentialValue | None]],
+        fn: Callable[[Credential | None], Awaitable[Credential | None]],
         options: AuthOperationOptions | None = None,
-    ) -> CredentialValue | None:
+    ) -> Credential | None:
         _throw_if_aborted(options)
         publish: Callable[[], None] | None = None
 
         async def update(current: str | None) -> LockResult:
             nonlocal publish
-            current_data = _coerce_storage_object(self._storage._parse_storage_data(current))
+            current_data = _coerce_storage_object(self.parseStorageData(current))
             produced = await fn(
                 _to_runtime_credential(
                     current_data.get(providerId), resolve_api_key=False
@@ -978,7 +660,7 @@ class AuthStorageCredentialStore:
             _throw_if_aborted(options)
             if produced is None:
                 publish = _once_callback(
-                    lambda: self._storage._replace_cached_data(current_data)
+                    lambda: self._replace_cached_data(current_data)
                 )
                 return LockResult(
                     result=_to_runtime_credential(
@@ -988,18 +670,18 @@ class AuthStorageCredentialStore:
                 )
             latest_data = {
                 **current_data,
-                providerId: produced.model_dump(exclude_none=False),
+                providerId: _storedCredential(produced),
             }
             publish = _once_callback(
-                lambda: self._storage._replace_cached_data(latest_data)
+                lambda: self._replace_cached_data(latest_data)
             )
             return LockResult(
                 result=produced,
-                next=json.dumps(latest_data, indent=2),
+                next=jsonStringify(latest_data, 2),
                 publish=publish,
             )
 
-        result = await _with_lock_async(self._storage.storage, update, options)
+        result = await _with_lock_async(self.storage, update, options)
         if publish is not None:
             publish()
         return result
@@ -1012,35 +694,150 @@ class AuthStorageCredentialStore:
 
         async def remove(current: str | None) -> LockResult:
             nonlocal publish
-            latest_data = _coerce_storage_object(self._storage._parse_storage_data(current))
+            latest_data = _coerce_storage_object(self.parseStorageData(current))
             latest_data.pop(providerId, None)
             _throw_if_aborted(options)
 
-            def publish_snapshot() -> None:
-                self._storage._replace_cached_data(latest_data)
-                self._storage.runtimeOverrides.pop(providerId, None)
-
-            publish = _once_callback(publish_snapshot)
+            publish = _once_callback(lambda: self._replace_cached_data(latest_data))
             return LockResult(
                 result=None,
-                next=json.dumps(latest_data, indent=2),
+                next=jsonStringify(latest_data, 2),
                 publish=publish,
             )
 
-        await _with_lock_async(self._storage.storage, remove, options)
+        await _with_lock_async(self.storage, remove, options)
         if publish is not None:
             publish()
+
+
+def _throw_if_aborted(options: AuthOperationOptions | None) -> None:
+    if options is not None:
+        throwIfAborted(options.signal)
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
+
+
+def _storedCredential(credential: Credential) -> AuthCredential:
+    """The record ``JSON.stringify`` writes for a credential: the fields it was given, none it was left without."""
+    return {"type": credential.type, **credential.model_dump(exclude_unset=True)}
+
+def _to_runtime_credential(
+    value: Any, *, resolve_api_key: bool = True
+) -> Credential | None:
+    if not isinstance(value, dict):
+        return None
+    # MISAKA fork: pi hands the stored object on as it is and its readers take the fields
+    # they know. The credential models here check them, so an api_key record keeps only the
+    # fields they declare, and a record they still cannot read is no credential -- not an
+    # error that stops every provider's availability, or the login that would replace it.
+    try:
+        if value.get("type") == "api_key":
+            credential = RuntimeApiKeyCredential.model_validate(
+                {key: item for key, item in value.items() if key in RuntimeApiKeyCredential.model_fields}
+            )
+            if credential.key is None or not resolve_api_key:
+                return credential
+            # pi auth-storage.ts `read`: an unresolvable key reads as no key, so the provider
+            # reports unconfigured instead of failing every availability check.
+            return credential.model_copy(update={"key": resolveConfigValue(credential.key, credential.env)})
+        if value.get("type") == "oauth":
+            return RuntimeOAuthCredential.model_validate(value)
+    except ValidationError:
+        return None
+    return None
+
+
+
+class ReadOnlyAuthStorage:
+    """A CredentialStore that reads auth.json once and never writes it (``ReadOnlyAuthStorage``)."""
+
+    def __init__(self, authPath: str | None = None) -> None:
+        self._authPath = FileAuthStorageBackend(authPath).authPath
+        self._data: dict[str, Any] | None = None
+
+    def _load(self) -> dict[str, Any]:
+        if self._data is not None:
+            return self._data
+        try:
+            with open(self._authPath, encoding="utf-8", errors="replace") as file:
+                parsed = jsonParse(stripBom(file.read()))
+        except FileNotFoundError:
+            self._data = {}
+            return self._data
+        except Exception as error:
+            raise RuntimeError(f"Failed to read auth.json: {error}") from error
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Invalid auth.json: expected an object")  # noqa: TRY004 - upstream throws Error
+        for providerId, credential in parsed.items():
+            if not isinstance(credential, dict):
+                raise RuntimeError(f'Invalid auth.json credential for provider "{providerId}"')  # noqa: TRY004
+            if credential.get("type") == "api_key":
+                env = credential.get("env")
+                validKey = "key" not in credential or isinstance(credential["key"], str)
+                validEnv = "env" not in credential or (
+                    isinstance(env, dict) and all(isinstance(entry, str) for entry in env.values())
+                )
+                if validKey and validEnv:
+                    continue
+            elif (
+                credential.get("type") == "oauth"
+                and isinstance(credential.get("access"), str)
+                and isinstance(credential.get("refresh"), str)
+                and isNumber(credential.get("expires"))
+                and math.isfinite(credential["expires"])
+            ):
+                continue
+            raise RuntimeError(f'Invalid auth.json credential for provider "{providerId}"')
+        self._data = parsed
+        return self._data
+
+    async def read(self, providerId: str, options: AuthOperationOptions | None = None) -> Credential | None:
+        _throw_if_aborted(options)
+        credential = self._load().get(providerId)
+        _throw_if_aborted(options)
+        return _to_runtime_credential(copy.deepcopy(credential)) if credential else None
+
+    async def list(self, options: AuthOperationOptions | None = None) -> list[CredentialInfo]:
+        _throw_if_aborted(options)
+        credentials = [
+            CredentialInfo(providerId=providerId, type=credential["type"]) for providerId, credential in self._load().items()
+        ]
+        _throw_if_aborted(options)
+        return credentials
+
+    async def modify(
+        self,
+        providerId: str,
+        fn: Callable[[Credential | None], Awaitable[Credential | None]],
+        options: AuthOperationOptions | None = None,
+    ) -> Credential | None:
+        raise RuntimeError("Read-only credential storage cannot modify auth.json")
+
+    async def delete(self, providerId: str, options: AuthOperationOptions | None = None) -> None:
+        raise RuntimeError("Read-only credential storage cannot modify auth.json")
+
+
+def readStoredCredential(providerId: str, authPath: str | None = None) -> AuthCredential | None:
+    """One-off synchronous read of a stored credential from an auth.json file, without instantiating a store or
+    resolving configured key values."""
+    try:
+        with open(FileAuthStorageBackend(authPath).authPath, encoding="utf-8", errors="replace") as file:
+            data = jsonParse(stripBom(file.read()))
+        return data.get(providerId) if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001 - upstream `catch { return undefined; }`
+        return None
 
 
 __all__ = [
     "ApiKeyCredential",
     "AuthCredential",
-    "AuthStatus",
     "AuthStorage",
     "AuthStorageBackend",
-    "AuthStorageCredentialStore",
     "AuthStorageData",
     "FileAuthStorageBackend",
     "InMemoryAuthStorageBackend",
     "OAuthCredential",
+    "ReadOnlyAuthStorage",
+    "readStoredCredential",
 ]

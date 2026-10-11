@@ -4,36 +4,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__all__ = [
-    "ANTHROPIC_SUBSCRIPTION_AUTH_WARNING",
-    "InteractiveMode",
-    "is_anthropic_subscription_auth_key",
-]
+__all__ = ["InteractiveMode"]
 
 if TYPE_CHECKING:
-    from misaka.ui.tui.interactive.interactive_mode import (
-        ANTHROPIC_SUBSCRIPTION_AUTH_WARNING,
-        InteractiveMode,
-        is_anthropic_subscription_auth_key,
-    )
+    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
 
 
 def __getattr__(name: str) -> Any:
     if name not in __all__:
         raise AttributeError(name)
 
-    from misaka.ui.tui.interactive.interactive_mode import (
-        ANTHROPIC_SUBSCRIPTION_AUTH_WARNING,
-        InteractiveMode,
-        is_anthropic_subscription_auth_key,
-    )
+    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
 
-    exports = {
-        "ANTHROPIC_SUBSCRIPTION_AUTH_WARNING": ANTHROPIC_SUBSCRIPTION_AUTH_WARNING,
-        "InteractiveMode": InteractiveMode,
-        "is_anthropic_subscription_auth_key": is_anthropic_subscription_auth_key,
-    }
-    return exports[name]
+    return InteractiveMode
 
 
 def __dir__() -> list[str]:

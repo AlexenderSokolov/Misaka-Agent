@@ -7,21 +7,19 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 from misaka.agent.agent import Agent
+from misaka.agent.stream_fn import setDefaultStreamFn
 from misaka.agent.types import AgentMessage, ThinkingLevel
-from misaka.ai.auth.resolve import AuthResolutionOverrides
-from misaka.ai.models import clamp_thinking_level
+from misaka.ai.compat import streamSimple
+from misaka.ai.models import clampThinkingLevel
 from misaka.ai.types import (
     Model,
-    ProviderStreamOptions,
     TextContent,
     validate_message,
 )
-from misaka.ai.utils.headers import provider_headers_to_record
 from misaka.config import get_agent_dir
 from misaka.core.agent_session import AgentSession
-from misaka.core.auth_guidance import format_no_models_available_message
-from misaka.core.auth_storage import AuthStorage
-from misaka.core.cache_warmer import CacheWarmer, CacheWarmingRequest
+from misaka.core.auth_guidance import formatNoModelsAvailableMessage
+from misaka.core.cache_warmer import CacheWarmer, CacheWarmRequest
 from misaka.core.defaults import DEFAULT_THINKING_LEVEL
 from misaka.core.extensions import (
     ExtensionAPI,
@@ -35,31 +33,44 @@ from misaka.core.extensions import (
     ToolDefinition,
 )
 from misaka.core.http_dispatcher import applyHttpProxySettings
+from misaka.core.mcp_servers import createToolNameMatcher
 from misaka.core.messages import convertToLlm
-from misaka.core.model_registry import ModelRegistry
 from misaka.core.model_resolver import findInitialModel
+from misaka.core.model_runtime import ModelRuntime
 from misaka.core.prompt_templates import PromptTemplate
-from misaka.core.provider_attribution import merge_provider_attribution_headers
+from misaka.core.provider_attribution import mergeProviderAttributionHeaders
 from misaka.core.resource_loader import DefaultResourceLoader, ResourceLoader
-from misaka.core.session_manager import SessionManager, get_default_session_dir
-from misaka.core.settings_manager import DEFAULT_TOOL_NAMES, SettingsManager
+from misaka.core.session_manager import SessionManager, getDefaultSessionDir
+from misaka.core.settings_manager import (
+    DEFAULT_TOOL_NAMES,
+    SettingsManager,
+    applyToolModifiers,
+    getToolListError,
+    isToolModifier,
+)
 from misaka.core.timings import time
 from misaka.core.tools import (
     Tool,
-    create_bash_tool,
-    create_coding_tools,
-    create_edit_tool,
-    create_find_tool,
-    create_grep_tool,
-    create_ls_tool,
-    create_powershell_tool,
-    create_read_only_tools,
-    create_read_tool,
-    create_write_tool,
-    with_file_mutation_queue,
+    createBashTool,
+    createCodingTools,
+    createEditTool,
+    createFindTool,
+    createGrepTool,
+    createLsTool,
+    createPowerShellTool,
+    createReadOnlyTools,
+    createReadTool,
+    createWriteTool,
+    withFileMutationQueue,
 )
-from misaka.utils.paths import resolve_path
+from misaka.core.virtual_models import getBranchSelection
+from misaka.utils.paths import resolvePath
 from misaka.utils.values import read_field
+
+# Preserve the pre-0.81 fallback for extensions that construct Agent instances
+# or invoke low-level agent loops without supplying streamFn. Agent core remains
+# provider-agnostic and does not import pi-ai/compat itself.
+setDefaultStreamFn(streamSimple)
 
 if TYPE_CHECKING:
     from misaka.core.agent_session_runtime import (
@@ -100,13 +111,25 @@ class ScopedModel(TypedDict):
 class CreateAgentSessionOptions(TypedDict, total=False):
     cwd: str
     agentDir: str
-    authStorage: AuthStorage
-    modelRegistry: ModelRegistry
+    modelRuntime: ModelRuntime
     model: Model[Any]
     thinkingLevel: ThinkingLevel
     scopedModels: list[ScopedModel]
     noTools: Literal["all", "builtin"]
+    # Optional allowlist of tool names or patterns, where `*` matches any characters.
+    #
+    # When omitted, the resolved `defaultTools` setting gives the initial selection when configured.
+    # Otherwise the default built-in tools are enabled. Extension/custom tools remain enabled unless
+    # `noTools` changes that default. When provided, only matching tools are enabled. MCP tools stay
+    # registered for codemode and tool search unless an entry starts with `mcp__`; then only matching
+    # MCP tools are kept. An empty list, like `noTools: "all"`, disables MCP tools too.
+    #
+    # A list of only `+name` and `-name` entries is not an allowlist: it adds tools to or removes them
+    # from the default selection, like the `defaultTools` setting. These entries take exact names.
+    # Mixing them with plain entries throws.
     tools: list[str]
+    # Optional denylist of tool names or patterns to disable. Applies after `tools` when both are
+    # provided, MCP tools included.
     excludeTools: list[str]
     customTools: list[ToolDefinition[Any, Any]]
     parts: list[Any]
@@ -126,21 +149,21 @@ class CreateAgentSessionResult(_CreateAgentSessionResultRequired, total=False):
     modelFallbackMessage: str
 
 
-def _get_default_agent_dir() -> str:
+def getDefaultAgentDir() -> str:
     return get_agent_dir()
 
 
-async def create_agent_session(options: CreateAgentSessionOptions | None = None) -> CreateAgentSessionResult:
+async def createAgentSession(options: CreateAgentSessionOptions | None = None) -> CreateAgentSessionResult:
     resolved_options = dict(options or {})
     explicit_session_manager = resolved_options.get("sessionManager")
     cwd_option = resolved_options.get("cwd", None)
-    cwd = resolve_path(cwd_option if cwd_option is not None else (
+    cwd = resolvePath(cwd_option if cwd_option is not None else (
         explicit_session_manager.getCwd() if explicit_session_manager else os.getcwd()
     ))
     agent_dir = (
-        resolve_path(resolved_options["agentDir"])
+        resolvePath(resolved_options["agentDir"])
         if resolved_options.get("agentDir")
-        else _get_default_agent_dir()
+        else getDefaultAgentDir()
     )
     resource_loader = resolved_options.get("resourceLoader")
 
@@ -150,17 +173,18 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
 
     custom_dir = resolved_options.get("agentDir")
     auth_path = str(home.path("auth", agent_dir)) if custom_dir else None
-    models_path = str(home.path("models", agent_dir)) if custom_dir else None
-    auth_storage = resolved_options.get("authStorage") or AuthStorage.create(auth_path)
+    models_path = str(home.path("models", agent_dir if custom_dir else None))
     settings_manager = resolved_options.get("settingsManager") or SettingsManager.create(cwd, agent_dir)
     applyHttpProxySettings(settings_manager.getGlobalSettings().get("httpProxy"))
-    model_registry = resolved_options.get("modelRegistry") or ModelRegistry.create(auth_storage, models_path)
+    model_runtime = resolved_options.get("modelRuntime") or await ModelRuntime.create(
+        authPath=auth_path, modelsPath=models_path
+    )
     if resolved_options.get("modelProfile"):
-        settings_manager.bindModelProfile(resolved_options["modelProfile"], model_registry)
+        settings_manager.bindModelProfile(resolved_options["modelProfile"], model_runtime)
     # The engine home only decides the session store when the caller named one; otherwise
     # sessions go to the product tree (config.sessions), where /resume and the panel look.
     session_manager = explicit_session_manager or SessionManager.create(
-        cwd, get_default_session_dir(cwd, resolved_options.get("agentDir") and agent_dir))
+        cwd, getDefaultSessionDir(cwd, resolved_options.get("agentDir") and agent_dir))
 
     if resource_loader is None:
         resource_loader = DefaultResourceLoader(
@@ -175,14 +199,17 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
 
     model = resolved_options.get("model")
     model_fallback_message: str | None = None
-    if model is None and has_existing_session and existing_session.model:
-        restored_model = model_registry.find(existing_session.model["provider"], existing_session.model["modelId"])
-        if restored_model is not None and model_registry.hasConfiguredAuth(restored_model):
+
+    # Assistant messages name the physical model that answered, so a virtual selection is only in
+    # model_change entries.
+    session_model = getBranchSelection(session_manager.getBranch(), model_runtime.getModel)
+
+    if model is None and has_existing_session and session_model:
+        restored_model = model_runtime.getModel(session_model["provider"], session_model["modelId"])
+        if restored_model is not None and model_runtime.hasConfiguredAuth(restored_model.provider):
             model = restored_model
         if model is None:
-            model_fallback_message = (
-                f'Could not restore model {existing_session.model["provider"]}/{existing_session.model["modelId"]}'
-            )
+            model_fallback_message = f'Could not restore model {session_model["provider"]}/{session_model["modelId"]}'
 
     if model is None and getattr(settings_manager, "getModelProfile", lambda: None)():
         from misaka.config import profiles
@@ -190,10 +217,10 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
         pin = profiles.pinned_model(settings_manager.getModelProfile(), strict=True)
         if pin and pin != "inherit":
             provider, model_id = settings_manager.getDefaultModelPair()
-            model = model_registry.find(provider, model_id)
+            model = model_runtime.getModel(provider, model_id)
             if model is None:
                 raise RuntimeError(f"Role default model is not available: {provider}/{model_id}")
-            if not model_registry.hasConfiguredAuth(model):
+            if not model_runtime.hasConfiguredAuth(model.provider):
                 model_fallback_message = (
                     f"No configured authentication for role default {provider}/{model_id}. "
                     "Use /login or misaka setup; the selected provider has not been changed."
@@ -209,12 +236,12 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
                 "defaultModelId": default_model,
                 "defaultThinkingLevel": settings_manager.getDefaultThinkingLevel(),
                 "modelThinkingLevels": settings_manager.getAllModelThinkingLevels(),
-                "modelRegistry": model_registry,
+                "modelRuntime": model_runtime,
             }
         )
         model = result.model
         if model is None:
-            model_fallback_message = format_no_models_available_message()
+            model_fallback_message = formatNoModelsAvailableMessage()
         elif model_fallback_message:
             model_fallback_message += f". Using {model.provider}/{model.id}"
 
@@ -233,28 +260,43 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
         thinking_level = settings_manager.getModelThinkingLevel(model.provider, model.id)
     if thinking_level is None:
         thinking_level = settings_manager.getDefaultThinkingLevel() or DEFAULT_THINKING_LEVEL
-    thinking_level = "off" if model is None else clamp_thinking_level(model, thinking_level)
+    thinking_level = "off" if model is None else clampThinkingLevel(model, thinking_level)
 
     # defaultTools selects initial built-ins; it does not populate the registry allowlist (pi 541045ae0).
+    tools_option = resolved_options.get("tools")
+    tool_list_error = getToolListError(tools_option) if tools_option else None
+    if tool_list_error:
+        raise ValueError(f"Invalid tools option: {tool_list_error}")
     configured_default_tools = settings_manager.getDefaultTools()
-    allowed_tool_names = resolved_options.get("tools")
-    if allowed_tool_names is None and resolved_options.get("noTools") == "all":
-        allowed_tool_names = []
+    default_tool_names = (
+        []
+        if resolved_options.get("noTools")
+        else list(DEFAULT_TOOL_NAMES if configured_default_tools is None else configured_default_tools)
+    )
+    # A `tools` list of only `+name`/`-name` entries changes the default selection instead of
+    # replacing it, like the `defaultTools` setting.
+    tool_modifiers = list(tools_option) if tools_option and any(map(isToolModifier, tools_option)) else None
+    selected_tool_names = (
+        applyToolModifiers(default_tool_names, tool_modifiers)
+        if tool_modifiers
+        else (list(tools_option) if tools_option is not None else None)
+    )
+    if tool_modifiers:
+        allowed_tool_names = selected_tool_names if resolved_options.get("noTools") == "all" else None
+    else:
+        allowed_tool_names = (
+            list(tools_option)
+            if tools_option is not None
+            else ([] if resolved_options.get("noTools") == "all" else None)
+        )
     excluded_tool_names = (
-        list(resolved_options["excludeTools"])
-        if resolved_options.get("excludeTools") is not None
-        else []
+        list(resolved_options["excludeTools"]) if resolved_options.get("excludeTools") is not None else None
     )
-    excluded_tool_name_set = set(excluded_tool_names)
-    initial_active_tool_names = (
-        list(resolved_options["tools"])
-        if resolved_options.get("tools") is not None
-        else ([] if resolved_options.get("noTools")
-              else (list(configured_default_tools) if configured_default_tools is not None
-                    else list(DEFAULT_TOOL_NAMES)))
-    )
+    is_excluded_tool = createToolNameMatcher(excluded_tool_names) if excluded_tool_names is not None else None
     initial_active_tool_names = [
-        name for name in initial_active_tool_names if name not in excluded_tool_name_set
+        name
+        for name in (selected_tool_names if selected_tool_names is not None else default_tool_names)
+        if not (is_excluded_tool is not None and is_excluded_tool(name))
     ]
 
     extension_runner_ref: dict[str, Any] = {}
@@ -275,19 +317,19 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
                 filtered_messages.append(message)
                 continue
 
-            filtered_content: list[Any] = []
-            previous_disabled = False
-            for item in content:
-                if _content_type(item) == "image":
-                    if not previous_disabled:
-                        filtered_content.append(TextContent(text="Image reading is disabled."))
-                    previous_disabled = True
-                    continue
-                previous_disabled = (
-                    _content_type(item) == "text"
-                    and _content_text(item) == "Image reading is disabled."
-                )
-                filtered_content.append(item)
+            def is_disabled_text(item: Any) -> bool:
+                return _content_type(item) == "text" and _content_text(item) == "Image reading is disabled."
+
+            mapped = [
+                TextContent(text="Image reading is disabled.") if _content_type(item) == "image" else item
+                for item in content
+            ]
+            # Dedupe consecutive "Image reading is disabled." texts
+            filtered_content = [
+                item
+                for index, item in enumerate(mapped)
+                if not (is_disabled_text(item) and index > 0 and is_disabled_text(mapped[index - 1]))
+            ]
 
             payload = _message_dump(message)
             payload["content"] = [_message_dump(item) for item in filtered_content]
@@ -295,78 +337,55 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
 
         return filtered_messages
 
-    async def stream_fn(model_value: Model[Any], context: Any, stream_options: Any = None) -> Any:
-        resolved_stream_options = _to_dict(stream_options)
-        resolution = await model_registry.getAuth(
-            model_value,
-            AuthResolutionOverrides(signal=resolved_stream_options.get("signal")),
-        )
-        if resolution is None:
-            raise RuntimeError(f"Provider is not configured: {model_value.provider}")
-        request_model = (
-            model_value.model_copy(update={"baseUrl": resolution.auth.baseUrl})
-            if resolution.auth.baseUrl
-            else model_value
-        )
-
+    def build_request_options(request_model: Model[Any], options: Any = None) -> dict[str, Any]:
+        resolved = _to_dict(options)
         provider_retry_settings = settings_manager.getProviderRetrySettings()
         http_idle_timeout_ms = settings_manager.getHttpIdleTimeoutMs()
         effective_timeout_ms = 2_147_483_647 if http_idle_timeout_ms == 0 else http_idle_timeout_ms
-        # pi sdk.ts:337 merges attribution over the auth headers before the caller's own,
-        # so an explicit header always wins over one of ours.
-        headers = merge_provider_attribution_headers(
-            model_value,
-            settings_manager,
-            session_manager.getSessionId(),
-            _merge_headers(
-                provider_headers_to_record(resolution.auth.headers),
-                resolved_stream_options.get("headers"),
-            ),
-        )
-        # pi sdk.ts:330-339 hands the merged headers to `before_provider_headers` handlers right
-        # here (models.ts:657, after mergeHeaders and before the provider call). Handlers mutate
-        # the mapping in place; a None value deletes that header (pi utils/headers.ts).
         header_runner = extension_runner_ref.get("current")
-        if header_runner is not None and header_runner.has_handlers("before_provider_headers"):
-            transformed = await header_runner.emit_before_provider_headers(dict(headers or {}))
-            headers = {key: str(value) for key, value in transformed.items() if value is not None} or None
-        final_options = dict(resolved_stream_options)
-        final_options["apiKey"] = resolution.auth.apiKey
-        request_env = {
-            **(resolution.env or {}),
-            **(resolved_stream_options.get("env") or {}),
-        }
-        if request_env:
-            final_options["env"] = request_env
-        if final_options.get("timeoutMs") is None:
-            provider_timeout_ms = provider_retry_settings.get("timeoutMs")
-            final_options["timeoutMs"] = (
-                provider_timeout_ms
-                if provider_timeout_ms is not None
-                else effective_timeout_ms
+
+        async def transform_headers(request_headers: dict[str, Any]) -> dict[str, Any]:
+            headers = mergeProviderAttributionHeaders(
+                request_model,
+                settings_manager,
+                resolved.get("sessionId"),
+                request_headers,
             )
-        if final_options.get("maxRetries") is None:
-            final_options["maxRetries"] = provider_retry_settings.get("maxRetries")
-        if final_options.get("maxRetryDelayMs") is None:
-            final_options["maxRetryDelayMs"] = provider_retry_settings.get("maxRetryDelayMs")
-        if headers is not None:
-            final_options["headers"] = headers
-        request_options = ProviderStreamOptions.model_validate(final_options)
+            if header_runner is not None and header_runner.hasHandlers("before_provider_headers"):
+                return await header_runner.emitBeforeProviderHeaders(dict(headers or {}))
+            return headers or {}
+
+        def first_defined(*values: Any) -> Any:
+            return next((value for value in values if value is not None), None)
+
+        return {
+            **resolved,
+            "timeoutMs": first_defined(
+                resolved.get("timeoutMs"), provider_retry_settings.get("timeoutMs"), effective_timeout_ms
+            ),
+            "websocketConnectTimeoutMs": first_defined(
+                resolved.get("websocketConnectTimeoutMs"), settings_manager.getWebSocketConnectTimeoutMs()
+            ),
+            "maxRetries": first_defined(resolved.get("maxRetries"), provider_retry_settings.get("maxRetries")),
+            "maxRetryDelayMs": first_defined(
+                resolved.get("maxRetryDelayMs"), provider_retry_settings.get("maxRetryDelayMs")
+            ),
+            "transformHeaders": transform_headers,
+        }
+
+    async def stream_fn(model_value: Model[Any], context: Any, stream_options: Any = None) -> Any:
+        request_options = build_request_options(model_value, stream_options)
         # Compaction and summaries use their own routing ids; only session requests
         # replace the cache entry, so warming restarts from them. Keep warming while
         # the current transcript still extends the request's prefix. Agent state may
         # shallow-copy the messages array or refresh the model object without changing
         # the provider request, so top-level object identity is not a valid cache key.
-        if resolved_stream_options.get("sessionId") == session_manager.getSessionId():
+        if request_options.get("sessionId") == session_manager.getSessionId():
             cache_warmer.start(
-                CacheWarmingRequest(model=request_model, context=context, options=request_options),
-                cache_context_is_current(request_model),
+                CacheWarmRequest(model=model_value, context=context, options=request_options),
+                cache_context_is_current(model_value),
             )
-        return model_registry.streamSimple(
-            request_model,
-            context,
-            request_options,
-        )
+        return model_runtime.streamSimple(model_value, context, request_options)
 
     def cache_context_is_current(request_model: Model[Any]) -> Callable[[], bool]:
         messages = agent.state.messages
@@ -388,27 +407,41 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
         runner = extension_runner_ref.get("current")
         if runner is None:
             return event["action"]
-        return await runner.emit_cache_warming_decision(event)
+        return await runner.emitCacheWarmingDecision(event)
 
     cache_warmer = CacheWarmer(
-        model_registry, session_manager, settings_manager.getCacheWarmingMode, decide_cache_warming
+        model_runtime, session_manager, settings_manager.getCacheWarmingMode, decide_cache_warming
     )
 
     async def on_payload(payload: dict[str, Any], _model: Model[Any]) -> Any:
         runner = extension_runner_ref.get("current")
-        if runner is None or not runner.has_handlers("before_provider_request"):
+        if runner is None or not runner.hasHandlers("before_provider_request"):
             return payload
-        return await runner.emit_before_provider_request(payload)
+        return await runner.emitBeforeProviderRequest(payload)
 
     async def on_response(response: Any, _model: Model[Any]) -> None:
         runner = extension_runner_ref.get("current")
-        if runner is None or not runner.has_handlers("after_provider_response"):
+        if runner is None or not runner.hasHandlers("after_provider_response"):
             return
         await runner.emit(
             {
                 "type": "after_provider_response",
                 "status": read_field(response, "status"),
                 "headers": read_field(response, "headers"),
+            }
+        )
+
+    async def on_provider_stream_event(data: Any, model: Model[Any]) -> None:
+        runner = extension_runner_ref.get("current")
+        if runner is None or not runner.hasHandlers("provider_stream_event"):
+            return
+        await runner.emit(
+            {
+                "data": data,
+                "type": "provider_stream_event",
+                "provider": model.provider,
+                "api": model.api,
+                "model": model.id,
             }
         )
 
@@ -421,7 +454,7 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
         runner = extension_runner_ref.get("current")
         if runner is None:
             return messages
-        return await runner.emit_context(messages)
+        return await runner.emitContext(messages)
 
     initial_model = model or _unknown_model()
     agent = Agent(
@@ -437,6 +470,7 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
             "streamFn": stream_fn,
             "onPayload": on_payload,
             "onResponse": on_response,
+            "onProviderStreamEvent": on_provider_stream_event,
             "sessionId": session_manager.getSessionId(),
             "transformContext": transform_context,
             "steeringMode": settings_manager.getSteeringMode(),
@@ -472,9 +506,12 @@ async def create_agent_session(options: CreateAgentSessionOptions | None = None)
             "resourceLoader": resource_loader,
             "customTools": resolved_options.get("customTools") or [],
             "parts": parts,
-            "modelRegistry": model_registry,
+            "modelRuntime": model_runtime,
             "cacheWarmer": cache_warmer,
             "initialActiveToolNames": initial_active_tool_names,
+            "usesDefaultTools": (resolved_options.get("tools") is None or tool_modifiers is not None)
+            and not resolved_options.get("noTools"),
+            "defaultToolModifiers": tool_modifiers,
             "allowedToolNames": allowed_tool_names,
             "excludedToolNames": excluded_tool_names,
             "extensionRunnerRef": extension_runner_ref,
@@ -509,14 +546,6 @@ def _to_dict(value: Any) -> dict[str, Any]:
     if hasattr(value, "__dict__"):
         return dict(vars(value))
     return dict(value)
-
-
-def _merge_headers(*header_groups: dict[str, str] | None) -> dict[str, str] | None:
-    merged: dict[str, str] = {}
-    for group in header_groups:
-        if group:
-            merged.update(group)
-    return merged or None
 
 
 def _unknown_model() -> Model[Any]:
@@ -554,17 +583,6 @@ def _content_text(block: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-createBashTool = create_bash_tool
-createCodingTools = create_coding_tools
-createEditTool = create_edit_tool
-createFindTool = create_find_tool
-createGrepTool = create_grep_tool
-createLsTool = create_ls_tool
-createPowerShellTool = create_powershell_tool
-createReadOnlyTools = create_read_only_tools
-createReadTool = create_read_tool
-createWriteTool = create_write_tool
-withFileMutationQueue = with_file_mutation_queue
 
 
 def __getattr__(name: str) -> Any:

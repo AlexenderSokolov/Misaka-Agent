@@ -13,7 +13,7 @@ from misaka.ui.tui.interactive.components.assistant_message import (
     AssistantMessageComponent,
 )
 from misaka.ui.tui.interactive.conversation import Conversation
-from misaka.utils.ansi import strip_ansi
+from misaka.utils.ansi import stripAnsi
 
 
 class ViewerUI(Container):
@@ -87,7 +87,7 @@ def assistants(screen):
 
 
 def rendered(screen):
-    return strip_ansi("\n".join(screen.chatContainer.render(120)))
+    return stripAnsi("\n".join(screen.chatContainer.render(120)))
 
 
 async def test_follow_live_thinking_text_commit_and_sanitize(viewer, monkeypatch):

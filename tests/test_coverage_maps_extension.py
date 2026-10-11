@@ -15,7 +15,7 @@ def _discovered():
     coverage.register(harness)
     found = asyncio.run(handlers["resources_discover"]({"type": "resources_discover"}, None))
     session = object.__new__(AgentSession)
-    return session._build_extension_resource_paths(
+    return session.buildExtensionResourcePaths(
         [{"path": path, "extensionPath": "<inline:coverage>"} for path in found["skillPaths"]])
 
 

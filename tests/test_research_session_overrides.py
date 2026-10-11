@@ -28,7 +28,7 @@ def _session(session_id="s-1", stream=None):
 
     session = SimpleNamespace(
         sessionManager=SimpleNamespace(getSessionId=lambda: session_id),
-        agent=SimpleNamespace(streamFn=stream or default_stream),
+        agent=SimpleNamespace(streamFunction=stream or default_stream),
         calls=calls)
     return session
 
@@ -81,29 +81,29 @@ def test_a_run_without_its_own_settings_follows_the_global_ones():
 def test_the_output_limit_caps_every_request_but_never_raises_the_model_maximum():
     session = _session()
     release = session_overrides.apply(session, {"max_output_tokens": 64_000})
-    session.agent.streamFn(SimpleNamespace(maxTokens=128_000), None, SimpleNamespace(maxTokens=None))
-    session.agent.streamFn(SimpleNamespace(maxTokens=32_000), None, None)
-    session.agent.streamFn(SimpleNamespace(maxTokens=128_000), None, {"maxTokens": 8_000})
+    session.agent.streamFunction(SimpleNamespace(maxTokens=128_000), None, SimpleNamespace(maxTokens=None))
+    session.agent.streamFunction(SimpleNamespace(maxTokens=32_000), None, None)
+    session.agent.streamFunction(SimpleNamespace(maxTokens=128_000), None, {"maxTokens": 8_000})
     assert [getattr(o, "maxTokens", None) or o["maxTokens"] for o in session.calls] == [64_000, 32_000, 8_000]
     release()
-    session.agent.streamFn(SimpleNamespace(maxTokens=128_000), None, None)
+    session.agent.streamFunction(SimpleNamespace(maxTokens=128_000), None, None)
     assert session.calls[-1] is None
 
 
 def test_a_session_is_wrapped_once_however_often_it_is_applied():
     session = _session()
     session_overrides.apply(session, {"max_output_tokens": 64_000})()
-    wrapped = session.agent.streamFn
+    wrapped = session.agent.streamFunction
     session_overrides.apply(session, {"max_output_tokens": 32_000})
-    assert session.agent.streamFn is wrapped
+    assert session.agent.streamFunction is wrapped
 
 
 def test_nothing_is_applied_without_overrides_or_a_session_id():
     session = _session()
-    stream = session.agent.streamFn
+    stream = session.agent.streamFunction
     session_overrides.apply(session, {})
     session_overrides.apply(SimpleNamespace(agent=session.agent), {"max_output_tokens": 64_000})
-    assert session.agent.streamFn is stream
+    assert session.agent.streamFunction is stream
 
 
 # --- the compaction threshold ---------------------------------------------------------------

@@ -10,7 +10,6 @@ for one card and a tool that refused to close any of them, ended up killing proc
 import asyncio
 import json
 import os
-import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -45,8 +44,10 @@ def panel(home, request):
     finally:
         for pane in list(daemon.panes.values()):
             # Only panes with a real child are closed: `close` signals the pane's process
-            # group, and a stand-in pid would aim that at somebody else's.
-            if not isinstance(pane.proc, subprocess.Popen):
+            # group, and a stand-in pid would aim that at somebody else's. On Windows a real
+            # child is a pseudo-console process, not a `Popen`; skipping it left the reader
+            # (`misaka chat --read-only`) running after the test.
+            if pane.proc is None or isinstance(pane.proc, SimpleNamespace):
                 daemon.panes.pop(pane.id, None)
                 continue
             try:

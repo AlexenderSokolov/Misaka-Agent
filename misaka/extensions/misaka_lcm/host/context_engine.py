@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from weakref import WeakValueDictionary
 
 from misaka.core.platform.prompt_guard import MARKER, untrusted
+from misaka.core.virtual_models import isVirtualModel
 from misaka.utils.values import read_field, signal_aborted
 
 from ..vendor import aux_session
@@ -212,7 +213,9 @@ atexit.register(close_all)
 
 def update_model(ctx) -> None:
     model = read_field(ctx, "model")
-    if model is None:
+    # A virtual selection has no window of its own: the model each request goes to is bound when the request is
+    # prepared (session_context_prepare), and stays bound between hooks.
+    if model is None or isVirtualModel(model):
         return
     built = engine(ctx)
     api = str(read_field(model, 'api', '') or '')
@@ -278,9 +281,9 @@ def freeze_context(ctx, transcript):
 
 
 def _session_originals(transcript):
-    from misaka.core.session_manager import session_entry_to_context_messages
+    from misaka.core.session_manager import sessionEntryToContextMessages
 
-    return {item["id"]: ingest.upstream_messages(session_entry_to_context_messages(item))
+    return {item["id"]: ingest.upstream_messages(sessionEntryToContextMessages(item))
             for item in transcript.entries if item["type"] != "compaction"}
 
 
@@ -398,9 +401,9 @@ def turn_key(transcript):
                                            else entry.get('message'))), None)
 
 def _messages(transcript, built):
-    from misaka.core.session_manager import build_session_context
+    from misaka.core.session_manager import buildSessionContext
 
-    native = build_session_context(transcript.branch).messages
+    native = buildSessionContext(transcript.branch).messages
     messages = ingest.upstream_messages(native)
     if built._bypasses_lcm_context_management():
         return messages
@@ -525,17 +528,17 @@ def start(ctx) -> str:
         built._misaka_preanswer = None
         branch = read_field(ctx.sessionManager, 'getBranch')
         if branch:
-            from misaka.core.session_manager import build_session_context
+            from misaka.core.session_manager import buildSessionContext
 
             from ..native.usage_anchor import capture_usage_anchor
             entries = list(branch())
-            messages = build_session_context(entries).messages
+            messages = buildSessionContext(entries).messages
             # Retained tail usage priced the pre-compaction request, not this
             # checkpoint's shorter prefix. Only a subsequent real response can
             # anchor the replacement view; otherwise use the original estimator.
             cut = next((i + 1 for i in range(len(entries) - 1, -1, -1)
                         if entries[i]['type'] == 'compaction'), 0)
-            first_priced = len(messages) - len(build_session_context(entries[cut:]).messages) if cut else 0
+            first_priced = len(messages) - len(buildSessionContext(entries[cut:]).messages) if cut else 0
             built._usage_anchor = None
             for index in range(len(messages) - 1, first_priced - 1, -1):
                 message = messages[index]
@@ -575,7 +578,7 @@ def end(ctx, *, transcript=None, reset=False) -> None:
 def usage(message, ctx) -> None:
     reported = read_field(message, "usage")
     if reported is not None:
-        from misaka.core.session_manager import build_session_context
+        from misaka.core.session_manager import buildSessionContext
 
         from ..native.image_token_cost import calibrate_from_usage
         from ..native.usage_anchor import capture_usage_anchor
@@ -583,7 +586,7 @@ def usage(message, ctx) -> None:
         data = llm.usage_dict(reported)
         branch = read_field(ctx.sessionManager, 'getBranch')
         if branch:
-            messages = ingest.upstream_messages(build_session_context(list(branch())).messages)
+            messages = ingest.upstream_messages(buildSessionContext(list(branch())).messages)
             if messages and messages[-1].get('role') == 'assistant':
                 messages = messages[:-1]
             calibrate_from_usage(built, messages, data['prompt_tokens'])
@@ -643,10 +646,10 @@ def _aligned(native, original_native):
 
 def prepare(event, ctx, *, transcript=None):
     """Original engine policy, without consulting Pi thresholds or cut points."""
-    from misaka.core.session_manager import build_session_context
+    from misaka.core.session_manager import buildSessionContext
 
     transcript = transcript or snapshot(ctx)
-    original_native = build_session_context(transcript.branch).messages
+    original_native = buildSessionContext(transcript.branch).messages
     native = read_field(event, 'messages')
     if native is None:
         native = original_native

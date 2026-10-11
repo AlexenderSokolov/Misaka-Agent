@@ -24,7 +24,7 @@ class HighlightOptions:
     # ask for; nothing reads the field.
     ignoreIllegals: bool | None = None
     # Only consulted when `language` is unset. Both in-repo callers gate on
-    # `supports_language()` and always pass `language`, so the scoring loop below and
+    # `supportsLanguage()` and always pass `language`, so the scoring loop below and
     # the `guess_lexer` fallback are reached only through this module's public
     # `highlight()` from outside the repo (an extension, a test).
     languageSubset: Sequence[str] | None = None
@@ -39,15 +39,20 @@ def highlight(code: str, options: HighlightOptions | dict[str, Any] | None = Non
 
     for token, value in lex(code, lexer):
         scope = _scope_for_token(token)
-        formatter = _get_scope_formatter(scope, theme) if scope else None
+        formatter = getScopeFormatter(scope, theme) if scope else None
         if formatter is None:
             formatter = theme.get("default")
-        output.append(formatter(value) if formatter else value)
+        # Format each line on its own, so a multi-line token (a docstring, a block comment) keeps
+        # its colour after highlightCode splits the result into lines (pi #10143).
+        if formatter is None:
+            output.append(value)
+            continue
+        output.append("\n".join(formatter(line) if line else line for line in value.split("\n")))
 
     return "".join(output)
 
 
-def supports_language(name: str) -> bool:
+def supportsLanguage(name: str) -> bool:
     try:
         get_lexer_by_name(name)
     except ClassNotFound:
@@ -68,18 +73,23 @@ def _resolve_options(options: HighlightOptions | dict[str, Any] | None) -> Highl
     return HighlightOptions()
 
 
+# MISAKA fork: Pygments strips leading blank lines and appends a newline by default; highlight.js keeps
+# the text line for line, so lexers are made without either.
+_LEXER_OPTIONS: dict[str, Any] = {"stripnl": False, "ensurenl": False}
+
+
 def _resolve_lexer(code: str, options: HighlightOptions):
     if options.language:
         try:
-            return get_lexer_by_name(options.language)
+            return get_lexer_by_name(options.language, **_LEXER_OPTIONS)
         except ClassNotFound:
-            return TextLexer()
+            return TextLexer(**_LEXER_OPTIONS)
     if options.languageSubset:
         best = None
         best_score: tuple[float, int, int] | None = None
         for name in options.languageSubset:
             try:
-                candidate = get_lexer_by_name(name)
+                candidate = get_lexer_by_name(name, **_LEXER_OPTIONS)
             except ClassNotFound:
                 continue
             analyse = getattr(candidate, "analyse_text", None)
@@ -99,12 +109,12 @@ def _resolve_lexer(code: str, options: HighlightOptions):
         if best is not None:
             return best
     try:
-        return guess_lexer(code)
+        return guess_lexer(code, **_LEXER_OPTIONS)
     except ClassNotFound:
-        return TextLexer()
+        return TextLexer(**_LEXER_OPTIONS)
 
 
-def _get_scope_formatter(scope: str | None, theme: HighlightTheme) -> HighlightFormatter | None:
+def getScopeFormatter(scope: str | None, theme: HighlightTheme) -> HighlightFormatter | None:
     if scope is None:
         return None
     exact = theme.get(scope)

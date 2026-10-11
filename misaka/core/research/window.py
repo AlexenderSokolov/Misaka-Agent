@@ -5,7 +5,7 @@ import asyncio
 import os
 from contextlib import ExitStack, asynccontextmanager
 
-from misaka.ai.utils.overflow import output_limit_error
+from misaka.ai.utils._output_limit import output_limit_error
 from misaka.core.network import worker
 from misaka.core.platform import budget
 from misaka.core.research.report import DRAFT_CONTRACT, FINAL_CONTRACT
@@ -180,11 +180,11 @@ class WindowLO:
 
         unsubscribe = session.subscribe(observe)
         try:
-            from misaka.core.research.planner import session_tools
+            from misaka.core.research.planner import MCP_CALLABLE, session_tools
             # Re-read at the actual turn boundary; a queued phase's old selection
             # must not resurrect capabilities the user has since disabled.
             names = [*session_tools(self), *(tool.name for tool in definitions)]
-            scope.enter_context(session.toolScope(names))
+            scope.enter_context(session.toolScope(names, callable=MCP_CALLABLE))
             scope.enter_context(self.publisher.snapshot(options.get("sister_catalog")))
             session.registerCustomTools(definitions)
             from misaka.core.research.planner import OPTIONAL_MATERIAL_TOOLS
@@ -285,7 +285,7 @@ async def node_session(con, cfg, run, node):
                     await session.prompt(text, {"streamingBehavior": "steer", "preflightResult": preflight})
                 else:
                     _obj, _answer, error = await bridge._execute(text, {
-                        "session_dir": directory, "tools": planner.session_tools(bridge),
+                        "session_dir": directory,
                         "extra_tools": list(getattr(control, "review_tools", ()) or ()),
                         "usage_db": cfg["db"], "usage_task_id": run["id"], "usage_generation": 1,
                         "usage_token_cap": None,

@@ -1,7 +1,7 @@
-"""The conversation screen, independent of who drives or owns the session.
+"""MISAKA fork: the conversation screen of the read-only/attach session viewer (``misaka chat --read-only/--attach``).
 
-InteractiveMode adds the agent/editor lifecycle. Opening saved messages uses this
-same screen without constructing either an agent or a writable SessionManager.
+It opens saved messages without an agent or a writable SessionManager: the containers and transcript toggles of pi's
+interactive mode, with ``TranscriptRenderer`` replaying the entries.
 """
 
 from dataclasses import replace
@@ -11,81 +11,55 @@ from misaka.ui.tui import Container
 
 from .components.assistant_message import AssistantMessageComponent
 from .components.transcript import TranscriptRenderer
-from .theme.theme import get_markdown_theme
-
-
-def _safe_call_bool(obj: Any, name: str, default: bool = False) -> bool:
-    getter = getattr(obj, name, None)
-    if not callable(getter):
-        return default
-    try:
-        return bool(getter())
-    except Exception:  # noqa: BLE001 - an accessor that fails yields the default
-        return default
-
-
-def _safe_call_int(obj: Any, name: str, default: int = 0) -> int:
-    getter = getattr(obj, name, None)
-    if not callable(getter):
-        return default
-    try:
-        return int(getter())
-    except Exception:  # noqa: BLE001 - an accessor that fails yields the default
-        return default
-
-
-def _safe_call_str(obj: Any, name: str, default: str | None = None) -> str | None:
-    getter = getattr(obj, name, None)
-    if not callable(getter):
-        return default
-    try:
-        value = getter()
-    except Exception:  # noqa: BLE001 - an accessor that fails yields the default
-        return default
-    return str(value) if value is not None else default
+from .theme.theme import getMarkdownTheme
 
 
 class Conversation:
-    def __init__(self, ui, settingsManager, cwd):
-        self.ui, self.settingsManager, self.cwd = ui, settingsManager, cwd
-        for name in (
-            "headerContainer", "chatContainer", "pendingMessagesContainer", "statusContainer",
-            "widgetContainerAbove", "editorContainer", "widgetContainerBelow",
-        ):
-            if not hasattr(self, name):
-                setattr(self, name, Container())
-        self.customHeader = getattr(self, "customHeader", None)
-        self.builtInHeader = getattr(self, "builtInHeader", None)
-        self.toolOutputExpanded = bool(getattr(self, "toolOutputExpanded", False))
-        self.hideThinkingBlock = bool(
-            getattr(self, "hideThinkingBlock", _safe_call_bool(settingsManager, "getHideThinkingBlock"))
-        )
-        self.outputPad = int(getattr(self, "outputPad", _safe_call_int(settingsManager, "getOutputPad", 1)))
-        self.defaultHiddenThinkingLabel = getattr(self, "defaultHiddenThinkingLabel", "Thinking...")
-        self.hiddenThinkingLabel = getattr(self, "hiddenThinkingLabel", self.defaultHiddenThinkingLabel)
-        self.entries = []
-        self._toolComponentsById = {}
-        self._liveComponent = None
+    def __init__(self, ui: Any, settingsManager: Any, cwd: str) -> None:
+        self.ui = ui
+        self.settingsManager = settingsManager
+        self.cwd = cwd
+        self.headerContainer = Container()
+        self.chatContainer = Container()
+        self.pendingMessagesContainer = Container()
+        self.statusContainer = Container()
+        self.widgetContainerAbove = Container()
+        self.editorContainer = Container()
+        self.widgetContainerBelow = Container()
+        self.footer: Any = None
+        self.customHeader: Any = None
+        self.builtInHeader: Any = None
+        self.toolOutputExpanded = False
+        self.hideThinkingBlock = settingsManager.getHideThinkingBlock()
+        self.outputPad = settingsManager.getOutputPad()
+        self.defaultHiddenThinkingLabel = "Thinking..."
+        self.hiddenThinkingLabel = self.defaultHiddenThinkingLabel
+        self.entries: list[Any] = []
+        self._toolComponentsById: dict[str, Any] = {}
+        self._liveComponent: AssistantMessageComponent | None = None
 
-    def mount(self):
+    def mount(self) -> None:
         for child in (
-            self.headerContainer, self.chatContainer, self.pendingMessagesContainer, self.statusContainer,
-            self.widgetContainerAbove, self.editorContainer, self.widgetContainerBelow, self.footer,
+            self.headerContainer,
+            self.chatContainer,
+            self.pendingMessagesContainer,
+            self.statusContainer,
+            self.widgetContainerAbove,
+            self.editorContainer,
+            self.widgetContainerBelow,
+            self.footer,
         ):
             self.ui.addChild(child)
 
-    def _request_render(self, force: bool | None = None) -> None:
-        request_render = getattr(self.ui, "requestRender", None)
-        if callable(request_render):
-            request_render() if force is None else request_render(force)
-
     def setToolsExpanded(self, expanded: bool) -> None:
+        if expanded == self.toolOutputExpanded:
+            return
         self.toolOutputExpanded = expanded
         for child in [self.customHeader or self.builtInHeader, *self.chatContainer.children]:
-            set_expanded = getattr(child, "setExpanded", None)
-            if callable(set_expanded):
-                set_expanded(expanded)
-        self._request_render()
+            setExpanded = getattr(child, "setExpanded", None)
+            if callable(setExpanded):
+                setExpanded(expanded)
+        self.ui.requestRender()
 
     def toggleToolOutputExpansion(self) -> None:
         self.setToolsExpanded(not self.toolOutputExpanded)
@@ -95,53 +69,54 @@ class Conversation:
         for child in self.chatContainer.children:
             if isinstance(child, AssistantMessageComponent):
                 child.setHideThinkingBlock(self.hideThinkingBlock)
-        self._request_render()
+        self.ui.requestRender()
 
     def getMarkdownThemeWithSettings(self) -> Any:
-        markdown_theme = get_markdown_theme()
-        indent = _safe_call_str(self.settingsManager, "getCodeBlockIndent", "  ")
-        try:
-            return replace(markdown_theme, codeBlockIndent=indent)
-        except TypeError:
-            markdown_theme.codeBlockIndent = indent
-            return markdown_theme
+        return replace(getMarkdownTheme(), codeBlockIndent=self.settingsManager.getCodeBlockIndent())
 
     def _transcriptRenderer(self) -> TranscriptRenderer:
         return TranscriptRenderer(
-            self.ui, self.cwd,
-            markdownTheme=self.getMarkdownThemeWithSettings(), outputPad=self.outputPad,
-            hideThinkingBlock=self.hideThinkingBlock, hiddenThinkingLabel=self.hiddenThinkingLabel,
+            self.ui,
+            self.cwd,
+            markdownTheme=self.getMarkdownThemeWithSettings(),
+            outputPad=self.outputPad,
+            hideThinkingBlock=self.hideThinkingBlock,
+            hiddenThinkingLabel=self.hiddenThinkingLabel,
             expanded=self.toolOutputExpanded,
-            showImages=_safe_call_bool(self.settingsManager, "getShowImages", True),
-            imageWidthCells=_safe_call_int(self.settingsManager, "getImageWidthCells", 40),
+            showImages=self.settingsManager.getShowImages(),
+            imageWidthCells=self.settingsManager.getImageWidthCells(),
         )
 
-    def updateEntries(self, entries) -> None:
+    def updateEntries(self, entries: list[Any]) -> None:
         """Follow committed context, preserving components unless its branch changed."""
         self.updateStreaming(None)
-        if entries[:len(self.entries)] != self.entries:
+        if entries[: len(self.entries)] != self.entries:
             self.entries = []
             self._toolComponentsById.clear()
             self.chatContainer.clear()
         self._transcriptRenderer().appendEntries(
-            self.chatContainer, entries[len(self.entries):], self._toolComponentsById,
+            self.chatContainer,
+            entries[len(self.entries) :],
+            self._toolComponentsById,
         )
         self.entries = entries
-        self._request_render()
+        self.ui.requestRender()
 
-    def updateStreaming(self, message) -> None:
+    def updateStreaming(self, message: Any) -> None:
         """Render an owner's transient assistant without adding it to saved entries."""
         if message is None:
             if self._liveComponent is not None:
                 self.chatContainer.removeChild(self._liveComponent)
                 self._liveComponent = None
-                self._request_render()
+                self.ui.requestRender()
             return
         if self._liveComponent is None:
             self._liveComponent = AssistantMessageComponent(
-                hideThinkingBlock=self.hideThinkingBlock, markdownTheme=self.getMarkdownThemeWithSettings(),
-                hiddenThinkingLabel=self.hiddenThinkingLabel, outputPad=self.outputPad,
+                hideThinkingBlock=self.hideThinkingBlock,
+                markdownTheme=self.getMarkdownThemeWithSettings(),
+                hiddenThinkingLabel=self.hiddenThinkingLabel,
+                outputPad=self.outputPad,
             )
             self.chatContainer.addChild(self._liveComponent)
         self._liveComponent.updateContent(message, True)
-        self._request_render()
+        self.ui.requestRender()

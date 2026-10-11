@@ -53,11 +53,11 @@ def prompt_home(tmp_path, monkeypatch):
 
 @asynccontextmanager
 async def assembled(home, role, kind, *, research=False, custom=False, prompt_flags=None):
-    from misaka.cli.args import parse_args
+    from misaka.cli.args import parseArgs
     from misaka.config import identity
-    from misaka.core.extensions.runner import emit_session_shutdown_event
+    from misaka.core.extensions.runner import emitSessionShutdownEvent
     from misaka.core.resource_loader import DefaultResourceLoader
-    from misaka.core.sdk import create_agent_session
+    from misaka.core.sdk import createAgentSession
     from misaka.core.session_manager import SessionManager
     from misaka.core.wiring import SessionSpec, assemble, role_session_setup
 
@@ -77,13 +77,13 @@ async def assembled(home, role, kind, *, research=False, custom=False, prompt_fl
         role_flags, assembly, _env = role_session_setup(
             str(profile), str(workspace), research_context=research,
             receive_messages=kind == "foreground")
-        sections = parse_args(role_flags).appendSystemPrompt or []
+        sections = parseArgs(role_flags).appendSystemPrompt or []
     else:
         sections = identity.base_prompt_sources(str(profile), role)
     options = {"cwd": str(workspace), "agentDir": str(agent_dir)}
     prompt_options = {"appendSystemPrompt": sections}
     if prompt_flags is not None:
-        parsed = parse_args(prompt_flags)
+        parsed = parseArgs(prompt_flags)
         prompt_options = {"systemPrompt": parsed.systemPrompt,
                           "appendSystemPrompt": parsed.appendSystemPrompt or []}
     if prompt_flags is not None:
@@ -91,7 +91,7 @@ async def assembled(home, role, kind, *, research=False, custom=False, prompt_fl
     loader = DefaultResourceLoader({**options, "extensionFactories": assembly.extension_factories,
                                     **prompt_options})
     await loader.reload()
-    result = await create_agent_session({**options, "resourceLoader": loader,
+    result = await createAgentSession({**options, "resourceLoader": loader,
                                          "customTools": assembly.custom_tools, "parts": assembly.parts,
                                          "sessionManager": SessionManager.inMemory(str(workspace))})
     session = result["session"]
@@ -99,20 +99,20 @@ async def assembled(home, role, kind, *, research=False, custom=False, prompt_fl
     async def no_model(*_args, **_kwargs):
         raise AssertionError("Prompt integration attempted a model turn")
 
-    session.agent.streamFn = no_model
+    session.agent.streamFunction = no_model
     try:
         yield session
     finally:
         event = {"type": "session_shutdown", "reason": "test"}
         try:
             await session.moments.session_shutdown(event)
-            await emit_session_shutdown_event(session.extensionRunner, event)
+            await emitSessionShutdownEvent(session.extensionRunner, event)
         finally:
             session.dispose()
 
 
 async def final_prompt(session):
-    await session._prepare_agent_start([], "Offline prompt assembly check", None)
+    await session._prepareAgentStart([], "Offline prompt assembly check", None)
     return session.systemPrompt
 
 
@@ -203,7 +203,7 @@ async def test_bare_research_with_custom_system_keeps_duties_without_false_tools
 @pytest.mark.parametrize("research", [False, True])
 @pytest.mark.parametrize("custom", [False, True])
 async def test_role_entry_keeps_shared_base_and_explicit_tool_ceiling(prompt_home, research, custom):
-    from misaka.cli.args import parse_args
+    from misaka.cli.args import parseArgs
     from misaka.config import home, identity
     from misaka.core.wiring import role_session_setup
 
@@ -214,8 +214,8 @@ async def test_role_entry_keeps_shared_base_and_explicit_tool_ceiling(prompt_hom
     flags, assembly, _env = role_session_setup(
         str(profile), str(prompt_home / "workspace"), research_context=research)
     assert assembly.spec.kind == "foreground"
-    assert (parse_args(flags).appendSystemPrompt or []).count(str(shared)) == 1
-    assert parse_args(flags).tools is None and not parse_args(flags).noTools
+    assert (parseArgs(flags).appendSystemPrompt or []).count(str(shared)) == 1
+    assert parseArgs(flags).tools is None and not parseArgs(flags).noTools
     flags += ["--tools", "read"]
     async with assembled(prompt_home, "last_order", "headless", research=research,
                          custom=custom, prompt_flags=flags) as session:
@@ -233,7 +233,7 @@ async def test_role_entry_keeps_shared_base_and_explicit_tool_ceiling(prompt_hom
 
 
 async def test_durable_sister_real_child_flags_retain_persona_and_current_tool_guidance(prompt_home):
-    from misaka.cli.args import parse_args
+    from misaka.cli.args import parseArgs
     from misaka.config import identity
     from misaka.core.network.sister_runtime import _SisterManager
     from misaka.core.research.planner import RESEARCH_SISTER_DISCIPLINE
@@ -256,7 +256,7 @@ async def test_durable_sister_real_child_flags_retain_persona_and_current_tool_g
     # Exercise the real atomic prompt-file writer, CLI parser, resource loader and SDK.
     # No subprocess, persisted card owner, or model session is started.
     flags = await manager._child_flags(task)
-    parsed = parse_args(flags)
+    parsed = parseArgs(flags)
     assert parsed.systemPrompt is None and parsed.tools is None
     saved = Path(parsed.appendSystemPrompt[0])
     assert saved.read_text(encoding="utf-8") == persona == definition.prompt
@@ -392,7 +392,7 @@ def test_lo_runtime_adapters_use_one_role_entry():
         calls = [n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
         assert calls.count("role_session_setup") == 1
         assert not any(isinstance(n, ast.Constant) and n.value == "--thinking" for n in ast.walk(tree))
-        assert not {"SessionSpec", "assemble", "Assembly", "build_system_prompt"}.intersection(calls)
+        assert not {"SessionSpec", "assemble", "Assembly", "buildSystemPrompt"}.intersection(calls)
 
 
 async def test_research_role_keeps_tools_without_stealing_root_notifications(prompt_home):
@@ -429,8 +429,6 @@ async def test_research_inherits_order_and_preserves_selection_through_lifecycle
         normal = session.getActiveToolNames()
         assert len(DRIVER_OWNED_TOOLS) == 9
         assert DRIVER_OWNED_TOOLS <= set(normal)
-        # Configured permission ceiling is not permission to revive a user-disabled tool.
-        monkeypatch.setattr(session, "_allowedToolNames", set(normal) | {"fixture_late", "misaka_research_assign"})
         selected = [name for name in normal if name not in {"write", "doc_verify"}]
         session.setActiveToolsByName(selected)
         owner = WindowLO(session, lambda: None, describe=dict)
@@ -461,14 +459,17 @@ async def test_research_inherits_order_and_preserves_selection_through_lifecycle
             session.refreshTools()
             assert session.getActiveToolNames() == expected
             await session.reload()
+            # As upstream: a reload activates again every extension tool that registration activates, so the
+            # disabled `doc_verify` is back; the built-in `write` stays off.
+            expected.append("doc_verify")
             assert session.getActiveToolNames() == expected
             assert list(planner.session_tools(owner)) == expected
         finally:
             await owner.close()
             await owner.close()  # restoration is idempotent
-        assert session.getActiveToolNames() == [*selected, late.name]
+        assert session.getActiveToolNames() == [*selected, late.name, "doc_verify"]
         session.unregisterCustomTools([late])
-        assert session.getActiveToolNames() == selected
+        assert session.getActiveToolNames() == [*selected, "doc_verify"]
 
 
 @pytest.mark.parametrize("thinking", ["max", "medium", "off"])

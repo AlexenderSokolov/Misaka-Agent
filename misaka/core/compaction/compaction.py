@@ -8,9 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
-from misaka.agent.harness.session.uuid import uuidv7
 from misaka.agent.types import AgentMessage, StreamFn, ThinkingLevel
-from misaka.ai.stream import complete_simple
+from misaka.ai.compat import completeSimple
 from misaka.ai.types import (
     AssistantMessage,
     Context,
@@ -20,8 +19,9 @@ from misaka.ai.types import (
     Usage,
     UserMessage,
 )
-from misaka.ai.utils.retry import RetryCallbacks, RetryPolicy, retry_assistant_call
-from misaka.ai.utils.transcript import get_current_system_message, normalize_context
+from misaka.ai.utils.retry import RetryCallbacks, RetryPolicy, retryAssistantCall
+from misaka.ai.utils.transcript import getCurrentSystemMessage, normalizeContext
+from misaka.ai.utils.uuid import uuidv7
 from misaka.core.compaction.utils import (
     SUMMARIZATION_SYSTEM_PROMPT as _SUMMARIZATION_SYSTEM_PROMPT,
 )
@@ -29,22 +29,23 @@ from misaka.core.compaction.utils import (
     FileOperations,
     _assistant_text,
     _safe_json_stringify,
-    compute_file_lists,
-    create_file_ops,
-    extract_file_ops_from_message,
-    format_file_operations,
+    computeFileLists,
+    createFileOps,
+    extractFileOpsFromMessage,
+    formatFileOperations,
 )
 from misaka.core.compaction.utils import (
-    serialize_conversation as _serialize_conversation,
+    serializeConversation as _serialize_conversation,
 )
 from misaka.core.messages import convertToLlm
 from misaka.core.session_manager import (
     SessionEntry,
     SessionProjection,
     SessionProjectionEntry,
-    build_session_projection,
-    session_entry_to_context_messages,
+    buildSessionProjection,
+    sessionEntryToContextMessages,
 )
+from misaka.core.usage_totals import combineUsage
 from misaka.utils.values import read_field
 
 
@@ -208,7 +209,7 @@ Create a concise checkpoint of the user's request and the progress shown above. 
 Only summarize information explicitly present above. Do not infer or recreate later messages."""
 
 
-def get_summarization_failure(response: AssistantMessage, label: str) -> str | None:
+def getSummarizationFailure(response: AssistantMessage, label: str) -> str | None:
     """Return why a summarization response is unsafe to persist."""
     if response.stopReason == "error":
         return f"{label} failed: {response.errorMessage or 'Unknown error'}"
@@ -217,41 +218,14 @@ def get_summarization_failure(response: AssistantMessage, label: str) -> str | N
     return None
 
 
-def combine_usage(first: Usage, second: Usage) -> Usage:
-    return Usage(
-        input=first.input + second.input,
-        output=first.output + second.output,
-        cacheRead=first.cacheRead + second.cacheRead,
-        cacheWrite=first.cacheWrite + second.cacheWrite,
-        cacheWrite1h=(
-            (first.cacheWrite1h or 0) + (second.cacheWrite1h or 0)
-            if first.cacheWrite1h is not None or second.cacheWrite1h is not None
-            else None
-        ),
-        reasoning=(
-            (first.reasoning or 0) + (second.reasoning or 0)
-            if first.reasoning is not None or second.reasoning is not None
-            else None
-        ),
-        totalTokens=first.totalTokens + second.totalTokens,
-        cost={
-            "input": first.cost.input + second.cost.input,
-            "output": first.cost.output + second.cost.output,
-            "cacheRead": first.cost.cacheRead + second.cost.cacheRead,
-            "cacheWrite": first.cost.cacheWrite + second.cost.cacheWrite,
-            "total": first.cost.total + second.cost.total,
-        },
-    )
-
-
-def calculate_context_tokens(usage: Usage | dict[str, Any]) -> int:
+def calculateContextTokens(usage: Usage | dict[str, Any]) -> int:
     total_tokens = _usage_field(usage, "totalTokens")
     if isinstance(total_tokens, int) and total_tokens:
         return total_tokens
     return sum(int(_usage_field(usage, name) or 0) for name in ("input", "output", "cacheRead", "cacheWrite"))
 
 
-def get_last_assistant_usage(entries: list[SessionEntry]) -> Usage | dict[str, Any] | None:
+def getLastAssistantUsage(entries: list[SessionEntry]) -> Usage | dict[str, Any] | None:
     for entry in reversed(entries):
         if _entry_field(entry, "type") != "message":
             continue
@@ -261,10 +235,10 @@ def get_last_assistant_usage(entries: list[SessionEntry]) -> Usage | dict[str, A
     return None
 
 
-def estimate_context_tokens(messages: list[AgentMessage]) -> ContextUsageEstimate:
+def estimateContextTokens(messages: list[AgentMessage]) -> ContextUsageEstimate:
     usage_info = _last_assistant_usage_info(messages)
     if usage_info is None:
-        estimated = sum(estimate_tokens(message) for message in messages)
+        estimated = sum(estimateTokens(message) for message in messages)
         return ContextUsageEstimate(
             tokens=estimated,
             usageTokens=0,
@@ -272,8 +246,8 @@ def estimate_context_tokens(messages: list[AgentMessage]) -> ContextUsageEstimat
             lastUsageIndex=None,
         )
 
-    usage_tokens = calculate_context_tokens(usage_info["usage"])
-    trailing_tokens = sum(estimate_tokens(message) for message in messages[usage_info["index"] + 1 :])
+    usage_tokens = calculateContextTokens(usage_info["usage"])
+    trailing_tokens = sum(estimateTokens(message) for message in messages[usage_info["index"] + 1 :])
     return ContextUsageEstimate(
         tokens=usage_tokens + trailing_tokens,
         usageTokens=usage_tokens,
@@ -282,11 +256,11 @@ def estimate_context_tokens(messages: list[AgentMessage]) -> ContextUsageEstimat
     )
 
 
-def estimate_projected_context_tokens(
+def estimateProjectedContextTokens(
     projection: SessionProjection, branch_entries: list[SessionEntry]
 ) -> ContextUsageEstimate:
     """Estimate projected context without trusting usage captured before a later edit or compaction."""
-    estimate = estimate_context_tokens(projection.messages)
+    estimate = estimateContextTokens(projection.messages)
     if estimate.lastUsageIndex is not None:
         projected_message_index = 0
         usage_entry_id: str | None = None
@@ -308,15 +282,15 @@ def estimate_projected_context_tokens(
                 break
         if usage_entry_index > latest_invalidating_entry_index:
             return estimate
-    current_system = get_current_system_message(projection.messages)
-    tokens = estimate_tokens(current_system) if current_system else 0
+    current_system = getCurrentSystemMessage(projection.messages)
+    tokens = estimateTokens(current_system) if current_system else 0
     for message in projection.messages:
         if read_field(message, "role") != "system":
-            tokens += estimate_tokens(message)
+            tokens += estimateTokens(message)
     return ContextUsageEstimate(tokens=tokens, usageTokens=0, trailingTokens=tokens, lastUsageIndex=None)
 
 
-def should_compact(context_tokens: int, context_window: int, settings: CompactionSettings) -> bool:
+def shouldCompact(context_tokens: int, context_window: int, settings: CompactionSettings) -> bool:
     return settings.enabled and context_tokens > context_window - settings.reserveTokens
 
 
@@ -325,7 +299,7 @@ def _utf16_length(text: str) -> int:
     return len(text) + sum(ord(char) > 0xFFFF for char in text)
 
 
-def estimate_tokens(message: AgentMessage) -> int:
+def estimateTokens(message: AgentMessage) -> int:
     role = read_field(message, "role")
     chars = 0
 
@@ -424,8 +398,8 @@ def _projected_messages(
 ) -> list[AgentMessage]:
     """The context projection of one entry, reusing ``projections`` when it has it.
 
-    ``session_entry_to_context_messages`` builds a fresh message for every
-    custom_message / branch_summary / compaction entry, and find_cut_point walks the same
+    ``sessionEntryToContextMessages`` builds a fresh message for every
+    custom_message / branch_summary / compaction entry, and findCutPoint walks the same
     range up to four times (cut points, keep window, metadata absorption, turn start), so
     the projection is computed once per call and shared. An empty list is a real answer
     (an entry the context cannot see) and is cached as such; ``None`` means "not cached".
@@ -434,7 +408,7 @@ def _projected_messages(
         cached = projections.get(index)
         if cached is not None:
             return cached
-    return session_entry_to_context_messages(entries[index])
+    return sessionEntryToContextMessages(entries[index])
 
 
 def _is_turn_start(entry: SessionEntry, messages: list[AgentMessage]) -> bool:
@@ -443,7 +417,7 @@ def _is_turn_start(entry: SessionEntry, messages: list[AgentMessage]) -> bool:
     return any(read_field(message, "role") in _TURN_START_ROLES for message in messages)
 
 
-def find_turn_start_index(
+def findTurnStartIndex(
     entries: list[SessionEntry],
     entry_index: int,
     start_index: int,
@@ -455,16 +429,16 @@ def find_turn_start_index(
     return -1
 
 
-def find_cut_point(
+def findCutPoint(
     entries: list[SessionEntry],
     start_index: int,
     end_index: int,
     keep_recent_tokens: int,
 ) -> CutPointResult:
     projections = {
-        index: session_entry_to_context_messages(entries[index]) for index in range(start_index, end_index)
+        index: sessionEntryToContextMessages(entries[index]) for index in range(start_index, end_index)
     }
-    cut_points = _find_valid_cut_points(entries, start_index, end_index, projections)
+    cut_points = findValidCutPoints(entries, start_index, end_index, projections)
     if not cut_points:
         return CutPointResult(firstKeptEntryIndex=start_index, turnStartIndex=-1, isSplitTurn=False)
 
@@ -482,7 +456,7 @@ def find_cut_point(
     # so does the previous compaction's own summary, which every second compaction walks
     # over and which the context pays for exactly like any other message.
     for index in range(end_index - 1, start_index - 1, -1):
-        message_tokens = sum(estimate_tokens(message) for message in projections[index])
+        message_tokens = sum(estimateTokens(message) for message in projections[index])
         if message_tokens == 0:
             continue
         accumulated_tokens += message_tokens
@@ -502,7 +476,7 @@ def find_cut_point(
         cut_index -= 1
 
     starts_turn = _is_turn_start(entries[cut_index], projections[cut_index])
-    turn_start_index = -1 if starts_turn else find_turn_start_index(entries, cut_index, start_index, projections)
+    turn_start_index = -1 if starts_turn else findTurnStartIndex(entries, cut_index, start_index, projections)
     return CutPointResult(
         firstKeptEntryIndex=cut_index,
         turnStartIndex=turn_start_index,
@@ -510,32 +484,32 @@ def find_cut_point(
     )
 
 
-def _create_summarization_options(
+def createSummarizationOptions(
     model: Model[Any],
-    max_tokens: int,
-    api_key: str | None,
+    maxTokens: int,
+    apiKey: str | None,
     headers: dict[str, str] | None,
+    env: dict[str, str] | None,
     signal: Any | None,
-    thinking_level: ThinkingLevel | None,
-    env: dict[str, str] | None = None,
-    session_id: str | None = None,
+    thinkingLevel: ThinkingLevel | None,
+    sessionId: str | None,
 ) -> SimpleStreamOptions:
     options = SimpleStreamOptions(
-        maxTokens=max_tokens,
+        maxTokens=maxTokens,
         signal=signal,
-        apiKey=api_key,
+        apiKey=apiKey,
         headers=headers,
         env=env,
-        sessionId=session_id,
+        sessionId=sessionId,
     )
-    if model.reasoning and thinking_level and thinking_level != "off":
-        options.reasoning = thinking_level
+    if model.reasoning and thinkingLevel and thinkingLevel != "off":
+        options.reasoning = thinkingLevel
     return options
 
 
-def _build_summarization_context(prompt_text: str) -> TranscriptContext:
+def buildSummarizationContext(prompt_text: str) -> TranscriptContext:
     """Build the provider context for a standalone summary request."""
-    return normalize_context(
+    return normalizeContext(
         Context(
             systemPrompt=_SUMMARIZATION_SYSTEM_PROMPT,
             messages=[UserMessage(content=[{"type": "text", "text": prompt_text}], timestamp=_timestamp_ms())],
@@ -543,7 +517,7 @@ def _build_summarization_context(prompt_text: str) -> TranscriptContext:
     )
 
 
-async def complete_summarization(
+async def completeSummarization(
     model: Model[Any],
     context: TranscriptContext | dict[str, Any],
     options: SimpleStreamOptions,
@@ -570,105 +544,13 @@ async def complete_summarization(
 
     async def produce() -> AssistantMessage:
         if stream_fn is None:
-            return await complete_simple(model, context, request_options)
+            return await completeSimple(model, context, request_options)
         stream = stream_fn(model, context, request_options)
         if inspect.isawaitable(stream):
             stream = await stream
         return await stream.result()
 
-    return await retry_assistant_call(produce, retry, request_options.signal, callbacks)
-
-
-async def generate_summary(
-    current_messages: list[AgentMessage],
-    model: Model[Any],
-    reserve_tokens: int,
-    api_key: str | None,
-    headers: dict[str, str] | None = None,
-    signal: Any | None = None,
-    custom_instructions: str | None = None,
-    previous_summary: str | None = None,
-    thinking_level: ThinkingLevel | None = None,
-    stream_fn: StreamFn | None = None,
-    retry: RetryPolicy | None = None,
-    env: dict[str, str] | None = None,
-    callbacks: RetryCallbacks | None = None,
-    session_id: str | None = None,
-) -> str:
-    return (
-        await generate_summary_with_usage(
-            current_messages,
-            model,
-            reserve_tokens,
-            api_key,
-            headers,
-            signal,
-            custom_instructions,
-            previous_summary,
-            thinking_level,
-            stream_fn,
-            retry,
-            env,
-            callbacks,
-            session_id,
-        )
-    ).text
-
-
-async def generate_summary_with_usage(
-    current_messages: list[AgentMessage],
-    model: Model[Any],
-    reserve_tokens: int,
-    api_key: str | None,
-    headers: dict[str, str] | None = None,
-    signal: Any | None = None,
-    custom_instructions: str | None = None,
-    previous_summary: str | None = None,
-    thinking_level: ThinkingLevel | None = None,
-    stream_fn: StreamFn | None = None,
-    retry: RetryPolicy | None = None,
-    env: dict[str, str] | None = None,
-    callbacks: RetryCallbacks | None = None,
-    session_id: str | None = None,
-) -> SummaryWithUsage:
-    max_tokens = min(
-        math.floor(0.8 * reserve_tokens),
-        model.maxTokens if model.maxTokens > 0 else math.inf,
-    )
-
-    base_prompt = _UPDATE_SUMMARIZATION_PROMPT if previous_summary else _SUMMARIZATION_PROMPT
-    if custom_instructions:
-        base_prompt = f"{base_prompt}\n\nAdditional focus: {custom_instructions}"
-
-    conversation_text = _serialize_conversation(convertToLlm(current_messages))
-    prompt_text = f"<conversation>\n{conversation_text}\n</conversation>\n\n"
-    if previous_summary:
-        prompt_text += f"<previous-summary>\n{previous_summary}\n</previous-summary>\n\n"
-    prompt_text += base_prompt
-
-    response = await complete_summarization(
-        model,
-        _build_summarization_context(prompt_text),
-        _create_summarization_options(
-            model,
-            int(max_tokens),
-            api_key,
-            headers,
-            signal,
-            thinking_level,
-            env,
-            session_id,
-        ),
-        stream_fn,
-        retry,
-        callbacks,
-    )
-    failure = get_summarization_failure(response, "Summarization")
-    if failure:
-        raise RuntimeError(failure)
-    if any(read_field(block, "type") == "toolCall" for block in response.content):
-        raise RuntimeError("Summarization attempted to call a tool")
-    return SummaryWithUsage(text=_assistant_text(response), usage=response.usage)
+    return await retryAssistantCall(produce, retry, request_options.signal, callbacks)
 
 
 async def generateSummary(
@@ -687,22 +569,24 @@ async def generateSummary(
     callbacks: RetryCallbacks | None = None,
     sessionId: str | None = None,
 ) -> str:
-    return await generate_summary(
-        currentMessages,
-        model,
-        reserveTokens,
-        apiKey,
-        headers=headers,
-        signal=signal,
-        custom_instructions=customInstructions,
-        previous_summary=previousSummary,
-        thinking_level=thinkingLevel,
-        stream_fn=streamFn,
-        retry=retry,
-        env=env,
-        callbacks=callbacks,
-        session_id=sessionId,
-    )
+    return (
+        await generateSummaryWithUsage(
+            currentMessages,
+            model,
+            reserveTokens,
+            apiKey,
+            headers,
+            signal,
+            customInstructions,
+            previousSummary,
+            thinkingLevel,
+            streamFn,
+            env,
+            retry,
+            callbacks,
+            sessionId,
+        )
+    ).text
 
 
 async def generateSummaryWithUsage(
@@ -721,38 +605,60 @@ async def generateSummaryWithUsage(
     callbacks: RetryCallbacks | None = None,
     sessionId: str | None = None,
 ) -> SummaryWithUsage:
-    return await generate_summary_with_usage(
-        currentMessages,
-        model,
-        reserveTokens,
-        apiKey,
-        headers=headers,
-        signal=signal,
-        custom_instructions=customInstructions,
-        previous_summary=previousSummary,
-        thinking_level=thinkingLevel,
-        stream_fn=streamFn,
-        retry=retry,
-        env=env,
-        callbacks=callbacks,
-        session_id=sessionId,
+    maxTokens = min(
+        math.floor(0.8 * reserveTokens),
+        model.maxTokens if model.maxTokens > 0 else math.inf,
     )
 
+    basePrompt = _UPDATE_SUMMARIZATION_PROMPT if previousSummary else _SUMMARIZATION_PROMPT
+    if customInstructions:
+        basePrompt = f"{basePrompt}\n\nAdditional focus: {customInstructions}"
 
-def _is_projected_turn_start(entry: SessionProjectionEntry) -> bool:
+    conversationText = _serialize_conversation(convertToLlm(currentMessages))
+    promptText = f"<conversation>\n{conversationText}\n</conversation>\n\n"
+    if previousSummary:
+        promptText += f"<previous-summary>\n{previousSummary}\n</previous-summary>\n\n"
+    promptText += basePrompt
+
+    response = await completeSummarization(
+        model,
+        buildSummarizationContext(promptText),
+        createSummarizationOptions(
+            model,
+            int(maxTokens),
+            apiKey,
+            headers,
+            env,
+            signal,
+            thinkingLevel,
+            sessionId,
+        ),
+        streamFn,
+        retry,
+        callbacks,
+    )
+    failure = getSummarizationFailure(response, "Summarization")
+    if failure:
+        raise RuntimeError(failure)
+    if any(read_field(block, "type") == "toolCall" for block in response.content):
+        raise RuntimeError("Summarization attempted to call a tool")
+    return SummaryWithUsage(text=_assistant_text(response), usage=response.usage)
+
+
+def isProjectedTurnStart(entry: SessionProjectionEntry) -> bool:
     if _entry_field(entry.sourceEntry, "type") == "compaction":
         return False
     return any(read_field(message, "role") in _TURN_START_ROLES for message in entry.messages)
 
 
-def _find_projected_turn_start_index(entries: list[SessionProjectionEntry], entry_index: int, start_index: int) -> int:
+def findProjectedTurnStartIndex(entries: list[SessionProjectionEntry], entry_index: int, start_index: int) -> int:
     for i in range(entry_index, start_index - 1, -1):
-        if _is_projected_turn_start(entries[i]):
+        if isProjectedTurnStart(entries[i]):
             return i
     return -1
 
 
-def _find_projected_cut_point(
+def findProjectedCutPoint(
     entries: list[SessionProjectionEntry], start_index: int, end_index: int, keep_recent_tokens: int
 ) -> CutPointResult:
     cut_points: list[int] = []
@@ -768,7 +674,7 @@ def _find_projected_cut_point(
     exceeded_budget = False
     cut_index = cut_points[0]
     for i in range(end_index - 1, start_index - 1, -1):
-        message_tokens = sum(estimate_tokens(message) for message in entries[i].messages)
+        message_tokens = sum(estimateTokens(message) for message in entries[i].messages)
         if message_tokens == 0:
             continue
         accumulated_tokens += message_tokens
@@ -787,7 +693,7 @@ def _find_projected_cut_point(
     def is_intrinsically_visible(entry: SessionProjectionEntry) -> bool:
         return (
             _entry_field(entry.sourceEntry, "type") != "context_edit"
-            and len(session_entry_to_context_messages(entry.sourceEntry)) > 0
+            and len(sessionEntryToContextMessages(entry.sourceEntry)) > 0
         )
 
     def is_omitted(entry: SessionProjectionEntry) -> bool:
@@ -822,8 +728,8 @@ def _find_projected_cut_point(
         if _entry_field(previous.sourceEntry, "type") == "compaction" or len(previous.messages) > 0:
             break
         cut_index -= 1
-    starts_turn = _is_projected_turn_start(entries[cut_index])
-    turn_start_index = -1 if starts_turn else _find_projected_turn_start_index(entries, cut_index, start_index)
+    starts_turn = isProjectedTurnStart(entries[cut_index])
+    turn_start_index = -1 if starts_turn else findProjectedTurnStartIndex(entries, cut_index, start_index)
     return CutPointResult(
         firstKeptEntryIndex=cut_index,
         turnStartIndex=turn_start_index,
@@ -831,7 +737,7 @@ def _find_projected_cut_point(
     )
 
 
-def prepare_compaction(
+def prepareCompaction(
     path_entries: list[SessionEntry],
     settings: CompactionSettings,
 ) -> CompactionPreparation | None:
@@ -839,7 +745,7 @@ def prepare_compaction(
         return None
     if path_entries[-1].get("type") == "compaction":
         return None
-    projection = build_session_projection(path_entries)
+    projection = buildSessionProjection(path_entries)
     projected_entries = projection.entries
     source_entries = [entry.sourceEntry for entry in projected_entries]
     # The newest compaction is projected first. Older compaction entries can still
@@ -873,8 +779,8 @@ def prepare_compaction(
             previous_summary = None
 
     boundary_end = len(projected_entries)
-    tokens_before = estimate_projected_context_tokens(projection, path_entries).tokens
-    cut_point = _find_projected_cut_point(projected_entries, boundary_start, boundary_end, settings.keepRecentTokens)
+    tokens_before = estimateProjectedContextTokens(projection, path_entries).tokens
+    cut_point = findProjectedCutPoint(projected_entries, boundary_start, boundary_end, settings.keepRecentTokens)
     first_kept_entry = (
         projected_entries[cut_point.firstKeptEntryIndex].sourceEntry
         if cut_point.firstKeptEntryIndex < len(projected_entries)
@@ -890,14 +796,14 @@ def prepare_compaction(
         *(
             message
             for entry in projected_entries[boundary_start:history_end]
-            for message in _get_messages_from_projected_entry_for_compaction(entry)
+            for message in getMessagesFromProjectedEntryForCompaction(entry)
         ),
     ]
     turn_prefix_messages: list[AgentMessage] = (
         [
             message
             for entry in projected_entries[cut_point.turnStartIndex : cut_point.firstKeptEntryIndex]
-            for message in _get_messages_from_projected_entry_for_compaction(entry)
+            for message in getMessagesFromProjectedEntryForCompaction(entry)
         ]
         if cut_point.isSplitTurn
         else []
@@ -906,10 +812,10 @@ def prepare_compaction(
         return None
 
     # Extract file operations from edited model-visible messages and the previous compaction.
-    file_ops = _extract_file_operations(messages_to_summarize, source_entries, prev_compaction_index)
+    file_ops = extractFileOperations(messages_to_summarize, source_entries, prev_compaction_index)
     if cut_point.isSplitTurn:
         for message in turn_prefix_messages:
-            extract_file_ops_from_message(message, file_ops)
+            extractFileOpsFromMessage(message, file_ops)
 
     return CompactionPreparation(
         firstKeptEntryId=first_kept_entry_id,
@@ -940,7 +846,7 @@ async def compact(
     if preparation.isSplitTurn and preparation.turnPrefixMessages:
         history_result = None
         if preparation.messagesToSummarize:
-            history_result = await generate_summary_with_usage(
+            history_result = await generateSummaryWithUsage(
                 preparation.messagesToSummarize,
                 model,
                 preparation.settings.reserveTokens,
@@ -950,14 +856,14 @@ async def compact(
                 custom_instructions,
                 preparation.previousSummary,
                 thinking_level,
-                stream_fn=stream_fn,
+                streamFn=stream_fn,
                 retry=retry,
                 env=env,
                 callbacks=callbacks,
-                session_id=session_id,
+                sessionId=session_id,
             )
 
-        turn_prefix_result = await _generate_turn_prefix_summary(
+        turn_prefix_result = await generateTurnPrefixSummary(
             preparation.turnPrefixMessages,
             model,
             preparation.settings.reserveTokens,
@@ -978,12 +884,12 @@ async def compact(
         )
         summary = f"{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_result.text}"
         summary_usage = (
-            combine_usage(history_result.usage, turn_prefix_result.usage)
+            combineUsage(history_result.usage, turn_prefix_result.usage)
             if history_result is not None
             else turn_prefix_result.usage
         )
     else:
-        summary_result = await generate_summary_with_usage(
+        summary_result = await generateSummaryWithUsage(
             preparation.messagesToSummarize,
             model,
             preparation.settings.reserveTokens,
@@ -993,17 +899,17 @@ async def compact(
             custom_instructions,
             preparation.previousSummary,
             thinking_level,
-            stream_fn=stream_fn,
+            streamFn=stream_fn,
             retry=retry,
             env=env,
             callbacks=callbacks,
-            session_id=session_id,
+            sessionId=session_id,
         )
         summary = summary_result.text
         summary_usage = summary_result.usage
 
-    file_lists = compute_file_lists(preparation.fileOps)
-    summary += format_file_operations(file_lists["readFiles"], file_lists["modifiedFiles"])
+    file_lists = computeFileLists(preparation.fileOps)
+    summary += formatFileOperations(file_lists["readFiles"], file_lists["modifiedFiles"])
     if not preparation.firstKeptEntryId:
         raise RuntimeError("First kept entry has no UUID - session may need migration")
     return CompactionResult(
@@ -1018,12 +924,12 @@ async def compact(
     )
 
 
-def _extract_file_operations(
+def extractFileOperations(
     messages: list[AgentMessage],
     entries: list[SessionEntry],
     previous_compaction_index: int,
 ) -> FileOperations:
-    file_ops = create_file_ops()
+    file_ops = createFileOps()
     if previous_compaction_index >= 0:
         previous = entries[previous_compaction_index]
         if not previous.get("fromHook") and previous.get("details") is not None:
@@ -1041,11 +947,11 @@ def _extract_file_operations(
                     if isinstance(path, str):
                         file_ops.edited.add(path)
     for message in messages:
-        extract_file_ops_from_message(message, file_ops)
+        extractFileOpsFromMessage(message, file_ops)
     return file_ops
 
 
-def _get_messages_from_projected_entry_for_compaction(entry: SessionProjectionEntry) -> list[AgentMessage]:
+def getMessagesFromProjectedEntryForCompaction(entry: SessionProjectionEntry) -> list[AgentMessage]:
     """Extract the AgentMessages an entry contributes to compaction. Empty for entries that
     don't contribute to LLM context."""
     if _entry_field(entry.sourceEntry, "type") == "compaction":
@@ -1063,7 +969,7 @@ def _tool_payload(tool: Any) -> Any:
     return tool.model_dump() if hasattr(tool, "model_dump") else tool
 
 
-def _find_valid_cut_points(
+def findValidCutPoints(
     entries: list[SessionEntry],
     start_index: int,
     end_index: int,
@@ -1079,7 +985,7 @@ def _find_valid_cut_points(
     return cut_points
 
 
-async def _generate_turn_prefix_summary(
+async def generateTurnPrefixSummary(
     messages: list[AgentMessage],
     model: Model[Any],
     reserve_tokens: int,
@@ -1099,24 +1005,24 @@ async def _generate_turn_prefix_summary(
     )
     conversation_text = _serialize_conversation(convertToLlm(messages))
     prompt_text = f"# Conversation\n{conversation_text}\n\n# Instructions\n{_TURN_PREFIX_SUMMARIZATION_PROMPT}"
-    response = await complete_summarization(
+    response = await completeSummarization(
         model,
-        _build_summarization_context(prompt_text),
-        _create_summarization_options(
+        buildSummarizationContext(prompt_text),
+        createSummarizationOptions(
             model,
             int(max_tokens),
             api_key,
             headers,
+            env,
             signal,
             thinking_level,
-            env,
             session_id,
         ),
         stream_fn,
         retry,
         callbacks,
     )
-    failure = get_summarization_failure(response, "Turn prefix summarization")
+    failure = getSummarizationFailure(response, "Turn prefix summarization")
     if failure:
         raise RuntimeError(failure)
     if any(read_field(block, "type") == "toolCall" for block in response.content):
@@ -1130,7 +1036,7 @@ def _assistant_usage(message: Any) -> Usage | dict[str, Any] | None:
     if read_field(message, "stopReason") in {"aborted", "error"}:
         return None
     usage = read_field(message, "usage")
-    return usage if usage is not None and calculate_context_tokens(usage) > 0 else None
+    return usage if usage is not None and calculateContextTokens(usage) > 0 else None
 
 
 def _last_assistant_usage_info(messages: list[AgentMessage]) -> dict[str, Any] | None:
@@ -1157,17 +1063,6 @@ def _timestamp_ms() -> int:
     return int(time.time() * 1000)
 
 
-calculateContextTokens = calculate_context_tokens
-completeSummarization = complete_summarization
-estimateContextTokens = estimate_context_tokens
-estimateTokens = estimate_tokens
-estimateProjectedContextTokens = estimate_projected_context_tokens
-findCutPoint = find_cut_point
-findTurnStartIndex = find_turn_start_index
-getLastAssistantUsage = get_last_assistant_usage
-getSummarizationFailure = get_summarization_failure
-prepareCompaction = prepare_compaction
-shouldCompact = should_compact
 
 
 __all__ = [
@@ -1180,30 +1075,17 @@ __all__ = [
     "CutPointResult",
     "SummaryWithUsage",
     "calculateContextTokens",
-    "calculate_context_tokens",
     "compact",
     "completeSummarization",
-    "complete_summarization",
     "estimateContextTokens",
     "estimateProjectedContextTokens",
     "estimateTokens",
-    "estimate_context_tokens",
-    "estimate_projected_context_tokens",
-    "estimate_tokens",
     "findCutPoint",
     "findTurnStartIndex",
-    "find_cut_point",
-    "find_turn_start_index",
     "generateSummary",
     "generateSummaryWithUsage",
-    "generate_summary",
-    "generate_summary_with_usage",
     "getLastAssistantUsage",
     "getSummarizationFailure",
-    "get_last_assistant_usage",
-    "get_summarization_failure",
     "prepareCompaction",
-    "prepare_compaction",
     "shouldCompact",
-    "should_compact",
 ]
