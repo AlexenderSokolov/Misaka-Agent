@@ -1,5 +1,5 @@
 """``misaka auth`` over the model runtime, after pi's ``auth-check.test.ts`` and
-``credential-print.test.ts`` (the command surface is misaka's own, ``misaka/cli/auth.py``)."""
+``credential-print.test.ts``; the command is ``runAuthCommand`` in ``misaka/cli/engine.py``."""
 
 from __future__ import annotations
 
@@ -9,8 +9,13 @@ import time
 import pytest
 
 from misaka.ai.auth.types import OAuthCredential
-from misaka.cli import auth
+from misaka.cli import auth_check
+from misaka.cli.args import parseArgs
+from misaka.cli.auth_command import AuthCommandError, parseAuthCommand
+from misaka.cli.credential_print import resolveCredentialForPrint
+from misaka.cli.engine import runAuthCommand
 from misaka.config import home
+from misaka.core.auth_storage import AuthStorage
 
 
 def _store(data) -> None:
@@ -19,33 +24,33 @@ def _store(data) -> None:
     path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
 
 
-def _command(*args: str):
-    return auth.parse_auth_command(list(args))
+async def _check(capsys, *args: str) -> tuple[int, dict]:
+    code = await runAuthCommand(["auth", "check", *args, "--json"])
+    return code, json.loads(capsys.readouterr().out)
 
 
 def _hour_ms() -> int:
     return int(time.time() * 1000) + 60 * 60 * 1000
 
 
-async def test_reports_a_configured_provider_as_ready():
+async def test_reports_a_configured_provider_as_ready(capsys):
     _store({"openai": {"type": "api_key", "key": "test-key"}})
 
-    result = await auth._check_auth(_command("check", "--provider", "openai"))
+    code, result = await _check(capsys, "--provider", "openai")
 
-    assert (result.status, result.provider, result.auth_type) == ("ready", "openai", "api_key")
+    assert code == 0
+    assert result == {"status": "ready", "provider": "openai", "authType": "api_key"}
 
 
-async def test_resolves_the_provider_from_model():
+async def test_resolves_the_provider_from_model(capsys):
     _store({"openai": {"type": "api_key", "key": "test-key"}})
 
-    result = await auth._check_auth(_command("check", "--model", "openai/gpt-4.1"))
-    assert (result.status, result.provider) == ("ready", "openai")
-    result = await auth._check_auth(_command("check", "--provider", "openai", "--model", "gpt-4.1"))
-    assert (result.status, result.provider) == ("ready", "openai")
+    assert (await _check(capsys, "--model", "openai/gpt-4.1"))[1]["provider"] == "openai"
+    assert (await _check(capsys, "--provider", "openai", "--model", "gpt-4.1"))[1]["status"] == "ready"
 
 
 def _patch_refresh(monkeypatch, provider_id: str, refreshed: list, access: str | None = None):
-    create = auth.create_auth_check_model_runtime
+    create = auth_check.createAuthCheckModelRuntime
 
     async def patched(credentials):
         runtime = await create(credentials)
@@ -59,122 +64,129 @@ def _patch_refresh(monkeypatch, provider_id: str, refreshed: list, access: str |
         oauth.refresh = refresh
         return runtime
 
-    monkeypatch.setattr(auth, "create_auth_check_model_runtime", patched)
+    monkeypatch.setattr(auth_check, "createAuthCheckModelRuntime", patched)
+    return patched
 
 
-async def test_reads_credentials_without_refreshing_oauth_when_requested(monkeypatch):
+async def test_reads_credentials_without_refreshing_oauth_when_requested(monkeypatch, capsys):
     _store({"openai-codex": {"type": "oauth", "access": "old-token", "refresh": "refresh-token", "expires": 0}})
     refreshed: list = []
     _patch_refresh(monkeypatch, "openai-codex", refreshed)
 
-    result = await auth._check_auth(_command("check", "--provider", "openai-codex", "--no-refresh", "--credentials"))
+    code, result = await _check(capsys, "--provider", "openai-codex", "--no-refresh", "--credentials")
 
-    assert (result.status, result.credential) == ("ready", "old-token")
+    assert code == 0 and result["credentials"] == "old-token"
     assert refreshed == []
 
 
-async def test_refreshes_oauth_by_default(monkeypatch):
+async def test_refreshes_oauth_by_default(monkeypatch, capsys):
     _store({"openai-codex": {"type": "oauth", "access": "old-token", "refresh": "refresh-token", "expires": 0}})
     refreshed: list = []
     _patch_refresh(monkeypatch, "openai-codex", refreshed)
 
-    result = await auth._check_auth(_command("check", "--provider", "openai-codex"))
+    code, result = await _check(capsys, "--provider", "openai-codex")
 
-    assert result.status == "ready"
+    assert code == 0 and result["status"] == "ready"
     assert refreshed == ["old-token"]
 
 
-async def test_reports_an_unknown_provider_as_not_ready():
-    result = await auth._check_auth(_command("check", "--provider", "not-installed"))
+async def test_reports_an_unknown_provider_as_not_ready(capsys):
+    code, result = await _check(capsys, "--provider", "not-installed")
 
-    assert (result.status, result.provider, result.reason) == ("not_ready", "not-installed", "provider_not_found")
+    assert code == 1
+    assert result == {"status": "not_ready", "provider": "not-installed", "reason": "provider_not_found"}
 
 
-async def test_does_not_treat_an_unresolved_stored_environment_reference_as_configured(monkeypatch):
+async def test_does_not_treat_an_unresolved_stored_environment_reference_as_configured(monkeypatch, capsys):
     monkeypatch.delenv("MISSING_AUTH_CHECK_KEY", raising=False)
     _store({"openai": {"type": "api_key", "key": "$MISSING_AUTH_CHECK_KEY"}})
 
-    result = await auth._check_auth(_command("check", "--provider", "openai", "--no-refresh"))
+    _code, result = await _check(capsys, "--provider", "openai", "--no-refresh")
 
-    assert (result.status, result.reason) == ("not_ready", "credentials_not_configured")
+    assert (result["status"], result["reason"]) == ("not_ready", "credentials_not_configured")
 
 
-async def test_reports_malformed_auth_state_as_invalid():
+async def test_reports_malformed_auth_state_as_invalid(capsys):
     _store("{invalid-json")
 
-    result = await auth._check_auth(_command("check", "--provider", "openai", "--no-refresh"))
+    code, result = await _check(capsys, "--provider", "openai", "--no-refresh")
 
-    assert (result.status, result.provider, result.reason) == ("invalid", "openai", "invalid_state")
+    assert code == 2
+    assert result == {"status": "invalid", "provider": "openai", "reason": "invalid_state"}
 
 
-async def test_does_not_create_an_auth_file_or_its_parent_directory():
-    result = await auth._check_auth(_command("check", "--provider", "openai", "--no-refresh"))
+async def test_does_not_create_an_auth_file_or_its_parent_directory(capsys):
+    _code, result = await _check(capsys, "--provider", "openai", "--no-refresh")
 
-    assert (result.status, result.reason) == ("not_ready", "credentials_not_configured")
+    assert (result["status"], result["reason"]) == ("not_ready", "credentials_not_configured")
     assert not home.path("auth").exists()
     assert not home.path("auth").parent.exists()
 
 
 async def test_creates_an_auth_check_runtime_without_catalog_storage():
-    from misaka.core.auth_storage import AuthStorage
-
-    runtime = await auth.create_auth_check_model_runtime(AuthStorage.inMemory())
+    runtime = await auth_check.createAuthCheckModelRuntime(AuthStorage.inMemory())
 
     assert runtime.getProvider("openai") is not None
     assert not home.path("models_store").exists()
 
 
-async def test_prints_a_resolved_api_key():
+async def test_prints_a_resolved_api_key(capsys):
     _store({"openai": {"type": "api_key", "key": "test-api-key"}})
 
-    assert await auth._print_credential(_command("print-api-key", "--provider", "openai")) == "test-api-key"
+    assert await runAuthCommand(["auth", "print-api-key", "--provider", "openai"]) == 0
+    assert capsys.readouterr().out == "test-api-key\n"
 
 
-async def test_prints_bearer_tokens_resolved_from_an_authorization_header():
+async def test_prints_bearer_tokens_resolved_from_an_authorization_header(capsys):
     _store({"kimi-coding": {
         "type": "oauth", "access": "header-test-token", "refresh": "test-refresh-token", "expires": _hour_ms(),
     }})
 
-    credential = await auth._print_credential(_command("print-bearer-token", "--provider", "kimi-coding"))
-
-    assert credential == "header-test-token"
+    assert await runAuthCommand(["auth", "print-bearer-token", "--provider", "kimi-coding"]) == 0
+    assert capsys.readouterr().out == "header-test-token\n"
 
 
 async def test_refreshes_an_expired_oauth_token_before_printing_it(monkeypatch):
     _store({"openai-codex": {"type": "oauth", "access": "old-test-token", "refresh": "test-refresh-token",
                              "expires": 0}})
     refreshed: list = []
-    _patch_refresh(monkeypatch, "openai-codex", refreshed, access="fresh-test-token")
+    patched = _patch_refresh(monkeypatch, "openai-codex", refreshed, access="fresh-test-token")
+    runtime = await patched(AuthStorage.create())
 
-    credential = await auth._print_credential(_command("print-bearer-token", "--provider", "openai-codex"))
+    credential = await resolveCredentialForPrint(parseArgs(["--provider", "openai-codex"]), runtime, "bearer_token")
 
     assert credential == "fresh-test-token"
     assert refreshed == ["old-test-token"]
     assert json.loads(home.path("auth").read_text(encoding="utf-8"))["openai-codex"]["access"] == "fresh-test-token"
 
 
-async def test_an_oauth_provider_does_not_print_as_an_api_key():
+async def test_an_oauth_provider_does_not_print_as_an_api_key(capsys):
     _store({"openai-codex": {"type": "oauth", "access": "test-token-not-to-be-printed",
                              "refresh": "test-refresh-token", "expires": _hour_ms()}})
 
-    with pytest.raises(auth.AuthCommandError, match="configured with OAuth, not an API key"):
-        await auth._print_credential(_command("print-api-key", "--provider", "openai-codex"))
+    assert await runAuthCommand(["auth", "print-api-key", "--provider", "openai-codex"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "configured with OAuth, not an API key" in captured.err
 
 
-def test_the_legacy_overview_reads_the_runtime_snapshot(capsys):
+def test_parse_rejects_flags_for_the_wrong_subcommand():
+    with pytest.raises(AuthCommandError, match="only supported by print-bearer-token"):
+        parseAuthCommand(["auth", "check", "--min-expiry", "1h"])
+    with pytest.raises(AuthCommandError, match="only supported by auth check"):
+        parseAuthCommand(["auth", "print-api-key", "--json"])
+    assert parseAuthCommand(["auth", "print-bearer-token", "--min-expiry", "2H"]).minExpiryMs == 7_200_000
+
+
+async def test_bare_auth_prints_help(capsys):
+    assert await runAuthCommand(["auth"]) == 0
+    assert capsys.readouterr().out.startswith("Usage:")
+
+
+async def test_a_bare_check_prints_the_misaka_provider_overview(capsys):
     _store({"openai": {"type": "api_key", "key": "test-key"}})
 
-    code = auth._run_legacy_check("openai", show=True)
+    await runAuthCommand(["auth", "check"])
 
-    line = capsys.readouterr().out.strip()
-    assert code == 0 and line.startswith("✓ openai  stored") and line.endswith("test-key")
-
-
-def test_the_legacy_overview_shows_a_token_sent_as_an_authorization_header(capsys):
-    _store({"kimi-coding": {
-        "type": "oauth", "access": "header-test-token", "refresh": "test-refresh-token", "expires": _hour_ms(),
-    }})
-
-    auth._run_legacy_check("kimi-coding", show=True)
-
-    assert capsys.readouterr().out.strip().endswith("header-test-token")
+    lines = capsys.readouterr().out.splitlines()
+    assert any(line.startswith(("✓ openai  stored", "! openai  stored")) for line in lines)

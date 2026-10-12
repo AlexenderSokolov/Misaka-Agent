@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Any, TypedDict
 
-from misaka.utils.js import UNDEFINED, jsonParse, jsTrim, jsTrimStart
+from misaka.utils.js import UNDEFINED, jsonParse, jsTrim, jsTrimStart, objectKeys
 
 CODEMODE_OPTIONS_PREFIX = "// @options:"
 
@@ -80,10 +80,8 @@ def _parseOptions(directive: str) -> CodemodeSourceOptions:
     if not isinstance(value, dict):
         raise CodemodeSourceError(f"@options must be a JSON object with supported fields {SUPPORTED_FIELDS_TEXT}")
     fields: dict[str, Any] = value
-    # MISAKA fork: keys are checked in insertion order, where `Object.keys` lists array-index keys first,
-    # so with two unsupported keys the message can name the other one; the syntax error detail is
-    # Python's, not V8's.
-    for key in fields:
+    # MISAKA fork: the syntax error detail is Python's, not V8's.
+    for key in objectKeys(fields):
         if key not in SUPPORTED_FIELDS:
             raise CodemodeSourceError(f"@options only supports {SUPPORTED_FIELDS_TEXT}; got `{key}`")
     options: CodemodeSourceOptions = {}

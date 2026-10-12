@@ -92,7 +92,7 @@ class _Flow:
 
 async def _runtime(flow: _Flow, stored: dict | None) -> tuple[ModelRuntime, AuthStorage]:
     storage = AuthStorage.inMemory({PROVIDER: stored} if stored else {})
-    runtime = await ModelRuntime.create(authStorage=storage, modelsPath=None)
+    runtime = await ModelRuntime.create({"authStorage": storage, "modelsPath": None})
     runtime.registerNativeProvider(SimpleNamespace(
         id=PROVIDER,
         name=PROVIDER,
@@ -164,9 +164,7 @@ async def test_a_logged_out_provider_is_not_a_recovery():
 
 
 async def test_a_configured_api_key_is_the_users_to_replace():
-    runtime = await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory({"anthropic": {"type": "api_key", "key": "stale-key"}}), modelsPath=None
-    )
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory({"anthropic": {"type": "api_key", "key": "stale-key"}}), "modelsPath": None})
     await _request(runtime, runtime.getModels("anthropic")[0])
 
     assert await runtime.recoverRejectedCredential("anthropic") is False

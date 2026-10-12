@@ -52,15 +52,20 @@ from misaka.mcp.transports.transport import McpTransport
 from misaka.utils.js import (
     UNDEFINED,
     AbortController,
+    Timeout,
     abortReason,
+    addAbortListener,
+    awaitValue,
+    clearTimeout,
+    eager,
     isAborted,
     isNumber,
     jsString,
     liveKeys,
-    onAbort,
+    nullishCoalesce,
+    setTimeout,
     spawn,
 )
-from misaka.utils.values import maybe_await
 
 DEFAULT_REQUEST_TIMEOUT_MS: Final = 30_000
 MAX_LIST_PAGES: Final = 1_000
@@ -86,21 +91,22 @@ class McpRequestOptions(TypedDict, total=False):
 
 
 @dataclass(slots=True)
-class _PendingRequest:
+class PendingRequest:
     resolve: Callable[[Any], None]
     reject: Callable[[BaseException], None]
     timeoutMs: float
-    timer: asyncio.TimerHandle | None
+    timer: Timeout | None
     signal: Any
     onAbort: Callable[[], None]
     cancellable: bool
     onProgress: Callable[[ProgressNotification], None] | None
     progressToken: JsonRpcId | None
-    # MISAKA fork: `removeEventListener("abort", ...)` for the watcher that stands in for the listener.
+    # MISAKA fork: `removeEventListener("abort", ...)`, which a signal without listeners (one of misaka's
+    # flag-style signals) answers with the watcher that stands in for the listener.
     removeAbortListener: Callable[[], None] = field(default=lambda: None)
 
 
-def _validateInitializeResult(value: Any) -> InitializeResult:
+def validateInitializeResult(value: Any) -> InitializeResult:
     if (
         not isObject(value)
         or not isinstance(value.get("protocolVersion"), str)
@@ -114,7 +120,7 @@ def _validateInitializeResult(value: Any) -> InitializeResult:
     return value  # type: ignore[return-value]
 
 
-def _invalid(message: str) -> McpError:
+def invalid(message: str) -> McpError:
     return McpError(JSON_RPC_ERROR_CODES.invalidRequest, message)
 
 
@@ -123,72 +129,72 @@ class _ListPage(TypedDict):
     nextCursor: NotRequired[str]
 
 
-def _validateListPage(
+def validateListPage(
     method: str, key: str, value: Any, isItem: Callable[[dict[str, Any]], bool]
 ) -> _ListPage:
     """One page of a paginated list: the items under ``key``, each checked by ``isItem``."""
     items = value.get(key) if isObject(value) else None
     if not isObject(value) or not isinstance(items, list):
-        raise _invalid(f"Invalid MCP {method} result")
+        raise invalid(f"Invalid MCP {method} result")
     for item in items:
         if not isObject(item) or not isItem(item):
-            raise _invalid(f"Invalid entry in MCP {method} result")
+            raise invalid(f"Invalid entry in MCP {method} result")
     # Some servers end pagination with `null` or `""` instead of omitting the cursor.
     nextCursor = value.get("nextCursor", UNDEFINED)
     if nextCursor is None or nextCursor == "":
         nextCursor = UNDEFINED
     if nextCursor is not UNDEFINED and not isinstance(nextCursor, str):
-        raise _invalid(f"Invalid MCP {method} cursor")
+        raise invalid(f"Invalid MCP {method} cursor")
     page: _ListPage = {"items": items}
     if isinstance(nextCursor, str):
         page["nextCursor"] = nextCursor
     return page
 
 
-def _isTool(tool: dict[str, Any]) -> bool:
+def isTool(tool: dict[str, Any]) -> bool:
     return isinstance(tool.get("name"), str) and isObject(tool.get("inputSchema"))
 
 
 # `name` is required by the spec, but some servers omit it; the URI stands in.
-def _isResource(resource: dict[str, Any]) -> bool:
+def isResource(resource: dict[str, Any]) -> bool:
     return isinstance(resource.get("uri"), str) and ("name" not in resource or isinstance(resource["name"], str))
 
 
-def _isResourceTemplate(template: dict[str, Any]) -> bool:
+def isResourceTemplate(template: dict[str, Any]) -> bool:
     return isinstance(template.get("uriTemplate"), str) and (
         "name" not in template or isinstance(template["name"], str)
     )
 
 
-def _toResource(item: dict[str, Any]) -> Resource:
+def toResource(item: dict[str, Any]) -> Resource:
     return {**item, "name": item["uri"] if item.get("name") is None else item["name"]}  # type: ignore[typeddict-item]
 
 
-def _toResourceTemplate(item: dict[str, Any]) -> ResourceTemplate:
+def toResourceTemplate(item: dict[str, Any]) -> ResourceTemplate:
     return {  # type: ignore[typeddict-item]
         **item,
         "name": item["uriTemplate"] if item.get("name") is None else item["name"],
     }
 
 
-def _pageCursor(page: _ListPage) -> dict[str, str]:
+def pageCursor(page: _ListPage) -> dict[str, str]:
     return {"nextCursor": page["nextCursor"]} if "nextCursor" in page else {}
 
 
-def _validateReadResourceResult(value: Any) -> ReadResourceResult:
+def validateReadResourceResult(value: Any) -> ReadResourceResult:
     if not isObject(value) or not isinstance(value.get("contents"), list):
-        raise _invalid("Invalid MCP resources/read result")
+        raise invalid("Invalid MCP resources/read result")
     for contents in value["contents"]:
         if (
             not isObject(contents)
             or not isinstance(contents.get("uri"), str)
             or (not isinstance(contents.get("text"), str) and not isinstance(contents.get("blob"), str))
         ):
-            raise _invalid("Invalid contents in MCP resources/read result")
+            raise invalid("Invalid contents in MCP resources/read result")
     return value  # type: ignore[return-value]
 
 
-def _validateCallToolResult(value: Any) -> CallToolResult:
+def validateCallToolResult(value: Any) -> CallToolResult:
     """``content`` is required by the spec, but servers that only return ``structuredContent`` omit it
     (the SDK defaults it too)."""
     if not isObject(value) or ("content" in value and not isinstance(value["content"], list)):
@@ -208,7 +214,7 @@ class McpClient:
         self._serverCapabilitiesValue: ServerCapabilities | None = None
         self._instructionsValue: str | None = None
         self._protocolVersionValue: str | None = None
-        self._pending: dict[JsonRpcId, _PendingRequest] = {}
+        self._pending: dict[JsonRpcId, PendingRequest] = {}
         self._progressRequests: dict[JsonRpcId, JsonRpcId] = {}
         self._incoming: dict[JsonRpcId, AbortController] = {}
         self._requestHandlers: dict[str, RequestHandler] = {}
@@ -224,7 +230,7 @@ class McpClient:
         if roots is not None:
 
             async def listRoots(_params: Any, _context: dict[str, Any]) -> dict[str, Any]:
-                return {"roots": list(await maybe_await(roots()) if callable(roots) else roots)}
+                return {"roots": list(await awaitValue(roots()) if callable(roots) else roots)}
 
             self._requestHandlers["roots/list"] = listRoots
 
@@ -248,6 +254,7 @@ class McpClient:
     def protocolVersion(self) -> str | None:
         return self._protocolVersionValue
 
+    @eager
     async def connect(self, transport: McpTransport) -> InitializeResult:
         if self._state != "idle":
             raise RuntimeError(f"Cannot connect MCP client in {self._state} state")
@@ -267,17 +274,17 @@ class McpClient:
             capabilities: ClientCapabilities = {**(self.options.get("capabilities") or {})}  # type: ignore[typeddict-item]
             if self.options.get("roots") is not None and "roots" not in capabilities:
                 capabilities["roots"] = {}
-            clientInfo: dict[str, Any] = {"name": self.options["name"], "version": self.options["version"]}
-            if self.options.get("title") is not None:
-                clientInfo["title"] = self.options["title"]
-            protocolVersion = self.options.get("protocolVersion")
-            result = _validateInitializeResult(
+            result = validateInitializeResult(
                 await self._requestInternal(
                     "initialize",
                     {
-                        "protocolVersion": protocolVersion if protocolVersion is not None else LATEST_PROTOCOL_VERSION,
+                        "protocolVersion": nullishCoalesce(self.options.get("protocolVersion"), LATEST_PROTOCOL_VERSION),
                         "capabilities": capabilities,
-                        "clientInfo": clientInfo,
+                        "clientInfo": {
+                            "name": self.options["name"],
+                            "version": self.options["version"],
+                            **({} if self.options.get("title") is None else {"title": self.options["title"]}),
+                        },
                     },
                     {},
                     True,
@@ -302,13 +309,13 @@ class McpClient:
                 pass
             raise
 
-    async def request(
+    def request(
         self, method: str, params: dict[str, Any] | None = None, options: McpRequestOptions | None = None
-    ) -> Any:
-        return await self._requestInternal(method, params, options if options is not None else {}, False)
+    ) -> asyncio.Future[Any]:
+        return self._requestInternal(method, params, options if options is not None else {}, False)
 
-    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        await self._notifyInternal(method, params, False)
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> asyncio.Future[None]:
+        return self._notifyInternal(method, params, False)
 
     def setRequestHandler(self, method: str, handler: RequestHandler) -> Callable[[], None]:
         self._requestHandlers[method] = handler
@@ -342,36 +349,42 @@ class McpClient:
         self._closeListeners[listener] = None
         return lambda: self._closeListeners.pop(listener, None)  # type: ignore[return-value]
 
+    @eager
     async def ping(self, options: McpRequestOptions | None = None) -> None:
         await self.request("ping", None, options)
 
+    @eager
     async def listTools(self, options: McpRequestOptions | None = None) -> list[Tool]:
-        return await self._listAll("tools/list", "tools", _isTool, options if options is not None else {})  # type: ignore[return-value]
+        return await self._listAll("tools/list", "tools", isTool, options if options is not None else {})  # type: ignore[return-value]
 
+    @eager
     async def listResources(self, options: McpRequestOptions | None = None) -> list[Resource]:
         """Every resource, following ``nextCursor`` through all pages."""
-        items = await self._listAll("resources/list", "resources", _isResource, options if options is not None else {})
-        return [_toResource(item) for item in items]
+        items = await self._listAll("resources/list", "resources", isResource, options if options is not None else {})
+        return [toResource(item) for item in items]
 
+    @eager
     async def listResourcesPage(
         self, cursor: str | None = None, options: McpRequestOptions | None = None
     ) -> ListResourcesResult:
         """One page of resources, starting at ``cursor``."""
         page = await self._listPage(
-            "resources/list", "resources", _isResource, cursor, options if options is not None else {}
+            "resources/list", "resources", isResource, cursor, options if options is not None else {}
         )
-        return {"resources": [_toResource(item) for item in page["items"]], **_pageCursor(page)}  # type: ignore[typeddict-item]
+        return {"resources": [toResource(item) for item in page["items"]], **pageCursor(page)}  # type: ignore[typeddict-item]
 
+    @eager
     async def listResourceTemplates(self, options: McpRequestOptions | None = None) -> list[ResourceTemplate]:
         """Every resource template, following ``nextCursor`` through all pages."""
         templates = await self._listAll(
             "resources/templates/list",
             "resourceTemplates",
-            _isResourceTemplate,
+            isResourceTemplate,
             options if options is not None else {},
         )
-        return [_toResourceTemplate(item) for item in templates]
+        return [toResourceTemplate(item) for item in templates]
 
+    @eager
     async def listResourceTemplatesPage(
         self, cursor: str | None = None, options: McpRequestOptions | None = None
     ) -> ListResourceTemplatesResult:
@@ -379,17 +392,18 @@ class McpClient:
         page = await self._listPage(
             "resources/templates/list",
             "resourceTemplates",
-            _isResourceTemplate,
+            isResourceTemplate,
             cursor,
             options if options is not None else {},
         )
         return {  # type: ignore[typeddict-item]
-            "resourceTemplates": [_toResourceTemplate(item) for item in page["items"]],
-            **_pageCursor(page),
+            "resourceTemplates": [toResourceTemplate(item) for item in page["items"]],
+            **pageCursor(page),
         }
 
+    @eager
     async def readResource(self, uri: str, options: McpRequestOptions | None = None) -> ReadResourceResult:
-        return _validateReadResourceResult(await self.request("resources/read", {"uri": uri}, options))
+        return validateReadResourceResult(await self.request("resources/read", {"uri": uri}, options))
 
     async def _listPage(
         self,
@@ -399,7 +413,7 @@ class McpClient:
         cursor: str | None,
         options: McpRequestOptions,
     ) -> _ListPage:
-        return _validateListPage(
+        return validateListPage(
             method,
             key,
             await self.request(method, None if cursor is None else {"cursor": cursor}, options),
@@ -428,13 +442,15 @@ class McpClient:
             cursor = page["nextCursor"]
         raise RuntimeError(f"MCP {method} exceeded {MAX_LIST_PAGES} pages")
 
+    @eager
     async def callTool(
         self, name: str, args: dict[str, Any] | None = None, options: McpRequestOptions | None = None
     ) -> CallToolResult:
-        return _validateCallToolResult(
+        return validateCallToolResult(
             await self.request("tools/call", {"name": name, **({} if args is None else {"arguments": args})}, options)
         )
 
+    @eager
     async def close(self) -> None:
         transport = self._transport
         self._transport = None
@@ -443,6 +459,7 @@ class McpClient:
         if transport is not None:
             await transport.close()
 
+    @eager
     async def _requestInternal(
         self,
         method: str,
@@ -490,7 +507,7 @@ class McpClient:
                 id, McpAbortError(), method != "initialize", jsString(reason if reason is not None else "Aborted")
             )
 
-        entry = _PendingRequest(
+        entry = PendingRequest(
             resolve=resolve,
             reject=reject,
             timeoutMs=timeoutMs,
@@ -505,7 +522,7 @@ class McpClient:
         self._pending[id] = entry
         if progressToken is not None:
             self._progressRequests[progressToken] = id
-        entry.removeAbortListener = onAbort(signal, entry.onAbort)
+        entry.removeAbortListener = addAbortListener(signal, entry.onAbort) if signal is not None else (lambda: None)
         self._armTimeout(id, entry)
         sending = spawn(transport.send(message), self._tasks)
         sending.add_done_callback(
@@ -521,11 +538,13 @@ class McpClient:
             self._cancelPending(id, McpAbortError(), entry.cancellable, "Cancelled")
             raise
 
+    @eager
     async def _notifyInternal(self, method: str, params: dict[str, Any] | None, allowConnecting: bool) -> None:
-        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            message["params"] = params
-        await self._requireTransport(allowConnecting).send(message)  # type: ignore[arg-type]
+        await self._requireTransport(allowConnecting).send({  # type: ignore[typeddict-item]
+            "jsonrpc": "2.0",
+            "method": method,
+            **({} if params is None else {"params": params}),
+        })
 
     def _requireTransport(self, allowConnecting: bool) -> McpTransport:
         if self._transport is not None and (
@@ -579,7 +598,7 @@ class McpClient:
         controller = AbortController()
         self._incoming[message["id"]] = controller
         try:
-            result = await maybe_await(handler(message.get("params"), {"signal": controller.signal}))
+            result = await awaitValue(handler(message.get("params", UNDEFINED), {"signal": controller.signal}))
             await transport.send({"jsonrpc": "2.0", "id": message["id"], "result": result if result is not None else {}})
         except Exception as error:  # noqa: BLE001 - answered to the server, as upstream
             if isinstance(error, McpError):
@@ -628,16 +647,14 @@ class McpClient:
             if controller is not None:
                 controller.abort(params.get("reason", UNDEFINED))
 
-    def _armTimeout(self, id: JsonRpcId, entry: _PendingRequest) -> None:
+    def _armTimeout(self, id: JsonRpcId, entry: PendingRequest) -> None:
         if entry.timer is not None:
-            entry.timer.cancel()
+            clearTimeout(entry.timer)
         if not isNumber(entry.timeoutMs) or not math.isfinite(entry.timeoutMs) or entry.timeoutMs <= 0:
             return
-        entry.timer = asyncio.get_running_loop().call_later(
-            entry.timeoutMs / 1000,
-            lambda: self._cancelPending(
-                id, McpTimeoutError(entry.timeoutMs), entry.cancellable, "Request timed out"
-            ),
+        entry.timer = setTimeout(
+            lambda: self._cancelPending(id, McpTimeoutError(entry.timeoutMs), entry.cancellable, "Request timed out"),
+            entry.timeoutMs,
         )
 
     def _cancelPending(self, id: JsonRpcId, error: BaseException, notifyServer: bool, reason: str | None = None) -> None:
@@ -661,10 +678,10 @@ class McpClient:
 
             spawn(sendCancelled(), self._tasks)
 
-    def _removePending(self, id: JsonRpcId, entry: _PendingRequest) -> None:
+    def _removePending(self, id: JsonRpcId, entry: PendingRequest) -> None:
         self._pending.pop(id, None)
         if entry.timer is not None:
-            entry.timer.cancel()
+            clearTimeout(entry.timer)
         if entry.progressToken is not None:
             self._progressRequests.pop(entry.progressToken, None)
         entry.removeAbortListener()
@@ -687,7 +704,7 @@ class McpClient:
         self._incoming.clear()
         if wasClosed:
             return
-        for listener in liveKeys(self._closeListeners):
+        for listener in list(self._closeListeners):
             try:
                 listener()
             except Exception as listenerError:  # noqa: BLE001 - reported, as upstream
@@ -704,4 +721,4 @@ class McpClient:
             dispose()
 
 
-__all__ = ["DEFAULT_REQUEST_TIMEOUT_MS", "MAX_LIST_PAGES", "McpClient", "McpClientOptions", "McpRequestOptions"]
+__all__ = ["McpClient", "McpClientOptions", "McpRequestOptions"]

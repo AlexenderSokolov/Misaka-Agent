@@ -86,7 +86,6 @@ from misaka.ai.utils._streaming_args import StreamingArgs
 from misaka.ai.utils.diagnostics import (
     AssistantMessageDiagnostic,
     appendAssistantMessageDiagnostic,
-    createAssistantMessageDiagnostic,
 )
 from misaka.ai.utils.event_stream import AssistantMessageEventStream, spawn_stream_task
 from misaka.ai.utils.headers import headersToRecord
@@ -670,9 +669,6 @@ def stream(
             # dropped at its stop event, as upstream deletes `block.index`.
             blockIndexes: dict[int, int] = {}
             partialJsons: dict[int, StreamingArgs] = {}
-            # MISAKA fork: deltas for a block index that never started (a compatible endpoint's framing fault),
-            # counted so a tool call that ends empty can say where its input went.
-            droppedDeltas: dict[str, int] = {}
 
             def blockAt(providerIndex: Any) -> int:
                 """``blocks.findIndex((b) => b.index === event.index)``."""
@@ -770,8 +766,6 @@ def stream(
                     delta = event["delta"]
                     index = blockAt(event["index"])
                     if index == -1:
-                        kind = str(delta.get("type") or "?")
-                        droppedDeltas[kind] = droppedDeltas.get(kind, 0) + 1
                         continue
                     block = output.content[index]
                     if delta["type"] == "text_delta":
@@ -810,7 +804,6 @@ def stream(
                             partialJson = partialJsons.pop(event["index"], None)
                             if partialJson is not None and partialJson.raw:
                                 partialJson.finish_into(block)
-                            _noteEmptyToolArguments(output, block, partialJson, droppedDeltas)
                             # Finalize in-place and strip the scratch buffer so replay only
                             # carries parsed arguments.
                             stream.push(ToolCallEndEvent(contentIndex=index, toolCall=block, partial=output))
@@ -1529,10 +1522,9 @@ def _isAnthropicStrictUnsupportedKeyword(key: str, value: Any) -> bool:
     return False
 
 
-# MISAKA fork: Anthropic rejects root combinators even without strict sampling, so a schema that has them is never
-# sent strict; and the non-strict schema keeps `$defs`/`definitions`, which MISAKA's tools reference from their
-# properties (pi sends only type/properties/required).
-_ROOT_COMBINATORS = frozenset({"oneOf", "allOf", "anyOf"})
+# MISAKA fork: the non-strict schema keeps `$defs`/`definitions`, which MCP servers' tool schemas reference from
+# their properties; pi sends only type/properties/required and drops them. Kept until pi lands the local `$ref`
+# inlining discussed in pi #9557 / #10270, then follow pi.
 _SCHEMA_DEFINITION_KEYS = ("$defs", "definitions")
 
 
@@ -1547,10 +1539,7 @@ def _convertTools(
         return []
 
     def convert(index: int, tool: Tool) -> dict[str, Any]:
-        rootCombinators = bool(_ROOT_COMBINATORS.intersection(tool.parameters_json_schema()))
-        strict = resolveJsonSchemaStrictSampling(
-            tool, supportsStrictTools and not rootCombinators, _isAnthropicStrictUnsupportedKeyword
-        )
+        strict = resolveJsonSchemaStrictSampling(tool, supportsStrictTools, _isAnthropicStrictUnsupportedKeyword)
         parameters = getJsonSchemaToolParameters(tool, strict)
         schema = parameters
         legacyInputSchema = {
@@ -1600,39 +1589,6 @@ def _mapStopReason(reason: str, stopDetails: Mapping[str, Any] | None = None) ->
         case _:
             # Handle unknown stop reasons gracefully (API may add new values)
             raise RuntimeError(f"Unhandled stop reason: {reason}")
-
-
-def _noteEmptyToolArguments(
-    output: AssistantMessage, block: ToolCall, partialJson: StreamingArgs | None, droppedDeltas: dict[str, int]
-) -> None:
-    """MISAKA fork: a tool call that ends with ``{}`` although its input was streamed is a silent failure with two
-    possible causes -- the streamed buffer did not parse, or its deltas were framed under a block that never started --
-    and the tool's validation error ("received {}") shows neither. The message keeps a diagnostic with what actually
-    arrived. A tool call that genuinely takes no arguments records nothing."""
-    if block.arguments != {}:
-        return
-    raw = partialJson.raw if partialJson is not None else ""
-    if raw.strip() not in ("", "{}"):
-        kind, why = "tool_arguments_unparsed", f"{len(raw)} streamed characters did not parse as a JSON object"
-    elif droppedDeltas.get("input_json_delta"):
-        kind, why = "tool_arguments_missing", "input_json_delta events arrived for a block that was never started"
-    else:
-        return
-    appendAssistantMessageDiagnostic(
-        output,
-        createAssistantMessageDiagnostic(
-            kind,
-            RuntimeError(f"tool {block.name}: {why}"),
-            {
-                "tool": block.name,
-                "toolCallId": block.id,
-                "rawLength": len(raw),
-                "rawHead": raw[:200],
-                "rawTail": raw[-200:] if len(raw) > 200 else "",
-                "droppedDeltas": dict(droppedDeltas),
-            },
-        ),
-    )
 
 
 __all__ = ["AnthropicEffort", "AnthropicOptions", "AnthropicThinkingDisplay", "stream", "streamSimple"]

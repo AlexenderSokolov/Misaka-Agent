@@ -93,7 +93,7 @@ def _mkdir(path, made):
 def _seed(path, text, made):
     if os.path.exists(path):
         return False
-    with open(path, "x", encoding="utf-8") as handle:
+    with open(path, "x", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
     made.append(path)
     return True

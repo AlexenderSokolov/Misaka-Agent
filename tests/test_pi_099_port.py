@@ -2190,7 +2190,7 @@ async def test_sdk_forwards_websocket_connect_timeout_from_settings(tmp_path, re
     from misaka.core.settings_manager import SettingsManager
 
     model = getModel("openai-codex", "gpt-5.5")
-    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsPath": None})
     captured: list = []
     runtime.streamSimple = lambda _model, _context, options=None: captured.append(options)
     result = await createAgentSession({
@@ -2235,7 +2235,7 @@ async def test_sdk_block_images_dedupes_every_consecutive_placeholder(tmp_path, 
 
     result = await createAgentSession({
         "cwd": str(tmp_path), "agentDir": str(tmp_path / "agent"),
-        "modelRuntime": await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None),
+        "modelRuntime": await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsPath": None}),
         "settingsManager": SettingsManager.inMemory({"images": {"blockImages": True}}),
         "sessionManager": SessionManager.inMemory(str(tmp_path)),
     })

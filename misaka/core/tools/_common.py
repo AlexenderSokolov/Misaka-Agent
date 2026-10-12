@@ -123,6 +123,19 @@ def _ignore_background_task_result(task: asyncio.Task[Any]) -> None:
     task.add_done_callback(_consume)
 
 
+async def settled[T](operation: Awaitable[T]) -> T:
+    """Await ``operation`` to its end, even through caller cancellation, then pass that cancellation on.
+
+    pi awaits a file operation and checks its signal afterwards, so the per-file mutation queue stays locked
+    until the in-flight operation has settled. A cancelled asyncio Task would release it at once while a thread
+    still writes, so the wait is shielded.
+    """
+    result, cancelled = await settle(asyncio.ensure_future(operation))
+    if cancelled is not None:
+        raise cancelled
+    return result
+
+
 async def _drain_worker(task: asyncio.Task[Any]) -> bool:
     """Wait through repeated caller cancellation; return whether another cancel arrived."""
     cancelled = False

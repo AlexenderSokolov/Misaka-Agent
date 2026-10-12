@@ -1,13 +1,11 @@
 """Translated from pi's ``packages/coding-agent/test/session-id-readonly.test.ts`` (v1.1.0).
 
 MISAKA fork: pi's metadata-command case spawns the CLI with a scratch agent dir; this runs ``main`` in process against
-the per-test ``MISAKA_HOME`` the conftest sets up, and ``console.error`` spies read the ``error_stream`` that
-``create_session_manager`` writes to.
+the per-test ``MISAKA_HOME`` the conftest sets up, and ``console.error`` spies read pytest's captured stderr.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import time
@@ -17,7 +15,7 @@ from typing import Any
 import pytest
 
 from misaka.cli.args import Args
-from misaka.cli.engine import create_session_manager, main
+from misaka.cli.engine import createSessionManager, main
 from misaka.config.sessions import sessions_root
 from misaka.core.session_manager import NewSessionOptions, SessionManager
 from misaka.core.settings_manager import SettingsManager
@@ -86,31 +84,25 @@ async def test_does_not_persist_a_custom_id_for_metadata_commands(
     assert hasSessionWithId(sessions_root(), "read-only-help") is False
 
 
-async def test_creates_missing_ids_and_reopens_existing_ids_in_process(tempRoot: Path):
+async def test_creates_missing_ids_and_reopens_existing_ids_in_process(
+    tempRoot: Path, capsys: pytest.CaptureFixture[str]
+):
     projectDir = tempRoot / "project"
     sessionDir = str(tempRoot / "sessions")
     projectDir.mkdir()
     settingsManager = SettingsManager.inMemory()
-    consoleError = io.StringIO()
 
-    readOnly = await create_session_manager(
-        args(sessionId="read-only", help=True), str(projectDir), sessionDir, settingsManager, error_stream=consoleError
-    )
+    readOnly = await createSessionManager(args(sessionId="read-only", help=True), str(projectDir), sessionDir, settingsManager)
     assert readOnly.getSessionId() == "read-only"
     assert readOnly.getSessionFile() is None
 
-    created = await create_session_manager(
-        args(sessionId="persisted-id"), str(projectDir), sessionDir, settingsManager, error_stream=consoleError
-    )
+    created = await createSessionManager(args(sessionId="persisted-id"), str(projectDir), sessionDir, settingsManager)
     persistSession(created, "persist me")
-    assert "creating a new session" in consoleError.getvalue()
+    assert "creating a new session" in capsys.readouterr().err
 
-    consoleError = io.StringIO()
-    reopened = await create_session_manager(
-        args(sessionId="persisted-id"), str(projectDir), sessionDir, settingsManager, error_stream=consoleError
-    )
+    reopened = await createSessionManager(args(sessionId="persisted-id"), str(projectDir), sessionDir, settingsManager)
     assert reopened.getSessionFile() == created.getSessionFile()
-    assert consoleError.getvalue() == ""
+    assert capsys.readouterr().err == ""
 
 
 # Regression test for #9440.
@@ -130,8 +122,8 @@ async def test_looks_up_exact_ids_without_building_full_session_listings(
 
     monkeypatch.setattr(SessionManager, "list", list_)
 
-    created = await create_session_manager(
-        args(sessionId="fresh-id"), str(projectDir), sessionDir, SettingsManager.inMemory(), error_stream=io.StringIO()
+    created = await createSessionManager(
+        args(sessionId="fresh-id"), str(projectDir), sessionDir, SettingsManager.inMemory()
     )
 
     assert created.getSessionId() == "fresh-id"
@@ -147,7 +139,7 @@ async def test_reopens_an_exact_id_from_a_renamed_session_file(tempRoot: Path):
     renamedPath = str(sessionDir / "imported-session.jsonl")
     os.rename(original.getSessionFile(), renamedPath)
 
-    reopened = await create_session_manager(
+    reopened = await createSessionManager(
         args(sessionId="renamed-id"), str(projectDir), str(sessionDir), SettingsManager.inMemory()
     )
 
@@ -177,11 +169,10 @@ async def test_rejects_an_existing_fork_target_in_process(tempRoot: Path):
     persistSession(target, "target")
 
     with pytest.raises(SystemExit) as exit_info:
-        await create_session_manager(
+        await createSessionManager(
             args(fork="source-id", sessionId="existing-id"),
             str(projectDir),
             sessionDir,
             SettingsManager.inMemory(),
-            error_stream=io.StringIO(),
         )
     assert exit_info.value.code == 1

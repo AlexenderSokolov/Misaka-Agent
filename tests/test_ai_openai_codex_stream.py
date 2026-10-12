@@ -8,7 +8,7 @@ MISAKA fork, in what the Python adapter forces on the fakes:
   (``_cachedWebsocket``), answers ``recv()`` from a queue, and reports ``state`` the way ``readyState`` is numbered. A
   socket that never opens is a connector that waits out ``open_timeout`` and raises ``TimeoutError``, as websockets does.
 - vitest's fake timers: the WebSocket timeouts run on real 50 ms clocks; the cached socket's age is moved back on its
-  monotonic clock instead of moving the system time; retry sleeps are recorded by replacing ``_sleep``.
+  creation time instead of moving the system time; retry sleeps are recorded by replacing ``_sleep``.
 - ``originator`` defaults to MISAKA's client name; zstd is checked only where a codec is installed.
 """
 
@@ -888,7 +888,7 @@ async def test_opens_a_fresh_cached_websocket_before_the_backend_connection_age_
     first = await streamOpenAICodexResponses(
         model, firstContext, {"apiKey": mockToken(), "sessionId": sessionId, "transport": "websocket-cached"}
     ).result()
-    # `vi.setSystemTime(startedAt + 56 min)`: the cached socket's monotonic birth moves back instead.
+    # `vi.setSystemTime(startedAt + 56 min)`: the cached socket's creation time moves back instead.
     for entry in codex._websocketSessionCache[sessionId].values():
         entry.createdAt -= 56 * 60 * 1000
     secondContext = normalizeContext(

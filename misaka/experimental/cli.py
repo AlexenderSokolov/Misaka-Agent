@@ -14,6 +14,9 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int | None:
+    from misaka.cli.setup import setupCli
+
+    setupCli()
     args = list(sys.argv[1:] if argv is None else argv)
     from misaka.core.experimental import areExperimentalFeaturesEnabled
 

@@ -20,7 +20,7 @@ from misaka.ai.providers.faux import fauxAssistantMessage, fauxToolCall
 from misaka.ai.types import AssistantMessage
 from misaka.config.home import DIR_NAME
 from misaka.core.settings_manager import SettingsManager
-from misaka.modes.jsonl import to_jsonable, toJsonEvent
+from misaka.modes.json_event import _wireValue, toJsonEvent
 from misaka.utils.frontmatter import parseFrontmatter
 from misaka.utils.text import splitBom
 from misaka.utils.values import read_field
@@ -48,7 +48,7 @@ async def test_includes_cumulative_usage_without_cumulative_message_snapshots():
         assert update is not None, "Expected an assistant update with populated usage"
 
         wireUpdate = toJsonEvent(update)
-        assert wireUpdate["usage"] == to_jsonable(read_field(read_field(update, "message"), "usage"))
+        assert wireUpdate["usage"] == _wireValue(read_field(read_field(update, "message"), "usage"))
         assert "message" not in wireUpdate
         assert "partial" not in wireUpdate["assistantMessageEvent"]
 
@@ -80,7 +80,7 @@ async def test_includes_the_tool_call_id_and_name_without_cumulative_snapshots()
 
         assert toJsonEvent(update) == {
             "type": "message_update",
-            "usage": to_jsonable(read_field(read_field(update, "message"), "usage")),
+            "usage": _wireValue(read_field(read_field(update, "message"), "usage")),
             "assistantMessageEvent": {
                 "type": "toolcall_start",
                 "contentIndex": 0,

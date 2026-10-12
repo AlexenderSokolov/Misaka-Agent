@@ -47,198 +47,6 @@ MAX_DELTA_OPERATIONS = 4_096
 MAX_SIMPLE_OBJECT_NODES = 128
 
 
-def isContainer(value: Any) -> bool:
-    return isinstance(value, list | dict)
-
-
-class _StatusCell:
-    __slots__ = ("value",)
-
-    def __init__(self, value: str) -> None:
-        self.value = value
-
-
-class _Index:
-    """A reference to a container the context stored (upstream's ``{ index }``)."""
-
-    __slots__ = ("index",)
-
-    def __init__(self, index: int) -> None:
-        self.index = index
-
-
-class _InsertSource:
-    """The values of one insertion. Compared by identity, as upstream's objects are."""
-
-    __slots__ = ("refs",)
-
-    def __init__(self, refs: list[Any]) -> None:
-        self.refs = refs
-
-
-class _Piece:
-    """``BasePiece`` (``kind == "base"``) or ``InsertPiece`` (``kind == "insert"``, with a ``source``)."""
-
-    __slots__ = ("kind", "length", "source", "start", "step")
-
-    def __init__(self, kind: str, start: int, length: int, step: int, source: _InsertSource | None = None) -> None:
-        self.kind = kind
-        self.start = start
-        self.length = length
-        self.step = step
-        self.source = source
-
-    def copy(self, *, start: int | None = None, length: int | None = None) -> _Piece:
-        return _Piece(
-            self.kind,
-            self.start if start is None else start,
-            self.length if length is None else length,
-            self.step,
-            self.source,
-        )
-
-
-class _PieceNode:
-    __slots__ = ("elements", "left", "piece", "priority", "right")
-
-    def __init__(self, piece: _Piece, priority: int) -> None:
-        self.piece = piece
-        self.left: _PieceNode | None = None
-        self.right: _PieceNode | None = None
-        self.priority = priority
-        self.elements = piece.length
-
-
-class _PieceLocation:
-    __slots__ = ("logicalStart", "maximum", "minimum", "piece")
-
-    def __init__(self, piece: _Piece, logicalStart: int, minimum: int, maximum: int) -> None:
-        self.piece = piece
-        self.logicalStart = logicalStart
-        self.minimum = minimum
-        self.maximum = maximum
-
-
-class _DenseRegion:
-    __slots__ = ("length", "start")
-
-    def __init__(self, start: int, length: int) -> None:
-        self.start = start
-        self.length = length
-
-
-class _DenseCandidates:
-    __slots__ = ("bits", "indices", "length")
-
-    def __init__(self, length: int) -> None:
-        self.indices: list[int] = []
-        self.bits: bytearray | None = None
-        self.length = length
-
-
-class _ArrayPlan:
-    __slots__ = ("insertRuns", "permutation", "removeRuns")
-
-    def __init__(self, removeRuns: list[int], permutation: list[int] | None, insertRuns: list[int]) -> None:
-        self.removeRuns = removeRuns
-        self.permutation = permutation
-        self.insertRuns = insertRuns
-
-
-class _ArrayOverlay:
-    __slots__ = (
-        "baseLocations",
-        "baseOverrides",
-        "generation",
-        "insertLocations",
-        "insertOverrides",
-        "locatedOffset",
-        "pieces",
-        "plan",
-        "root",
-        "seed",
-        "structural",
-    )
-
-    def __init__(self) -> None:
-        self.root: _PieceNode | None = None
-        self.pieces: list[_Piece] | None = None
-        self.baseOverrides: dict[int, Any] | None = None
-        self.insertOverrides: dict[_InsertSource, dict[int, Any]] | None = None
-        self.structural = False
-        self.generation = 0
-        self.plan: _ArrayPlan | None = None
-        self.seed = 0x9E3779B9
-        self.locatedOffset = 0
-        self.baseLocations: list[_PieceLocation] | None = None
-        self.insertLocations: dict[_InsertSource, list[_PieceLocation]] | None = None
-
-
-class _OverlayNode:
-    """One container the draft has touched. ``writeValue`` is ``UNDEFINED`` while ``writeKey`` is unset."""
-
-    def __init__(
-        self,
-        context: _OverlayContext,
-        baseIndex: int,
-        parentIndex: int,
-        parentKind: int,
-        parentKey: str | int,
-        parentPlacement: bool,
-    ) -> None:
-        self.context = context
-        self.baseIndex = baseIndex
-        self.parentIndex = parentIndex
-        self.parentKind = parentKind
-        self.parentKey = parentKey
-        self.parentSource: _InsertSource | None = None
-        self.parentPlacement = parentPlacement
-        self.proxy: DraftObject | DraftArray | None = None
-        self.writeKey: str | None = None
-        self.writeValue: Any = UNDEFINED
-        self.writes: dict[str, Any] | None = None
-        self.deleteKey: str | None = None
-        # ``Set``s, which iterate in insertion order: the ``d`` operations come out in that order.
-        self.deletes: dict[str, None] | None = None
-        self.readded: dict[str, None] | None = None
-        self.array: _ArrayOverlay | None = None
-        self.dirty = False
-        self.subtreeDirty = False
-        self.preparedPath: list[Any] | None = None
-
-
-class _OverlayContext:
-    def __init__(
-        self,
-        owner: object,
-        tracker: weakref.ref[TrackerImpl],
-        baseRevision: int,
-        replacement: bool,
-        base: Any,
-    ) -> None:
-        self.owner = owner
-        self.tracker = tracker
-        self.baseRevision = baseRevision
-        self.status = _StatusCell("open")
-        self.root: _OverlayNode | None = None
-        self.bases: list[Any] | None = []
-        self.stored: list[Any] | None = []
-        self.dirty: list[_OverlayNode] = []
-        self.nodes: list[_OverlayNode] = []
-        self.rawNodes: dict[int, _OverlayNode] | None = {}
-        self.ops: list[Op] | None = None
-        self.replacement = replacement
-        self.replacementNoop = False
-        self.baseValue: Any = base
-        self.overlayReleased = False
-        self.simpleObjectMaterialization = False
-        self.registryRef: weakref.ref[_OverlayContext] | None = None
-
-
-# The context each prepared change came from. `WeakMap<object, OverlayContext>`.
-PREPARED: weakref.WeakKeyDictionary[Any, _OverlayContext] = weakref.WeakKeyDictionary()
-
-
 class Prepared(Protocol):
     base: Any
     value: Any
@@ -464,263 +272,6 @@ def materializeOperations(base: Any, operations: Sequence[Op]) -> Any:
     return applyImmutableTrusted(base, operations)
 
 
-def createContext(
-    tracker: weakref.ref[TrackerImpl], owner: object, baseRevision: int, root: Any, replacement: bool, base: Any
-) -> _OverlayContext:
-    context = _OverlayContext(owner, tracker, baseRevision, replacement, base)
-    context.root = createNode(context, root, None)
-    return context
-
-
-# ─── Drafts ──────────────────────────────────────────────────────────────────
-
-
-def _toKey(property: Any) -> str:
-    if isinstance(property, str):
-        return property
-    if isinstance(property, int) and not isinstance(property, bool):
-        return str(property)
-    raise TypeError("Overlay objects are addressed by string keys")
-
-
-class DraftObject:
-    """The draft of one JSON object, valid while its change is open."""
-
-    __slots__ = ("_node",)
-    _node: _OverlayNode | None
-
-    def __init__(self, node: _OverlayNode) -> None:
-        object.__setattr__(self, "_node", node)
-
-    def _target(self) -> _OverlayNode:
-        node = self._node
-        if node is None:
-            raise TypeError("Cannot use a settled overlay")
-        return node
-
-    def __getitem__(self, key: Any) -> Any:
-        return getProperty(self._target(), _toKey(key))
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        setProperty(self._target(), _toKey(key), value)
-
-    def __delitem__(self, key: Any) -> None:
-        deleteProperty(self._target(), _toKey(key))
-
-    def __contains__(self, key: Any) -> bool:
-        return hasProperty(self._target(), _toKey(key))
-
-    def __iter__(self):
-        return iter(ownKeys(self._target()))
-
-    def __len__(self) -> int:
-        return len(ownKeys(self._target()))
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise TypeError("Defining overlay properties is not supported")
-
-    def keys(self) -> list[str]:
-        return list(ownKeys(self._target()))
-
-    def values(self) -> list[Any]:
-        node = self._target()
-        return [getProperty(node, key) for key in ownKeys(node)]
-
-    def items(self) -> list[tuple[str, Any]]:
-        node = self._target()
-        return [(key, getProperty(node, key)) for key in ownKeys(node)]
-
-    def get(self, key: Any, default: Any = UNDEFINED) -> Any:
-        node = self._target()
-        key = _toKey(key)
-        return getProperty(node, key) if hasProperty(node, key) else default
-
-    def __repr__(self) -> str:
-        return "<overlay object>" if self._node is not None else "<settled overlay>"
-
-
-class DraftArray:
-    """The draft of one JSON array, valid while its change is open. Entries are read and written by index; an
-    index at or past the length reads ``UNDEFINED``, and writing exactly the length appends."""
-
-    __slots__ = ("_node",)
-    _node: _OverlayNode | None
-
-    def __init__(self, node: _OverlayNode) -> None:
-        object.__setattr__(self, "_node", node)
-
-    def _target(self) -> _OverlayNode:
-        node = self._node
-        if node is None:
-            raise TypeError("Cannot use a settled overlay")
-        return node
-
-    def __getitem__(self, index: Any) -> Any:
-        node = self._target()
-        assertReadable(node.context)
-        position = arrayIndex(index)
-        if position is None:
-            return UNDEFINED
-        return getArrayIndex(node, position)
-
-    def __setitem__(self, index: Any, value: Any) -> None:
-        node = self._target()
-        assertWritable(node.context)
-        position = arrayIndex(index)
-        if position is None:
-            raise TypeError("Only array indices and length can be written")
-        if position > arrayLength(arrayOverlay(node)):
-            raise TypeError("Overlay arrays cannot contain holes")
-        setArrayIndex(node, position, clonePlacement(value))
-
-    def __delitem__(self, index: Any) -> None:
-        node = self._target()
-        assertWritable(node.context)
-        raise TypeError("Overlay arrays cannot contain holes")
-
-    def __len__(self) -> int:
-        node = self._target()
-        assertReadable(node.context)
-        return arrayLength(arrayOverlay(node))
-
-    def __iter__(self):
-        node = self._target()
-        assertReadable(node.context)
-        index = 0
-        while index < arrayLength(arrayOverlay(node)):
-            yield getArrayIndex(node, index)
-            index += 1
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name == "length":
-            node = self._target()
-            assertWritable(node.context)
-            setArrayLength(node, toArrayLength(value))
-            return
-        raise TypeError("Defining overlay properties is not supported")
-
-    @property
-    def length(self) -> int:
-        return len(self)
-
-    def has(self, index: Any) -> bool:
-        node = self._target()
-        assertReadable(node.context)
-        position = arrayIndex(index)
-        return position is not None and position < arrayLength(arrayOverlay(node))
-
-    def push(self, *items: Any) -> int:
-        node = mutatorNode(self)
-        length = arrayLength(arrayOverlay(node))
-        replacePieceRange(node, length, 0, insertPlacementPiece(node, list(items)))
-        return length + len(items)
-
-    def pop(self) -> Any:
-        node = mutatorNode(self)
-        length = arrayLength(arrayOverlay(node))
-        if length == 0:
-            return UNDEFINED
-        value = getArrayIndex(node, length - 1)
-        replacePieceRange(node, length - 1, 1, [])
-        return value
-
-    def shift(self) -> Any:
-        node = mutatorNode(self)
-        length = arrayLength(arrayOverlay(node))
-        if length == 0:
-            return UNDEFINED
-        value = getArrayIndex(node, 0)
-        replacePieceRange(node, 0, 1, [])
-        return value
-
-    def unshift(self, *items: Any) -> int:
-        node = mutatorNode(self)
-        replacePieceRange(node, 0, 0, insertPlacementPiece(node, list(items)))
-        return arrayLength(arrayOverlay(node))
-
-    def splice(self, *args: Any) -> list[Any]:
-        node = mutatorNode(self)
-        length = arrayLength(arrayOverlay(node))
-        start = 0 if len(args) == 0 else clampIndex(toIntegerOrInfinity(args[0]), length)
-        if len(args) == 0:
-            remove = 0
-        elif len(args) == 1:
-            remove = length - start
-        else:
-            remove = int(min(max(toIntegerOrInfinity(args[1]), 0), length - start))
-        removed = [getArrayIndex(node, start + offset) for offset in range(remove)]
-        itemStart = min(2, len(args))
-        itemCount = max(len(args) - 2, 0)
-        replacePieceRange(node, start, remove, insertPlacementPiece(node, list(args), itemStart))
-        setArrayLength(node, length - remove + itemCount)
-        return removed
-
-    def reverse(self) -> DraftArray:
-        node = mutatorNode(self)
-        overlay = arrayOverlay(node)
-        if arrayLength(overlay) < 2:
-            return node.proxy  # type: ignore[return-value]
-        pieces = list(reversed(piecesOf(overlay)))
-        for piece in pieces:
-            piece.start += piece.step * (piece.length - 1)
-            piece.step = -1 if piece.step == 1 else 1
-        replaceAllPieces(overlay, pieces)
-        overlay.structural = True
-        overlay.generation += 1
-        overlay.plan = None
-        markDirty(node)
-        return node.proxy  # type: ignore[return-value]
-
-    def sort(self, comparator: Callable[[Any, Any], Any] | None = None) -> DraftArray:
-        node = mutatorNode(self)
-        return arraySort(node, comparator)
-
-    def fill(self, supplied: Any, startArg: Any = UNDEFINED, endArg: Any = UNDEFINED) -> DraftArray:
-        node = mutatorNode(self)
-        length = arrayLength(arrayOverlay(node))
-        start = 0 if startArg is UNDEFINED else clampIndex(toIntegerOrInfinity(startArg), length)
-        end = length if endArg is UNDEFINED else clampIndex(toIntegerOrInfinity(endArg), length)
-        if end <= start:
-            return node.proxy  # type: ignore[return-value]
-        items = [clonePlacement(supplied) for _ in range(end - start)]
-        replacePieceRange(node, start, end - start, insertPiece(node, items))
-        return node.proxy  # type: ignore[return-value]
-
-    def copyWithin(self, targetArg: Any, startArg: Any, endArg: Any = UNDEFINED) -> DraftArray:
-        node = mutatorNode(self)
-        length = arrayLength(arrayOverlay(node))
-        target = clampIndex(toIntegerOrInfinity(targetArg), length)
-        start = clampIndex(toIntegerOrInfinity(startArg), length)
-        end = length if endArg is UNDEFINED else clampIndex(toIntegerOrInfinity(endArg), length)
-        count = int(min(max(end - start, 0), length - target))
-        values = [clonePlacement(getArrayIndex(node, start + offset)) for offset in range(count)]
-        replacePieceRange(node, target, count, insertPiece(node, values))
-        return node.proxy  # type: ignore[return-value]
-
-    def slice(self, start: Any = 0, end: Any = UNDEFINED) -> list[Any]:
-        """``Array.prototype.slice``: the entries, containers as drafts, in a plain list."""
-        node = self._target()
-        assertReadable(node.context)
-        length = arrayLength(arrayOverlay(node))
-        first = clampIndex(toIntegerOrInfinity(start), length)
-        last = length if end is UNDEFINED else clampIndex(toIntegerOrInfinity(end), length)
-        return [getArrayIndex(node, index) for index in range(first, max(first, last))]
-
-    def indexOf(self, value: Any) -> int:
-        """``Array.prototype.indexOf``: strict equality, a container by identity (a draft is its own
-        identity)."""
-        node = self._target()
-        assertReadable(node.context)
-        for index in range(arrayLength(arrayOverlay(node))):
-            entry = getArrayIndex(node, index)
-            if entry is value or strictEquals(entry, value):
-                return index
-        return -1
-
-    def __repr__(self) -> str:
-        return "<overlay array>" if self._node is not None else "<settled overlay>"
-
-
 def createNode(
     context: _OverlayContext,
     base: Any,
@@ -803,15 +354,15 @@ def assertWritable(context: _OverlayContext) -> None:
         raise TypeError("Prepared overlays are read-only")
 
 
-def getProperty(node: _OverlayNode, key: str) -> Any:
+def getProperty(node: _OverlayNode, property: str) -> Any:
     """Read a property of an object draft."""
     assertReadable(node.context)
-    if not objectHas(node, key):
+    if not objectHas(node, property):
         return UNDEFINED
-    value = objectValue(node, key)
+    value = objectValue(node, property)
     if not isContainer(value):
         return value
-    return createNode(node.context, value, node, 0, key, None, hasObjectWrite(node, key)).proxy
+    return createNode(node.context, value, node, 0, property, None, hasObjectWrite(node, property)).proxy
 
 
 def getArrayIndex(node: _OverlayNode, index: int) -> Any:
@@ -834,40 +385,40 @@ def getArrayIndex(node: _OverlayNode, index: int) -> Any:
     ).proxy
 
 
-def setProperty(node: _OverlayNode, key: str, supplied: Any) -> None:
+def setProperty(node: _OverlayNode, property: str, supplied: Any) -> None:
     """Write a property of an object draft. Writing ``UNDEFINED`` deletes it."""
     assertWritable(node.context)
     if supplied is UNDEFINED:
-        deleteProperty(node, key)
+        deleteProperty(node, property)
         return
     stored = clonePlacement(supplied)
-    current = objectValue(node, key)
-    wasDeleted = isObjectDeleted(node, key)
+    current = objectValue(node, property)
+    wasDeleted = isObjectDeleted(node, property)
     if not wasDeleted and not isContainer(stored) and strictEquals(current, stored):
         return
-    setObjectWrite(node, key, stored)
-    if wasDeleted and key in nodeBase(node):
+    setObjectWrite(node, property, stored)
+    if wasDeleted and property in nodeBase(node):
         if node.readded is None:
             node.readded = {}
-        node.readded[key] = None
-    deleteObjectDeletion(node, key)
+        node.readded[property] = None
+    deleteObjectDeletion(node, property)
     markDirty(node)
 
 
-def deleteProperty(node: _OverlayNode, key: str) -> None:
+def deleteProperty(node: _OverlayNode, property: str) -> None:
     assertWritable(node.context)
-    if not objectHas(node, key):
+    if not objectHas(node, property):
         return
-    deleteObjectWrite(node, key)
+    deleteObjectWrite(node, property)
     if node.readded is not None:
-        node.readded.pop(key, None)
-    setObjectDeletion(node, key)
+        node.readded.pop(property, None)
+    setObjectDeletion(node, property)
     markDirty(node)
 
 
-def hasProperty(node: _OverlayNode, key: str) -> bool:
+def hasProperty(node: _OverlayNode, property: str) -> bool:
     assertReadable(node.context)
-    return objectHas(node, key)
+    return objectHas(node, property)
 
 
 def ownKeys(node: _OverlayNode) -> list[str]:
@@ -2360,6 +1911,455 @@ def clearContext(context: _OverlayContext) -> None:
     context.stored = None
     context.baseValue = UNDEFINED
     context.overlayReleased = True
+
+
+def isContainer(value: Any) -> bool:
+    return isinstance(value, list | dict)
+
+
+class _StatusCell:
+    __slots__ = ("value",)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _Index:
+    """A reference to a container the context stored (upstream's ``{ index }``)."""
+
+    __slots__ = ("index",)
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+
+
+class _InsertSource:
+    """The values of one insertion. Compared by identity, as upstream's objects are."""
+
+    __slots__ = ("refs",)
+
+    def __init__(self, refs: list[Any]) -> None:
+        self.refs = refs
+
+
+class _Piece:
+    """``BasePiece`` (``kind == "base"``) or ``InsertPiece`` (``kind == "insert"``, with a ``source``)."""
+
+    __slots__ = ("kind", "length", "source", "start", "step")
+
+    def __init__(self, kind: str, start: int, length: int, step: int, source: _InsertSource | None = None) -> None:
+        self.kind = kind
+        self.start = start
+        self.length = length
+        self.step = step
+        self.source = source
+
+    def copy(self, *, start: int | None = None, length: int | None = None) -> _Piece:
+        return _Piece(
+            self.kind,
+            self.start if start is None else start,
+            self.length if length is None else length,
+            self.step,
+            self.source,
+        )
+
+
+class _PieceNode:
+    __slots__ = ("elements", "left", "piece", "priority", "right")
+
+    def __init__(self, piece: _Piece, priority: int) -> None:
+        self.piece = piece
+        self.left: _PieceNode | None = None
+        self.right: _PieceNode | None = None
+        self.priority = priority
+        self.elements = piece.length
+
+
+class _PieceLocation:
+    __slots__ = ("logicalStart", "maximum", "minimum", "piece")
+
+    def __init__(self, piece: _Piece, logicalStart: int, minimum: int, maximum: int) -> None:
+        self.piece = piece
+        self.logicalStart = logicalStart
+        self.minimum = minimum
+        self.maximum = maximum
+
+
+class _DenseRegion:
+    __slots__ = ("length", "start")
+
+    def __init__(self, start: int, length: int) -> None:
+        self.start = start
+        self.length = length
+
+
+class _DenseCandidates:
+    __slots__ = ("bits", "indices", "length")
+
+    def __init__(self, length: int) -> None:
+        self.indices: list[int] = []
+        self.bits: bytearray | None = None
+        self.length = length
+
+
+class _ArrayPlan:
+    __slots__ = ("insertRuns", "permutation", "removeRuns")
+
+    def __init__(self, removeRuns: list[int], permutation: list[int] | None, insertRuns: list[int]) -> None:
+        self.removeRuns = removeRuns
+        self.permutation = permutation
+        self.insertRuns = insertRuns
+
+
+class _ArrayOverlay:
+    __slots__ = (
+        "baseLocations",
+        "baseOverrides",
+        "generation",
+        "insertLocations",
+        "insertOverrides",
+        "locatedOffset",
+        "pieces",
+        "plan",
+        "root",
+        "seed",
+        "structural",
+    )
+
+    def __init__(self) -> None:
+        self.root: _PieceNode | None = None
+        self.pieces: list[_Piece] | None = None
+        self.baseOverrides: dict[int, Any] | None = None
+        self.insertOverrides: dict[_InsertSource, dict[int, Any]] | None = None
+        self.structural = False
+        self.generation = 0
+        self.plan: _ArrayPlan | None = None
+        self.seed = 0x9E3779B9
+        self.locatedOffset = 0
+        self.baseLocations: list[_PieceLocation] | None = None
+        self.insertLocations: dict[_InsertSource, list[_PieceLocation]] | None = None
+
+
+class _OverlayNode:
+    """One container the draft has touched. ``writeValue`` is ``UNDEFINED`` while ``writeKey`` is unset."""
+
+    def __init__(
+        self,
+        context: _OverlayContext,
+        baseIndex: int,
+        parentIndex: int,
+        parentKind: int,
+        parentKey: str | int,
+        parentPlacement: bool,
+    ) -> None:
+        self.context = context
+        self.baseIndex = baseIndex
+        self.parentIndex = parentIndex
+        self.parentKind = parentKind
+        self.parentKey = parentKey
+        self.parentSource: _InsertSource | None = None
+        self.parentPlacement = parentPlacement
+        self.proxy: DraftObject | DraftArray | None = None
+        self.writeKey: str | None = None
+        self.writeValue: Any = UNDEFINED
+        self.writes: dict[str, Any] | None = None
+        self.deleteKey: str | None = None
+        # ``Set``s, which iterate in insertion order: the ``d`` operations come out in that order.
+        self.deletes: dict[str, None] | None = None
+        self.readded: dict[str, None] | None = None
+        self.array: _ArrayOverlay | None = None
+        self.dirty = False
+        self.subtreeDirty = False
+        self.preparedPath: list[Any] | None = None
+
+
+class _OverlayContext:
+    def __init__(
+        self,
+        owner: object,
+        tracker: weakref.ref[TrackerImpl],
+        baseRevision: int,
+        replacement: bool,
+        base: Any,
+    ) -> None:
+        self.owner = owner
+        self.tracker = tracker
+        self.baseRevision = baseRevision
+        self.status = _StatusCell("open")
+        self.root: _OverlayNode | None = None
+        self.bases: list[Any] | None = []
+        self.stored: list[Any] | None = []
+        self.dirty: list[_OverlayNode] = []
+        self.nodes: list[_OverlayNode] = []
+        self.rawNodes: dict[int, _OverlayNode] | None = {}
+        self.ops: list[Op] | None = None
+        self.replacement = replacement
+        self.replacementNoop = False
+        self.baseValue: Any = base
+        self.overlayReleased = False
+        self.simpleObjectMaterialization = False
+        self.registryRef: weakref.ref[_OverlayContext] | None = None
+
+
+# The context each prepared change came from. `WeakMap<object, OverlayContext>`.
+PREPARED: weakref.WeakKeyDictionary[Any, _OverlayContext] = weakref.WeakKeyDictionary()
+
+
+def createContext(
+    tracker: weakref.ref[TrackerImpl], owner: object, baseRevision: int, root: Any, replacement: bool, base: Any
+) -> _OverlayContext:
+    context = _OverlayContext(owner, tracker, baseRevision, replacement, base)
+    context.root = createNode(context, root, None)
+    return context
+
+
+# ─── Drafts ──────────────────────────────────────────────────────────────────
+
+
+def _toKey(property: Any) -> str:
+    if isinstance(property, str):
+        return property
+    if isinstance(property, int) and not isinstance(property, bool):
+        return str(property)
+    raise TypeError("Overlay objects are addressed by string keys")
+
+
+class DraftObject:
+    """The draft of one JSON object, valid while its change is open."""
+
+    __slots__ = ("_node",)
+    _node: _OverlayNode | None
+
+    def __init__(self, node: _OverlayNode) -> None:
+        object.__setattr__(self, "_node", node)
+
+    def _target(self) -> _OverlayNode:
+        node = self._node
+        if node is None:
+            raise TypeError("Cannot use a settled overlay")
+        return node
+
+    def __getitem__(self, key: Any) -> Any:
+        return getProperty(self._target(), _toKey(key))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        setProperty(self._target(), _toKey(key), value)
+
+    def __delitem__(self, key: Any) -> None:
+        deleteProperty(self._target(), _toKey(key))
+
+    def __contains__(self, key: Any) -> bool:
+        return hasProperty(self._target(), _toKey(key))
+
+    def __iter__(self):
+        return iter(ownKeys(self._target()))
+
+    def __len__(self) -> int:
+        return len(ownKeys(self._target()))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise TypeError("Defining overlay properties is not supported")
+
+    def keys(self) -> list[str]:
+        return list(ownKeys(self._target()))
+
+    def values(self) -> list[Any]:
+        node = self._target()
+        return [getProperty(node, key) for key in ownKeys(node)]
+
+    def items(self) -> list[tuple[str, Any]]:
+        node = self._target()
+        return [(key, getProperty(node, key)) for key in ownKeys(node)]
+
+    def get(self, key: Any, default: Any = UNDEFINED) -> Any:
+        node = self._target()
+        key = _toKey(key)
+        return getProperty(node, key) if hasProperty(node, key) else default
+
+    def __repr__(self) -> str:
+        return "<overlay object>" if self._node is not None else "<settled overlay>"
+
+
+class DraftArray:
+    """The draft of one JSON array, valid while its change is open. Entries are read and written by index; an
+    index at or past the length reads ``UNDEFINED``, and writing exactly the length appends."""
+
+    __slots__ = ("_node",)
+    _node: _OverlayNode | None
+
+    def __init__(self, node: _OverlayNode) -> None:
+        object.__setattr__(self, "_node", node)
+
+    def _target(self) -> _OverlayNode:
+        node = self._node
+        if node is None:
+            raise TypeError("Cannot use a settled overlay")
+        return node
+
+    def __getitem__(self, index: Any) -> Any:
+        node = self._target()
+        assertReadable(node.context)
+        position = arrayIndex(index)
+        if position is None:
+            return UNDEFINED
+        return getArrayIndex(node, position)
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        node = self._target()
+        assertWritable(node.context)
+        position = arrayIndex(index)
+        if position is None:
+            raise TypeError("Only array indices and length can be written")
+        if position > arrayLength(arrayOverlay(node)):
+            raise TypeError("Overlay arrays cannot contain holes")
+        setArrayIndex(node, position, clonePlacement(value))
+
+    def __delitem__(self, index: Any) -> None:
+        node = self._target()
+        assertWritable(node.context)
+        raise TypeError("Overlay arrays cannot contain holes")
+
+    def __len__(self) -> int:
+        node = self._target()
+        assertReadable(node.context)
+        return arrayLength(arrayOverlay(node))
+
+    def __iter__(self):
+        node = self._target()
+        assertReadable(node.context)
+        index = 0
+        while index < arrayLength(arrayOverlay(node)):
+            yield getArrayIndex(node, index)
+            index += 1
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "length":
+            node = self._target()
+            assertWritable(node.context)
+            setArrayLength(node, toArrayLength(value))
+            return
+        raise TypeError("Defining overlay properties is not supported")
+
+    @property
+    def length(self) -> int:
+        return len(self)
+
+    def has(self, index: Any) -> bool:
+        node = self._target()
+        assertReadable(node.context)
+        position = arrayIndex(index)
+        return position is not None and position < arrayLength(arrayOverlay(node))
+
+    def push(self, *items: Any) -> int:
+        node = mutatorNode(self)
+        length = arrayLength(arrayOverlay(node))
+        replacePieceRange(node, length, 0, insertPlacementPiece(node, list(items)))
+        return length + len(items)
+
+    def pop(self) -> Any:
+        node = mutatorNode(self)
+        length = arrayLength(arrayOverlay(node))
+        if length == 0:
+            return UNDEFINED
+        value = getArrayIndex(node, length - 1)
+        replacePieceRange(node, length - 1, 1, [])
+        return value
+
+    def shift(self) -> Any:
+        node = mutatorNode(self)
+        length = arrayLength(arrayOverlay(node))
+        if length == 0:
+            return UNDEFINED
+        value = getArrayIndex(node, 0)
+        replacePieceRange(node, 0, 1, [])
+        return value
+
+    def unshift(self, *items: Any) -> int:
+        node = mutatorNode(self)
+        replacePieceRange(node, 0, 0, insertPlacementPiece(node, list(items)))
+        return arrayLength(arrayOverlay(node))
+
+    def splice(self, *args: Any) -> list[Any]:
+        node = mutatorNode(self)
+        length = arrayLength(arrayOverlay(node))
+        start = 0 if len(args) == 0 else clampIndex(toIntegerOrInfinity(args[0]), length)
+        if len(args) == 0:
+            remove = 0
+        elif len(args) == 1:
+            remove = length - start
+        else:
+            remove = int(min(max(toIntegerOrInfinity(args[1]), 0), length - start))
+        removed = [getArrayIndex(node, start + offset) for offset in range(remove)]
+        itemStart = min(2, len(args))
+        itemCount = max(len(args) - 2, 0)
+        replacePieceRange(node, start, remove, insertPlacementPiece(node, list(args), itemStart))
+        setArrayLength(node, length - remove + itemCount)
+        return removed
+
+    def reverse(self) -> DraftArray:
+        node = mutatorNode(self)
+        overlay = arrayOverlay(node)
+        if arrayLength(overlay) < 2:
+            return node.proxy  # type: ignore[return-value]
+        pieces = list(reversed(piecesOf(overlay)))
+        for piece in pieces:
+            piece.start += piece.step * (piece.length - 1)
+            piece.step = -1 if piece.step == 1 else 1
+        replaceAllPieces(overlay, pieces)
+        overlay.structural = True
+        overlay.generation += 1
+        overlay.plan = None
+        markDirty(node)
+        return node.proxy  # type: ignore[return-value]
+
+    def sort(self, comparator: Callable[[Any, Any], Any] | None = None) -> DraftArray:
+        node = mutatorNode(self)
+        return arraySort(node, comparator)
+
+    def fill(self, supplied: Any, startArg: Any = UNDEFINED, endArg: Any = UNDEFINED) -> DraftArray:
+        node = mutatorNode(self)
+        length = arrayLength(arrayOverlay(node))
+        start = 0 if startArg is UNDEFINED else clampIndex(toIntegerOrInfinity(startArg), length)
+        end = length if endArg is UNDEFINED else clampIndex(toIntegerOrInfinity(endArg), length)
+        if end <= start:
+            return node.proxy  # type: ignore[return-value]
+        items = [clonePlacement(supplied) for _ in range(end - start)]
+        replacePieceRange(node, start, end - start, insertPiece(node, items))
+        return node.proxy  # type: ignore[return-value]
+
+    def copyWithin(self, targetArg: Any, startArg: Any, endArg: Any = UNDEFINED) -> DraftArray:
+        node = mutatorNode(self)
+        length = arrayLength(arrayOverlay(node))
+        target = clampIndex(toIntegerOrInfinity(targetArg), length)
+        start = clampIndex(toIntegerOrInfinity(startArg), length)
+        end = length if endArg is UNDEFINED else clampIndex(toIntegerOrInfinity(endArg), length)
+        count = int(min(max(end - start, 0), length - target))
+        values = [clonePlacement(getArrayIndex(node, start + offset)) for offset in range(count)]
+        replacePieceRange(node, target, count, insertPiece(node, values))
+        return node.proxy  # type: ignore[return-value]
+
+    def slice(self, start: Any = 0, end: Any = UNDEFINED) -> list[Any]:
+        """``Array.prototype.slice``: the entries, containers as drafts, in a plain list."""
+        node = self._target()
+        assertReadable(node.context)
+        length = arrayLength(arrayOverlay(node))
+        first = clampIndex(toIntegerOrInfinity(start), length)
+        last = length if end is UNDEFINED else clampIndex(toIntegerOrInfinity(end), length)
+        return [getArrayIndex(node, index) for index in range(first, max(first, last))]
+
+    def indexOf(self, value: Any) -> int:
+        """``Array.prototype.indexOf``: strict equality, a container by identity (a draft is its own
+        identity)."""
+        node = self._target()
+        assertReadable(node.context)
+        for index in range(arrayLength(arrayOverlay(node))):
+            entry = getArrayIndex(node, index)
+            if entry is value or strictEquals(entry, value):
+                return index
+        return -1
+
+    def __repr__(self) -> str:
+        return "<overlay array>" if self._node is not None else "<settled overlay>"
 
 
 __all__ = ["Change", "Prepared", "Tracker", "track"]

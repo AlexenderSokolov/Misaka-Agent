@@ -17,6 +17,7 @@ from misaka.core.tools import render_utils
 from misaka.core.tools.render_utils import getTextOutput, replaceTabs
 from misaka.ui.tui import Container, Spacer, Text
 from misaka.utils.js import (
+    UNDEFINED,
     jsLength,
     jsRound,
     jsSlice,
@@ -60,8 +61,9 @@ def statusIcon(call: Any, theme: Any) -> str:
             return theme.fg("success", "✓")
         case "error":
             return theme.fg("error", "✗")
-        case _:
+        case "cancelled":
             return theme.fg("muted", "⊘")
+    return UNDEFINED  # type: ignore[return-value]
 
 
 def formatCall(call: Any, theme: Any, expanded: bool) -> str:
@@ -96,7 +98,7 @@ def renderCall(args: Any, theme: Any, context: Any) -> Any:
     # The code includes the `// @options:` line, so options show as part of the script.
     code = render_utils.str(read_field(args, "code")) if args is not None else render_utils.str(None)
     title = theme.fg("toolTitle", theme.bold("codemode"))
-    component = context.lastComponent if isinstance(context.lastComponent, Container) else Container()
+    component = context.lastComponent if context.lastComponent is not None else Container()
     component.clear()
     if code is None:
         component.addChild(Text(f"{title} {theme.fg('error', '[invalid arg]')}", 0, 0))  # type: ignore[abstract]
@@ -128,7 +130,7 @@ def renderResult(result: Any, options: Any, theme: Any, context: Any) -> Any:
     )
 
     expanded = bool(read_field(options, "expanded"))
-    component = context.lastComponent if isinstance(context.lastComponent, Container) else Container()
+    component = context.lastComponent if context.lastComponent is not None else Container()
     component.clear()
     details = read_field(result, "details")
     calls: Sequence[Any] = (read_field(details, "calls") if details is not None else None) or []

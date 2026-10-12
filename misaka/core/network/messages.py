@@ -26,6 +26,7 @@ from xml.sax.saxutils import escape
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.config import CFG, sisters
 from misaka.core.extensions.types import ToolDefinition
 from misaka.utils.async_lifecycle import run_in_thread, settle, settle_thread_call
@@ -814,7 +815,7 @@ class MessagesPart:
                 + (" Only request_input=true to a Last Order parks this card for input before "
                    "queuing a help request." if self.card_task else "")
             ),
-            parameters=SendMessageParams.model_json_schema(),
+            parameters=typeboxSchema(SendMessageParams),
             execute=self._send,
             promptSnippet="Send a message to another agent",
             promptGuidelines=(

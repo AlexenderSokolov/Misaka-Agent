@@ -346,7 +346,7 @@ async def test_saving_new_role_default_does_not_expand_global_enabled_models(tmp
 @pytest.mark.parametrize("explicit_scope", [False, True])
 def test_shared_enabled_models_do_not_override_role_pin_but_explicit_scope_can(tmp_path, registry, shared_storage, explicit_scope):
     from misaka.cli.args import Args
-    from misaka.cli.engine import build_session_options
+    from misaka.cli.engine import buildSessionOptions
     from misaka.core.model_resolver import ScopedModel
 
     role = make_role(tmp_path, "10032", "vendor-a/shared")
@@ -354,7 +354,7 @@ def test_shared_enabled_models_do_not_override_role_pin_but_explicit_scope_can(t
     pinned = registry.find("vendor-a", "shared")
     scoped = registry.find("vendor-b", "shared")
     args = Args(models=["vendor-b/shared"] if explicit_scope else None)
-    result = build_session_options(args, [ScopedModel(scoped)], False, registry.modelRuntime, settings)
+    result = buildSessionOptions(args, [ScopedModel(scoped)], False, registry.modelRuntime, settings)
     if explicit_scope:
         assert result.options["model"] is scoped
     else:
@@ -364,11 +364,11 @@ def test_shared_enabled_models_do_not_override_role_pin_but_explicit_scope_can(t
 
 def test_provider_without_model_is_reported_as_an_error(tmp_path, registry, shared_storage):
     from misaka.cli.args import Args
-    from misaka.cli.engine import build_session_options
+    from misaka.cli.engine import buildSessionOptions
 
     settings = bind(shared_storage, make_role(tmp_path, "10033", "vendor-a/shared"), registry)
 
-    result = build_session_options(Args(provider="vendor-a"), [], False, registry.modelRuntime, settings)
+    result = buildSessionOptions(Args(provider="vendor-a"), [], False, registry.modelRuntime, settings)
 
     assert [(diagnostic.type, diagnostic.message) for diagnostic in result.diagnostics] == [
         ("error", "--provider requires --model (for example: --provider vendor-a --model <pattern>)")
@@ -388,7 +388,6 @@ def sdk_host(tmp_path, monkeypatch, registry, shared_storage):
     monkeypatch.setattr(sdk, "AgentSession", lambda config: SimpleNamespace(
         model=config["agent"].state.model, settingsManager=config["settingsManager"],
     ))
-    monkeypatch.setattr(sdk, "applyHttpProxySettings", lambda _settings: None)
     return {
         "cwd": str(tmp_path),
         "agentDir": str(tmp_path / "engine"),

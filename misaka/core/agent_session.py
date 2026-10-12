@@ -755,13 +755,7 @@ class AgentSession:
     ) -> dict[str, Any]:
         # Route a virtual model first: summaries size their input and output from the model they get.
         if isVirtualModel(selected_model):
-            route = await self._modelRuntime.resolveModel(
-                selected_model,
-                convertToLlm(self.messages),
-                reason="direct",
-                thinkingLevel=self.thinkingLevel,
-                signal=signal,
-            )
+            route = await self._modelRuntime.resolveModel(selected_model, convertToLlm(self.messages), {"reason": "direct", "thinkingLevel": self.thinkingLevel, "signal": signal})
             model, thinking_level = route.model, route.thinkingLevel
         else:
             model, thinking_level = selected_model, self.thinkingLevel
@@ -2147,7 +2141,7 @@ class AgentSession:
             custom_instructions, signal, request["thinkingLevel"], self.agent.streamFunction,
             retry=self._summarizationRetryPolicy(), env=request.get("env"),
             callbacks=self._summarizationRetryCallbacks({"source": "compaction", "reason": reason}),
-            session_id=None)
+            sessionId=None)
 
     async def compact(self, customInstructions: str | None = None) -> SessionCompactionResult:
         # Keep the agent subscription live across compaction (pi #7370/e56893f4c):
@@ -3724,15 +3718,7 @@ class AgentSession:
             )
             user_turn = any(_message_role(message) == "user" for message in context.messages[last_response + 1 :])
             state = getVirtualModelState(self.sessionManager.getBranch(), model.provider, model.id)
-            route = await self._modelRuntime.resolveModel(
-                model,
-                convertToLlm(context.messages),
-                reason="retry" if failed is not None else "user" if user_turn else "continuation",
-                thinkingLevel=thinking_level,
-                signal=signal,
-                failed=failed,
-                state=state,
-            )
+            route = await self._modelRuntime.resolveModel(model, convertToLlm(context.messages), {"reason": "retry" if failed is not None else "user" if user_turn else "continuation", "thinkingLevel": thinking_level, "signal": signal, "failed": failed, "state": state})
             if route.state is not None and route.state is not state:
                 data: VirtualModelStateData = {"provider": model.provider, "modelId": model.id, "state": route.state}
                 entry = self.sessionManager.getEntry(

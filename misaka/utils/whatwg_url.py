@@ -231,7 +231,14 @@ class URL:
         if base is not None:
             baseUrl = base if isinstance(base, URL) else URL(base)
             if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", text):
-                text = urljoin(baseUrl.href, text)
+                if re.match(r"^[/\\]{2}" if baseUrl._special else r"^//", text):
+                    # A scheme-relative reference keeps only the base's scheme (the relative slash state): for a
+                    # special scheme every leading slash or backslash is skipped and the authority follows, so
+                    # `//?q` against `http://h/` has an empty host and fails.
+                    rest = text.lstrip("/\\") if baseUrl._special else text[2:]
+                    text = f"{baseUrl.protocol}//{rest}"
+                else:
+                    text = urljoin(baseUrl.href, text)
         # A special scheme other than `file` takes its authority after any number of slashes or
         # backslashes, none included (`https:example.com`), unless the base has the same scheme.
         special = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):(?![/\\]{2}(?![/\\]))", text)

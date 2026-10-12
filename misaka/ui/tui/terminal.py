@@ -12,8 +12,7 @@ MISAKA forks, each marked where it happens:
 - ``setTimeout``/``setInterval`` are timers on the event loop.
 - The escape timeout comes from settings (``tui.esc_timeout_ms``), not an environment variable, and a pane of
   MISAKA's panel gets the relayed-transport window ssh gets.
-- ``PI_PROGRAM_STATUS`` is ``MISAKA_PROGRAM_STATUS``.
-- No write log (``PI_TUI_WRITE_LOG``): a debug diagnostic switched by an environment variable.
+- ``PI_PROGRAM_STATUS`` and ``PI_TUI_WRITE_LOG`` are ``MISAKA_PROGRAM_STATUS`` and ``MISAKA_TUI_WRITE_LOG``.
 """
 
 from __future__ import annotations
@@ -186,6 +185,18 @@ def jsTruthyNumber(value: float) -> bool:
     return bool(value) and not math.isnan(value)
 
 
+def _writeLogPath() -> str:
+    """``writeLogPath``: ``MISAKA_TUI_WRITE_LOG`` names a file, or a directory that gets a file per process."""
+    env = os.environ.get("MISAKA_TUI_WRITE_LOG") or ""
+    if not env:
+        return ""
+    # `fs.statSync(env).isDirectory()`: anything that is not an existing directory is used as-is (file path).
+    if os.path.isdir(env):
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+        return os.path.join(env, f"tui-{ts}-{os.getpid()}.log")
+    return env
+
+
 class ProcessTerminal:
     """Real terminal using process.stdin/stdout"""
 
@@ -209,6 +220,7 @@ class ProcessTerminal:
         self.programStatusSupported = False
         # The support query was sent and its DA1 sentinel has not arrived yet.
         self.programStatusQueryPending = False
+        self.writeLogPath = _writeLogPath()
 
         # MISAKA fork: the Node runtime pieces (see the module docstring).
         self.stdin: Any = sys.stdin
@@ -534,6 +546,13 @@ class ProcessTerminal:
         flush = getattr(self.stdout, "flush", None)
         if callable(flush):
             flush()
+        if self.writeLogPath:
+            try:
+                with open(self.writeLogPath, "a", encoding="utf-8", newline="") as handle:
+                    handle.write(data)
+            except Exception:  # noqa: BLE001, S110
+                # Ignore logging errors
+                pass
 
     @property
     def columns(self) -> int:

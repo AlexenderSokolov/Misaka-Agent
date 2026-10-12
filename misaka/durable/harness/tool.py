@@ -51,104 +51,6 @@ from .output import (
 )
 from .usage import recordUsage
 
-COMPLETED: dict[str, Any] = {"status": "completed"}
-"""How a tool task ends; the result entry is appended either way. ``failed`` (execution threw or was interrupted)
-records cancellation intent for the conversations the call owns; a result with ``isError`` still completes."""
-
-
-async def callPhase(task: dict[str, Any], runtime: Any, context: Context) -> None:
-    call = await readCall(runtime, task["input"], context)
-    tool = next((each for each in (await runtime.agent(context))["tools"] if each["name"] == call["name"]), None)
-    if tool is None:
-        error = harnessError("tool_unavailable", f"Tool {call['name']} is not available")
-        await settle(runtime, call, COMPLETED, lambda slot: error, context)
-        return
-    prepared = prepare(tool, call["arguments"])
-    checked = prepared if "error" in prepared else validate(tool, call, prepared["args"])
-    if "error" in checked:
-        await settle(runtime, call, COMPLETED, lambda slot: invalid(checked["error"]), context)
-        return
-    args = checked["args"]
-    block: str | None = None
-
-    async def beforeTool(hook: Any) -> None:
-        nonlocal block, args
-        if block is not None:
-            return
-        try:
-            decision = await awaitValue(hook({**call, "arguments": args}, runtime, context))
-            if decision is not None and decision.get("block") is not None:
-                block = decision["block"]
-            elif decision is not None and decision.get("arguments") is not None:
-                args = decision["arguments"]
-        except Exception as error:
-            if runtime.signal.aborted:
-                raise
-            block = errorText(error)
-
-    await runtime.hooks.each("beforeTool", beforeTool)
-    if block is not None:
-        blocked = harnessError("blocked", f"Tool call blocked: {block}")
-        await settle(runtime, call, COMPLETED, lambda slot: blocked, context)
-        return
-    validated = validate(tool, call, args)
-    if "error" in validated:
-        await settle(runtime, call, COMPLETED, lambda slot: invalid(validated["error"]), context)
-        return
-    final = validated["args"]
-
-    async def recordIntent(tx: Tx, current: dict[str, Any]) -> dict[str, Any]:
-        slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId)
-        if slot is not None:
-            slot["status"] = "running"
-        intent = {"phase": "execute", "arguments": final, "replay": tool["replay"] if tool.get("replay") is not None else "unsafe"}
-        return {"status": "running", "checkpoint": intent}
-
-    await runtime.commit(recordIntent, context)
-    await run(runtime, call, tool, final, context)
-
-
-async def executePhase(task: dict[str, Any], runtime: Any, context: Context) -> None:
-    """Recovery after intent: rerun only when the stored and the current policy both say ``safe``."""
-    args = task["state"]["checkpoint"]["arguments"]
-    replay = task["state"]["checkpoint"]["replay"]
-    call = await readCall(runtime, task["input"], context)
-    tool = next((each for each in (await runtime.agent(context))["tools"] if each["name"] == call["name"]), None)
-    if replay == "safe" and tool is not None and tool.get("replay") == "safe":
-        # The rerun reports from scratch; clear what the interrupted attempt published.
-        async def clear(tx: Tx, current: dict[str, Any]) -> None:
-            slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId)
-            if slot is not None:
-                clearProgress(slot)
-
-        await runtime.commit(clear, context)
-        await run(runtime, call, tool, args, context)
-        return
-    message = f"Tool {call['name']} was interrupted and may have partially run"
-    # ``failed`` records cancellation intent, so the call's owned conversations, left unsupervised, are aborted.
-    ending = {"status": "failed", "message": message}
-    await settle(runtime, call, ending, lambda slot: fromSlot(slot, "interrupted", message), context)
-
-
-async def abortPhase(task: dict[str, Any], runtime: Any, context: Context) -> None:
-    call = await readCall(runtime, task["input"], context)
-    message = f"Tool {call['name']} was aborted"
-    await settle(runtime, call, {"status": "aborted"}, lambda slot: fromSlot(slot, "aborted", message), context)
-
-
-ToolTask = defineTask(
-    {
-        "name": "pi.tool",
-        "version": 1,
-        "initial": lambda input: {"phase": "call"},
-        "phases": {"call": callPhase, "execute": executePhase},
-        "abort": abortPhase,
-    }
-)
-"""Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs ``beforeTool``, records
-intent, executes, runs ``afterTool``, and appends the result, all in one ``call`` handler so nothing separates
-resolution from settlement. ``execute`` is reached only by recovery and applies the replay rule."""
-
 
 async def readCall(runtime: Any, input: dict[str, Any], context: Context) -> dict[str, Any]:
     """The tool call ``callId`` of the assistant entry."""
@@ -449,6 +351,104 @@ async def settle(
         return {"status": "terminal", "outcome": {"status": "completed", "result": {"entryId": entryId, **control}}}
 
     await runtime.commit(apply, context)
+
+COMPLETED: dict[str, Any] = {"status": "completed"}
+"""How a tool task ends; the result entry is appended either way. ``failed`` (execution threw or was interrupted)
+records cancellation intent for the conversations the call owns; a result with ``isError`` still completes."""
+
+
+async def callPhase(task: dict[str, Any], runtime: Any, context: Context) -> None:
+    call = await readCall(runtime, task["input"], context)
+    tool = next((each for each in (await runtime.agent(context))["tools"] if each["name"] == call["name"]), None)
+    if tool is None:
+        error = harnessError("tool_unavailable", f"Tool {call['name']} is not available")
+        await settle(runtime, call, COMPLETED, lambda slot: error, context)
+        return
+    prepared = prepare(tool, call["arguments"])
+    checked = prepared if "error" in prepared else validate(tool, call, prepared["args"])
+    if "error" in checked:
+        await settle(runtime, call, COMPLETED, lambda slot: invalid(checked["error"]), context)
+        return
+    args = checked["args"]
+    block: str | None = None
+
+    async def beforeTool(hook: Any) -> None:
+        nonlocal block, args
+        if block is not None:
+            return
+        try:
+            decision = await awaitValue(hook({**call, "arguments": args}, runtime, context))
+            if decision is not None and decision.get("block") is not None:
+                block = decision["block"]
+            elif decision is not None and decision.get("arguments") is not None:
+                args = decision["arguments"]
+        except Exception as error:
+            if runtime.signal.aborted:
+                raise
+            block = errorText(error)
+
+    await runtime.hooks.each("beforeTool", beforeTool)
+    if block is not None:
+        blocked = harnessError("blocked", f"Tool call blocked: {block}")
+        await settle(runtime, call, COMPLETED, lambda slot: blocked, context)
+        return
+    validated = validate(tool, call, args)
+    if "error" in validated:
+        await settle(runtime, call, COMPLETED, lambda slot: invalid(validated["error"]), context)
+        return
+    final = validated["args"]
+
+    async def recordIntent(tx: Tx, current: dict[str, Any]) -> dict[str, Any]:
+        slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId)
+        if slot is not None:
+            slot["status"] = "running"
+        intent = {"phase": "execute", "arguments": final, "replay": tool["replay"] if tool.get("replay") is not None else "unsafe"}
+        return {"status": "running", "checkpoint": intent}
+
+    await runtime.commit(recordIntent, context)
+    await run(runtime, call, tool, final, context)
+
+
+async def executePhase(task: dict[str, Any], runtime: Any, context: Context) -> None:
+    """Recovery after intent: rerun only when the stored and the current policy both say ``safe``."""
+    args = task["state"]["checkpoint"]["arguments"]
+    replay = task["state"]["checkpoint"]["replay"]
+    call = await readCall(runtime, task["input"], context)
+    tool = next((each for each in (await runtime.agent(context))["tools"] if each["name"] == call["name"]), None)
+    if replay == "safe" and tool is not None and tool.get("replay") == "safe":
+        # The rerun reports from scratch; clear what the interrupted attempt published.
+        async def clear(tx: Tx, current: dict[str, Any]) -> None:
+            slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId)
+            if slot is not None:
+                clearProgress(slot)
+
+        await runtime.commit(clear, context)
+        await run(runtime, call, tool, args, context)
+        return
+    message = f"Tool {call['name']} was interrupted and may have partially run"
+    # ``failed`` records cancellation intent, so the call's owned conversations, left unsupervised, are aborted.
+    ending = {"status": "failed", "message": message}
+    await settle(runtime, call, ending, lambda slot: fromSlot(slot, "interrupted", message), context)
+
+
+async def abortPhase(task: dict[str, Any], runtime: Any, context: Context) -> None:
+    call = await readCall(runtime, task["input"], context)
+    message = f"Tool {call['name']} was aborted"
+    await settle(runtime, call, {"status": "aborted"}, lambda slot: fromSlot(slot, "aborted", message), context)
+
+
+ToolTask = defineTask(
+    {
+        "name": "pi.tool",
+        "version": 1,
+        "initial": lambda input: {"phase": "call"},
+        "phases": {"call": callPhase, "execute": executePhase},
+        "abort": abortPhase,
+    }
+)
+"""Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs ``beforeTool``, records
+intent, executes, runs ``afterTool``, and appends the result, all in one ``call`` handler so nothing separates
+resolution from settlement. ``execute`` is reached only by recovery and applies the replay rule."""
 
 
 def fromSlot(slot: Any, code: str, message: str) -> dict[str, Any]:

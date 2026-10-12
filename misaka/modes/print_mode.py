@@ -1,9 +1,11 @@
-"""Print mode for single-shot non-interactive execution."""
+"""Translated from pi's ``packages/coding-agent/src/modes/print-mode.ts`` (v1.1.0).
+
+Print mode for single-shot non-interactive execution.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -42,8 +44,9 @@ def _content_type(block: Any) -> str | None:
 
 
 def _serialize_json_line(value: Any) -> str:
-    from misaka.modes.jsonl import toJsonEvent
-    return json.dumps(toJsonEvent(value), ensure_ascii=False, separators=(",", ":")) + "\n"
+    from misaka.modes.json_event import toJsonEvent
+    from misaka.utils.js import jsonStringify
+    return jsonStringify(toJsonEvent(value)) + "\n"
 
 
 async def runPrintMode(runtime_host: Any, options: PrintModeOptions | dict[str, Any]) -> int:

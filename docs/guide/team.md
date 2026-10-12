@@ -54,7 +54,8 @@ each Sister.
 MCP servers are set in `mcp.json` files, in the `mcpServers` shape other MCP clients use. Each role
 has her own: Last Order's are in the home's `~/.misaka/mcp.json` (and her
 `profiles/last_order/mcp.json`), a Sister's in `profiles/sisters/<number>/mcp.json`, and one role never
-connects another's servers:
+connects another's servers. A sub-agent a Sister starts reaches her servers and no others; servers
+written inline in a sub-agent's definition are not started:
 
 ```json
 {"mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}}

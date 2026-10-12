@@ -29,7 +29,7 @@ class EmptyContext(BaseContext):
     def __init__(self, name: str) -> None:
         self._name = name
 
-    def value[T](self, key: ContextKey[T]) -> T:
+    def value[T](self, _key: ContextKey[T]) -> T:
         return UNDEFINED  # type: ignore[return-value]
 
     def __str__(self) -> str:
@@ -93,18 +93,18 @@ def withCancel(context: Context) -> CancelableContext:
     )
 
 
-async def awaitWithContext[T](awaitable: Awaitable[T], context: Context) -> T:
+async def awaitWithContext[T](promise: Awaitable[T], context: Context) -> T:
     """Observe an awaitable until it settles or the invocation is cancelled. Cancellation raises only for
     this waiter; it does not cancel the underlying awaitable."""
     signal = context.abortSignal
     if signal is None:
-        return await awaitable
+        return await promise
     if signal.aborted:
-        if inspect.iscoroutine(awaitable):
-            awaitable.close()
+        if inspect.iscoroutine(promise):
+            promise.close()
         raise abortError(signal)
     loop = asyncio.get_running_loop()
-    work = asyncio.ensure_future(awaitable)
+    work = asyncio.ensure_future(promise)
     waiter: asyncio.Future[T] = loop.create_future()
 
     def onAbort() -> None:

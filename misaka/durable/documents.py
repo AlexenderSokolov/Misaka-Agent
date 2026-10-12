@@ -16,17 +16,6 @@ from misaka.utils.js import jsIsInteger, jsonStringify
 from .ids import idFromNumber
 from .types import DocumentAddress, JsonObject
 
-type AnyDocDefinition = dict[str, Any]
-"""Erased definition shape used by the Session after overload resolution."""
-type AnyDocToken = dict[str, Any]
-"""Erased singleton or family token."""
-
-_MAX_SAFE_INTEGER = 2**53 - 1
-
-
-def _isSafeInteger(value: Any) -> bool:
-    return jsIsInteger(value) and abs(value) <= _MAX_SAFE_INTEGER
-
 
 def defineDoc(definition: AnyDocDefinition) -> AnyDocToken:
     """Define a singleton document: Session-scoped, a latest-only or rewindable conversation document, or a task
@@ -39,6 +28,17 @@ def defineDocFamily(definition: AnyDocDefinition) -> AnyDocToken:
     """Define a document family: the same scopes as ``defineDoc``, with ``family: True`` and ``initial(seed)``."""
     validateDefinition(definition)
     return {"definition": definition}
+
+type AnyDocDefinition = dict[str, Any]
+"""Erased definition shape used by the Session after overload resolution."""
+type AnyDocToken = dict[str, Any]
+"""Erased singleton or family token."""
+
+_MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def _isSafeInteger(value: Any) -> bool:
+    return jsIsInteger(value) and abs(value) <= _MAX_SAFE_INTEGER
 
 
 def validateDefinition(definition: AnyDocDefinition) -> None:

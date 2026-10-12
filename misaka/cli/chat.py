@@ -35,12 +35,12 @@ def resolve_session(session, who):
     """The engine's own resolution (path, id prefix in this folder's bucket, then any bucket), done
     once, here, before the folder changes -- so a prefix is not mistaken for a file and a relative
     path is not resolved twice. Returns the absolute session file."""
-    from misaka.cli.engine import resolve_session_path
+    from misaka.cli.engine import resolveSessionPath
     explicit_path = "/" in session or "\\" in session or session.endswith(".jsonl")
     bucket = None
     if not explicit_path:
         bucket = sessions.chat_dir(who, os.getcwd())
-    resolved = asyncio.run(resolve_session_path(session, os.getcwd(), bucket))
+    resolved = asyncio.run(resolveSessionPath(session, os.getcwd(), bucket))
     if not resolved.path:
         sys.exit(f"No session found matching '{session}'.")
     return resolved.path
@@ -130,8 +130,7 @@ def launch(who, model=None, cont=False, pick=False, session=None, read_only=Fals
     os.environ.update({
         "MISAKA_APP_TITLE": title, "MISAKA_TAGLINE": tagline,
         **env,
-        "MISAKA_INPUT_HISTORY": str(home.path("input_history") / f"{who or 'last-order'}.json"),
-        "MISAKA_CODING_AGENT": "true"})
+        "MISAKA_INPUT_HISTORY": str(home.path("input_history") / f"{who or 'last-order'}.json")})
 
     from misaka.cli.engine import main as engine_main
     from misaka.utils import loop_watchdog

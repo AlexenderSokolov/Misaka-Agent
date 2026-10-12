@@ -24,6 +24,15 @@ class ExtensionInputOptions(TypedDict, total=False):
 
 
 class ExtensionInputComponent(Container):
+    @property
+    def focused(self) -> bool:
+        return self._focused
+
+    @focused.setter
+    def focused(self, value: bool) -> None:
+        self._focused = value
+        self.input.focused = value
+
     def __init__(
         self,
         title: str,
@@ -54,9 +63,7 @@ class ExtensionInputComponent(Container):
 
         timeout = opts.get("timeout") if opts else None
         tui = opts.get("tui") if opts else None
-        # MISAKA fork: extensions send the timeout through JSON, so a bool (an `int` subclass) or a string can arrive
-        # where a number belongs; only a real number starts the countdown.
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0 and tui:
+        if timeout and timeout > 0 and tui:
 
             def onTick(s: int) -> None:
                 self.titleText.setText(theme.fg("accent", f"{self.baseTitle} ({s}s)"))
@@ -72,15 +79,6 @@ class ExtensionInputComponent(Container):
         self.addChild(Text(f"{keyHint('tui.select.confirm', 'submit')}  {keyHint('tui.select.cancel', 'cancel')}", 1, 0))
         self.addChild(Spacer(1))
         self.addChild(DynamicBorder())
-
-    @property
-    def focused(self) -> bool:
-        return self._focused
-
-    @focused.setter
-    def focused(self, value: bool) -> None:
-        self._focused = value
-        self.input.focused = value
 
     def handleInput(self, keyData: str) -> None:
         kb = getKeybindings()

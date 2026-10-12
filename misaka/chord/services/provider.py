@@ -38,8 +38,6 @@ from .state import serviceDeliveryContext
 from .state_internals import ReplicatedStateInternals, getReplicatedStateInternals
 from .wire import decodeServiceControlCall
 
-type ServiceUpdatePublisher = Callable[[str, ServiceProviderUpdate, Context], Any]
-
 
 class InstanceMember:
     """``{"kind": "method", "method"}`` or ``{"kind": "state", "state"}``."""
@@ -131,6 +129,60 @@ def _serviceId(service: Any) -> str:
 def _isLocal(service: Any) -> bool:
     local = service.get("local") if isinstance(service, Mapping) else getattr(service, "local", None)
     return local is True
+
+type ServiceUpdatePublisher = Callable[[str, ServiceProviderUpdate, Context], Any]
+
+
+class RemoteServiceEndpoint:
+    """Hosts one provider for one remote consumer and owns that consumer's subscriptions."""
+
+    def __init__(self, provider: RemoteServiceProvider) -> None:
+        self._provider = provider
+        self._subscriptions: dict[str, ServiceSubscription] = {}
+        self._disposed = False
+
+    async def invoke(self, call: ServiceCall, publish: ServiceUpdatePublisher, context: Context) -> Any:
+        if self._disposed:
+            raise RuntimeError("Remote service endpoint is disposed")
+        control = decodeServiceControlCall(call)
+        if control is not None and control["type"] == "catalogue":
+            return self._provider.catalogue
+        if control is not None and control["type"] == "subscribe":
+            subscriptionId = control["subscriptionId"]
+            if subscriptionId in self._subscriptions:
+                raise RuntimeError("Service subscription ID is already active")
+
+            def listener(update: ServiceProviderUpdate, updateContext: Context) -> None:
+                result = publish(subscriptionId, update, updateContext)
+                if inspect.isawaitable(result):
+                    startTask(result).add_done_callback(_ignore)
+
+            subscription = self._provider.subscribe(control["serviceId"], control["mode"], listener)
+            self._subscriptions[subscriptionId] = subscription
+            subscription.activate()
+            return subscription.snapshot
+        if control is not None and control["type"] == "unsubscribe":
+            existing = self._subscriptions.get(control["subscriptionId"])
+            if existing is None:
+                raise RuntimeError("Service subscription was not found")
+            existing.close()
+            del self._subscriptions[control["subscriptionId"]]
+            return UNDEFINED
+        return await self._provider.invoke(call, context)
+
+    def dispose(self) -> None:
+        if self._disposed:
+            return
+        self._disposed = True
+        for subscription in self._subscriptions.values():
+            subscription.close()
+        self._subscriptions.clear()
+
+
+def _ignore(task: asyncio.Future[Any]) -> None:
+    """``.catch(() => {})``: a failed publication is dropped, and its exception is retrieved."""
+    if not task.cancelled():
+        task.exception()
 
 
 class RemoteServiceProvider:
@@ -521,58 +573,6 @@ def updateCoveredBySnapshot(sequences: dict[str, int], update: ServiceProviderUp
 
 def stateMemberKey(instance: ServiceInstanceAddress | None, member: str) -> str:
     return jsonStringify([member] if instance is None else [instance["key"], instance["generation"], member])
-
-
-class RemoteServiceEndpoint:
-    """Hosts one provider for one remote consumer and owns that consumer's subscriptions."""
-
-    def __init__(self, provider: RemoteServiceProvider) -> None:
-        self._provider = provider
-        self._subscriptions: dict[str, ServiceSubscription] = {}
-        self._disposed = False
-
-    async def invoke(self, call: ServiceCall, publish: ServiceUpdatePublisher, context: Context) -> Any:
-        if self._disposed:
-            raise RuntimeError("Remote service endpoint is disposed")
-        control = decodeServiceControlCall(call)
-        if control is not None and control["type"] == "catalogue":
-            return self._provider.catalogue
-        if control is not None and control["type"] == "subscribe":
-            subscriptionId = control["subscriptionId"]
-            if subscriptionId in self._subscriptions:
-                raise RuntimeError("Service subscription ID is already active")
-
-            def listener(update: ServiceProviderUpdate, updateContext: Context) -> None:
-                result = publish(subscriptionId, update, updateContext)
-                if inspect.isawaitable(result):
-                    startTask(result).add_done_callback(_ignore)
-
-            subscription = self._provider.subscribe(control["serviceId"], control["mode"], listener)
-            self._subscriptions[subscriptionId] = subscription
-            subscription.activate()
-            return subscription.snapshot
-        if control is not None and control["type"] == "unsubscribe":
-            existing = self._subscriptions.get(control["subscriptionId"])
-            if existing is None:
-                raise RuntimeError("Service subscription was not found")
-            existing.close()
-            del self._subscriptions[control["subscriptionId"]]
-            return UNDEFINED
-        return await self._provider.invoke(call, context)
-
-    def dispose(self) -> None:
-        if self._disposed:
-            return
-        self._disposed = True
-        for subscription in self._subscriptions.values():
-            subscription.close()
-        self._subscriptions.clear()
-
-
-def _ignore(task: asyncio.Future[Any]) -> None:
-    """``.catch(() => {})``: a failed publication is dropped, and its exception is retrieved."""
-    if not task.cancelled():
-        task.exception()
 
 
 def createRemoteServiceEndpoint(provider: RemoteServiceProvider) -> RemoteServiceEndpoint:

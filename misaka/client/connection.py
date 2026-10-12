@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 from misaka.protocol import (
     DEFAULT_MAX_FRAME_LENGTH,
@@ -75,22 +75,19 @@ class _Handlers:
             self._connection._failAndClose(toDisconnectedError(error))
 
 
+class ConnectionOptions(TypedDict):
+    transportFactory: ByteTransportFactory
+    serverId: str
+    maxFrameLength: NotRequired[int | None]
+    onHandshake: Callable[[ServerHello], None]
+    onMessage: Callable[[ResponseEnvelope | ServiceEventEnvelope | AttachmentEnvelope], None]
+    onStateChange: Callable[[ConnectionStateChange], None]
+
+
 class Connection:
-    def __init__(
-        self,
-        *,
-        transportFactory: ByteTransportFactory,
-        serverId: str,
-        onHandshake: Callable[[ServerHello], None],
-        onMessage: Callable[[ResponseEnvelope | ServiceEventEnvelope | AttachmentEnvelope], None],
-        onStateChange: Callable[[ConnectionStateChange], None],
-        maxFrameLength: int | None = None,
-    ) -> None:
-        self._transportFactory = transportFactory
-        self._serverId = serverId
-        self._onHandshake = onHandshake
-        self._onMessage = onMessage
-        self._onStateChange = onStateChange
+    def __init__(self, options: ConnectionOptions) -> None:
+        self._options = options
+        maxFrameLength = options.get("maxFrameLength")
         self._maxFrameLength = maxFrameLength if maxFrameLength is not None else DEFAULT_MAX_FRAME_LENGTH
         if not jsIsInteger(self._maxFrameLength) or self._maxFrameLength <= 0 or self._maxFrameLength > MAX_UINT32:
             raise TypeError(f"Client maxFrameLength must be an integer between 1 and {MAX_UINT32}")
@@ -118,7 +115,7 @@ class Connection:
             None,
             handshake,
         )
-        self._onStateChange({"state": "connecting"})
+        self._options["onStateChange"]({"state": "connecting"})
         startTask(self._openTransport(id_, _Handlers(self, id_)))
         return handshake
 
@@ -156,7 +153,7 @@ class Connection:
     async def _openTransport(self, id: int, handlers: _Handlers) -> None:
         try:
             # ``await`` takes a turn whatever it is given, so ``connect()`` returns while the state is still connecting.
-            transport = await awaitValue(self._transportFactory(handlers))  # type: ignore[arg-type]
+            transport = await awaitValue(self._options["transportFactory"](handlers))  # type: ignore[arg-type]
         except Exception as error:  # noqa: BLE001
             if self._isCurrent(id):
                 self._fail(toDisconnectedError(error))
@@ -203,10 +200,10 @@ class Connection:
             if message["type"] != "hello":
                 self._failAndClose(ProtocolValidationError("Expected server hello as first message"))
                 return
-            if message["serverId"] != self._serverId:
+            if message["serverId"] != self._options["serverId"]:
                 self._failAndClose(
                     ProtocolValidationError(
-                        f"Connected server {jsonStringify(message['serverId'])} does not match {jsonStringify(self._serverId)}"
+                        f"Connected server {jsonStringify(message['serverId'])} does not match {jsonStringify(self._options['serverId'])}"
                     )
                 )
                 return
@@ -216,14 +213,14 @@ class Connection:
             connected = _Lifecycle("connected", lifecycle.id, lifecycle.decoder, lifecycle.transport, lifecycle.handshake)
             self._lifecycle = connected
             try:
-                self._onHandshake(message)
+                self._options["onHandshake"](message)
             except Exception as error:  # noqa: BLE001
                 if self._lifecycle is connected:
                     self._failAndClose(toError(error))
                 return
             if self._lifecycle is not connected:
                 return
-            self._onStateChange({"state": "connected"})
+            self._options["onStateChange"]({"state": "connected"})
             if self._lifecycle is not connected:
                 return
             handshake = lifecycle.handshake
@@ -237,7 +234,7 @@ class Connection:
         if message["type"] == "hello" or message["type"] == "hello_error":
             self._failAndClose(ProtocolValidationError("Unexpected handshake message"))
             return
-        self._onMessage(message)
+        self._options["onMessage"](message)
 
     def _handleClose(self) -> None:
         lifecycle = self._lifecycle
@@ -267,7 +264,7 @@ class Connection:
             lifecycle.handshake.set_exception(error)
             # Nobody may be waiting for the handshake; a failure no one reads is not an unhandled error.
             lifecycle.handshake.exception()
-        self._onStateChange({"state": "disconnected", "error": error})
+        self._options["onStateChange"]({"state": "disconnected", "error": error})
 
     def _isCurrent(self, id: int) -> bool:
         return self._lifecycle.state != "disconnected" and self._lifecycle.id == id

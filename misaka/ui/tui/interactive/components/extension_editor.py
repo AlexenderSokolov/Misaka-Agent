@@ -37,6 +37,15 @@ class ExtensionEditorOptions(EditorOptions):
 
 
 class ExtensionEditorComponent(Container):
+    @property
+    def focused(self) -> bool:
+        return self._focused
+
+    @focused.setter
+    def focused(self, value: bool) -> None:
+        self._focused = value
+        self.editor.focused = value
+
     def __init__(
         self,
         tui: TUI,
@@ -110,15 +119,6 @@ class ExtensionEditorComponent(Container):
 
         # Add bottom border
         self.addChild(DynamicBorder())
-
-    @property
-    def focused(self) -> bool:
-        return self._focused
-
-    @focused.setter
-    def focused(self, value: bool) -> None:
-        self._focused = value
-        self.editor.focused = value
 
     def handleInput(self, keyData: str) -> None:
         kb = getKeybindings()

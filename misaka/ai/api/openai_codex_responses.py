@@ -13,7 +13,7 @@ MISAKA fork, kept to what the Python platform forces (each is marked where it ha
   coroutine scheduled on the loop. ``websockets`` is part of every install (through ``mcp[ws]``); were it missing, the
   WebSocket transport would be "not available in this runtime" and a WebSocket attempt would fall back to SSE.
 - ``originator`` defaults to MISAKA's client name instead of ``pi``.
-- A cached WebSocket's age is measured on the monotonic clock, and the token payload is decoded as base64url.
+- The token payload is decoded as base64url.
 - Request body fields pi leaves ``undefined`` are left out (a Python ``None`` would be sent as ``null``).
 - After each event the loop turns once, as a JavaScript ``for await`` hands control to the consumer.
 """
@@ -916,8 +916,7 @@ class _CachedWebSocketContinuationState:
 class _CachedWebSocketConnection:
     socket: Any
     busy: bool
-    # MISAKA fork: on the monotonic clock (milliseconds), so a wall-clock jump neither ages nor rejuvenates it.
-    createdAt: float
+    createdAt: int
     # MISAKA fork: the loop's timer handle stands in for `setTimeout`'s.
     idleTimer: asyncio.TimerHandle | None = None
     continuation: _CachedWebSocketContinuationState | None = None
@@ -1066,7 +1065,7 @@ def _isWebSocketReusable(socket: Any) -> bool:
 
 
 def _isWebSocketSessionExpired(entry: _CachedWebSocketConnection) -> bool:
-    return time.monotonic() * 1000 - entry.createdAt >= _SESSION_WEBSOCKET_MAX_AGE_MS
+    return int(time.time() * 1000) - entry.createdAt >= _SESSION_WEBSOCKET_MAX_AGE_MS
 
 
 def _closeWebSocketSilently(socket: Any, code: int = 1000, reason: str = "done") -> None:
@@ -1217,7 +1216,7 @@ async def _acquireWebSocket(
                 _websocketSessionCache.pop(sessionId, None)
 
     socket = await _connectWebSocket(url, headers, signal, connectTimeoutMs, env)
-    entry = _CachedWebSocketConnection(socket=socket, busy=True, createdAt=time.monotonic() * 1000)
+    entry = _CachedWebSocketConnection(socket=socket, busy=True, createdAt=int(time.time() * 1000))
     accountEntries = _websocketSessionCache.get(sessionId)
     if accountEntries is None:
         accountEntries = {}

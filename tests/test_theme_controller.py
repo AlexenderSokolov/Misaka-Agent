@@ -28,13 +28,7 @@ def createUi() -> mock.Mock:
 def createController(
     ui: mock.Mock, getSettingsManager: Callable[[], SettingsManager], initialThemeSetting: str | None = None
 ) -> InteractiveThemeController:
-    return InteractiveThemeController(
-        ui,
-        getSettingsManager=getSettingsManager,
-        showError=mock.Mock(),
-        onChanged=mock.Mock(),
-        initialThemeSetting=initialThemeSetting,
-    )
+    return InteractiveThemeController(ui, {"getSettingsManager": getSettingsManager, "showError": mock.Mock(), "onChanged": mock.Mock(), "initialThemeSetting": initialThemeSetting})
 
 
 @pytest.fixture(autouse=True)

@@ -1211,8 +1211,11 @@ class SubagentManager:
             return
 
         specific = [spec for spec in definition.mcp_servers if isinstance(spec, str)]
-        specific.extend(name for name, _ in agent_roster.inline_mcp_entries(definition.mcp_servers))
-        available = agent_roster.available_mcp_servers(self.session)
+        # MISAKA fork: configured servers count, as before the MCP extension, as well as registered ones.
+        available = [
+            *agent_roster.configured_mcp_servers(self.role_context.profile_dir),
+            *agent_roster.available_mcp_servers(self.session),
+        ]
         missing_config = [
             pattern
             for pattern in required
@@ -2130,10 +2133,7 @@ class SubagentManager:
             )
         else:
             env.pop("MISAKA_SUBAGENT_CLI_TOOL_RULES", None)
-        if config_path := self._agent_mcp_config(task):
-            env["MISAKA_MCP_CONFIG"] = config_path
-        else:
-            env.pop("MISAKA_MCP_CONFIG", None)
+        self._warn_inline_mcp_servers(task)
         if task._stop_requested:
             raise AgentCancelled()
         task.hook_environ = dict(env)
@@ -2574,7 +2574,7 @@ class SubagentManager:
         # general-purpose child this file is the SOUL plus the whole persona.
         tmp_path = prompt_dir / f".{task.id}.md.{secrets.token_hex(6)}.tmp"
         try:
-            with tmp_path.open("x", encoding="utf-8") as handle:
+            with tmp_path.open("x", encoding="utf-8", newline="\n") as handle:
                 handle.write(system_prompt)
             tmp_path.chmod(0o600)
             os.replace(tmp_path, prompt_path)
@@ -2794,21 +2794,16 @@ class SubagentManager:
             return {"MISAKA_SKILL_SANDBOX": self.role_context.skill_sandbox}
         return {}
 
-    def _agent_mcp_config(self, task: AgentTask) -> str | None:
-        if not task.definition.mcp_servers:
-            return None
-        # Only what the definition spells out inline. The child loads the global, role and project
-        # `mcp.json` itself (the MCP extension), so a definition's `mcpServers` can only add: naming
-        # a configured server by its string is a no-op, and only the inline `{name: {...}}` form
-        # carries a server the child would not have.
-        selected: dict[str, Any] = dict(
-            agent_roster.inline_mcp_entries(task.definition.mcp_servers, on_invalid=_log_warning)
-        )
-        if not selected:
-            return None
-        path = task.metadata_path.parent / ".mcp" / f"{task.id}.json"
-        _atomic_json(path, {"mcpServers": selected})
-        return str(path)
+    def _warn_inline_mcp_servers(self, task: AgentTask) -> None:
+        """A sub-agent reaches its parent's MCP servers and no others, as a Hermes child inherits its parent's
+        toolsets and never gains one the parent lacks: the child loads the same role's `mcp.json` itself, and a
+        definition's inline `{name: {...}}` servers are not started."""
+        inline = [name for name, _ in agent_roster.inline_mcp_entries(task.definition.mcp_servers, on_invalid=_log_warning)]
+        if inline:
+            _log_warning(
+                f"Agent '{task.definition.name}' declares MCP servers inline ({', '.join(inline)}); a sub-agent "
+                "reaches only its parent's MCP servers, so they are not started"
+            )
 
     def _memory_enabled(self, task: AgentTask | None = None) -> bool:
         from misaka.core.subagent.configuration import settings_layers

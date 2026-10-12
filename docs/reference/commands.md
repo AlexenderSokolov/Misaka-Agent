@@ -241,6 +241,7 @@ A message that starts with `//` is not treated as a command; it goes to the agen
 | Ctrl+T | show or hide the agent's thinking |
 | Ctrl+G | write the message in your own editor |
 | Ctrl+X | copy the selection, or the last reply; on a sign-in screen, the sign-in address |
+| Shift+Ctrl+D | the same as `/debug`, from anywhere on the screen |
 
 Windows and WSL get the alternatives because their terminals keep Ctrl+V, Alt+Enter and Shift+Ctrl+P
 for themselves. `/hotkeys` shows the complete list as it applies on this machine, including your own

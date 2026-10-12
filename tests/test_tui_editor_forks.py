@@ -7,7 +7,6 @@ import re
 from misaka.ui.tui.components.editor import Editor, wordWrapLine
 from misaka.ui.tui.components.input import Input
 from misaka.ui.tui.tui_main_screen import TuiMainScreen
-from misaka.ui.tui.utils import visibleWidth
 from tests.tui_test_themes import defaultEditorTheme
 from tests.tui_virtual_terminal import VirtualTerminal
 
@@ -16,20 +15,6 @@ _SGR = re.compile(r"\x1b\[[0-9;]*m")
 
 def _editor() -> Editor:
     return Editor(TuiMainScreen(VirtualTerminal(80, 24)), defaultEditorTheme)
-
-
-def test_bottom_border_shows_the_history_position_while_browsing(monkeypatch):
-    monkeypatch.delenv("MISAKA_INPUT_HISTORY", raising=False)
-    editor = _editor()
-    editor.addToHistory("first")
-    editor.addToHistory("second")
-
-    assert " History " not in _SGR.sub("", editor.render(40)[-1])
-    editor.handleInput("\x1b[A")
-    bottom = _SGR.sub("", editor.render(40)[-1])
-    assert bottom.endswith(" History 1/2 ─") and visibleWidth(bottom) == 40
-    editor.handleInput("\x1b[A")
-    assert _SGR.sub("", editor.render(40)[-1]).endswith(" History 2/2 ─")
 
 
 def test_backspace_removes_a_whole_marker_left_of_a_shortened_renumbered_one():

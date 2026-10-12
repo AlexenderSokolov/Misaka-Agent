@@ -12,6 +12,6 @@ from __future__ import annotations
 
 from misaka.chord import defineService
 
-SlashCommands = defineService("pi.local.slash-commands", local=True)
+SlashCommands = defineService("pi.local.slash-commands", {"local": True})
 
 __all__ = ["SlashCommands"]

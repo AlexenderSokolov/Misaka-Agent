@@ -15,13 +15,6 @@ from misaka.chord.types import Context, JsonValue, ServiceCall, ServiceProviderU
 if TYPE_CHECKING:
     from .listener import ServerListener
 
-type MaybePromise[T] = T | Awaitable[T]
-type PublishServiceUpdate = Callable[[str, ServiceProviderUpdate, Context], MaybePromise[None]]
-
-# Minimal durable Session metadata the server needs for routing: a mapping with an ``id`` (or an object with an
-# ``id`` attribute). Applications may extend it.
-type SessionMetadata = Any
-
 
 class ServerOptions(TypedDict):
     """``listeners`` and ``serverId`` (the stable logical server identity supplied by the installation or profile)
@@ -33,6 +26,13 @@ class ServerOptions(TypedDict):
     handshakeTimeoutMs: NotRequired[int]
     onConnectionCountChanged: NotRequired[Callable[[int], None]]
     onError: NotRequired[Callable[[Exception], None]]
+
+type MaybePromise[T] = T | Awaitable[T]
+type PublishServiceUpdate = Callable[[str, ServiceProviderUpdate, Context], MaybePromise[None]]
+
+# Minimal durable Session metadata the server needs for routing: a mapping with an ``id`` (or an object with an
+# ``id`` attribute). Applications may extend it.
+type SessionMetadata = Any
 
 
 class RoutedSessionAttachment(Protocol):

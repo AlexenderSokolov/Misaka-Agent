@@ -21,7 +21,7 @@ from misaka.ai.types import AssistantMessage, DoneEvent, TextContent, Usage
 from misaka.ai.utils.event_stream import createAssistantMessageEventStream
 from misaka.ai.utils.transcript import getCurrentSystemPrompt, getCurrentTools
 from misaka.core.compaction import estimateTokens
-from misaka.modes.jsonl import to_jsonable
+from misaka.modes.json_event import to_jsonable
 from misaka.utils.js import jsonStringify
 from misaka.utils.values import read_field
 from tests.suite_harness import createHarness, getUserTexts

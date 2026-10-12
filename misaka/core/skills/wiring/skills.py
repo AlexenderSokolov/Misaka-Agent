@@ -15,6 +15,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.config import home
 from misaka.core.moments import CoreCommand
 from misaka.core.platform import home_guard
@@ -338,7 +339,7 @@ class SkillsPart:
         self.tools.append(ToolDefinition(
             name="skills_list", label="List skills",
             description="List available skills (name + description). Use skill_view(name) to load full content.",
-            parameters=ListParams.model_json_schema(), execute=list_execute,
+            parameters=typeboxSchema(ListParams), execute=list_execute,
             promptSnippet="List the available skills"))
 
         async def view_execute(tool_call_id, raw, signal, on_update, ctx):
@@ -386,7 +387,7 @@ class SkillsPart:
         self.tools.append(ToolDefinition(
             name="skill_view", label="View skill",
             description="Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' index showing available references/templates/scripts. To access those, call again with file_path parameter.",
-            parameters=ViewParams.model_json_schema(), execute=view_execute,
+            parameters=typeboxSchema(ViewParams), execute=view_execute,
             promptSnippet="Load a skill's full instructions"))
 
         async def manage_execute(tool_call_id, raw, signal, on_update, ctx):

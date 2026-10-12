@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Callable, Iterator
-from typing import Any, Protocol
+from typing import Any, Protocol, TypedDict
 
 from misaka.chord.context import BACKGROUND_CONTEXT, withCancel
 from misaka.chord.types import Context
@@ -38,14 +38,21 @@ class _Observer:
         self.closed = False
 
 
+class InstanceDirectoryOptions(TypedDict):
+    """The options object ``InstanceDirectory`` takes."""
+
+    ready: bool
+    onError: Callable[[Exception], None]
+
+
 class InstanceDirectory[TEntry: InstanceDirectoryEntry]:
     """Owns keyed instance lifetime and the cancellable tasks observing those instances."""
 
-    def __init__(self, *, ready: bool, onError: Callable[[Exception], None]) -> None:
+    def __init__(self, options: InstanceDirectoryOptions) -> None:
         self._entries: dict[str, TEntry] = {}
         self._observers: list[_Observer] = []
-        self._reportError = onError
-        self._ready = ready
+        self._ready = options["ready"]
+        self._reportError = options["onError"]
         self._disposed = False
 
     @property

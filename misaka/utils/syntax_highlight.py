@@ -1,4 +1,9 @@
-"""Syntax highlighting helpers built on Pygments."""
+"""Translated from pi's ``packages/coding-agent/src/utils/syntax-highlight.ts`` (v1.1.0).
+
+MISAKA fork: Pygments stands in for highlight.js. Its tokens are mapped to the highlight.js scope names the theme
+styles (``_scopeForToken``), so the theme's table applies unchanged; every Pygments lexer is available at once, so
+there is no ``loadAllHighlightLanguages`` and no HTML to render (``renderHighlightedHtml``).
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ from typing import Any
 
 from pygments import lex
 from pygments.lexers import TextLexer, get_lexer_by_name, guess_lexer
-from pygments.token import Comment, Keyword, Literal, Name, Operator, Token
+from pygments.token import Comment, Generic, Keyword, Literal, Name, Operator, Token
 from pygments.util import ClassNotFound
 
 HighlightFormatter = Callable[[str], str]
@@ -31,14 +36,36 @@ class HighlightOptions:
     theme: HighlightTheme | None = None
 
 
+def getScopeFormatter(scope: str | None, theme: HighlightTheme) -> HighlightFormatter | None:
+    if scope is None:
+        return None
+    exact = theme.get(scope)
+    if exact:
+        return exact
+
+    dotIndex = scope.find(".")
+    if dotIndex != -1:
+        prefixFormatter = theme.get(scope[:dotIndex])
+        if prefixFormatter:
+            return prefixFormatter
+
+    dashIndex = scope.find("-")
+    if dashIndex != -1:
+        prefixFormatter = theme.get(scope[:dashIndex])
+        if prefixFormatter:
+            return prefixFormatter
+
+    return None
+
+
 def highlight(code: str, options: HighlightOptions | dict[str, Any] | None = None) -> str:
-    resolved = _resolve_options(options)
-    lexer = _resolve_lexer(code, resolved)
+    resolved = _resolveOptions(options)
+    lexer = _resolveLexer(code, resolved)
     output: list[str] = []
     theme = resolved.theme or {}
 
     for token, value in lex(code, lexer):
-        scope = _scope_for_token(token)
+        scope = _scopeForToken(token)
         formatter = getScopeFormatter(scope, theme) if scope else None
         if formatter is None:
             formatter = theme.get("default")
@@ -60,7 +87,7 @@ def supportsLanguage(name: str) -> bool:
     return True
 
 
-def _resolve_options(options: HighlightOptions | dict[str, Any] | None) -> HighlightOptions:
+def _resolveOptions(options: HighlightOptions | dict[str, Any] | None) -> HighlightOptions:
     if isinstance(options, HighlightOptions):
         return options
     if isinstance(options, dict):
@@ -78,7 +105,7 @@ def _resolve_options(options: HighlightOptions | dict[str, Any] | None) -> Highl
 _LEXER_OPTIONS: dict[str, Any] = {"stripnl": False, "ensurenl": False}
 
 
-def _resolve_lexer(code: str, options: HighlightOptions):
+def _resolveLexer(code: str, options: HighlightOptions):
     if options.language:
         try:
             return get_lexer_by_name(options.language, **_LEXER_OPTIONS)
@@ -114,44 +141,52 @@ def _resolve_lexer(code: str, options: HighlightOptions):
         return TextLexer(**_LEXER_OPTIONS)
 
 
-def getScopeFormatter(scope: str | None, theme: HighlightTheme) -> HighlightFormatter | None:
-    if scope is None:
-        return None
-    exact = theme.get(scope)
-    if exact is not None:
-        return exact
-    for separator in (".", "-"):
-        index = scope.find(separator)
-        if index != -1:
-            formatter = theme.get(scope[:index])
-            if formatter is not None:
-                return formatter
-    return None
-
-
-def _scope_for_token(token: Any) -> str | None:
-    if token in Keyword:
+def _scopeForToken(token: Any) -> str | None:
+    """The highlight.js scope of a Pygments token, most specific first, or None for plain text."""
+    if token in Keyword.Constant:
+        return "literal"  # true, false, null, None
+    if token in Keyword.Type:
+        return "type"
+    if token in Keyword or token in Operator.Word:
         return "keyword"
-    if token in Literal.Number:
-        return "number"
+    if token in Literal.String.Regex:
+        return "regexp"
+    if token in Literal.String.Interpol:
+        return "subst"
     if token in Literal.String:
         return "string"
+    if token in Literal.Number:
+        return "number"
+    if token in Comment.Preproc or token in Comment.PreprocFile:
+        return "meta"
     if token in Comment:
         return "comment"
-    if token in Name.Function or token in Name.Class:
-        return "title"
+    if token in Name.Decorator:
+        return "meta"
+    if token in Name.Function:
+        return "title.function"
+    if token in Name.Class:
+        return "title.class"
+    if token in Name.Builtin.Pseudo:
+        return "variable.language"  # self, this
+    if token in Name.Builtin:
+        return "built_in"
     if token in Name.Tag:
         return "tag"
     if token in Name.Attribute:
         return "attr"
-    if token in Name.Builtin:
-        return "built_in"
     if token in Name.Variable:
         return "variable"
     if token in Operator:
         return "operator"
-    if token is Token.Text:
-        return None
+    if token in Generic.Inserted:
+        return "addition"
+    if token in Generic.Deleted:
+        return "deletion"
+    if token in Generic.Emph:
+        return "emphasis"
+    if token in Generic.Strong:
+        return "strong"
     return None
 
 
@@ -159,5 +194,7 @@ __all__ = [
     "HighlightFormatter",
     "HighlightOptions",
     "HighlightTheme",
+    "getScopeFormatter",
     "highlight",
-    ]
+    "supportsLanguage",
+]

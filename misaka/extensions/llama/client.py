@@ -304,8 +304,9 @@ class LlamaClient:
             raise RuntimeError(errorMessage(payload, f"llama.cpp returned HTTP {response.status}"))
         return payload
 
-    async def list(self, *, reload: bool = False, signal: Any = None) -> list[LlamaModelInfo]:
-        payload = await self.request(f"/models{'?reload=1' if reload else ''}", {"signal": signal})
+    async def list(self, options: Mapping[str, Any] | None = None) -> list[LlamaModelInfo]:
+        options = options if options is not None else {}
+        payload = await self.request(f"/models{'?reload=1' if options.get('reload') else ''}", {"signal": options.get("signal")})
         if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
             raise RuntimeError("llama.cpp returned an invalid model catalog")  # noqa: TRY004
         data = payload["data"]
@@ -313,9 +314,10 @@ class LlamaClient:
             raise RuntimeError("Server is not running in llama.cpp router mode")
         return [_modelInfo(value) for value in data]
 
-    async def props(self, *, model: str | None = None, signal: Any = None) -> LlamaServerProps:
-        query = f"?{URLSearchParams({'model': model, 'autoload': 'false'})}" if model else ""
-        payload = await self.request(f"/props{query}", {"signal": signal})
+    async def props(self, options: Mapping[str, Any] | None = None) -> LlamaServerProps:
+        options = options if options is not None else {}
+        query = f"?{URLSearchParams({'model': options['model'], 'autoload': 'false'})}" if options.get("model") else ""
+        payload = await self.request(f"/props{query}", {"signal": options.get("signal")})
         if not isinstance(payload, Mapping):
             return LlamaServerProps()
         modelsAutoload = payload.get("models_autoload")
@@ -334,7 +336,7 @@ class LlamaClient:
     async def unloadAndWait(self, model: str, signal: Any = None) -> None:
         await self.unload(model, signal)
         while True:
-            entry = next((candidate for candidate in await self.list(signal=signal) if candidate.id == model), None)
+            entry = next((candidate for candidate in await self.list({"signal": signal}) if candidate.id == model), None)
             if not entry or entry.status.value == "unloaded":
                 return
             await sleep(100, signal)
@@ -407,7 +409,7 @@ class LlamaClient:
             while True:
                 if signal_aborted(signal):
                     raise _cancelled(signal)
-                entry = next((candidate for candidate in await self.list(signal=signal) if candidate.id == model), None)
+                entry = next((candidate for candidate in await self.list({"signal": signal}) if candidate.id == model), None)
                 if entry is not None and entry.status.value == "loaded":
                     return entry
                 if eventLoaded and not entry:
@@ -459,7 +461,7 @@ class LlamaClient:
                     raise _cancelled(signal)
                 if failure:
                     raise RuntimeError(failure)
-                models = await self.list(signal=signal)
+                models = await self.list({"signal": signal})
                 polls += 1
                 entry = next((candidate for candidate in models if candidate.id == model), None)
                 if entry is not None and entry.status.value == "downloading":
@@ -468,7 +470,7 @@ class LlamaClient:
                     if progress:
                         onProgress(progress)
                 elif finished or (entry and (sawDownloading or polls >= 2)):
-                    return await self.list(reload=True, signal=signal)
+                    return await self.list({"reload": True, "signal": signal})
                 await sleep(500, signal)
         finally:
             unlink()

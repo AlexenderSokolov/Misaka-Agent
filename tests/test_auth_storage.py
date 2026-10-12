@@ -1,6 +1,6 @@
 """Ported from pi's ``packages/coding-agent/test/auth-storage.test.ts`` (v1.1.0).
 
-pi spies on proper-lockfile's ``lock``; here the same seams are the backend's own: ``_acquire_lock_async_with_retry``
+pi spies on proper-lockfile's ``lock``; here the same seams are the backend's own: ``acquireLockAsync``
 (one async acquisition), ``_create_lock`` (one attempt at the lock file) and ``_lock_signature`` (how a compromised
 lock is noticed).
 """
@@ -92,7 +92,7 @@ class _Spy:
 
 
 def _spyOnAsyncLock(monkeypatch, implementation=None) -> _Spy:
-    original = FileAuthStorageBackend._acquire_lock_async_with_retry
+    original = FileAuthStorageBackend.acquireLockAsync
     spy = _Spy()
 
     async def lock(self, options=None):
@@ -101,7 +101,7 @@ def _spyOnAsyncLock(monkeypatch, implementation=None) -> _Spy:
             return await implementation()
         return await original(self, options)
 
-    monkeypatch.setattr(FileAuthStorageBackend, "_acquire_lock_async_with_retry", lock)
+    monkeypatch.setattr(FileAuthStorageBackend, "acquireLockAsync", lock)
     return spy
 
 

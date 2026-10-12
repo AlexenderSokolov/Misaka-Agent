@@ -12,10 +12,12 @@ from __future__ import annotations
 import sys
 
 from misaka.cli import bootstrap
+from misaka.cli.setup import setupCli
 from misaka.core.research import node
 
 
 def main(argv: list[str] | None = None) -> int:
+    setupCli()
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) not in (2, 4) or args[0] != "--run-card" or (len(args) == 4 and args[2] != "--say"):
         sys.exit("usage: python -m misaka.cli.research_node --run-card TASK_ID [--say TEXT]")

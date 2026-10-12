@@ -153,7 +153,8 @@ class PendingLaunch:
 
 
 def _defaultKill(pid: int, signalName: str) -> None:
-    os.kill(pid, getattr(signal, signalName))
+    # MISAKA fork: Windows has no SIGKILL; os.kill with SIGTERM is TerminateProcess there, as node's kill is.
+    os.kill(pid, getattr(signal, signalName, signal.SIGTERM))
 
 
 class SessionWorkerManager:
@@ -821,6 +822,6 @@ def scopedServiceSubscriptionKey(scope: dict[str, str], subscriptionId: str) -> 
     return f"{scope['serverConnectionId']}\0{scope['attachmentId']}\0{subscriptionId}"
 
 
-def abortError(abortSignal: Any) -> BaseException:
-    reason = abortSignal.reason
+def abortError(signal: Any) -> BaseException:
+    reason = signal.reason
     return reason if isinstance(reason, Exception) else DOMException("The operation was aborted", "AbortError")

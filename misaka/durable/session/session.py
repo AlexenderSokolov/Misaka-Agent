@@ -271,7 +271,7 @@ class SessionImpl:
 
         await self._enqueue(shutdown)
 
-    def conversationCreated(self, tx: Transaction, record: dict[str, Any]) -> Awaitable[None]:
+    def conversationCreated(self, _tx: Transaction, _record: dict[str, Any]) -> Awaitable[None]:
         """Runs inside every transaction that creates or forks a conversation, after the conversation record is staged.
         A plain Session stages nothing; a Harness stages its built-in documents."""
 

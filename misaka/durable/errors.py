@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from misaka.utils.js import ErrorOptions
+
 
 class ReadAfterWrite(Exception):
     """A transaction read a table after its first table write. Read every required row before writing."""
@@ -14,12 +16,13 @@ class ReadAfterWrite(Exception):
 class StorageRejected(Exception):
     """Storage rejected a batch before any durable effect; the owning Session may continue safely."""
 
-    def __init__(self, message: str, cause: BaseException | None = None) -> None:
+    def __init__(self, message: str, options: ErrorOptions | None = None) -> None:
         super().__init__(message)
         self.name = "StorageRejected"
-        self.cause = cause
-        if cause is not None:
-            self.__cause__ = cause
+        # `super(message, options)`: Error keeps `options.cause` as `cause`, which Python also chains.
+        self.cause = options.get("cause") if options is not None else None
+        if self.cause is not None:
+            self.__cause__ = self.cause
 
 
 class ConversationBusy(Exception):

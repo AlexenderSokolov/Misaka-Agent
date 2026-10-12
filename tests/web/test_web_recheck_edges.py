@@ -213,14 +213,14 @@ async def test_cancelled_xai_force_refresh_still_persists_the_refresh_it_started
     release.set()
     for _ in range(200):
         # While the refresh holds the store lock a fresh reader cannot load the file and reads nothing.
-        current = auth_storage.AuthStorage.create(path).data.get("xai")
+        current = auth_storage.AuthStorage.create(path).readState.data.get("xai")
         if current is not None and current["access"] == "rotated":
             break
         await asyncio.sleep(0.01)
     writer = auth_storage.AuthStorage.create(path)
-    assert (writer.data.get("xai")["access"], writer.data.get("xai")["refresh"]) == ("rotated", "rotated-refresh")
+    assert (writer.readState.data.get("xai")["access"], writer.readState.data.get("xai")["refresh"]) == ("rotated", "rotated-refresh")
     await asyncio.wait_for(writer.delete("xai"), 2)
-    assert auth_storage.AuthStorage.create(path).data.get("xai") is None
+    assert auth_storage.AuthStorage.create(path).readState.data.get("xai") is None
 
 
 def test_concurrent_download_publications_keep_every_complete_file(tmp_path):

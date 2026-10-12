@@ -95,36 +95,36 @@ def isMcpAppResource(item: Mapping[str, Any]) -> bool:
     )
 
 
-def _listed(server: str, item: Mapping[str, Any]) -> dict[str, Any]:
+def listed(server: str, item: Mapping[str, Any]) -> dict[str, Any]:
     """A listed resource or template without ``_meta`` and icons, tagged with its server."""
     return {"server": server, **{key: value for key, value in item.items() if key not in ("_meta", "icons")}}
 
 
-def _stringProperty(description: str) -> dict[str, str]:
+def stringProperty(description: str) -> dict[str, str]:
     return {"type": "string", "description": description}
 
 
-_SERVER_FILTER = _stringProperty("MCP server name. Omit to list every server with resources.")
-_CURSOR = _stringProperty("Opaque cursor from a previous call with the same server; omit for the first page.")
-_LIST_PARAMETERS: dict[str, Any] = {
+SERVER_FILTER = stringProperty("MCP server name. Omit to list every server with resources.")
+CURSOR = stringProperty("Opaque cursor from a previous call with the same server; omit for the first page.")
+LIST_PARAMETERS: dict[str, Any] = {
     "type": "object",
-    "properties": {"server": _SERVER_FILTER, "cursor": _CURSOR},
+    "properties": {"server": SERVER_FILTER, "cursor": CURSOR},
     "additionalProperties": False,
 }
-_READ_PARAMETERS: dict[str, Any] = {
+READ_PARAMETERS: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "server": _stringProperty(
+        "server": stringProperty(
             "MCP server name exactly as configured. Must match the 'server' field returned by list_mcp_resources.",
         ),
-        "uri": _stringProperty("Resource URI to read. Must be one of the URIs returned by list_mcp_resources."),
+        "uri": stringProperty("Resource URI to read. Must be one of the URIs returned by list_mcp_resources."),
     },
     "required": ["server", "uri"],
     "additionalProperties": False,
 }
 
-_optionalString = {"type": "string"}
-_LISTING_ERRORS: dict[str, Any] = {
+optionalString = {"type": "string"}
+LISTING_ERRORS: dict[str, Any] = {
     "type": "array",
     "description": "Servers that could not be listed",
     "items": {
@@ -133,10 +133,10 @@ _LISTING_ERRORS: dict[str, Any] = {
         "required": ["server", "error"],
     },
 }
-_LIST_OUTPUT_SCHEMA: dict[str, Any] = {
+LIST_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "server": _optionalString,
+        "server": optionalString,
         "resources": {
             "type": "array",
             "items": {
@@ -145,23 +145,23 @@ _LIST_OUTPUT_SCHEMA: dict[str, Any] = {
                     "server": {"type": "string"},
                     "uri": {"type": "string"},
                     "name": {"type": "string"},
-                    "title": _optionalString,
-                    "description": _optionalString,
-                    "mimeType": _optionalString,
+                    "title": optionalString,
+                    "description": optionalString,
+                    "mimeType": optionalString,
                     "size": {"type": "number"},
                 },
                 "required": ["server", "uri", "name"],
             },
         },
-        "nextCursor": _optionalString,
-        "errors": _LISTING_ERRORS,
+        "nextCursor": optionalString,
+        "errors": LISTING_ERRORS,
     },
     "required": ["resources"],
 }
-_LIST_TEMPLATES_OUTPUT_SCHEMA: dict[str, Any] = {
+LIST_TEMPLATES_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "server": _optionalString,
+        "server": optionalString,
         "resourceTemplates": {
             "type": "array",
             "items": {
@@ -170,19 +170,19 @@ _LIST_TEMPLATES_OUTPUT_SCHEMA: dict[str, Any] = {
                     "server": {"type": "string"},
                     "uriTemplate": {"type": "string", "description": "RFC 6570 URI template"},
                     "name": {"type": "string"},
-                    "title": _optionalString,
-                    "description": _optionalString,
-                    "mimeType": _optionalString,
+                    "title": optionalString,
+                    "description": optionalString,
+                    "mimeType": optionalString,
                 },
                 "required": ["server", "uriTemplate", "name"],
             },
         },
-        "nextCursor": _optionalString,
-        "errors": _LISTING_ERRORS,
+        "nextCursor": optionalString,
+        "errors": LISTING_ERRORS,
     },
     "required": ["resourceTemplates"],
 }
-_READ_OUTPUT_SCHEMA: dict[str, Any] = {
+READ_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "server": {"type": "string"},
@@ -193,14 +193,14 @@ _READ_OUTPUT_SCHEMA: dict[str, Any] = {
                 "anyOf": [
                     {
                         "type": "object",
-                        "properties": {"uri": {"type": "string"}, "mimeType": _optionalString, "text": {"type": "string"}},
+                        "properties": {"uri": {"type": "string"}, "mimeType": optionalString, "text": {"type": "string"}},
                         "required": ["uri", "text"],
                     },
                     {
                         "type": "object",
                         "properties": {
                             "uri": {"type": "string"},
-                            "mimeType": _optionalString,
+                            "mimeType": optionalString,
                             "blob": {"type": "string", "description": "base64"},
                         },
                         "required": ["uri", "blob"],
@@ -213,7 +213,7 @@ _READ_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 
-def _stringArgument(params: Any, key: str) -> str | None:
+def stringArgument(params: Any, key: str) -> str | None:
     value = params.get(key) if isinstance(params, Mapping) else None
     if value is None:
         return None
@@ -222,7 +222,7 @@ def _stringArgument(params: Any, key: str) -> str | None:
     return jsTrim(value) or None
 
 
-async def _jsonResult(tool: str, server: str | None, payload: dict[str, Any]) -> AgentToolResult:
+async def jsonResult(tool: str, server: str | None, payload: dict[str, Any]) -> AgentToolResult:
     limited = await limitMcpContent([TextContent(text=jsonStringify(payload))])
     details: McpToolDetails = {"server": server if server is not None else "", "tool": tool}
     if "fullOutputPath" in limited:
@@ -264,8 +264,8 @@ def createMcpResourceToolDefinitions(
         all: Callable[[McpResourceServer, McpRequestOptions], Awaitable[builtins.list[Any]]],
     ) -> dict[str, Any]:
         """One page of one server, or every page of every server."""
-        serverName = _stringArgument(params, "server")
-        cursor = _stringArgument(params, "cursor")
+        serverName = stringArgument(params, "server")
+        cursor = stringArgument(params, "cursor")
 
         def visible(item: Mapping[str, Any]) -> bool:
             return not isMcpAppResource(item)
@@ -275,7 +275,7 @@ def createMcpResourceToolDefinitions(
             result = await page(server, cursor, {"signal": signal, "timeoutMs": server.timeoutMs})
             payload: dict[str, Any] = {
                 "server": server.name,
-                key: [_listed(server.name, item) for item in result["items"] if visible(item)],
+                key: [listed(server.name, item) for item in result["items"] if visible(item)],
             }
             if "nextCursor" in result:
                 payload["nextCursor"] = result["nextCursor"]
@@ -289,7 +289,7 @@ def createMcpResourceToolDefinitions(
         for index, result in enumerate(results):
             serverName = servers[index].name
             if result.status == "fulfilled":
-                items.extend(_listed(serverName, item) for item in result.value if visible(item))
+                items.extend(listed(serverName, item) for item in result.value if visible(item))
             else:
                 errors.append({"server": serverName, "error": errorMessage(result.reason)})
         payload = {key: items}
@@ -314,7 +314,7 @@ def createMcpResourceToolDefinitions(
             resourcesPage,
             lambda server, requestOptions: server.allResources(requestOptions),
         )
-        return await _jsonResult(LIST_MCP_RESOURCES_TOOL, _stringArgument(params, "server"), payload)
+        return await jsonResult(LIST_MCP_RESOURCES_TOOL, stringArgument(params, "server"), payload)
 
     listResources: ToolDefinition[Any, McpToolDetails] = ToolDefinition(
         name=LIST_MCP_RESOURCES_TOOL,
@@ -324,8 +324,8 @@ def createMcpResourceToolDefinitions(
             "context to language models, such as files, database schemas, or application-specific "
             "information. Prefer resources over web search when possible."
         ),
-        parameters=_LIST_PARAMETERS,
-        outputSchema=_LIST_OUTPUT_SCHEMA,
+        parameters=LIST_PARAMETERS,
+        outputSchema=LIST_OUTPUT_SCHEMA,
         exposure=toToolExposure(options["exposure"]),
         annotations=readOnly,
         execute=executeListResources,
@@ -350,7 +350,7 @@ def createMcpResourceToolDefinitions(
             templatesPage,
             lambda server, requestOptions: server.allResourceTemplates(requestOptions),
         )
-        return await _jsonResult(LIST_MCP_RESOURCE_TEMPLATES_TOOL, _stringArgument(params, "server"), payload)
+        return await jsonResult(LIST_MCP_RESOURCE_TEMPLATES_TOOL, stringArgument(params, "server"), payload)
 
     listTemplates: ToolDefinition[Any, McpToolDetails] = ToolDefinition(
         name=LIST_MCP_RESOURCE_TEMPLATES_TOOL,
@@ -361,8 +361,8 @@ def createMcpResourceToolDefinitions(
             "database schemas, or application-specific information. Prefer resource templates over web search "
             "when possible."
         ),
-        parameters=_LIST_PARAMETERS,
-        outputSchema=_LIST_TEMPLATES_OUTPUT_SCHEMA,
+        parameters=LIST_PARAMETERS,
+        outputSchema=LIST_TEMPLATES_OUTPUT_SCHEMA,
         exposure=toToolExposure(options["exposure"]),
         annotations=readOnly,
         execute=executeListTemplates,
@@ -371,8 +371,8 @@ def createMcpResourceToolDefinitions(
     async def executeReadResource(
         _toolCallId: str, params: Any, signal: Any = None, _onUpdate: Any = None, _ctx: Any = None
     ) -> AgentToolResult:
-        serverName = _stringArgument(params, "server")
-        uri = _stringArgument(params, "uri")
+        serverName = stringArgument(params, "server")
+        uri = stringArgument(params, "uri")
         if not serverName:
             raise RuntimeError("server must be provided")
         if not uri:
@@ -403,8 +403,8 @@ def createMcpResourceToolDefinitions(
         name=READ_MCP_RESOURCE_TOOL,
         label=READ_MCP_RESOURCE_TOOL,
         description="Read a specific resource from an MCP server given the server name and resource URI.",
-        parameters=_READ_PARAMETERS,
-        outputSchema=_READ_OUTPUT_SCHEMA,
+        parameters=READ_PARAMETERS,
+        outputSchema=READ_OUTPUT_SCHEMA,
         exposure=toToolExposure(options["exposure"]),
         annotations=readOnly,
         execute=executeReadResource,

@@ -556,7 +556,7 @@ class _ModelsImpl:
         errors: dict[str, BaseException] = {}
         if signal_aborted(callerSignal):
             return ModelsRefreshResult(aborted=True, errors=errors)
-        selected = set(options.providers) if options.providers else None
+        selected = set(options.providers) if options.providers is not None else None
         refreshable = [
             provider
             for provider in self._providers.values()
@@ -779,7 +779,7 @@ class _ModelsImpl:
                 signal=signal,
             ),
         )
-        if not result or isinstance(providerOrModel, str) or not providerOrModel.headers:
+        if not result or isinstance(providerOrModel, str) or providerOrModel.headers is None:
             return result
         return result.model_copy(
             update={
@@ -905,7 +905,7 @@ class _ModelsImpl:
             produced = transformHeaders(headers if headers is not None else {})
             headers = await produced if inspect.isawaitable(produced) else produced
         optionEnv: ProviderEnv | None = read_field(options, "env")
-        env = {**(resolution.env or {}), **(optionEnv or {})} if resolution.env or optionEnv else None
+        env = {**(resolution.env or {}), **(optionEnv or {})} if resolution.env is not None or optionEnv is not None else None
         requestModel = model.model_copy(update={"baseUrl": auth.baseUrl}) if auth.baseUrl else model
         requestOptions = _mergeRequestOptions(options, apiKey=apiKey, headers=headers, env=env, into=into)
 

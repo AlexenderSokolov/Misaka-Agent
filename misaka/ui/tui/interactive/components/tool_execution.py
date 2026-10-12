@@ -3,7 +3,6 @@
 MISAKA forks, each marked where it happens:
 
 - D1: no ``MouseRegion`` around results and no ``handleMouse``; only the fullscreen renderer delivers clicks.
-- A call without a renderer says what it is waiting on while it is partial (running, queued, generating arguments).
 - A renderer that returns ``None`` gets the default fallback, as one that raises does.
 - ``ui`` may be missing (read-only transcripts); a render request then does nothing.
 - The render context is the ``ToolRenderContext`` dataclass below (upstream: an object literal), and a tool's
@@ -186,14 +185,7 @@ class ToolExecutionComponent(Container):
         )
 
     def createCallFallback(self) -> Component:
-        text = formatToolCallWithArgs(self.toolName, self.args, theme, self.expanded)
-        if self.isPartial:
-            # MISAKA fork: say what a call without a renderer is waiting on, at the end of its first line so both
-            # the collapsed and the expanded form keep it.
-            state = "running" if self.executionStarted else "queued" if self.argsComplete else "generating arguments"
-            first, newline, rest = text.partition("\n")
-            text = f"{first}{theme.fg('muted', f' — {state}')}{newline}{rest}"
-        return Text(text, 0, 0)
+        return Text(formatToolCallWithArgs(self.toolName, self.args, theme, self.expanded), 0, 0)
 
     def createResultFallback(self) -> Component | None:
         output = self.getTextOutput()

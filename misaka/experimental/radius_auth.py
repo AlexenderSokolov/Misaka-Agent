@@ -13,7 +13,7 @@ import os
 from typing import Any
 
 from misaka.ai.providers.radius_config import normalizeRadiusGatewayUrl
-from misaka.cli.auth import get_auth_credential
+from misaka.cli.auth_command import getAuthCredential
 from misaka.core.model_runtime import ModelRuntime, ModelRuntimeAuthOverrides
 from misaka.core.radius import ENV_RADIUS_GATEWAY, getRadiusGatewayUrl
 from misaka.utils.abort import raceWithAbortSignal
@@ -54,11 +54,11 @@ class RadiusRelayAuthResolver:
             return {"gateway": self._gateway, "token": explicit}
 
         if self._modelRuntime is None:
-            self._modelRuntime = asyncio.ensure_future(ModelRuntime.create(refreshOnCreate=False, allowModelNetwork=False))
+            self._modelRuntime = asyncio.ensure_future(ModelRuntime.create({"refreshOnCreate": False, "allowModelNetwork": False}))
         runtime = await self._modelRuntime
         if signal is not None:
             signal.throwIfAborted()
-        token = get_auth_credential(
+        token = getAuthCredential(
             await runtime.getAuth("radius", ModelRuntimeAuthOverrides(minOAuthValidityMs=5 * 60_000, signal=signal))
         )
         if token is not None and len(token) > 0:

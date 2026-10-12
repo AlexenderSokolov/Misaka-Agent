@@ -454,7 +454,6 @@ def run_interactive(run_id, node_id, *, runner_key):
                            "execution. Her Sisters open beside this window."),
         **env,
         "MISAKA_INPUT_HISTORY": str(home.path("input_history") / "last-order.json"),
-        "MISAKA_CODING_AGENT": "true",
         # Her tools' spending counts against the run, as a card's counts against its card.
         "MISAKA_USAGE_DB": str(cfg["db"]), "MISAKA_USAGE_TASK_ID": run_id,
         "MISAKA_USAGE_GENERATION": "1", "MISAKA_USAGE_TOKEN_CAP": ""})

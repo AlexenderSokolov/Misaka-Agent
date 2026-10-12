@@ -15,9 +15,9 @@ from wcmatch import glob
 from misaka.ai.models import modelsAreEqual
 from misaka.ai.types import Model
 from misaka.cli.args import isValidThinkingLevel
-from misaka.config import home
 from misaka.core.defaults import DEFAULT_THINKING_LEVEL
 from misaka.utils.collation import localeSortKey
+from misaka.utils.js import jsTrim
 
 type ResolvedThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
@@ -113,7 +113,7 @@ def findExactModelReferenceMatch(modelReference: str, availableModels: list[Mode
     """Find an exact model reference match.
     Supports either a bare model id or a canonical provider/modelId reference.
     When matching by bare id, ambiguous matches across providers are rejected."""
-    trimmedReference = modelReference.strip()
+    trimmedReference = jsTrim(modelReference)
     if not trimmedReference:
         return None
 
@@ -129,8 +129,8 @@ def findExactModelReferenceMatch(modelReference: str, availableModels: list[Mode
 
     slashIndex = trimmedReference.find("/")
     if slashIndex != -1:
-        provider = trimmedReference[:slashIndex].strip()
-        modelId = trimmedReference[slashIndex + 1 :].strip()
+        provider = jsTrim(trimmedReference[:slashIndex])
+        modelId = jsTrim(trimmedReference[slashIndex + 1 :])
         if provider and modelId:
             providerMatches = [
                 model
@@ -404,11 +404,10 @@ def resolveCliModel(options: dict[str, Any]) -> ResolveCliModelResult:
 
     provider = providerMap.get(cliProvider.lower()) if cliProvider else None
     if cliProvider and not provider:
-        # MISAKA fork: the error also says where custom providers and the default live.
         return ResolveCliModelResult(
             model=None,
             warning=None,
-            error=f'Unknown provider "{cliProvider}". Use --list-models to see available providers/models; custom providers are defined in {home.display(home.path("models"))} and the default is defaultProvider in settings.json.',
+            error=f'Unknown provider "{cliProvider}". Use --list-models to see available providers/models.',
         )
 
     # If no explicit --provider, try to interpret "provider/model" format first.

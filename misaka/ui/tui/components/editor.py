@@ -5,8 +5,7 @@ MISAKA forks, each marked where it happens:
 - No alt screen (D1): ``handleMouse``, the render geometry only it reads (``renderedVisibleLineCount``,
   ``renderedAutocompleteHeight``) and the autocomplete list's ``onSelect`` (reached only by a mouse click) are not
   ported; only the alt screen produces mouse events.
-- Prompt history persists in a file when ``MISAKA_INPUT_HISTORY`` names one, and the bottom border shows the history
-  position while browsing.
+- Prompt history persists in a file when ``MISAKA_INPUT_HISTORY`` names one.
 - String offsets count code points (Python strings), where upstream counts UTF-16 code units.
 """
 
@@ -581,13 +580,6 @@ class Editor(Component):
 
     def renderBottomBorder(self, width: int, hiddenLineCount: int) -> str:
         border = createScrollBorder("↓", hiddenLineCount, width) if hiddenLineCount > 0 else "─" * width
-        # MISAKA fork: while browsing history, the position shows at the right end of the bottom border when the dash
-        # run there has room for it.
-        if self.historyIndex > -1 and self.history:
-            label = f" History {self.historyIndex + 1}/{len(self.history)} "
-            labelWidth = visibleWidth(label)
-            if border.endswith("─" * (labelWidth + 2)):
-                border = border[: len(border) - labelWidth - 1] + label + "─"
         return self.borderColor(border)
 
     def render(self, width: int) -> list[str]:

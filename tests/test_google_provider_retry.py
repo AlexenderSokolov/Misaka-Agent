@@ -39,32 +39,38 @@ class _Models:
         return _chunks()
 
 
-def _client(models):
-    return SimpleNamespace(aio=SimpleNamespace(models=models))
+def _useClient(monkeypatch, models) -> None:
+    """The SDK client the adapters build: both modules' ``GoogleGenAI`` answers one serving ``models``."""
+    client = SimpleNamespace(aio=SimpleNamespace(models=models))
+    monkeypatch.setattr(google_generative_ai, "GoogleGenAI", lambda **_kwargs: client)
+    monkeypatch.setattr(google_vertex, "GoogleGenAI", lambda **_kwargs: client)
 
 
 @pytest.mark.parametrize("stream,provider", PROVIDERS)
-async def test_a_transient_failure_is_retried_up_to_max_retries(stream, provider):
+async def test_a_transient_failure_is_retried_up_to_max_retries(stream, provider, monkeypatch):
     models = _Models(failures=2)
-    options = {"client": _client(models), "maxRetries": 2, "maxRetryDelayMs": 1}
+    _useClient(monkeypatch, models)
+    options = {"apiKey": "test-key", "maxRetries": 2, "maxRetryDelayMs": 1}
     result = await stream(getModel(provider, "gemini-2.5-flash"), Context(messages=[]), options).result()
     assert result.stopReason == "stop", result.errorMessage
     assert models.calls == 3
 
 
 @pytest.mark.parametrize("stream,provider", PROVIDERS)
-async def test_without_max_retries_the_first_failure_ends_the_turn(stream, provider):
+async def test_without_max_retries_the_first_failure_ends_the_turn(stream, provider, monkeypatch):
     models = _Models(failures=1)
+    _useClient(monkeypatch, models)
     result = await stream(getModel(provider, "gemini-2.5-flash"), Context(messages=[]),
-                          {"client": _client(models)}).result()
+                          {"apiKey": "test-key"}).result()
     assert result.stopReason == "error"
     assert models.calls == 1
 
 
 @pytest.mark.parametrize("stream,provider", PROVIDERS)
-async def test_abort_while_connecting_ends_the_turn_as_aborted(stream, provider):
+async def test_abort_while_connecting_ends_the_turn_as_aborted(stream, provider, monkeypatch):
     controller = AbortController()
-    options = {"client": _client(_Models(failures=0, hang=True)), "signal": controller.signal}
+    _useClient(monkeypatch, _Models(failures=0, hang=True))
+    options = {"apiKey": "test-key", "signal": controller.signal}
     pending = stream(getModel(provider, "gemini-2.5-flash"), Context(messages=[]), options).result()
     await asyncio.sleep(0.05)
     controller.abort()

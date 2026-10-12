@@ -296,7 +296,7 @@ class KeyedBinding:
         self._reportError = reportError
         self._assertAccess = assertAccess
         self._onEmpty = onEmpty
-        self._instances: InstanceDirectory[KeyedInstance] = InstanceDirectory(ready=False, onError=reportError)
+        self._instances: InstanceDirectory[KeyedInstance] = InstanceDirectory({"ready": False, "onError": reportError})
         self._subscription: ServiceSubscription | None = None
         self._starting: asyncio.Future[None] | None = None
         self._closed = False
@@ -760,8 +760,10 @@ def sameAddress(left: ServiceInstanceAddress | None, right: ServiceInstanceAddre
 
 
 def isContext(value: Any) -> bool:
-    # MISAKA fork: a `Context` instance, where upstream accepts any object with `value` and `toString` functions.
-    return isinstance(value, Context)
+    # `typeof value !== "object"`: None, primitives and functions. Every object has `toString` (`__str__`).
+    if value is None or isinstance(value, str | int | float | bool) or callable(value):
+        return False
+    return callable(getattr(value, "value", None))
 
 
 def toError(error: BaseException) -> Exception:

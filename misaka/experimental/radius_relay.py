@@ -53,15 +53,6 @@ CLIENT_RETRY_MAX_MS = 30_000
 LOCAL_PROTOCOL_ERROR_CLOSE_CODE = 4000
 LOCAL_TRANSPORT_ERROR_CLOSE_CODE = 4001
 
-# A RadiusRelayWebSocket is an object with ``binaryType``, ``bufferedAmount``, ``protocol``, ``readyState``, ``OPEN``,
-# ``send(data)`` (``str`` or ``bytes``), ``close(code=None, reason=None)``, ``addEventListener(type, listener, options=None)``
-# and ``removeEventListener(type, listener)``. Its events are ``open`` ({}), ``message`` ({"data"}), ``close`` ({"code",
-# "reason"}) and ``error`` ({"error"?, "message"?}). A factory takes ``{"url", "protocol", "authorization"}``.
-
-
-def toError(error: Any) -> Exception:
-    return error if isinstance(error, Exception) else RuntimeError(str(error))
-
 
 class RadiusRelayHost:
     """Maintain the experimental server's multiplexed, authenticated Radius host connection. ``options`` is
@@ -771,3 +762,12 @@ async def delay(milliseconds: float, signal: Any, timers: Any) -> None:
     if signal is not None:
         signal.addEventListener("abort", onAbort, True)
     await done
+
+# A RadiusRelayWebSocket is an object with ``binaryType``, ``bufferedAmount``, ``protocol``, ``readyState``, ``OPEN``,
+# ``send(data)`` (``str`` or ``bytes``), ``close(code=None, reason=None)``, ``addEventListener(type, listener, options=None)``
+# and ``removeEventListener(type, listener)``. Its events are ``open`` ({}), ``message`` ({"data"}), ``close`` ({"code",
+# "reason"}) and ``error`` ({"error"?, "message"?}). A factory takes ``{"url", "protocol", "authorization"}``.
+
+
+def toError(error: Any) -> Exception:
+    return error if isinstance(error, Exception) else RuntimeError(str(error))

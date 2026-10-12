@@ -23,7 +23,7 @@ from tests.chord_helpers import createLoopbackServiceTransport, waitFor
 
 Models = defineService("test.review.models")
 Dialogs = defineService("test.review.dialogs")
-Shared = defineService("test.review.shared", local=True)
+Shared = defineService("test.review.shared", {"local": True})
 
 
 def test_the_default_sort_compares_utf16_code_units():

@@ -39,6 +39,7 @@ from misaka.utils.js import (
     jsonStringify,
     jsSlice,
     jsString,
+    nullishCoalesce,
     toFixed,
 )
 from misaka.utils.output_files import writeOutputFile
@@ -304,7 +305,7 @@ def isStoreEntryData(data: Any) -> bool:
     if not isinstance(data, dict):
         return False
     set_, deleted = data.get("set"), data.get("delete")
-    return isinstance(set_, dict) and isinstance(deleted, list) and all(isinstance(key, str) for key in deleted)
+    return isinstance(set_, dict | list) and isinstance(deleted, list) and all(isinstance(key, str) for key in deleted)
 
 
 def readCodemodeStore(branch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -382,7 +383,7 @@ def formatError(result: CodemodeFailure, calls: Sequence[CodemodeNestedCall]) ->
     error = result["error"]
     kind = error["kind"]
     if kind == "script":
-        head = error.get("stack") or f"{error.get('name') or 'Error'}: {error['message']}"
+        head = nullishCoalesce(error.get("stack"), f"{nullishCoalesce(error.get('name'), 'Error')}: {error['message']}")
     elif kind == "timeout":
         head = f"Script timed out: {error['message']}"
     elif kind == "aborted":

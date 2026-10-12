@@ -118,30 +118,30 @@ def _object(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
-def _compact(value: dict[str, Any]) -> dict[str, Any]:
+def compact(value: dict[str, Any]) -> dict[str, Any]:
     """Drops ``undefined`` values so optional fields are absent rather than present-but-undefined."""
     return {key: item for key, item in value.items() if item is not UNDEFINED}
 
 
-def _requiredString(value: Any, name: str) -> str:
+def requiredString(value: Any, name: str) -> str:
     if not isinstance(value, str) or len(value) == 0:
         raise RuntimeError(f"Invalid {name}")
     return value
 
 
-def _absent(value: Any) -> bool:
+def absent(value: Any) -> bool:
     """Treats ``null`` and ``""`` as absent: servers send them for fields they have no value for,
     like ``scope: ""``."""
     return value is UNDEFINED or value is None or (isinstance(value, str) and value == "")
 
 
-def _optionalString(value: Any, name: str) -> Any:
-    if _absent(value):
+def optionalString(value: Any, name: str) -> Any:
+    if absent(value):
         return UNDEFINED
-    return _requiredString(value, name)
+    return requiredString(value, name)
 
 
-def _optionalStrings(value: Any, name: str) -> Any:
+def optionalStrings(value: Any, name: str) -> Any:
     if value is UNDEFINED or value is None:
         return UNDEFINED
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
@@ -149,8 +149,8 @@ def _optionalStrings(value: Any, name: str) -> Any:
     return list(value)
 
 
-def _safeUrl(value: Any, name: str) -> str:
-    text = _requiredString(value, name)
+def safeUrl(value: Any, name: str) -> str:
+    text = requiredString(value, name)
     # URL parsing throws a `TypeError`, which discovery reserves for network failures.
     if not URL.canParse(text):
         raise RuntimeError(f"Invalid {name}")
@@ -160,44 +160,44 @@ def _safeUrl(value: Any, name: str) -> str:
     return text
 
 
-def _optionalUrl(value: Any, name: str) -> Any:
-    return UNDEFINED if _absent(value) else _safeUrl(value, name)
+def optionalUrl(value: Any, name: str) -> Any:
+    return UNDEFINED if absent(value) else safeUrl(value, name)
 
 
 def parseProtectedResourceMetadata(value: Any) -> OAuthProtectedResourceMetadata:
     input = _object(value, "OAuth protected resource metadata")
-    return _compact({  # type: ignore[return-value]
+    return compact({  # type: ignore[return-value]
         **input,
-        "resource": _safeUrl(input.get("resource", UNDEFINED), "OAuth protected resource metadata resource"),
+        "resource": safeUrl(input.get("resource", UNDEFINED), "OAuth protected resource metadata resource"),
         "authorization_servers": (
-            [_safeUrl(url, "authorization server URL") for url in servers]
-            if (servers := _optionalStrings(input.get("authorization_servers", UNDEFINED), "authorization_servers"))
+            [safeUrl(url, "authorization server URL") for url in servers]
+            if (servers := optionalStrings(input.get("authorization_servers", UNDEFINED), "authorization_servers"))
             is not UNDEFINED
             else UNDEFINED
         ),
-        "scopes_supported": _optionalStrings(input.get("scopes_supported", UNDEFINED), "scopes_supported"),
+        "scopes_supported": optionalStrings(input.get("scopes_supported", UNDEFINED), "scopes_supported"),
     })
 
 
 def parseAuthorizationServerMetadata(value: Any) -> AuthorizationServerMetadata:
     input = _object(value, "authorization server metadata")
-    responseTypes = _optionalStrings(input.get("response_types_supported", UNDEFINED), "response_types_supported")
+    responseTypes = optionalStrings(input.get("response_types_supported", UNDEFINED), "response_types_supported")
     if responseTypes is UNDEFINED:
         raise RuntimeError("Invalid response_types_supported")
-    return _compact({  # type: ignore[return-value]
+    return compact({  # type: ignore[return-value]
         **input,
-        "issuer": _safeUrl(input.get("issuer", UNDEFINED), "authorization server issuer"),
-        "authorization_endpoint": _safeUrl(input.get("authorization_endpoint", UNDEFINED), "authorization endpoint"),
-        "token_endpoint": _safeUrl(input.get("token_endpoint", UNDEFINED), "token endpoint"),
-        "registration_endpoint": _optionalUrl(input.get("registration_endpoint", UNDEFINED), "registration endpoint"),
-        "scopes_supported": _optionalStrings(input.get("scopes_supported", UNDEFINED), "scopes_supported"),
+        "issuer": safeUrl(input.get("issuer", UNDEFINED), "authorization server issuer"),
+        "authorization_endpoint": safeUrl(input.get("authorization_endpoint", UNDEFINED), "authorization endpoint"),
+        "token_endpoint": safeUrl(input.get("token_endpoint", UNDEFINED), "token endpoint"),
+        "registration_endpoint": optionalUrl(input.get("registration_endpoint", UNDEFINED), "registration endpoint"),
+        "scopes_supported": optionalStrings(input.get("scopes_supported", UNDEFINED), "scopes_supported"),
         "response_types_supported": responseTypes,
-        "grant_types_supported": _optionalStrings(input.get("grant_types_supported", UNDEFINED), "grant_types_supported"),
-        "token_endpoint_auth_methods_supported": _optionalStrings(
+        "grant_types_supported": optionalStrings(input.get("grant_types_supported", UNDEFINED), "grant_types_supported"),
+        "token_endpoint_auth_methods_supported": optionalStrings(
             input.get("token_endpoint_auth_methods_supported", UNDEFINED),
             "token_endpoint_auth_methods_supported",
         ),
-        "code_challenge_methods_supported": _optionalStrings(
+        "code_challenge_methods_supported": optionalStrings(
             input.get("code_challenge_methods_supported", UNDEFINED),
             "code_challenge_methods_supported",
         ),
@@ -217,25 +217,25 @@ def parseAuthorizationServerMetadata(value: Any) -> AuthorizationServerMetadata:
 def parseOAuthTokens(value: Any) -> OAuthTokens:
     input = _object(value, "OAuth token response")
     # `Number(null)` is 0, which would mark the token as expired at once.
-    expires: Any = UNDEFINED if _absent(input.get("expires_in", UNDEFINED)) else jsNumber(input["expires_in"])
+    expires: Any = UNDEFINED if absent(input.get("expires_in", UNDEFINED)) else jsNumber(input["expires_in"])
     if expires is not UNDEFINED and not math.isfinite(expires):
         raise RuntimeError("Invalid expires_in")
-    return _compact({  # type: ignore[return-value]
-        "access_token": _requiredString(input.get("access_token", UNDEFINED), "access_token"),
-        "token_type": _requiredString(input.get("token_type", UNDEFINED), "token_type"),
+    return compact({  # type: ignore[return-value]
+        "access_token": requiredString(input.get("access_token", UNDEFINED), "access_token"),
+        "token_type": requiredString(input.get("token_type", UNDEFINED), "token_type"),
         "expires_in": expires,
-        "scope": _optionalString(input.get("scope", UNDEFINED), "scope"),
-        "refresh_token": _optionalString(input.get("refresh_token", UNDEFINED), "refresh_token"),
-        "id_token": _optionalString(input.get("id_token", UNDEFINED), "id_token"),
+        "scope": optionalString(input.get("scope", UNDEFINED), "scope"),
+        "refresh_token": optionalString(input.get("refresh_token", UNDEFINED), "refresh_token"),
+        "id_token": optionalString(input.get("id_token", UNDEFINED), "id_token"),
     })
 
 
 def parseClientInformation(value: Any) -> OAuthClientInformationFull:
     input = _object(value, "OAuth client registration response")
-    return _compact({  # type: ignore[return-value]
+    return compact({  # type: ignore[return-value]
         **input,
-        "client_id": _requiredString(input.get("client_id", UNDEFINED), "client_id"),
-        "client_secret": _optionalString(input.get("client_secret", UNDEFINED), "client_secret"),
+        "client_id": requiredString(input.get("client_id", UNDEFINED), "client_id"),
+        "client_secret": optionalString(input.get("client_secret", UNDEFINED), "client_secret"),
         "client_id_issued_at": (
             input["client_id_issued_at"] if isNumber(input.get("client_id_issued_at")) else UNDEFINED
         ),
@@ -244,7 +244,7 @@ def parseClientInformation(value: Any) -> OAuthClientInformationFull:
         ),
         "redirect_uris": (
             redirectUris
-            if (redirectUris := _optionalStrings(input.get("redirect_uris", UNDEFINED), "redirect_uris"))
+            if (redirectUris := optionalStrings(input.get("redirect_uris", UNDEFINED), "redirect_uris"))
             is not UNDEFINED
             else []
         ),

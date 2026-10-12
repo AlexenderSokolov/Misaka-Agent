@@ -89,7 +89,7 @@ async def createStartupTui(settingsManager: SettingsManager) -> TUI:
     return ui
 
 
-def startStartupTui(ui: TUI, _settingsManager: SettingsManager) -> None:
+def startStartupTui(ui: TUI, settingsManager: SettingsManager) -> None:
     ui.start()
     # MISAKA fork (D11): no terminal colour query.
 
@@ -100,7 +100,7 @@ async def clearStartupTui(ui: TUI) -> None:
     await asyncio.sleep(0.025)
 
 
-def shouldRunFirstTimeSetup(_settingsPath: str | None = None) -> bool:
+def shouldRunFirstTimeSetup(settingsPath: str | None = None) -> bool:
     """MISAKA fork: first-time setup runs for the official Pi distribution only."""
     return False
 

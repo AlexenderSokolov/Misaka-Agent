@@ -4,8 +4,6 @@ MISAKA forks:
 - (D1) The fullscreen rows (``tui-mode``, ``fullscreen-exit-output``, ``fullscreen-scrollbar``,
   ``fullscreen-copy-on-select``, ``fullscreen-wheel-scroll-lines``) and their config fields and callbacks are not
   ported: MISAKA has only the regular renderer.
-- No ``mermaid-rendering`` row, ``mermaidRenderingMode`` field or ``onMermaidRenderingModeChange``: Mermaid rendering
-  is not ported (it needs the grok-mermaid package).
 - (D11) No system theme: where upstream lists or falls back to it, MISAKA uses the built-in theme matching the
   terminal.
 """
@@ -28,6 +26,7 @@ from misaka.core.settings_manager import (
     CACHE_WARMING_MODES,
     CacheWarmingMode,
     DefaultProjectTrust,
+    MermaidRenderingMode,
     QuietStartup,
     WarningSettings,
 )
@@ -105,6 +104,7 @@ class SettingsConfig:
     terminalTheme: TerminalTheme
     availableThemes: list[str]
     hideThinkingBlock: bool
+    mermaidRenderingMode: MermaidRenderingMode
     showCacheMissNotices: bool
     collapseChangelog: bool
     enableInstallTelemetry: bool
@@ -141,6 +141,7 @@ class SettingsCallbacks:
     onThemeChange: Callable[[str], None]
     onThemePreview: Callable[[str], None] | None = None
     onHideThinkingBlockChange: Callable[[bool], None]
+    onMermaidRenderingModeChange: Callable[[MermaidRenderingMode], None]
     onShowCacheMissNoticesChange: Callable[[bool], None]
     onCollapseChangelogChange: Callable[[bool], None]
     onEnableInstallTelemetryChange: Callable[[bool], None]
@@ -665,6 +666,13 @@ class SettingsSelectorComponent(Container):
                 values=["true", "false"],
             ),
             SettingItem(
+                id="mermaid-rendering",
+                label="Mermaid diagrams",
+                description="Render Mermaid code blocks as Unicode diagrams",
+                currentValue=config.mermaidRenderingMode,
+                values=["off", "final", "streaming"],
+            ),
+            SettingItem(
                 id="cache-miss-notices",
                 label="Cache miss notices",
                 description="Show transcript notices for cache costs and provider recovery diagnostics",
@@ -926,6 +934,8 @@ class SettingsSelectorComponent(Container):
                     callbacks.onCacheWarmingModeChange(value)
                 case "hide-thinking":
                     callbacks.onHideThinkingBlockChange(newValue == "true")
+                case "mermaid-rendering":
+                    callbacks.onMermaidRenderingModeChange(newValue)  # type: ignore[arg-type]
                 case "cache-miss-notices":
                     callbacks.onShowCacheMissNoticesChange(newValue == "true")
                 case "collapse-changelog":

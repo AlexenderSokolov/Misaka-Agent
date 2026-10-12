@@ -149,9 +149,7 @@ async def test_a_session_resumes_on_the_moa_preset_it_selected_not_the_aggregato
         "presets": {"default": {"aggregator": {"provider": "anthropic", "model": "claude-opus-4-6"}}},
     })
     monkeypatch.setattr(moa, "load_moa_config", lambda: config)
-    runtime = await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=None, allowModelNetwork=False
-    )
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": None, "allowModelNetwork": False})
     await runtime.setRuntimeApiKey("anthropic", "fixture")
     await runtime.refresh(ModelsRefreshOptions(allowNetwork=False))
     preset = runtime.getModel("moa", "default")

@@ -92,11 +92,7 @@ def anthropicProvider() -> Provider:
             baseUrl="https://api.anthropic.com",
             auth=ProviderAuth(
                 apiKey=_anthropicApiKeyAuth(),
-                oauth=lazyOAuth(
-                    name="Anthropic (Claude Pro/Max)",
-                    isSubscription=True,
-                    load=loadAnthropicOAuth,
-                ),
+                oauth=lazyOAuth({"name": "Anthropic (Claude Pro/Max)", "isSubscription": True, "load": loadAnthropicOAuth}),
             ),
             models=list(ANTHROPIC_MODELS.values()),
             api=anthropicMessagesApi(),

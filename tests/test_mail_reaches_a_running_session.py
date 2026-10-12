@@ -65,7 +65,7 @@ async def world(tmp_path, monkeypatch):
                                     "noExtensions": True, "noPromptTemplates": True, "noThemes": True})
     await loader.reload()
     model = next(m for m in getModels("openai") if "image" in m.input)
-    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsPath": None})
     await runtime.setRuntimeApiKey(model.provider, "fixture")
     result = await createAgentSession({
         "cwd": str(tmp_path), "agentDir": str(tmp_path / "agent"), "model": model, "modelRuntime": runtime,

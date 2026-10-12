@@ -18,12 +18,7 @@ def xaiProvider() -> Provider:
             baseUrl="https://api.x.ai/v1",
             auth=ProviderAuth(
                 apiKey=envApiKeyAuth("xAI API key", ["XAI_API_KEY"]),
-                oauth=lazyOAuth(
-                    name="xAI (Grok/X subscription)",
-                    isSubscription=True,
-                    loginLabel="Sign in with SuperGrok or X Premium",
-                    load=loadXaiOAuth,
-                ),
+                oauth=lazyOAuth({"name": "xAI (Grok/X subscription)", "isSubscription": True, "loginLabel": "Sign in with SuperGrok or X Premium", "load": loadXaiOAuth}),
             ),
             models=list(XAI_MODELS.values()),
             api=openAIResponsesApi(),

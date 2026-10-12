@@ -374,8 +374,8 @@ async def test_xai_rejected_refresh_rechecks_latest_credential(monkeypatch, tmp_
     monkeypatch.setattr(xai_oauth, "_refreshXaiToken", refresh)
     assert await xai._force_refresh_oauth_token(xai.OAuthAccount(stale, None), "old-access") == (replacement or "")
     assert calls == []
-    assert stale.data.get("xai") == writer.data.get("xai")
-    assert auth_storage.AuthStorage.create(path).data.get("xai") == writer.data.get("xai")
+    assert stale.readState.data.get("xai") == writer.readState.data.get("xai")
+    assert auth_storage.AuthStorage.create(path).readState.data.get("xai") == writer.readState.data.get("xai")
 
 
 async def test_xai_concurrent_401s_refresh_once_under_store_lock(monkeypatch, tmp_path):

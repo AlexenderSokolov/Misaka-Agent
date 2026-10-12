@@ -55,7 +55,7 @@ from .node_watch import NodeFileWatcher, NodeWatchOptions
 MAX_TIMEOUT_MS = 2_147_483_647
 MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000
 # MISAKA fork: no `EXIT_STDIO_GRACE_MS`; upstream's `waitForChildProcess` is misaka.utils.child_process, which applies
-# the 100 ms post-exit stdio grace itself (`_EXIT_STDIO_GRACE_SECONDS`, re-armed while `spillIsDraining`).
+# the 100 ms post-exit stdio grace itself (`EXIT_STDIO_GRACE_MS`, re-armed while `spillIsDraining`).
 SPILL_HIGH_WATER_MARK = 1024 * 1024
 # Largest single read of a `BinaryReader`, so a huge `length` allocates only as much as the file yields.
 BINARY_READ_CHUNK = 1024 * 1024
@@ -161,6 +161,8 @@ def _hasInvalidWindowsName(path: str) -> bool:
     return any(character in _WINDOWS_INVALID_NAME_CHARACTERS for character in os.path.splitdrive(path)[1])
 
 
+# MISAKA fork: `openingFile` -- Windows refuses to open a directory with a permission error, which is `is_directory`
+# only when the call was opening a file.
 def toFileError(error: Any, fallbackPath: str | None = None, openingFile: bool = False) -> FileError:
     if isinstance(error, FileError):
         return error
@@ -486,7 +488,7 @@ class NodeTextLineReader:
         except Exception as error:  # noqa: BLE001
             return err(toFileError(error, self._path))
 
-    async def close(self, context: Context) -> None:
+    async def close(self, _context: Context) -> None:
         if self._closed:
             return
         self._closed = True
@@ -1028,10 +1030,10 @@ class NodeExecutionEnv:
         except Exception as error:  # noqa: BLE001
             return err(toFileError(error))
 
-    async def absolutePath(self, path: str, context: Context) -> Result:
+    async def absolutePath(self, path: str, _context: Context) -> Result:
         return ok(resolvePath(self.cwd, path))
 
-    async def joinPath(self, parts: list[str], context: Context) -> Result:
+    async def joinPath(self, parts: list[str], _context: Context) -> Result:
         return ok(node_path.join(*parts))
 
     async def exec(self, command: str | list[str], options: dict[str, Any] | None, context: Context) -> Result:
@@ -1371,7 +1373,7 @@ class NodeExecutionEnv:
         except Exception as error:  # noqa: BLE001
             return err(toFileError(error, filePath))
 
-    async def cleanup(self, context: Context) -> None:
+    async def cleanup(self, _context: Context) -> None:
         for pid in list(self._activeChildPids):
             killProcessTree(pid)
         self._activeChildPids.clear()

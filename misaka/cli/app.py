@@ -27,6 +27,8 @@ def _parser(extension_commands=None):
     # The first thing anyone types after installing. Without it argparse answers the version
     # question with a usage error and exit 2, which reads as "this install is broken".
     p.add_argument("--version", "-V", action="version", version=VERSION)
+    p.add_argument("--offline", action="store_true",
+                   help="Disable startup network operations (same as MISAKA_OFFLINE=1); any command takes it")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     tk = sub.add_parser("task", help="Add a task card, start one, or delete one",
@@ -627,7 +629,15 @@ def _cmd_skills(args):
         import json
         from pathlib import Path
 
+        from misaka.config import get_agent_dir
+        from misaka.core.http_dispatcher import applyHttpProxySettings
+        from misaka.core.settings_manager import SettingsManager
         from misaka.core.skills.operations import execute
+
+        # A skill operation may run a review session in this process: the global HTTP proxy first, as at startup.
+        applyHttpProxySettings(
+            SettingsManager.create(_os.getcwd(), get_agent_dir(), {"projectTrusted": False}).getGlobalSettings().get("httpProxy")
+        )
         role = Path(args.role)
         if role.is_absolute() or ".." in role.parts:
             sys.exit("Role must be relative to roles_root.")
@@ -876,7 +886,7 @@ def _cmd_doc(args):
             print(f"  p{pg['page']:<4} {pg['head']}")
 
 def _cmd_setup(args):
-    from misaka.cli import setup
+    from misaka.cli import setup_wizard as setup
     sys.exit(setup.run(args.section))
 
 
@@ -922,6 +932,12 @@ def main(argv=None):
     """The CLI entry point: one handler per sub-command (``COMMANDS``), each opening the board only
     if it uses it; ``argv`` defaults to the process arguments so tests can drive it directly."""
     argv = list(sys.argv[1:] if argv is None else argv)
+    # pi's `--offline` (`PI_OFFLINE=1`). MISAKA fork: every command takes it, before or after its name, and the
+    # environment carries it to the panel's panes, cards and research nodes this process starts.
+    end = argv.index("--") if "--" in argv else len(argv)
+    if "--offline" in argv[:end]:
+        argv = [arg for index, arg in enumerate(argv) if not (index < end and arg == "--offline")]
+        os.environ["MISAKA_OFFLINE"] = "1"
     # setup, update and uninstall must still run on a settings.json that stops everything else.
     bootstrap.install(check_settings=argv[:1] not in (["setup"], ["update"], ["uninstall"]))
     from misaka.config import env as env_file
@@ -944,7 +960,7 @@ def main(argv=None):
         # No arguments: open the panel in a terminal, plain chat when piped.
         interactive = sys.stdin.isatty() and sys.stdout.isatty()
         if interactive:
-            from misaka.cli import setup
+            from misaka.cli import setup_wizard as setup
             if not setup.configured_anywhere():
                 # A first run: no credential for the default provider anywhere. The wizard
                 # is the door, and the panel opens once it is done.
@@ -964,9 +980,11 @@ def main(argv=None):
     if argv[0] == "auth":
         # Auth has its own Pi-compatible grammar; preserve the raw option order instead
         # of sending it through the product CLI's unrelated parser.
-        from misaka.cli.auth import run_auth_command
+        import asyncio
 
-        return run_auth_command(argv[1:])
+        from misaka.cli.engine import runAuthCommand
+
+        raise SystemExit(asyncio.run(runAuthCommand(argv)))
     if argv[0] in ("-h", "--help"):
         from misaka import extensions
         _parser(extensions.commands()).parse_args(argv)

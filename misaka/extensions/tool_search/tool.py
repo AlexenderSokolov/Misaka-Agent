@@ -19,6 +19,7 @@ from typing import Any, Protocol, TypedDict
 
 from misaka.agent.types import AgentToolResult
 from misaka.ai.types import TextContent
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.core.extensions.types import (
     ToolDefinition,
     ToolExposure,
@@ -127,12 +128,12 @@ def createToolSearchDocument(tool: Any, namespace: ToolNamespace | None = None) 
     """Search text of a tool: the name, the name with ``_`` as spaces, the description, schema
     descriptions and property names, and the namespace with its description and instructions."""
     name = read_field(tool, "name")
-    parts = [name, name.replace("_", " "), read_field(tool, "description") or ""]
+    parts = [name, name.replace("_", " "), read_field(tool, "description")]
     parameters = read_field(tool, "parameters")
     # MISAKA fork: misaka tools may declare their parameters as a pydantic model class (pi's are
     # always TypeBox objects); index the JSON schema it produces.
     if isinstance(parameters, type) and hasattr(parameters, "model_json_schema"):
-        parameters = parameters.model_json_schema()
+        parameters = typeboxSchema(parameters)
     _schemaText(parameters, parts)
     if namespace:
         parts.extend([namespace["name"], namespace.get("description") or "", namespace.get("instructions") or ""])
@@ -142,9 +143,10 @@ def createToolSearchDocument(tool: Any, namespace: ToolNamespace | None = None) 
 class Bm25Ranker:
     """Okapi BM25 with the usual parameters. Ties keep document order."""
 
-    def __init__(self, *, k1: float | None = None, b: float | None = None) -> None:
-        self._k1 = 1.2 if k1 is None else k1
-        self._b = 0.75 if b is None else b
+    def __init__(self, options: Mapping[str, float] | None = None) -> None:
+        options = options if options is not None else {}
+        self._k1 = options.get("k1") if options.get("k1") is not None else 1.2
+        self._b = options.get("b") if options.get("b") is not None else 0.75
 
     def rank(self, query: str, documents: Sequence[ToolSearchDocument], limit: int) -> list[ToolSearchMatch]:
         queryTerms = list(dict.fromkeys(tokenize(query)))
@@ -177,8 +179,10 @@ class Bm25Ranker:
         return sorted(matches, key=lambda match: -match.score)[:limit]
 
 
+# `Type.Object(...)` as TypeBox emits it (key order `type`, `required`, `properties`): the bytes the model sees.
 toolSearchSchema: dict[str, Any] = {
     "type": "object",
+    "required": ["query"],
     "properties": {
         "query": {"type": "string", "description": "Search query for deferred tools."},
         "limit": {
@@ -186,7 +190,6 @@ toolSearchSchema: dict[str, Any] = {
             "description": f"Maximum number of tools to return. Defaults to {DEFAULT_TOOL_SEARCH_LIMIT}.",
         },
     },
-    "required": ["query"],
 }
 
 
@@ -286,11 +289,11 @@ def createToolSearchToolDefinition(
         query = params["query"]
         limit = params.get("limit")
         if jsTrim(query) == "":
-            raise ValueError("query must not be empty")
+            raise RuntimeError("query must not be empty")
         max = DEFAULT_TOOL_SEARCH_LIMIT if limit is None else limit
         # `Number.isInteger`: a whole float counts, a bool is not a number.
         if isinstance(max, bool) or not (isinstance(max, int) or (isinstance(max, float) and max.is_integer())) or max <= 0:
-            raise ValueError("limit must be a positive integer")
+            raise RuntimeError("limit must be a positive integer")
         reachable = read_field(ctx, "tools") if ctx is not None else None
         callable = {read_field(tool, "name") for tool in reachable} if reachable is not None else None
         tools = _searchAndLoad(options.tools, query, int(max), callable) if options.tools is not None else []

@@ -122,7 +122,7 @@ async def session_with(tmp_path, extension_factories, **options):
     loader = DefaultResourceLoader({**base, "settingsManager": settings, "extensionFactories": extension_factories})
     await loader.reload()
     model = next(m for m in getModels("anthropic") if m.id == "claude-opus-5")
-    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsPath": None})
     await runtime.setRuntimeApiKey(model.provider, "fixture")
     result = await createAgentSession({
         **base, "resourceLoader": loader, "model": model, "modelRuntime": runtime, "settingsManager": settings,
@@ -223,10 +223,10 @@ async def test_tool_search_rejects_empty_queries_and_bad_limits(tmp_path):
     )
 
     definition = createToolSearchToolDefinition(ToolSearchToolOptions())
-    with pytest.raises(ValueError, match="query must not be empty"):
+    with pytest.raises(RuntimeError, match="query must not be empty"):
         await definition.execute("call", {"query": "  "})
     for limit in (0, -1, 1.5, True):
-        with pytest.raises(ValueError, match="positive integer"):
+        with pytest.raises(RuntimeError, match="positive integer"):
             await definition.execute("call", {"query": "x", "limit": limit})
     # Without the session's tools it finds nothing.
     result = await definition.execute("call", {"query": "x", "limit": 2.0})
@@ -244,7 +244,7 @@ async def test_trimming_follows_javascript_whitespace():
     )
 
     definition = createToolSearchToolDefinition(ToolSearchToolOptions())
-    with pytest.raises(ValueError, match="query must not be empty"):
+    with pytest.raises(RuntimeError, match="query must not be empty"):
         await definition.execute("call", {"query": "\ufeff"})
     for query in ("\x1c", "\x85"):
         result = await definition.execute("call", {"query": query})

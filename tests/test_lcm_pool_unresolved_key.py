@@ -18,7 +18,7 @@ async def test_an_unresolvable_pooled_key_is_skipped(monkeypatch):
                          "expires": int(time.time() * 1000) + 3_600_000},
         "openai-codex:alt": {"type": "api_key", "key": "$UNSET_LCM_POOL_KEY"},
     })
-    registry = ModelRegistry(await ModelRuntime.create(authStorage=storage, modelsPath=None))
+    registry = ModelRegistry(await ModelRuntime.create({"authStorage": storage, "modelsPath": None}))
     pool = Pool(registry, "openai-codex", ["openai-codex", "openai-codex:alt"], "fill_first")
 
     entry = await pool._select(failed_key=None, error=None, signal=None)

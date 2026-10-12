@@ -1,4 +1,9 @@
-"""Engine-side (formerly harn/pi) configuration: package metadata and the engine's path accessors.
+"""Translated from pi's ``packages/coding-agent/src/config.ts`` (v1.1.0), as far as MISAKA keeps it.
+
+MISAKA fork: the home is MISAKA's own layout (``misaka.config.home``), so every path comes from that table and
+``getAgentDir`` reads ``MISAKA_HOME``. pi's install-method detection and self-update, package/docs/examples/changelog
+paths, the bundled interactive assets and the QuickJS wasm paths are not ported: MISAKA updates through
+``misaka update`` and ships none of those files. ``configure_logging``, ``bundle_root`` and ``bundle_installer`` are MISAKA's.
 
 Every location comes from the one table in :mod:`misaka.config.home`; the functions here keep
 the names pi's code calls them by. Product-side CFG lives in misaka/config/product.py.
@@ -14,6 +19,65 @@ from pathlib import Path
 
 from misaka.config import home
 from misaka.utils.paths import normalizePath
+
+# `{ kind: "updated"; version }` or `{ kind: "removed" }`.
+type InstallChange = dict[str, str]
+
+
+def detectInstallChange(metadataPath: Path | None = None) -> InstallChange | None:
+    """Detect that the package this process runs from changed on disk, for example after `misaka update`
+    in another terminal. Code loaded on demand can then be missing or from another version.
+
+    Checks the metadata read at startup. Resolving it again could find another installation of the
+    package on the path.
+    """
+    path = metadataPath if metadataPath is not None else _startupMetadataPath
+    # MISAKA fork: a release archive keeps every version in a directory of its own, so replacing it does not
+    # affect this process (pi: the Bun binary embeds its code).
+    if bundle_root() is not None or not path:
+        return None
+    try:
+        installed = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {"kind": "removed"}
+    except OSError:
+        return None
+    version = next(
+        (line.partition(":")[2].strip() for line in installed.splitlines() if line.startswith("Version:")), None
+    )
+    return {"kind": "updated", "version": version} if version and version != VERSION else None
+
+
+def _get_package_module_dir() -> Path:
+    """Return the ``misaka`` package directory via ``__file__``.
+
+    Works from both a source checkout and an installed wheel. This module lives
+    one level down in misaka/config/, hence ``parents[1]``.
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def get_themes_dir() -> str:
+    # Use __file__-relative resolution so that theme files are found correctly
+    # both when running from source (uv run misaka) and when installed as a
+    # package (uv tool install misaka / pip install misaka).
+    return str(_get_package_module_dir() / "ui" / "tui" / "interactive" / "theme")
+
+
+def get_export_template_dir() -> str:
+    return str(_get_package_module_dir() / "core" / "export_html")
+
+
+def get_sessions_dir() -> str:
+    """The store of sessions created without an explicit directory.
+
+    pi's is ``<agent dir>/sessions``. MISAKA's is the coordinator's root in the product
+    tree (``config.sessions``): a session that names no role is Last Order's, and it has
+    to land where ``/resume`` and the panel look.
+    """
+    from misaka.config import sessions
+
+    return sessions.role_dir()
 
 # MISAKA is not white-labelled: these were read out of a package.json / [tool.harn]
 # section that this repository does not have, so every one of them always took its
@@ -126,66 +190,6 @@ def bundle_installer(root: Path) -> str:
     if ("winget", "packages") in pairs and any(part.startswith("luciole-studio.misaka") for part in parts):
         return "winget"
     return ""
-
-
-# `{ kind: "updated"; version }` or `{ kind: "removed" }`.
-type InstallChange = dict[str, str]
-
-
-def detectInstallChange(metadataPath: Path | None = None) -> InstallChange | None:
-    """Detect that the package this process runs from changed on disk, for example after `misaka update`
-    in another terminal. Code loaded on demand can then be missing or from another version.
-
-    Checks the metadata read at startup. Resolving it again could find another installation of the
-    package on the path.
-    """
-    path = metadataPath if metadataPath is not None else _startupMetadataPath
-    # MISAKA fork: a release archive keeps every version in a directory of its own, so replacing it does not
-    # affect this process (pi: the Bun binary embeds its code).
-    if bundle_root() is not None or not path:
-        return None
-    try:
-        installed = path.read_text(encoding="utf-8-sig")
-    except FileNotFoundError:
-        return {"kind": "removed"}
-    except OSError:
-        return None
-    version = next(
-        (line.partition(":")[2].strip() for line in installed.splitlines() if line.startswith("Version:")), None
-    )
-    return {"kind": "updated", "version": version} if version and version != VERSION else None
-
-
-def _get_package_module_dir() -> Path:
-    """Return the ``misaka`` package directory via ``__file__``.
-
-    Works from both a source checkout and an installed wheel. This module lives
-    one level down in misaka/config/, hence ``parents[1]``.
-    """
-    return Path(__file__).resolve().parents[1]
-
-
-def get_themes_dir() -> str:
-    # Use __file__-relative resolution so that theme files are found correctly
-    # both when running from source (uv run misaka) and when installed as a
-    # package (uv tool install misaka / pip install misaka).
-    return str(_get_package_module_dir() / "ui" / "tui" / "interactive" / "theme")
-
-
-def get_export_template_dir() -> str:
-    return str(_get_package_module_dir() / "core" / "export_html")
-
-
-def get_sessions_dir() -> str:
-    """The store of sessions created without an explicit directory.
-
-    pi's is ``<agent dir>/sessions``. MISAKA's is the coordinator's root in the product
-    tree (``config.sessions``): a session that names no role is Last Order's, and it has
-    to land where ``/resume`` and the panel look.
-    """
-    from misaka.config import sessions
-
-    return sessions.role_dir()
 
 
 __all__ = [

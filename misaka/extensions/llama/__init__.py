@@ -70,7 +70,7 @@ def register(harn: Any) -> None:
 
     async def syncCatalog(ctx: Any, client: LlamaClient, catalog: list[LlamaModelInfo] | None = None) -> list[LlamaModelInfo]:
         signal = AbortSignal.timeout(15_000)
-        current = catalog if catalog is not None else await client.list(signal=signal)
+        current = catalog if catalog is not None else await client.list({"signal": signal})
         provider.setCatalog(current, client.serverUrl)
         result = await ctx.modelRegistry.refresh(
             ModelsRefreshOptions(
@@ -116,16 +116,7 @@ def register(harn: Any) -> None:
                 await client.unloadAndWait(model.id)
 
         try:
-            result = await runWithProgress(
-                ui,
-                title="Loading model",
-                model=target.id,
-                initialMessage="Starting…",
-                cancelTitle="Stop loading?",
-                cancelMessage=target.id,
-                run=lambda signal, update: client.loadAndWait(target.id, update, signal),
-                cancel=lambda: client.unload(target.id),
-            )
+            result = await runWithProgress(ui, {"title": "Loading model", "model": target.id, "initialMessage": "Starting…", "cancelTitle": "Stop loading?", "cancelMessage": target.id, "run": lambda signal, update: client.loadAndWait(target.id, update, signal), "cancel": lambda: client.unload(target.id)})
             if result.cancelled:
                 if replace:
                     await restoreLoaded()
@@ -192,16 +183,7 @@ def register(harn: Any) -> None:
             if not quantization:
                 return
         model = f"{details.id}:{quantization}" if quantization else details.id
-        result = await runWithProgress(
-            ui,
-            title="Downloading model",
-            model=model,
-            initialMessage="Starting…",
-            cancelTitle="Stop download?",
-            cancelMessage=model,
-            run=lambda signal, update: client.downloadAndWait(model, update, signal),
-            cancel=lambda: client.unload(model),
-        )
+        result = await runWithProgress(ui, {"title": "Downloading model", "model": model, "initialMessage": "Starting…", "cancelTitle": "Stop download?", "cancelMessage": model, "run": lambda signal, update: client.downloadAndWait(model, update, signal), "cancel": lambda: client.unload(model)})
         if result.cancelled:
             return
         await syncCatalog(ctx, client, result.value)

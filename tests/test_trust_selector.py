@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
-from misaka.core.project_trust import ProjectTrustStoreEntry, ProjectTrustUpdate
+from misaka.core.trust_manager import ProjectTrustStoreEntry, ProjectTrustUpdate
 from misaka.ui.tui import setKeybindings
 from misaka.ui.tui.interactive.components.trust_selector import (
     TrustSelection,

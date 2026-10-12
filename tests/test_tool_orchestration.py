@@ -105,7 +105,7 @@ async def harness(tmp_path, extension_factories):
     loader = DefaultResourceLoader({**options, "settingsManager": settings, "extensionFactories": extension_factories})
     await loader.reload()
     model = next(m for m in getModels("anthropic") if m.id == "claude-opus-5")
-    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsPath": None})
     await runtime.setRuntimeApiKey(model.provider, "fixture")
     result = await createAgentSession({
         **options, "resourceLoader": loader, "model": model, "modelRuntime": runtime, "settingsManager": settings,

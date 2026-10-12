@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from misaka import workspace as workspace_index
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.config import CFG
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.platform import tasks as task_store
@@ -118,7 +119,7 @@ def register(harn):
             "with their dispositions, and findings. Each call reads current records; saved workspace-index and graph "
             "files are snapshots. This tool is read-only."
         ),
-        parameters=Params.model_json_schema(), execute=execute,
+        parameters=typeboxSchema(Params), execute=execute,
         promptSnippet="Inspect live research state, material paths, and declarations",
         promptGuidelines=[
             ("For research state or file locations, use misaka_research_view(view='workspace', run_id=...) instead of a saved index. "
@@ -153,7 +154,7 @@ def register(harn):
                          "where it was -- without waiting for the level to end and the run to be resumed")
     harn.registerTool(ToolDefinition(
         name="misaka_research_retry", label="Retry a failed research node", description=retry_description,
-        parameters=Retry.model_json_schema(), execute=execute_retry, promptSnippet=retry_description,
+        parameters=typeboxSchema(Retry), execute=execute_retry, promptSnippet=retry_description,
         promptGuidelines=[("When a research node fails -- a provider refused its request, a Sister card failed, its process "
                            "died -- and the cause was passing, misaka_research_retry(node=...) runs it again at once; a "
                            "node that keeps failing the same way is left for the user.")],

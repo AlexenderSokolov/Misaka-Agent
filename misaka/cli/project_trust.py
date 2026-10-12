@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import Any, TypedDict
 
 from misaka.core.extensions.types import ProjectTrustContext
 from misaka.core.project_trust import AppMode
@@ -13,46 +13,51 @@ from misaka.utils.chalk import chalk
 from .startup_ui import StartupOption, showStartupInput, showStartupSelector
 
 
-def createProjectTrustContext(
-    *, cwd: str, mode: AppMode, settingsManager: SettingsManager, hasUI: bool
-) -> ProjectTrustContext:
+class CreateProjectTrustContextOptions(TypedDict):
+    cwd: str
+    mode: AppMode
+    settingsManager: SettingsManager
+    hasUI: bool
+
+
+def createProjectTrustContext(options: CreateProjectTrustContextOptions) -> ProjectTrustContext:
     async def select(title: str, selectOptions: list[str], _opts: Any = None) -> str | None:
-        if not hasUI:
+        if not options["hasUI"]:
             return None
-        if mode != "interactive":
+        if options["mode"] != "interactive":
             return None
         return await showStartupSelector(
-            settingsManager, title, [StartupOption(label=option, value=option) for option in selectOptions]
+            options["settingsManager"], title, [StartupOption(label=option, value=option) for option in selectOptions]
         )
 
     async def confirm(title: str, message: str, _opts: Any = None) -> bool:
-        if not hasUI:
+        if not options["hasUI"]:
             return False
-        if mode != "interactive":
+        if options["mode"] != "interactive":
             return False
         result = await showStartupSelector(
-            settingsManager,
+            options["settingsManager"],
             f"{title}\n{message}",
             [StartupOption(label="Yes", value=True), StartupOption(label="No", value=False)],
         )
         return result if result is not None else False
 
     async def input(title: str, placeholder: str | None = None, _opts: Any = None) -> str | None:
-        if not hasUI:
+        if not options["hasUI"]:
             return None
-        if mode != "interactive":
+        if options["mode"] != "interactive":
             return None
-        return await showStartupInput(settingsManager, title, placeholder)
+        return await showStartupInput(options["settingsManager"], title, placeholder)
 
     def notify(message: str, type: str = "info") -> None:
-        if mode != "interactive":
+        if options["mode"] != "interactive":
             color = chalk.red if type == "error" else chalk.yellow if type == "warning" else chalk.cyan
             print(color(message), file=sys.stderr)
 
     return {
-        "cwd": cwd,
-        "mode": "tui" if mode == "interactive" else mode,  # type: ignore[typeddict-item]
-        "hasUI": hasUI,
+        "cwd": options["cwd"],
+        "mode": "tui" if options["mode"] == "interactive" else options["mode"],  # type: ignore[typeddict-item]
+        "hasUI": options["hasUI"],
         "ui": {"select": select, "confirm": confirm, "input": input, "notify": notify},
     }
 

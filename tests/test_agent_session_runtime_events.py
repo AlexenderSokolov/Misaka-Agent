@@ -59,7 +59,7 @@ async def createRuntimeHost(cleanups: list[Any], extensionFactory: Any) -> Any:
         return ApiKeyCredential(type="api_key", key="faux-key")
 
     await authStorage.modify(faux.getModel().provider, apiKey)
-    modelRuntime = await ModelRuntime.create(authStorage=authStorage, modelsPath=os.path.join(tempDir, "models.json"))
+    modelRuntime = await ModelRuntime.create({"authStorage": authStorage, "modelsPath": os.path.join(tempDir, "models.json")})
     model = faux.getModel()
     modelRuntime.registerProvider(model.provider, {
         "baseUrl": model.baseUrl,

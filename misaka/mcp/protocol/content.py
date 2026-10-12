@@ -109,7 +109,8 @@ class _LlmImageContent(TypedDict):
 
 
 # Tool result content in the shape LLM APIs accept: text and base64 images. Matches the
-# `TextContent` and `ImageContent` types of misaka's `ai.types`.
+# `TextContent` and `ImageContent` types of `@earendil-works/pi-ai`.
+# MISAKA fork: those are `misaka.ai.types`, which are models; the MCP extension converts these dicts to them.
 type LlmContent = _LlmTextContent | _LlmImageContent
 
 
@@ -120,7 +121,7 @@ def _field(block: Any, key: str) -> Any:
     return block.get(key, UNDEFINED) if isinstance(block, Mapping) else UNDEFINED
 
 
-def _blockToLlmContent(block: ContentBlock) -> LlmContent:
+def blockToLlmContent(block: ContentBlock) -> LlmContent:
     match _field(block, "type"):
         case "text":
             return {"type": "text", "text": _field(block, "text")}
@@ -163,7 +164,7 @@ def toLlmContent(result: Mapping[str, Any]) -> list[LlmContent]:
     blocks = nullishCoalesce(result.get("content", UNDEFINED), [])
     if not isinstance(blocks, list):
         raise TypeError("(result.content ?? []).map is not a function")
-    content = [_blockToLlmContent(block) for block in blocks]
+    content = [blockToLlmContent(block) for block in blocks]
     if len(content) == 0 and "structuredContent" in result:
         content.append({"type": "text", "text": jsonStringify(result["structuredContent"], 2)})
     return content

@@ -487,3 +487,17 @@ async def test_a_constructed_response_reads_like_a_fetched_one():
     assert response.headers.get("www-authenticate") == "Bearer"
     assert response.headers.get("missing") is None
     assert await response.text() == ""
+
+
+async def test_close_does_not_wait_for_a_stream_reader_stuck_in_the_auth_provider():
+    from misaka.utils.js import spawn
+
+    closed: list = []
+    transport = StreamableHttpTransport({"url": "http://127.0.0.1:1/mcp"})
+    transport.onClose(lambda: closed.append(True))
+    await transport.start()
+    # A GET stream reader waiting on a token that never comes.
+    spawn(asyncio.Event().wait(), transport._tasks)
+
+    await asyncio.wait_for(transport.close(), 1)
+    assert closed == [True]

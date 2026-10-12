@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.core.extensions.types import ToolDefinition
 from misaka.ui.tui.interactive.components.ask_user_question import (
     AskUserQuestionComponent,
@@ -156,7 +157,7 @@ def register(harn: Any) -> None:
                 "Optional Markdown previews let the user compare concrete artifacts side by side. "
                 "Do not use it for facts you can find in the workspace."
             ),
-            parameters=AskUserQuestionParams.model_json_schema(),
+            parameters=typeboxSchema(AskUserQuestionParams),
             execute=execute,
             executionMode="sequential",
             promptSnippet="Ask the user a structured question",

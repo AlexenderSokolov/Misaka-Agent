@@ -180,11 +180,11 @@ class WindowLO:
 
         unsubscribe = session.subscribe(observe)
         try:
-            from misaka.core.research.planner import MCP_CALLABLE, session_tools
+            from misaka.core.research.planner import session_tools
             # Re-read at the actual turn boundary; a queued phase's old selection
             # must not resurrect capabilities the user has since disabled.
             names = [*session_tools(self), *(tool.name for tool in definitions)]
-            scope.enter_context(session.toolScope(names, callable=MCP_CALLABLE))
+            scope.enter_context(session.toolScope(names))
             scope.enter_context(self.publisher.snapshot(options.get("sister_catalog")))
             session.registerCustomTools(definitions)
             from misaka.core.research.planner import OPTIONAL_MATERIAL_TOOLS

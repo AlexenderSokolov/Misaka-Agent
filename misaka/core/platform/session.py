@@ -1,7 +1,6 @@
 """Session adapter for creating, resuming, and driving engine sessions."""
 import asyncio
 import contextvars
-import json
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -94,8 +93,16 @@ def run_coro(coro):
 async def open_session(flags, cwd, assembly=None):
     """Open and bind a headless session; return ``(runtime, session, error)``."""
     from misaka.cli.args import parseArgs
-    from misaka.cli.engine import create_runtime_factory, resolve_cli_paths
+    from misaka.cli.engine import createRuntimeFactory, resolveCliPaths
     from misaka.config import get_agent_dir
+    from misaka.core.http_dispatcher import applyHttpProxySettings
+    from misaka.core.settings_manager import SettingsManager
+
+    # A headless session is how its process enters the engine, so it applies the global HTTP proxy first, as pi's
+    # main.ts and harness setups do at startup.
+    applyHttpProxySettings(
+        SettingsManager.create(cwd, get_agent_dir(), {"projectTrusted": False}).getGlobalSettings().get("httpProxy")
+    )
     from misaka.core.agent_session_runtime import createAgentSessionRuntime
     from misaka.core.session_manager import SessionManager
     from misaka.utils.paths import normalizePath
@@ -118,16 +125,16 @@ async def open_session(flags, cwd, assembly=None):
     else:
         sm = SessionManager.create(cwd, session_dir)
     runtime = await createAgentSessionRuntime(
-        create_runtime_factory(
+        createRuntimeFactory(
             parsed,
-            resolved_extension_paths=resolve_cli_paths(cwd, parsed.extensions),
-            resolved_prompt_template_paths=resolve_cli_paths(cwd, parsed.promptTemplates),
-            resolved_theme_paths=resolve_cli_paths(cwd, parsed.themes),
-            extension_factories=list(assembly.extension_factories) if assembly else None,
-            custom_tools=list(assembly.custom_tools) if assembly else None,
+            resolvedExtensionPaths=resolveCliPaths(cwd, parsed.extensions),
+            resolvedPromptTemplatePaths=resolveCliPaths(cwd, parsed.promptTemplates),
+            resolvedThemePaths=resolveCliPaths(cwd, parsed.themes),
+            extensionFactories=list(assembly.extension_factories) if assembly else None,
+            customTools=list(assembly.custom_tools) if assembly else None,
             parts=list(assembly.parts) if assembly else None,
-            model_profile=assembly.model_profile if assembly else None,
-            model_defaults_read_only=assembly.model_defaults_read_only if assembly else False,
+            modelProfile=assembly.model_profile if assembly else None,
+            modelDefaultsReadOnly=assembly.model_defaults_read_only if assembly else False,
         ),
         {"cwd": sm.getCwd(), "agentDir": get_agent_dir(), "sessionManager": sm},
     )
@@ -160,8 +167,9 @@ async def dispose(runtime):
 
 def event_line(ev):
     """Serialize an engine event in the existing JSONL wire format."""
-    from misaka.modes.jsonl import toJsonEvent
-    return json.dumps(toJsonEvent(ev), ensure_ascii=False, separators=(",", ":"))
+    from misaka.modes.json_event import toJsonEvent
+    from misaka.utils.js import jsonStringify
+    return jsonStringify(toJsonEvent(ev))
 
 
 _ENV_LOCK = threading.Lock()

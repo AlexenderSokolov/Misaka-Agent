@@ -11,7 +11,7 @@ from misaka.ai.types import AssistantMessage, DoneEvent, Model
 from misaka.ai.utils.event_stream import createAssistantMessageEventStream
 from misaka.core.compaction import generateBranchSummary
 from misaka.core.compaction.branch_summarization import GenerateBranchSummaryOptions
-from misaka.modes.jsonl import to_jsonable
+from misaka.modes.json_event import to_jsonable
 from misaka.utils.js import AbortController
 from misaka.utils.values import read_field
 from tests.suite_harness import createHarness

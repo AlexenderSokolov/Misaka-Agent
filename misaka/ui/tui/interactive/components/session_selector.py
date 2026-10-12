@@ -319,6 +319,15 @@ class SessionList:
         selected = jsIndex(self.filteredSessions, self.selectedIndex)
         return selected.session.path if selected else None
 
+    @property
+    def focused(self) -> bool:
+        return self._focused
+
+    @focused.setter
+    def focused(self, value: bool) -> None:
+        self._focused = value
+        self.searchInput.focused = value
+
     def __init__(
         self,
         sessions: list[SessionInfo],
@@ -367,15 +376,6 @@ class SessionList:
                 self.onSelect(selected.session.path)
 
         self.searchInput.onSubmit = onSubmit
-
-    @property
-    def focused(self) -> bool:
-        return self._focused
-
-    @focused.setter
-    def focused(self, value: bool) -> None:
-        self._focused = value
-        self.searchInput.focused = value
 
     def setSortMode(self, sortMode: SortMode) -> None:
         self.sortMode = sortMode

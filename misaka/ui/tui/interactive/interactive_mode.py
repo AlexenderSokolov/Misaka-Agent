@@ -12,8 +12,7 @@ MISAKA forks that shape the whole file:
   screen and ``TranscriptRenderer``; this file does not use either.
 - MISAKA has no ``/bug`` (pi's reports go to the Pi developers), no ``/changelog`` and changelog notices (no changelog
   ships), no package sources or package updates, no pi version check, no install telemetry ping, and no managed fd/rg
-  download; the easter eggs are not ported. Mermaid diagrams are not rendered (the renderer needs the grok-mermaid
-  package).
+  download; the easter eggs are not ported.
 """
 
 from __future__ import annotations
@@ -80,7 +79,11 @@ from misaka.core.cache_warmer import (
 from misaka.core.crash_log import findExtensionStackMatches
 from misaka.core.defaults import DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS
 from misaka.core.extensions import startup_sections
-from misaka.core.extensions.types import ProjectTrustContext, WorkingIndicatorOptions
+from misaka.core.extensions.types import (
+    MarkdownTransformer,
+    ProjectTrustContext,
+    WorkingIndicatorOptions,
+)
 from misaka.core.footer_data_provider import FooterDataProvider
 from misaka.core.http_dispatcher import configureHttpDispatcher, formatHttpIdleTimeoutMs
 from misaka.core.keybindings import KeybindingsManager
@@ -91,13 +94,9 @@ from misaka.core.model_resolver import (
     resolveModelScopeFromModels,
 )
 from misaka.core.model_runtime import CredentialSynchronizationError
-from misaka.core.project_trust import (
-    ProjectTrustStore,
-    hasTrustRequiringProjectResources,
-)
 from misaka.core.prompt_templates import parse_prompt_template_invocation
 from misaka.core.provider_attribution import CLIENT_NAME
-from misaka.core.radius import RADIUS_PROVIDER_ID
+from misaka.core.radius import RADIUS_MCP_URL, RADIUS_PROVIDER_ID
 from misaka.core.session_cwd import (
     MissingSessionCwdError,
     formatMissingSessionCwdPrompt,
@@ -108,12 +107,17 @@ from misaka.core.session_manager import (
     session_entry_to_display_messages,
     sessions_root_of,
 )
+from misaka.core.settings_manager import MermaidRenderingMode
 from misaka.core.slash_commands import (
     _LOCAL_ALIAS_SLASH_COMMANDS,
     BUILTIN_SLASH_COMMANDS,
 )
 from misaka.core.tools.renderers import withBuiltInRenderers
 from misaka.core.tools.truncate import TruncationResult
+from misaka.core.trust_manager import (
+    ProjectTrustStore,
+    hasTrustRequiringProjectResources,
+)
 from misaka.core.usage_totals import getUsageCostBreakdown
 from misaka.ui.tui import (
     AutocompleteProvider,
@@ -164,7 +168,7 @@ from misaka.utils.js import (
 )
 from misaka.utils.paths import getCwdRelativePath
 from misaka.utils.shell import killTrackedDetachedChildren
-from misaka.utils.tools_manager import find_tool
+from misaka.utils.tools_manager import ToolStatus, ensureTool
 from misaka.utils.values import maybe_await, read_field, signal_aborted
 
 from .components.assistant_message import AssistantMessageComponent
@@ -188,6 +192,10 @@ from .components.keybinding_hints import (
     rawKeyHint,
 )
 from .components.login_dialog import LoginDialogComponent
+from .components.mermaid import (
+    MermaidTransformerOptions,
+    createMermaidMarkdownTransformer,
+)
 from .components.model_selector import (
     DefaultModelReference,
     ModelSelectorComponent,
@@ -807,6 +815,7 @@ class InteractiveMode:
         self.lastStatusSpacer: Spacer | None = None
         self.lastStatusText: ThemedText | None = None
         self.lastStatusMessage = ""
+        self.managedToolStatusStarted = False
 
         # Streaming message tracking
         self.streamingComponent: AssistantMessageComponent | None = None
@@ -822,6 +831,9 @@ class InteractiveMode:
         # Thinking block visibility state
         self.hideThinkingBlock = False
         self.outputPad = 1
+        self.mermaidMarkdownTransformer: MarkdownTransformer = createMermaidMarkdownTransformer(
+            MermaidTransformerOptions(getMode=lambda: self.settingsManager.getMermaidRenderingMode(), theme=theme)
+        )
 
         # Agent subscription unsubscribe function
         self.unsubscribe: Callable[[], None] | None = None
@@ -956,13 +968,7 @@ class InteractiveMode:
 
         # Register themes from resource loader and initialize
         setRegisteredThemes(read_field(self.session.resourceLoader.getThemes(), "themes", []))
-        self.themeController = InteractiveThemeController(
-            self.ui,
-            getSettingsManager=lambda: self.settingsManager,
-            showError=lambda message: self.showError(message),
-            onChanged=lambda: self.updateEditorBorderColor(),
-            initialThemeSetting=options.initialThemeSetting,
-        )
+        self.themeController = InteractiveThemeController(self.ui, {"getSettingsManager": lambda: self.settingsManager, "showError": lambda message: self.showError(message), "onChanged": lambda: self.updateEditorBorderColor(), "initialThemeSetting": options.initialThemeSetting})
 
     def getAutocompleteSourceTag(self, sourceInfo: Any = None) -> str | None:
         # Built-in extension commands are untagged, like built-in commands.
@@ -1311,9 +1317,14 @@ class InteractiveMode:
             self.headerContainer.addChild(self.builtInHeader)
         self.ui.requestRender()
 
-        # MISAKA fork: fd is looked up on PATH; MISAKA never downloads tools at runtime, and rg is found by the tools
-        # that use it.
-        self.fdPath = find_tool("fd")
+        # Ensure fd and rg are available after mounting the TUI.
+        # Both are needed: fd for autocomplete, rg for grep tool and bash commands.
+        # MISAKA fork: never downloaded (see tools_manager); a missing one is reported.
+        fdPath, _rgPath = await asyncio.gather(
+            ensureTool("fd", lambda status: self.showManagedToolStatus(status)),
+            ensureTool("rg", lambda status: self.showManagedToolStatus(status)),
+        )
+        self.fdPath = fdPath
 
         # Enable the remaining input handlers only after managed-tool setup completes.
         self.setupKeyHandlers()
@@ -1437,13 +1448,13 @@ class InteractiveMode:
                     initialMessage, {"images": self.options.initialImages, "streamingBehavior": "followUp"}
                 )
             except Exception as error:  # noqa: BLE001 - upstream `catch (error)` shows any failure
-                self.showError(errorMessage(error) or "Unknown error occurred")
+                self.showError(errorMessage(error))
 
         for message in self.options.initialMessages or []:
             try:
                 await self.session.prompt(message, {"streamingBehavior": "followUp"})
             except Exception as error:  # noqa: BLE001 - upstream `catch (error)` shows any failure
-                self.showError(errorMessage(error) or "Unknown error occurred")
+                self.showError(errorMessage(error))
 
     async def _runInputLoop(self) -> None:
         """MISAKA fork: the main loop as a task, so `run` can return the exit code."""
@@ -1461,7 +1472,7 @@ class InteractiveMode:
                 # had the turn started a moment earlier. Idle is unchanged.
                 await self.session.prompt(userInput, {"streamingBehavior": "steer"})
             except Exception as error:  # noqa: BLE001 - upstream `catch (error)` shows any failure
-                self.showError(errorMessage(error) or "Unknown error occurred")
+                self.showError(errorMessage(error))
 
     # MISAKA fork: no `checkForPackageUpdates` (MISAKA has no package sources).
 
@@ -2276,9 +2287,8 @@ class InteractiveMode:
             toolName, lambda: withBuiltInRenderers(toolName, self.session.getToolDefinition(toolName))
         )
 
-    def getMarkdownTransformers(self) -> list[Any]:
-        # MISAKA fork: no Mermaid transformer (its renderer needs the grok-mermaid package).
-        return [*self.session.extensionRunner.getMarkdownTransformers()]
+    def getMarkdownTransformers(self) -> list[MarkdownTransformer]:
+        return [self.mermaidMarkdownTransformer, *self.session.extensionRunner.getMarkdownTransformers()]
 
     def setupExtensionShortcuts(self, extensionRunner: Any) -> None:
         """Set up keyboard shortcuts registered by extensions."""
@@ -3031,7 +3041,7 @@ class InteractiveMode:
                 # Resolve overlay options - can be static or dynamic function
                 def resolveOptions() -> Any:
                     overlayOptions = read_field(options, "overlayOptions")
-                    if overlayOptions:
+                    if overlayOptions is not None:
                         return overlayOptions() if callable(overlayOptions) else overlayOptions
                     # Fallback: use component's width property if available
                     w = getattr(component, "width", None)
@@ -3116,7 +3126,8 @@ class InteractiveMode:
             "app.model.cycleBackward", lambda: self._schedule_task(self.cycleModel("backward"))
         )
 
-        # MISAKA fork: no global debug key; the TUI does not port Shift+Ctrl+D (`/debug` writes the same log).
+        # Global debug handler on TUI (works regardless of focus)
+        self.ui.onDebug = lambda: self.handleDebugCommand()
         self.defaultEditor.onAction("app.model.select", lambda: self.showModelSelector())
         self.defaultEditor.onAction("app.tools.expand", lambda: self.toggleToolOutputExpansion())
         self.defaultEditor.onAction("app.thinking.toggle", lambda: self.toggleThinkingBlockVisibility())
@@ -3803,7 +3814,17 @@ class InteractiveMode:
         )
         return "".join(read_field(c, "text") for c in textBlocks)
 
-    # MISAKA fork: no `showManagedToolStatus` (fd and rg are never downloaded at runtime).
+    def showManagedToolStatus(self, status: ToolStatus) -> None:
+        """Show a managed-tool status update in the chat."""
+        if not self.managedToolStatusStarted:
+            self.chatContainer.addChild(Spacer(1))
+            self.managedToolStatusStarted = True
+        message = f"Warning: {status.message}" if status.type == "warning" else status.message
+        color = "warning" if status.type == "warning" else "dim"
+        self.chatContainer.addChild(ThemedText(lambda: theme.fg(color, message), 1, 0))
+        self.lastStatusSpacer = None
+        self.lastStatusText = None
+        self.ui.requestRender()
 
     def showStatus(self, message: str) -> None:
         """Show a status message in the chat.
@@ -4415,6 +4436,24 @@ class InteractiveMode:
         threading.excepthook = threadingExcepthook
         self.signalCleanupHandlers.append(lambda: setattr(threading, "excepthook", previousThreadingExcepthook))
 
+        # MISAKA fork: an exception raised in an event-loop callback, or a task failure nobody awaited, is what Node
+        # reports as an uncaught exception or an unhandled rejection; asyncio hands both to the loop's handler.
+        if ownerLoop is not None:
+            previousLoopHandler = ownerLoop.get_exception_handler()
+
+            def loopExceptionHandler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+                error = context.get("exception")
+                if isinstance(error, Exception):
+                    self.uncaughtCrash(error)
+                    return
+                if previousLoopHandler is not None:
+                    previousLoopHandler(loop, context)
+                else:
+                    loop.default_exception_handler(context)
+
+            ownerLoop.set_exception_handler(loopExceptionHandler)
+            self.signalCleanupHandlers.append(lambda: ownerLoop.set_exception_handler(previousLoopHandler))
+
     def unregisterSignalHandlers(self) -> None:
         for cleanup in self.signalCleanupHandlers:
             cleanup()
@@ -4954,6 +4993,11 @@ class InteractiveMode:
                 self.settingsManager.setHideThinkingBlock(hidden)
                 self.updateThinkingBlockVisibility()
 
+            def onMermaidRenderingModeChange(mode: MermaidRenderingMode) -> None:
+                self.settingsManager.setMermaidRenderingMode(mode)
+                self.chatContainer.invalidate()
+                self.ui.requestRender()
+
             def onShowCacheMissNoticesChange(shown: bool) -> None:
                 self.settingsManager.setShowCacheMissNotices(shown)
                 self.rebuildChatFromMessages()
@@ -5021,7 +5065,7 @@ class InteractiveMode:
                     terminalTheme=self.themeController.getTerminalTheme(),
                     availableThemes=getAvailableThemes(),
                     hideThinkingBlock=self.hideThinkingBlock,
-                    # MISAKA fork: no `mermaidRenderingMode` (Mermaid rendering is not ported).
+                    mermaidRenderingMode=self.settingsManager.getMermaidRenderingMode(),
                     collapseChangelog=self.settingsManager.getCollapseChangelog(),
                     enableInstallTelemetry=self.settingsManager.getEnableInstallTelemetry(),
                     doubleEscapeAction=self.settingsManager.getDoubleEscapeAction(),
@@ -5058,6 +5102,7 @@ class InteractiveMode:
                     onThemeChange=onThemeChange,
                     onThemePreview=lambda themeName: self.themeController.preview(themeName),
                     onHideThinkingBlockChange=onHideThinkingBlockChange,
+                    onMermaidRenderingModeChange=onMermaidRenderingModeChange,
                     onShowCacheMissNoticesChange=onShowCacheMissNoticesChange,
                     onCollapseChangelogChange=lambda collapsed: self.settingsManager.setCollapseChangelog(collapsed),
                     onEnableInstallTelemetryChange=lambda enabled: self.settingsManager.setEnableInstallTelemetry(
@@ -5263,11 +5308,11 @@ class InteractiveMode:
     def showTrustSelector(self) -> None:
         cwd = self.sessionManager.getCwd()
         trustStore = ProjectTrustStore(self.runtimeHost.services.agentDir)
-        savedDecision = trustStore.get_entry(cwd)
+        savedDecision = trustStore.getEntry(cwd)
 
         def create(done: Callable[[], None]) -> dict[str, Any]:
             def onSelect(selection: Any) -> None:
-                trustStore.set_many(selection.updates)
+                trustStore.setMany(selection.updates)
                 done()
                 self.showStatus(
                     f"Saved trust decision: {'trusted' if selection.trusted else 'untrusted'}. "
@@ -5398,7 +5443,7 @@ class InteractiveMode:
                     and all(id in availableModelIds for id in enabledIds)
                 )
                 newPatterns = None if enabledIds is None or allEnabled else enabledIds
-                self.settingsManager.setEnabledModels([*newPatterns] if newPatterns else None)
+                self.settingsManager.setEnabledModels([*newPatterns] if newPatterns is not None else None)
                 self.showStatus("Model selection saved to settings")
 
             def onCancel() -> None:
@@ -5708,7 +5753,7 @@ class InteractiveMode:
                 sessionPath,
                 {
                     "withSession": read_field(options, "withSession"),
-                    "projectTrustContextFactory": lambda cwd: self.createProjectTrustContext(cwd),
+                    "projectTrustContextFactory": lambda cwd: self.createProjectTrustContext({"cwd": cwd}),
                 },
             )
             if read_field(result, "cancelled"):
@@ -5725,7 +5770,7 @@ class InteractiveMode:
                 {
                     "cwdOverride": selectedCwd,
                     "withSession": read_field(options, "withSession"),
-                    "projectTrustContextFactory": lambda cwd: self.createProjectTrustContext(cwd),
+                    "projectTrustContextFactory": lambda cwd: self.createProjectTrustContext({"cwd": cwd}),
                 },
             )
             if read_field(result, "cancelled"):
@@ -6378,6 +6423,8 @@ class InteractiveMode:
             await self.loginProvider(dialog, providerId, providerName, "oauth", account=account)
             restoreEditor()
             await self.completeProviderAuthentication(providerId, providerName, "oauth", previousModel, account=account)
+            if providerId == RADIUS_PROVIDER_ID:
+                self.offerRadiusMcpServer(providerId, providerName)
         except Exception as error:  # noqa: BLE001 - reported below
             restoreEditor()
             errorMsg = errorMessage(error)
@@ -6389,8 +6436,71 @@ class InteractiveMode:
             else:
                 self.showError(f"Failed to login to {providerName}: {errorMsg}")
 
-    # MISAKA fork: no `offerRadiusMcpServer`. It writes the MCP extension's `mcp.json` through that extension's own
-    # module, and bundled extensions are pluggable: nothing outside them imports one (owner's rule, 2026-09-29).
+    def offerRadiusMcpServer(self, providerId: str, providerName: str) -> None:
+        """Offer to point the Radius MCP server in the global mcp.json at the Radius login, adding the server
+        when missing. Nothing is asked when a global server already uses this login."""
+        # MISAKA fork: the one module outside the bundled extensions that imports one, by the owner's decision
+        # (2026-10-12) to follow upstream here; imported on use, so a session that never logs in to Radius
+        # does not load it.
+        from misaka.extensions.mcp.config import addMcpServerConfig, loadMcpConfig
+
+        mcpPath = os.path.join(get_agent_dir(), "mcp.json")
+
+        def normalizeUrl(url: str) -> str:
+            return re.sub(r"/+\Z", "", url)
+
+        servers = loadMcpConfig({
+            "agentDir": get_agent_dir(),
+            "cwd": self.sessionManager.getCwd(),
+            "projectTrusted": False,
+        })["servers"]
+        existing = next(
+            (
+                server
+                for server in servers
+                if "url" in server["config"] and normalizeUrl(server["config"]["url"]) == normalizeUrl(RADIUS_MCP_URL)  # type: ignore[typeddict-item]
+            ),
+            None,
+        )
+        if (
+            existing is not None
+            and "url" in existing["config"]
+            and (existing["config"].get("auth") or {}).get("provider") == providerId  # type: ignore[union-attr]
+        ):
+            return
+
+        name = existing["name"] if existing is not None else "radius"
+        if existing is None and any(server["name"] == name for server in servers):
+            name = "radius-mcp"
+        config: dict[str, Any] = (
+            {**existing["config"], "auth": {"provider": providerId}}
+            if existing is not None and "url" in existing["config"]
+            else {"url": RADIUS_MCP_URL, "auth": {"provider": providerId}}
+        )
+        # `auth` replaces the MCP OAuth sign-in.
+        config.pop("oauth", None)
+
+        def create(done: Callable[[], None]) -> dict[str, Any]:
+            def onSelect(option: str) -> None:
+                done()
+                if option != "Yes":
+                    return
+                try:
+                    addMcpServerConfig(mcpPath, name, config)  # type: ignore[arg-type]
+                except Exception as error:  # noqa: BLE001 - reported to the user
+                    self.showError(f"Could not update {mcpPath}: {errorMessage(error)}")
+                    return
+                # The MCP extension reads mcp.json when the session starts.
+                spawn(self.handleReloadCommand(), self._backgroundTasks)
+
+            def onCancel() -> None:
+                done()
+                self.ui.requestRender()
+
+            selector = ExtensionSelectorComponent(f"Configure {providerName} MCP in {mcpPath}?", ["Yes", "No"], onSelect, onCancel)
+            return {"component": selector, "focus": selector}
+
+        self.showSelector(create)
 
     # =========================================================================
     # Command handlers
@@ -6490,7 +6600,7 @@ class InteractiveMode:
                 filePath = await self.session.exportToHtml(outputPath, {"themeName": theme.name})
                 self.showStatus(f"Session exported to: {filePath}")
         except Exception as error:  # noqa: BLE001 - shown to the user
-            self.showError(f"Failed to export session: {str(error) or 'Unknown error'}")
+            self.showError(f"Failed to export session: {errorMessage(error)}")
 
     def getPathCommandArgument(self, text: str, command: Literal["/export", "/import"]) -> str | None:
         if text == command:
@@ -6988,7 +7098,7 @@ class InteractiveMode:
         except Exception as error:  # noqa: BLE001 - shown to the user
             if self.bashComponent:
                 self.bashComponent.setComplete(None, False)
-            self.showError(f"Bash command failed: {str(error) or 'Unknown error'}")
+            self.showError(f"Bash command failed: {errorMessage(error)}")
 
         self.bashComponent = None
         self.ui.requestRender()

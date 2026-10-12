@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 
 from misaka.ai.utils.pi_user_agent import getPiUserAgent
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 
 SESSION_KINDS = {"foreground", "dm", "card", "bare"}
 API = "https://api.openalex.org"
@@ -233,7 +234,7 @@ def register(harn):
         description="Show where a question lives in the literature (OpenAlex titles and abstracts): each facet of "
                     "the question alone, all together and in pairs, grouped by subfield, topic, language and "
                     "publication type, to help check a research design for overlooked fields.",
-        parameters=ScanParams.model_json_schema(), execute=execute,
+        parameters=typeboxSchema(ScanParams), execute=execute,
         promptSnippet="See which fields of the literature discuss a question",
         promptGuidelines=[("Use coverage_scan when checking a research design for overlooked fields: cut the "
                           "question into facets and give each its alternative terms, in the languages its "

@@ -23,12 +23,12 @@ type WireServiceMemberSnapshot = dict[str, Any]
 type WireServiceInstanceSnapshot = dict[str, Any]
 type WireServiceSubscriptionSnapshot = dict[str, Any]
 type WireServiceProviderUpdate = dict[str, Any]
-type ServiceControlCall = dict[str, Any]
 
 SERVICE_CONTROL_ID = "$chord.service"
 SERVICE_CATALOGUE_MEMBER = "catalogue"
 SERVICE_SUBSCRIBE_MEMBER = "subscribe"
 SERVICE_UNSUBSCRIBE_MEMBER = "unsubscribe"
+type ServiceControlCall = dict[str, Any]
 
 
 def createServiceCatalogueCall() -> ServiceCall:

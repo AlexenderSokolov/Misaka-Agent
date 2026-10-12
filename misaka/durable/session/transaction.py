@@ -36,10 +36,6 @@ from ..errors import ReadAfterWrite
 from ..types import ROOT_CONVERSATION_ID, Cursor, Storage
 from .forks import prepareForkDocumentCopies
 
-INTERNAL_SCAN_PAGE_SIZE = 256
-EMPTY_OPERATIONS: list[Op] = []
-TABLE_JSON_COPY_OPTIONS = {"omitUndefinedProperties": True}
-
 
 def applySubmissionChange(current: dict[str, Any], change: dict[str, Any]) -> dict[str, Any]:
     """Complete record after applying one change. Placement turns a queued input ``placed`` and a queued write ``done``;
@@ -55,6 +51,10 @@ def applySubmissionChange(current: dict[str, Any], change: dict[str, Any]) -> di
         raise RuntimeError(f"Submission {current['id']} is not a placed input")
     # Queued and placed records carry no answer, reason, or detail; an unanswered input keeps its entry.
     return {**current, **change}
+
+INTERNAL_SCAN_PAGE_SIZE = 256
+EMPTY_OPERATIONS: list[Op] = []
+TABLE_JSON_COPY_OPTIONS = {"omitUndefinedProperties": True}
 
 
 class LoadedDocument:

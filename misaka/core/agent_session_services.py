@@ -11,7 +11,6 @@ from misaka.ai.models import ModelsRefreshOptions
 from misaka.ai.types import Model
 from misaka.config import get_agent_dir
 from misaka.core.extensions.types import ToolDefinition
-from misaka.core.http_dispatcher import applyHttpProxySettings
 from misaka.core.model_runtime import ModelRuntime
 from misaka.core.resource_loader import (
     DefaultResourceLoader,
@@ -122,13 +121,8 @@ async def createAgentSessionServices(
     from misaka.config import home
 
     role_dir = agent_dir if options.get("agentDir") else None
-    model_runtime = options.get("modelRuntime") or await ModelRuntime.create(
-        authPath=str(home.path("auth", role_dir)),
-        modelsPath=str(home.path("models", role_dir)),
-        signal=options.get("modelRuntimeSignal"),
-    )
+    model_runtime = options.get("modelRuntime") or await ModelRuntime.create({"authPath": str(home.path("auth", role_dir)), "modelsPath": str(home.path("models", role_dir)), "signal": options.get("modelRuntimeSignal")})
     settings_manager = options.get("settingsManager") or SettingsManager.create(cwd, agent_dir)
-    applyHttpProxySettings(settings_manager.getGlobalSettings().get("httpProxy"))
     resource_loader = DefaultResourceLoader(
         {
             **(options.get("resourceLoaderOptions") or {}),

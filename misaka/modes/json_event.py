@@ -1,4 +1,9 @@
-"""The JSONL wire form for engine events."""
+"""Translated from pi's ``packages/coding-agent/src/modes/json-event.ts`` (v1.1.0): the JSONL wire form for engine events.
+
+MISAKA fork: ``to_jsonable`` is MISAKA's helper for turning models and dataclasses into plain data (other modules use
+it too). The wire form itself is ``toJsonEvent`` written with ``jsonStringify``: a model field that is not set (``None``)
+is left out, as ``JSON.stringify`` leaves out an ``undefined`` property, and numbers print as JavaScript prints them.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +22,21 @@ def to_jsonable(value: Any) -> Any:
         return [to_jsonable(item) for item in value]
     if hasattr(value, "__dict__") and not isinstance(value, type):
         return to_jsonable(vars(value))
+    return value
+
+
+def _wireValue(value: Any) -> Any:
+    """The event as ``JSON.stringify`` sees it: model fields that are ``None`` are not set, so they are left out."""
+    if hasattr(value, "model_dump"):
+        return _wireValue(value.model_dump(exclude_none=True))
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _wireValue({key: item for key, item in dataclasses.asdict(value).items() if item is not None})
+    if isinstance(value, dict):
+        return {str(key): _wireValue(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_wireValue(item) for item in value]
+    if hasattr(value, "__dict__") and not isinstance(value, type):
+        return _wireValue({key: item for key, item in vars(value).items() if item is not None})
     return value
 
 
@@ -43,7 +63,7 @@ def toJsonAssistantMessageEvent(event: Any) -> Any:
     return event
 
 
-def toJsonEvent(value: Any) -> Any:
+def toJsonEvent(event: Any) -> Any:
     """Convert an event to its wire form.
 
     ``message_update`` events carry only the delta: the accumulated ``partial``
@@ -55,7 +75,7 @@ def toJsonEvent(value: Any) -> Any:
     tool call's ``id`` and ``toolName``. Both are constant-size, so consumers can bill
     tokens and pair a tool call with its result without the snapshot.
     """
-    data = to_jsonable(value)
+    data = _wireValue(event)
     if not isinstance(data, dict) or data.get("type") != "message_update":
         return data
 

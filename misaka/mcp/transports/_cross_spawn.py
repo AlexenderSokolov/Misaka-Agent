@@ -4,7 +4,8 @@ pi spawns stdio servers with the ``cross-spawn`` npm package, which on Windows r
 (``which`` 2.0.2, ``isexe`` 2.0.0, ``path-key`` 3.1.1), honours shebangs (``shebang-command`` 2.0.0)
 and runs anything that is not an ``.exe`` or ``.com`` -- ``npx.cmd``, ``uvx`` shims -- through
 ``cmd.exe /d /s /c`` with every argument escaped for it. The parsing below is translated from those
-packages (MIT/ISC, see THIRD_PARTY_NOTICES.md). The process itself is a ``subprocess.Popen`` with
+packages (MIT/ISC, see THIRD_PARTY_NOTICES.md); only what the stdio transport calls is ported (no ``spawnSync``,
+no ``shell`` or ``forceShell`` options). The process itself is a ``subprocess.Popen`` with
 threads that read its pipes and wait for it, handing everything to the event loop the way Node's
 ``ChildProcess`` emits ``spawn``, ``data``, ``exit`` and ``close``.
 """
@@ -13,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import ntpath
 import os
 import queue
 import re
@@ -24,6 +24,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from misaka.utils import node_path
 from misaka.utils.shell import trackDetachedChildPid, untrackDetachedChildPid
 
 isWin = sys.platform == "win32"
@@ -79,14 +80,15 @@ def _which(cmd: str, path: str | None, pathExt: str | None, cwd: str) -> str | N
     if "/" in cmd or (isWin and "\\" in cmd):
         pathEnv = [""]
     else:
-        pathEnv = [*([cwd] if isWin else []), *(path if path is not None else os.environ.get("PATH", "")).split(colon)]
+        # `opt.path || process.env.PATH || ""`: an empty PATH falls back to the process's.
+        pathEnv = [*([cwd] if isWin else []), *(path or os.environ.get("PATH") or "").split(colon)]
     pathExtExe = (pathExt or os.environ.get("PATHEXT") or ".EXE;.CMD;.BAT;.COM") if isWin else ""
     extensions = pathExtExe.split(colon) if isWin else [""]
     if isWin and "." in cmd and extensions[0] != "":
         extensions.insert(0, "")
     for ppRaw in pathEnv:
         pathPart = ppRaw[1:-1] if len(ppRaw) >= 2 and ppRaw.startswith('"') and ppRaw.endswith('"') else ppRaw
-        pCmd = os.path.normpath(os.path.join(pathPart, cmd)) if pathPart else os.path.normpath(cmd)
+        pCmd = node_path.join(pathPart, cmd)
         p = cmd[:2] + pCmd if not pathPart and re.match(r"^\.[\\/]", cmd) else pCmd
         for extension in extensions:
             current = p + extension
@@ -102,7 +104,9 @@ def _which(cmd: str, path: str | None, pathExt: str | None, cwd: str) -> str | N
 def _resolveCommandAttempt(parsed: _Parsed, withoutPathExt: bool) -> str | None:
     env = parsed.options.get("env") or os.environ
     cwdOption = parsed.options.get("cwd")
-    cwd = cwdOption if cwdOption is not None else os.getcwd()
+    # `process.chdir(cwd)` fails quietly for a directory that does not exist, and `which` then searches the
+    # process's own cwd.
+    cwd = os.path.abspath(cwdOption) if cwdOption is not None and os.path.isdir(cwdOption) else os.getcwd()
     resolved = _which(parsed.command, env.get(pathKey(env)), os.pathsep if withoutPathExt else None, cwd)
     # If we successfully resolved, ensure that an absolute path is returned.
     if resolved:
@@ -198,7 +202,7 @@ def _parseNonShell(parsed: _Parsed) -> _Parsed:
         # Need to double escape meta chars if the command is a cmd-shim located in `node_modules/.bin/`.
         needsDoubleEscapeMetaChars = bool(_IS_CMD_SHIM.search(commandFile or "undefined"))
         # Normalize posix paths into OS compatible paths (e.g.: foo/bar -> foo\bar)
-        parsed.command = ntpath.normpath(parsed.command)
+        parsed.command = node_path.win32Normalize(parsed.command)
         parsed.command = escapeCommand(parsed.command)
         parsed.args = [escapeArgument(arg, needsDoubleEscapeMetaChars) for arg in parsed.args]
         shellCommand = " ".join([parsed.command, *parsed.args])
@@ -422,11 +426,14 @@ _REQUIRED_WINDOWS_VARS = (
 
 def _windowsEnv(env: Mapping[str, str]) -> dict[str, str]:
     merged: dict[str, str] = {}
-    for key, value in env.items():
-        # One entry per name, case-insensitively, the last one winning, as Windows keeps them.
-        for existing in [name for name in merged if name.upper() == key.upper()]:
-            del merged[existing]
-        merged[key] = value
+    sawKey: set[str] = set()
+    # Env keys are case insensitive on Windows: the first of each name in sorted order (UTF-16 code units) is kept.
+    for key in sorted(env, key=lambda name: name.encode("utf-16-be")):
+        uppercaseKey = key.upper()
+        if uppercaseKey in sawKey:
+            continue
+        sawKey.add(uppercaseKey)
+        merged[key] = env[key]
     upper = {key.upper() for key in merged}
     for name in _REQUIRED_WINDOWS_VARS:
         if name not in upper and name in os.environ:
@@ -457,7 +464,9 @@ def spawn(command: str, args: Sequence[str], options: Mapping[str, Any]) -> Chil
         # libuv adds CREATE_NO_WINDOW only when no stdio is inherited.
         popenOptions["creationflags"] = 0 if inheritStderr else subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
         if parsed.verbatim:
-            popenArgs: Any = " ".join([f'"{parsed.command}"' if " " in parsed.command else parsed.command, *parsed.args])
+            popenArgs: Any = " ".join([parsed.command, *parsed.args])
+            if " " in parsed.command:
+                popenOptions["executable"] = parsed.command
         else:
             popenArgs = [parsed.command, *parsed.args]
             if parsed.executable:

@@ -9,7 +9,7 @@ be a plain function or a coroutine function.
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 
@@ -29,12 +29,12 @@ class CommandOption:
         self.parse = parse
 
 
-def valueOption(name: str, parse: Callable[[str], dict[str, Any]], repeatable: bool = False) -> CommandOption:
-    return CommandOption(name, parse, repeatable=repeatable)
+def valueOption(name: str, parse: Callable[[str], dict[str, Any]], options: Mapping[str, bool] | None = None) -> CommandOption:
+    return CommandOption(name, parse, repeatable=bool((options or {}).get("repeatable", False)))
 
 
-def stringOption(name: str, repeatable: bool = False) -> CommandOption:
-    return valueOption(name, lambda value: {"ok": True, "value": value}, repeatable)
+def stringOption(name: str, options: Mapping[str, bool] | None = None) -> CommandOption:
+    return valueOption(name, lambda value: {"ok": True, "value": value}, options)
 
 
 def flagOption(name: str) -> CommandOption:

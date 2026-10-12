@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 from misaka.ai.auth.types import (
     ApiKeyAuth,
@@ -52,13 +52,16 @@ def envApiKeyAuth(name: str, envVars: list[str] | tuple[str, ...]) -> ApiKeyAuth
     return ApiKeyAuth(name=name, login=login, resolve=resolve)
 
 
-def lazyOAuth(
-    *,
-    name: str,
-    isSubscription: bool | None = None,
-    loginLabel: str | None = None,
-    load: Callable[[], Awaitable[OAuthAuth]],
-) -> OAuthAuth:
+class LazyOAuthInput(TypedDict):
+    """The object ``lazyOAuth`` takes."""
+
+    name: str
+    isSubscription: NotRequired[bool]
+    loginLabel: NotRequired[str]
+    load: Callable[[], Awaitable[OAuthAuth]]
+
+
+def lazyOAuth(input: LazyOAuthInput) -> OAuthAuth:
     """Wraps a dynamically imported `OAuthAuth` so provider definitions can
     advertise OAuth without importing the implementation. The flow loads on
     first `login`/`refresh`/`toAuth` call; callers keep Node-only flow code out
@@ -70,7 +73,7 @@ def lazyOAuth(
     def loaded() -> Awaitable[OAuthAuth]:
         nonlocal promise
         if promise is None:
-            promise = asyncio.ensure_future(load())
+            promise = asyncio.ensure_future(input["load"]())
         return asyncio.shield(promise)
 
     async def login(interaction: ProviderAuthInteraction, options: LoginOptions | None = None) -> OAuthCredential:
@@ -83,9 +86,9 @@ def lazyOAuth(
         return await (await loaded()).toAuth(credential)
 
     return OAuthAuth(
-        name=name,
-        isSubscription=isSubscription,
-        loginLabel=loginLabel,
+        name=input["name"],
+        isSubscription=input.get("isSubscription"),
+        loginLabel=input.get("loginLabel"),
         login=login,
         refresh=refresh,
         toAuth=toAuth,

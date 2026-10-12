@@ -58,15 +58,6 @@ def readMember(target: Any, name: str) -> Any:
     return getattr(target, name, UNDEFINED)
 
 
-def isObject(value: Any) -> bool:
-    """A JavaScript object or function: anything but a primitive."""
-    return not (value is None or value is UNDEFINED or isinstance(value, str | bytes | int | float | bool))
-
-
-def _isDunder(name: str) -> bool:
-    return name.startswith("__") and name.endswith("__")
-
-
 class ServiceSlot:
     """Host-owned mutable target with consumer-owned guarded views."""
 
@@ -84,12 +75,12 @@ class ServiceSlot:
     def unbind(self) -> None:
         self._implementation = None
 
-    def resolve(self, name: str, assertAccess: Callable[[], None]) -> _Resolved:
+    def resolve(self, property: str, assertAccess: Callable[[], None]) -> _Resolved:
         assertAccess()
         implementation = self._implementation
         if implementation is None:
             raise RuntimeError(f"Service {self._serviceId} is disconnected")
-        return _Resolved(readMember(implementation, name), implementation)
+        return _Resolved(readMember(implementation, property), implementation)
 
 
 class _ServiceView:
@@ -108,7 +99,7 @@ class _ServiceView:
             return current
         member = self._members.get(name)
         if member is None:
-            member = ValueView(resolve)
+            member = ValueView(resolve, callable(current))
             self._members[name] = member
         return member
 
@@ -132,13 +123,18 @@ class ValueView:
     """A guarded view of one member: calling it calls the member currently bound, and reading an attribute
     reads the current member's attribute (a callable one as a view again)."""
 
-    __slots__ = ("_children", "_resolve")
+    __slots__ = ("_callable", "_children", "_resolve")
 
-    def __init__(self, resolve: ValueResolver) -> None:
+    def __init__(self, resolve: ValueResolver, callable: bool) -> None:
         object.__setattr__(self, "_resolve", resolve)
         object.__setattr__(self, "_children", {})
+        # MISAKA fork: the view is one class, so ``callable(view)`` is always true; a view made over a non-function
+        # member refuses the call, as calling pi's non-function proxy target does.
+        object.__setattr__(self, "_callable", callable)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not self._callable:
+            raise TypeError("Service member is not a function")
         resolved = self._resolve()
         if not callable(resolved.value):
             raise TypeError("Service member is not callable")
@@ -159,12 +155,21 @@ class ValueView:
             return current
         child = self._children.get(name)
         if child is None:
-            child = ValueView(resolve)
+            child = ValueView(resolve, True)
             self._children[name] = child
         return child
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise TypeError("A service handle is read-only")
+
+
+def isObject(value: Any) -> bool:
+    """A JavaScript object or function: anything but a primitive."""
+    return not (value is None or value is UNDEFINED or isinstance(value, str | bytes | int | float | bool))
+
+
+def _isDunder(name: str) -> bool:
+    return name.startswith("__") and name.endswith("__")
 
 
 __all__ = ["AttributeMapping", "ServiceSlot", "ValueView", "isObject", "readMember"]

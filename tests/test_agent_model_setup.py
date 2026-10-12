@@ -6,13 +6,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from misaka.cli import setup
+from misaka.cli import setup_wizard as setup
 
 
 @pytest.fixture
 def catalog(tmp_path, monkeypatch):
     from misaka import config
-    from misaka.cli import auth
+    from misaka.cli import auth_overview
 
     roles = tmp_path / "profiles"
     (roles / "last_order").mkdir(parents=True)
@@ -29,8 +29,8 @@ def catalog(tmp_path, monkeypatch):
         return NS(runtime=runtime, credentials=None)
 
     monkeypatch.setattr(config, "current_config", lambda: cfg.copy())
-    monkeypatch.setattr(auth, "_create_runtime", create_runtime)
-    monkeypatch.setattr(auth, "_missing_sdk_extras", lambda *args: [])
+    monkeypatch.setattr(auth_overview, "create_auth_runtime", create_runtime)
+    monkeypatch.setattr(auth_overview, "missing_sdk_extras", lambda *args: [])
     monkeypatch.setattr(setup.Wizard, "_provider_labels", staticmethod(lambda runtime, providers, oauth: providers))
     monkeypatch.setattr(setup.Wizard, "_credential", lambda *args: None)
     return cfg, models

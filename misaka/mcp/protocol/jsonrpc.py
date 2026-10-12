@@ -27,7 +27,7 @@ class JsonRpcNotification(TypedDict):
 
 
 class JsonRpcErrorObject(TypedDict):
-    code: int
+    code: int | float
     message: str
     data: NotRequired[Any]
 
@@ -60,7 +60,7 @@ JSON_RPC_ERROR_CODES = _JsonRpcErrorCodes()
 
 
 class McpError(Exception):
-    def __init__(self, code: int, message: str, data: Any = UNDEFINED) -> None:
+    def __init__(self, code: float, message: str, data: Any = UNDEFINED) -> None:
         super().__init__(message)
         self.message = message
         self.name = "McpError"

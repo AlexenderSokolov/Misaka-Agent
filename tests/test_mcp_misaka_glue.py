@@ -1,6 +1,6 @@
 """MISAKA's MCP glue (``createMisakaMcpExtension``): the untrusted-data fence on every path the model reads MCP
-output through, the role's names in a stdio server's environment, servers a parent hands a sub-agent
-(``MISAKA_MCP_CONFIG``), and the role's own ``mcp.json``. None of it exists upstream."""
+output through, the role's names in a stdio server's environment, and the role's own ``mcp.json``. None of it
+exists upstream."""
 
 from __future__ import annotations
 
@@ -33,8 +33,15 @@ def _fixture(exposure: str) -> dict:
 async def _runOnce(tmp_path: Path, exposure: str, call: ToolCall) -> tuple[list[str], str]:
     """One turn that makes ``call`` against the fixture server; the tool results' text and the echo tool's
     description."""
-    _writeConfig(Path(os.environ["MISAKA_HOME"]) / "mcp.json", _fixture(exposure))
-    spec = types.SimpleNamespace(role=None, profile_dir=None, mcp_role=None)
+    home = Path(os.environ["MISAKA_HOME"])
+    if exposure == "codemode":
+        # Last Order reaches every server directly; a Sister keeps the exposure her config names.
+        profile = home / "profiles" / "sisters" / "10032"
+        _writeConfig(profile / "mcp.json", _fixture(exposure))
+        spec = types.SimpleNamespace(role="sisters/10032", profile_dir=str(profile), mcp_role="10032")
+    else:
+        _writeConfig(home / "mcp.json", _fixture(exposure))
+        spec = types.SimpleNamespace(role=None, profile_dir=None, mcp_role=None)
     async with session_with(tmp_path, [createCodemodeExtension(), createMisakaMcpExtension(spec)]) as session:
         await session.bindExtensions({})
         for _ in range(200):
@@ -102,22 +109,6 @@ def _ctx(cwd: Path):
     return types.SimpleNamespace(cwd=str(cwd), isProjectTrusted=lambda: False)
 
 
-def test_servers_a_parent_hands_over_join_unless_mcp_json_has_the_namespace(monkeypatch, tmp_path):
-    home = Path(os.environ["MISAKA_HOME"])
-    _writeConfig(home / "mcp.json", {"shared": {"command": "from-home"}})
-    injected = tmp_path / "inline.json"
-    _writeConfig(injected, {"shared": {"command": "from-parent"}, "extra": {"command": "extra-server"}})
-    monkeypatch.setenv("MISAKA_MCP_CONFIG", str(injected))
-    captured = _captureOptions(monkeypatch, types.SimpleNamespace(role=None, profile_dir=None))
-
-    loaded = captured["loadConfig"](_ctx(tmp_path))
-
-    servers = {entry["name"]: entry for entry in loaded["servers"]}
-    assert servers["shared"]["config"]["command"] == "from-home"
-    assert servers["extra"]["config"]["command"] == "extra-server" and servers["extra"]["scope"] == "extension"
-    assert loaded["errors"] == []
-
-
 def test_a_sister_does_not_see_the_servers_of_the_home_mcp_json(monkeypatch, tmp_path):
     home = Path(os.environ["MISAKA_HOME"])
     _writeConfig(home / "mcp.json", {"docs": {"command": "home-docs"}, "web": {"command": "home-web"}})
@@ -161,3 +152,47 @@ def test_a_sister_keeps_her_mcp_sign_ins_in_her_profile_and_last_order_in_the_ho
     assert stores["last_order"].tokens("docs", "https://docs.example/mcp")["access_token"] == "none"
     assert (sister / "credentials" / "mcp-auth.json").is_file()
     assert home.path("mcp_auth").is_file()
+
+
+def test_last_order_reaches_every_server_directly_and_a_sisters_keep_pi_s_default(monkeypatch, tmp_path):
+    """MISAKA fork: Last Order has neither codemode nor tool_search, so her servers declare their tools to her
+    directly, as pi does with both off; only `hidden` stands. A Sister's servers keep pi's `codemode` default.
+    Nothing is written to `mcp.json`."""
+    home = Path(os.environ["MISAKA_HOME"])
+    _writeConfig(home / "mcp.json", {
+        "plain": {"command": "a"},
+        "scripted": {"command": "b", "exposure": "codemode", "toolExposure": {"x": "deferred", "y": "hidden"}},
+        "hidden": {"command": "c", "exposure": "hidden"},
+    })
+    lastOrder = _captureOptions(monkeypatch, types.SimpleNamespace(role=None, profile_dir=None))["loadConfig"](_ctx(tmp_path))
+    configs = {entry["name"]: entry["config"] for entry in lastOrder["servers"]}
+    assert {name: config.get("exposure") for name, config in configs.items()} == {
+        "plain": "direct",
+        "scripted": "direct",
+        "hidden": "hidden",
+    }
+    assert configs["scripted"]["toolExposure"] == {"x": "direct", "y": "hidden"}
+    assert "exposure" not in json.loads((home / "mcp.json").read_text(encoding="utf-8"))["mcpServers"]["plain"]
+
+    sister = home / "profiles" / "sisters" / "10032"
+    _writeConfig(sister / "mcp.json", {"plain": {"command": "c"}})
+    spec = types.SimpleNamespace(role="sisters/10032", mcp_role="10032", profile_dir=str(sister))
+    hers = _captureOptions(monkeypatch, spec)["loadConfig"](_ctx(tmp_path))
+    assert [entry["config"].get("exposure") for entry in hers["servers"]] == [None]
+
+
+def test_codemode_and_tool_search_load_for_sisters_only(monkeypatch):
+    """The bundled-extension loader honours `ROLES`: Last Order's sessions never load codemode or tool_search."""
+    import misaka.extensions as bundled
+    from misaka.extensions import codemode, tool_search
+
+    home = Path(os.environ["MISAKA_HOME"])
+    activated: list[tuple[str, str]] = []
+    for name, module in (("codemode", codemode), ("tool_search", tool_search)):
+        monkeypatch.setattr(module, "activate", lambda spec, name=name: activated.append((name, spec.kind)) or (lambda _api: None))
+    monkeypatch.setattr(bundled, "_modules", lambda package: iter((codemode, tool_search)) if package == bundled.__name__ else iter(()))
+    for profile, expected in ((home / "profiles" / "last_order", set()), (home / "profiles" / "sisters" / "10032", {"codemode", "tool_search"})):
+        activated.clear()
+        for kind in ("foreground", "dm", "card", "child"):
+            bundled.discover(types.SimpleNamespace(profile_dir=str(profile), kind=kind, role=None))
+        assert {name for name, _kind in activated} == expected

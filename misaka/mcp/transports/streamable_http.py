@@ -8,7 +8,6 @@ Translated from pi's ``packages/mcp/src/transports/streamable-http.ts``.
 from __future__ import annotations
 
 import asyncio
-import codecs
 import contextlib
 import re
 import time
@@ -35,6 +34,7 @@ from misaka.utils import whatwg_fetch as _fetch
 from misaka.utils.js import (
     AbortController,
     AbortSignal,
+    Utf8Decoder,
     addAbortListener,
     jsLength,
     jsNumber,
@@ -43,6 +43,7 @@ from misaka.utils.js import (
     jsSlice,
     jsTrim,
     spawn,
+    throwIfAborted,
 )
 from misaka.utils.whatwg_url import URL
 
@@ -69,8 +70,7 @@ class ConsumeSseOptions(TypedDict, total=False):
 
 
 async def consumeSseStream(stream: AsyncIterator[bytes], options: ConsumeSseOptions) -> None:
-    # `TextDecoder`: UTF-8 with the byte order mark dropped and invalid sequences replaced.
-    decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
+    decoder = Utf8Decoder()
     buffered = ""
     eventName: str | None = None
     eventId: str | None = None
@@ -89,9 +89,7 @@ async def consumeSseStream(stream: AsyncIterator[bytes], options: ConsumeSseOpti
             eventId = None
             return
         data = "\n".join(dataLines)
-        event: SseEvent = {"data": data}
-        if eventName:
-            event["event"] = eventName
+        event: SseEvent = {**({"event": eventName} if eventName else {}), "data": data}  # type: ignore[typeddict-item]
         if eventId:
             event["id"] = eventId
         options["onEvent"](event)
@@ -129,26 +127,20 @@ async def consumeSseStream(stream: AsyncIterator[bytes], options: ConsumeSseOpti
             if onRetry is not None:
                 onRetry(jsNumber(value))
 
-    try:
-        async for value in stream:
-            buffered += decoder.decode(value)
+    async for value in stream:
+        buffered += decoder.decode(value)
+        newline = buffered.find("\n")
+        while newline >= 0:
+            processLine(buffered[:newline])
+            buffered = buffered[newline + 1 :]
             newline = buffered.find("\n")
-            while newline >= 0:
-                processLine(buffered[:newline])
-                buffered = buffered[newline + 1 :]
-                newline = buffered.find("\n")
-            if len(buffered.encode("utf-8")) > maxEventBytes:
-                raise RuntimeError(f"MCP SSE event exceeds {maxEventBytes} bytes")
-        buffered += decoder.decode(b"", final=True)
-        if buffered:
-            processLine(buffered)
-        dispatch()
-    finally:
-        # MISAKA fork: `releaseLock()` leaves the stream to the garbage collector; an httpx body holds
-        # a pooled connection, so the stream is closed here (a `Body`'s `cancel`, a generator's `aclose`).
-        aclose = getattr(stream, "aclose", None)
-        if aclose is not None:
-            await aclose()
+        if len(buffered.encode("utf-8")) > maxEventBytes:
+            raise RuntimeError(f"MCP SSE event exceeds {maxEventBytes} bytes")
+    buffered += decoder.decode(b"", final=True)
+    if buffered:
+        processLine(buffered)
+    dispatch()
+    # `reader.releaseLock()`: the stream stays the caller's.
 
 
 class StreamableHttpReconnectOptions(TypedDict, total=False):
@@ -194,12 +186,12 @@ class McpSessionExpiredError(McpHttpError):
         self.name = "McpSessionExpiredError"
 
 
-def _contentType(response: _fetch.Response) -> str | None:
+def contentType(response: _fetch.Response) -> str | None:
     value = response.headers.get("content-type")
     return jsTrim(value.split(";", 1)[0]).lower() if value is not None else None
 
 
-def _needsAuthorization(response: _fetch.Response) -> bool:
+def needsAuthorization(response: _fetch.Response) -> bool:
     """401, or 403 with an ``insufficient_scope`` bearer challenge (step-up authorization)."""
     if response.status == 401:
         return True
@@ -213,29 +205,35 @@ def _needsAuthorization(response: _fetch.Response) -> bool:
     )
 
 
-def _isTransientStatus(status: int) -> bool:
+def isTransientStatus(status: int) -> bool:
     """Statuses worth retrying when a stream fails to (re)open."""
     return status == 408 or status == 429 or status >= 500
 
 
-async def _discard(response: _fetch.Response) -> None:
+async def discard(response: _fetch.Response) -> None:
     if response.body is not None:
         with contextlib.suppress(Exception):
             await response.body.cancel()
 
 
-def _describeHttpFailure(status: int, body: str) -> str:
+def describeHttpFailure(status: int, body: str) -> str:
     text = jsTrim(body)
     snippet = f"{jsSlice(text, 0, ERROR_MESSAGE_BODY_CHARS - 3)}..." if jsLength(text) > ERROR_MESSAGE_BODY_CHARS else text
     return f"MCP HTTP request failed with status {status}{f': {snippet}' if snippet else ''}"
 
 
 @dataclass(slots=True)
-class _StreamCursor:
+class StreamCursor:
     lastEventId: str | None
     retryMs: float | None
     # Whether the stream delivered any event since it was (re)opened.
     received: bool
+
+
+def _headerValue(value: str) -> str:
+    """A header value as WHATWG ``Headers`` stores it: leading and trailing HTTP whitespace (tab, LF, CR,
+    space) removed."""
+    return value.strip("\t\n\r ")
 
 
 class StreamableHttpTransport(TransportEvents):
@@ -256,6 +254,7 @@ class StreamableHttpTransport(TransportEvents):
 
             async def defaultFetch(input: str | URL, init: _fetch.RequestInit | None = None) -> _fetch.Response:
                 assert client is not None
+                throwIfAborted((init or {}).get("signal"))
                 if client.is_closed:
                     # A fetch after `close()` (an auth refresh still running) fails the way fetch fails on a
                     # destroyed dispatcher, which the OAuth flow and the retry logic key on.
@@ -308,16 +307,16 @@ class StreamableHttpTransport(TransportEvents):
 
         if not isJsonRpcRequest(message):
             # Notifications and responses are acknowledged with 202 and carry no reply; ignore any body.
-            await _discard(response)
+            await discard(response)
             # The server-to-client stream may only open once the session is initialized.
             if "method" in message and message["method"] == "notifications/initialized":  # type: ignore[typeddict-item]
                 self._startGetStream()
             return
         if response.status == 202 or response.status == 204:
             # MISAKA fork: the unread body is closed, so its connection returns to the pool.
-            await _discard(response)
+            await discard(response)
             raise McpHttpError(response.status, f"MCP server accepted request {message['method']} without a response")
-        type = _contentType(response)
+        type = contentType(response)
         if type == "application/json":
             body: Any = await response.json()
             for item in body if isinstance(body, list) else [body]:
@@ -326,7 +325,7 @@ class StreamableHttpTransport(TransportEvents):
         if type == "text/event-stream" and response.body is not None:
             spawn(self._consumeResponseStream(response.body, message["id"]), self._tasks)
             return
-        await _discard(response)
+        await discard(response)
         raise McpHttpError(response.status, f"Unsupported MCP response content type: {type if type is not None else 'missing'}")
 
     async def close(self) -> None:
@@ -346,15 +345,19 @@ class StreamableHttpTransport(TransportEvents):
                         "signal": AbortSignal.timeout(1_000),
                     },
                 )
-                await _discard(response)
+                await discard(response)
             except Exception:  # noqa: BLE001, S110 - upstream `catch {}`
                 pass
-        # MISAKA fork: the aborted stream readers finish before their connection pool closes.
+        self._emitClose()
+        # MISAKA fork: then the transport's connection pool closes, after its stream readers. Those the abort
+        # did not end (one waiting on the auth provider) are cancelled: closing never waits for a refresh, and
+        # a refresh is shielded inside the provider, so it still saves its tokens.
+        for task in list(self._tasks):
+            task.cancel()
         if self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
         if self._client is not None:
             await self._client.aclose()
-        self._emitClose()
 
     async def _authorizedFetch(self, method: Literal["GET", "POST"], init: dict[str, Any]) -> _fetch.Response:
         """Fetch with auth headers. A 401 (or a 403 asking for more scope) is handed to the auth provider
@@ -368,7 +371,7 @@ class StreamableHttpTransport(TransportEvents):
                 self.url,
                 {"method": method, "headers": headers, "body": init.get("body"), "signal": self._controller.signal},
             )
-            if attempt > 0 or onUnauthorized is None or not _needsAuthorization(response):
+            if attempt > 0 or onUnauthorized is None or not needsAuthorization(response):
                 return response
             try:
                 context: UnauthorizedContext = {"response": response, "serverUrl": self.url, "fetch": self._authFetch}
@@ -376,7 +379,7 @@ class StreamableHttpTransport(TransportEvents):
                     context["token"] = token
                 await onUnauthorized(context)
             finally:
-                await _discard(response)
+                await discard(response)
             attempt += 1
 
     async def _headers(self, extra: Mapping[str, str] | None = None) -> tuple[httpx.Headers, str | None]:
@@ -386,15 +389,15 @@ class StreamableHttpTransport(TransportEvents):
         return self._buildHeaders(extra if extra is not None else {}, token), (token if token else None)
 
     def _buildHeaders(self, extra: Mapping[str, str], token: str | None) -> httpx.Headers:
-        headers = httpx.Headers(self.options.get("headers"))
+        headers = httpx.Headers({name: _headerValue(value) for name, value in (self.options.get("headers") or {}).items()})
         for name, value in extra.items():
-            headers[name] = value
+            headers[name] = _headerValue(value)
         if self._sessionIdValue:
-            headers["Mcp-Session-Id"] = self._sessionIdValue
+            headers["Mcp-Session-Id"] = _headerValue(self._sessionIdValue)
         if self._protocolVersion:
-            headers["MCP-Protocol-Version"] = self._protocolVersion
+            headers["MCP-Protocol-Version"] = _headerValue(self._protocolVersion)
         if token:
-            headers["Authorization"] = f"Bearer {token}"
+            headers["Authorization"] = _headerValue(f"Bearer {token}")
         return headers
 
     def _captureSession(self, response: _fetch.Response) -> None:
@@ -413,12 +416,12 @@ class StreamableHttpTransport(TransportEvents):
             raise McpAuthRequiredError(response, body)
         if response.status == 404 and self._sessionIdValue:
             raise McpSessionExpiredError(body)
-        raise McpHttpError(response.status, _describeHttpFailure(response.status, body), body)
+        raise McpHttpError(response.status, describeHttpFailure(response.status, body), body)
 
     async def _consumeSse(
         self,
         stream: AsyncIterator[bytes],
-        cursor: _StreamCursor,
+        cursor: StreamCursor,
         onMessage: Callable[[JsonRpcMessage], None] | None = None,
     ) -> None:
         def onId(id: str) -> None:
@@ -442,21 +445,28 @@ class StreamableHttpTransport(TransportEvents):
             self._emitMessage(message)
 
         maxMessageBytes = self.options.get("maxMessageBytes")
-        await consumeSseStream(
-            stream,
-            {
-                "maxEventBytes": maxMessageBytes if maxMessageBytes is not None else DEFAULT_MAX_MESSAGE_BYTES,
-                "onId": onId,
-                "onRetry": onRetry,
-                "onEvent": onEvent,
-            },
-        )
+        try:
+            await consumeSseStream(
+                stream,
+                {
+                    "maxEventBytes": maxMessageBytes if maxMessageBytes is not None else DEFAULT_MAX_MESSAGE_BYTES,
+                    "onId": onId,
+                    "onRetry": onRetry,
+                    "onEvent": onEvent,
+                },
+            )
+        finally:
+            # MISAKA fork: an httpx body holds a pooled connection until it is closed, where a released
+            # web stream is left to the garbage collector.
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     async def _consumeResponseStream(self, body: AsyncIterator[bytes], requestId: JsonRpcId) -> None:
         """Read the SSE stream answering one request. When the stream ends or breaks before the response
         arrives and the server assigned event IDs, resume it with GET and ``Last-Event-ID``, as the
         server may close response streams at will. Otherwise only this request fails."""
-        cursor = _StreamCursor(lastEventId=None, retryMs=None, received=False)
+        cursor = StreamCursor(lastEventId=None, retryMs=None, received=False)
         answered = False
 
         def onMessage(message: JsonRpcMessage) -> None:
@@ -511,7 +521,7 @@ class StreamableHttpTransport(TransportEvents):
 
     async def _runGetStream(self) -> None:
         """Keep the server-to-client stream open, reconnecting with backoff when it drops."""
-        cursor = _StreamCursor(lastEventId=None, retryMs=None, received=False)
+        cursor = StreamCursor(lastEventId=None, retryMs=None, received=False)
         attempt = 0
         while not self._closed:
             try:
@@ -546,13 +556,13 @@ class StreamableHttpTransport(TransportEvents):
             headers["last-event-id"] = lastEventId
         response = await self._authorizedFetch("GET", {"headers": headers})
         if response.status == 405:
-            await _discard(response)
+            await discard(response)
             return None
         await self._checkResponse(response)
         self._captureSession(response)
-        type = _contentType(response)
+        type = contentType(response)
         if type != "text/event-stream" or response.body is None:
-            await _discard(response)
+            await discard(response)
             raise McpHttpError(
                 response.status, f"Unsupported MCP GET response content type: {type if type is not None else 'missing'}"
             )
@@ -562,7 +572,7 @@ class StreamableHttpTransport(TransportEvents):
         """Network failures and transient statuses are retried; auth, session, and protocol errors are not.
         ``fetch`` reports network failures, including a connection dropped mid-body, as ``TypeError``."""
         if isinstance(error, McpHttpError):
-            return _isTransientStatus(error.status)
+            return isTransientStatus(error.status)
         if isinstance(error, TypeError):
             return True
         code = getattr(error, "code", None)

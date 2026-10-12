@@ -45,147 +45,7 @@ ServerIdSchema: Final[dict[str, Any]] = {
     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 }
 
-ProtocolErrorSchema = StrictObject({"code": IdSchema, "message": {"type": "string"}})
-
-# Must be the first frame sent by a client.
-ClientHelloSchema = StrictObject({"type": _literal("hello"), "version": {"type": "integer", "minimum": 0}})
-
-# A server-wide call, fenced to one logical server.
-ServerTargetSchema = StrictObject({"serverId": ServerIdSchema})
-# A session call, fenced to one logical server, durable session, and live attachment.
-SessionTargetSchema = StrictObject({"serverId": ServerIdSchema, "sessionId": IdSchema, "attachmentId": IdSchema})
-RpcTargetSchema: Final[dict[str, Any]] = {"anyOf": [ServerTargetSchema, SessionTargetSchema]}
-
-RequestEnvelopeSchema = StrictObject({
-    "type": _literal("request"),
-    "id": IdSchema,
-    "target": RpcTargetSchema,
-    "call": OpaqueJsonValueSchema,
-})
-CancelEnvelopeSchema = StrictObject({"type": _literal("cancel"), "id": IdSchema, "target": RpcTargetSchema})
-ClientMessageSchema: Final[dict[str, Any]] = {"anyOf": [ClientHelloSchema, RequestEnvelopeSchema, CancelEnvelopeSchema]}
-
-ServerHelloSchema = StrictObject({
-    "type": _literal("hello"),
-    "version": _literal(PROTOCOL_VERSION),
-    "serverId": ServerIdSchema,
-})
-ServerHelloErrorSchema = StrictObject({"type": _literal("hello_error"), "error": ProtocolErrorSchema})
-ResponseEnvelopeSchema: Final[dict[str, Any]] = {
-    "anyOf": [
-        StrictObject(
-            {"type": _literal("response"), "id": IdSchema, "ok": _literal(True), "result": OpaqueJsonValueSchema},
-            optional=["result"],
-        ),
-        StrictObject({"type": _literal("response"), "id": IdSchema, "ok": _literal(False), "error": ProtocolErrorSchema}),
-    ]
-}
-ServiceEventEnvelopeSchema = StrictObject({
-    "type": _literal("service_update"),
-    "subscriptionId": IdSchema,
-    "update": OpaqueJsonValueSchema,
-})
-# Out-of-band update to this presentation's selected Session route.
-AttachmentEnvelopeSchema = StrictObject({
-    "type": _literal("attachment"),
-    "attachment": {"anyOf": [SessionTargetSchema, {"type": "null"}]},
-})
-ServerMessageSchema: Final[dict[str, Any]] = {
-    "anyOf": [
-        ServerHelloSchema,
-        ServerHelloErrorSchema,
-        ResponseEnvelopeSchema,
-        ServiceEventEnvelopeSchema,
-        AttachmentEnvelopeSchema,
-    ]
-}
-
-_SERVER_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
-
 type ServerId = str
-type ProtocolErrorCode = str
-
-
-class ProtocolError(TypedDict):
-    code: str
-    message: str
-
-
-class ClientHello(TypedDict):
-    """Must be the first frame sent by a client."""
-
-    type: Literal["hello"]
-    version: int
-
-
-class ServerTarget(TypedDict):
-    """A server-wide call, fenced to one logical server."""
-
-    serverId: str
-
-
-class SessionTarget(TypedDict):
-    """A session call, fenced to one logical server, durable session, and live attachment."""
-
-    serverId: str
-    sessionId: str
-    attachmentId: str
-
-
-type RpcTarget = ServerTarget | SessionTarget
-
-
-class RequestEnvelope(TypedDict):
-    type: Literal["request"]
-    id: str
-    target: RpcTarget
-    call: Any
-
-
-class CancelEnvelope(TypedDict):
-    type: Literal["cancel"]
-    id: str
-    target: RpcTarget
-
-
-type ClientMessage = ClientHello | RequestEnvelope | CancelEnvelope
-
-
-class ServerHello(TypedDict):
-    type: Literal["hello"]
-    version: Literal[8]
-    serverId: str
-
-
-class ServerHelloError(TypedDict):
-    type: Literal["hello_error"]
-    error: ProtocolError
-
-
-class ResponseEnvelope(TypedDict):
-    """``ok`` true carries an optional ``result``; ``ok`` false carries an ``error``."""
-
-    type: Literal["response"]
-    id: str
-    ok: bool
-    result: NotRequired[Any]
-    error: NotRequired[ProtocolError]
-
-
-class ServiceEventEnvelope(TypedDict):
-    type: Literal["service_update"]
-    subscriptionId: str
-    update: Any
-
-
-class AttachmentEnvelope(TypedDict):
-    """Out-of-band update to this presentation's selected Session route."""
-
-    type: Literal["attachment"]
-    attachment: SessionTarget | None
-
-
-type ServerMessage = ServerHello | ServerHelloError | ResponseEnvelope | ServiceEventEnvelope | AttachmentEnvelope
 
 
 def isServerId(value: Any) -> bool:
@@ -306,6 +166,146 @@ def checkServerMessage(value: Any) -> bool:
         or _checkServiceEvent(value)
         or _checkAttachment(value)
     )
+
+ProtocolErrorSchema = StrictObject({"code": IdSchema, "message": {"type": "string"}})
+type ProtocolErrorCode = str
+
+
+class ProtocolError(TypedDict):
+    code: str
+    message: str
+
+# Must be the first frame sent by a client.
+ClientHelloSchema = StrictObject({"type": _literal("hello"), "version": {"type": "integer", "minimum": 0}})
+
+
+class ClientHello(TypedDict):
+    """Must be the first frame sent by a client."""
+
+    type: Literal["hello"]
+    version: int
+
+
+class ServerTarget(TypedDict):
+    """A server-wide call, fenced to one logical server."""
+
+    serverId: str
+
+# A server-wide call, fenced to one logical server.
+ServerTargetSchema = StrictObject({"serverId": ServerIdSchema})
+# A session call, fenced to one logical server, durable session, and live attachment.
+SessionTargetSchema = StrictObject({"serverId": ServerIdSchema, "sessionId": IdSchema, "attachmentId": IdSchema})
+
+
+class SessionTarget(TypedDict):
+    """A session call, fenced to one logical server, durable session, and live attachment."""
+
+    serverId: str
+    sessionId: str
+    attachmentId: str
+RpcTargetSchema: Final[dict[str, Any]] = {"anyOf": [ServerTargetSchema, SessionTargetSchema]}
+
+
+type RpcTarget = ServerTarget | SessionTarget
+
+RequestEnvelopeSchema = StrictObject({
+    "type": _literal("request"),
+    "id": IdSchema,
+    "target": RpcTargetSchema,
+    "call": OpaqueJsonValueSchema,
+})
+CancelEnvelopeSchema = StrictObject({"type": _literal("cancel"), "id": IdSchema, "target": RpcTargetSchema})
+
+
+class RequestEnvelope(TypedDict):
+    type: Literal["request"]
+    id: str
+    target: RpcTarget
+    call: Any
+
+
+class CancelEnvelope(TypedDict):
+    type: Literal["cancel"]
+    id: str
+    target: RpcTarget
+ClientMessageSchema: Final[dict[str, Any]] = {"anyOf": [ClientHelloSchema, RequestEnvelopeSchema, CancelEnvelopeSchema]}
+
+
+type ClientMessage = ClientHello | RequestEnvelope | CancelEnvelope
+
+ServerHelloSchema = StrictObject({
+    "type": _literal("hello"),
+    "version": _literal(PROTOCOL_VERSION),
+    "serverId": ServerIdSchema,
+})
+ServerHelloErrorSchema = StrictObject({"type": _literal("hello_error"), "error": ProtocolErrorSchema})
+ResponseEnvelopeSchema: Final[dict[str, Any]] = {
+    "anyOf": [
+        StrictObject(
+            {"type": _literal("response"), "id": IdSchema, "ok": _literal(True), "result": OpaqueJsonValueSchema},
+            optional=["result"],
+        ),
+        StrictObject({"type": _literal("response"), "id": IdSchema, "ok": _literal(False), "error": ProtocolErrorSchema}),
+    ]
+}
+ServiceEventEnvelopeSchema = StrictObject({
+    "type": _literal("service_update"),
+    "subscriptionId": IdSchema,
+    "update": OpaqueJsonValueSchema,
+})
+# Out-of-band update to this presentation's selected Session route.
+AttachmentEnvelopeSchema = StrictObject({
+    "type": _literal("attachment"),
+    "attachment": {"anyOf": [SessionTargetSchema, {"type": "null"}]},
+})
+ServerMessageSchema: Final[dict[str, Any]] = {
+    "anyOf": [
+        ServerHelloSchema,
+        ServerHelloErrorSchema,
+        ResponseEnvelopeSchema,
+        ServiceEventEnvelopeSchema,
+        AttachmentEnvelopeSchema,
+    ]
+}
+
+_SERVER_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+
+class ServerHello(TypedDict):
+    type: Literal["hello"]
+    version: Literal[8]
+    serverId: str
+
+
+class ServerHelloError(TypedDict):
+    type: Literal["hello_error"]
+    error: ProtocolError
+
+
+class ResponseEnvelope(TypedDict):
+    """``ok`` true carries an optional ``result``; ``ok`` false carries an ``error``."""
+
+    type: Literal["response"]
+    id: str
+    ok: bool
+    result: NotRequired[Any]
+    error: NotRequired[ProtocolError]
+
+
+class ServiceEventEnvelope(TypedDict):
+    type: Literal["service_update"]
+    subscriptionId: str
+    update: Any
+
+
+class AttachmentEnvelope(TypedDict):
+    """Out-of-band update to this presentation's selected Session route."""
+
+    type: Literal["attachment"]
+    attachment: SessionTarget | None
+
+
+type ServerMessage = ServerHello | ServerHelloError | ResponseEnvelope | ServiceEventEnvelope | AttachmentEnvelope
 
 
 __all__ = [

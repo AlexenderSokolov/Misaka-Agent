@@ -19,10 +19,13 @@ from typing import Any
 from misaka.utils.js import (
     UNDEFINED,
     AbortController,
+    Timeout,
+    addAbortListener,
     jsonParse,
     jsonStringify,
     jsString,
-    onAbort,
+    nullishCoalesce,
+    setTimeout,
     spawn,
 )
 from misaka.utils.values import read_field
@@ -73,14 +76,11 @@ def errorMessage(error: Any) -> str:
 
 
 def _stringify(value: Any) -> str | None:
-    """``JSON.stringify(value)``: ``None`` where it gives ``undefined`` (``undefined`` itself and values
-    that have no JSON)."""
-    if value is UNDEFINED:
+    """``JSON.stringify(value)``: ``None`` where it gives ``undefined`` (``undefined`` itself and functions);
+    a value that cannot be serialized (circular) throws."""
+    if value is UNDEFINED or callable(value):
         return None
-    try:
-        return jsonStringify(value)
-    except (TypeError, ValueError):
-        return None
+    return jsonStringify(value)
 
 
 def serializeStore(store: Mapping[str, Any] | None) -> dict[str, str]:
@@ -181,7 +181,7 @@ class Execution:
         self._tools = options.tools
         self._globals = options.globals
         self._signal = options.signal
-        self._timer: asyncio.TimerHandle | None = None
+        self._timer: Timeout | None = None
         self._removeAbortListener: Callable[[], None] = lambda: None
         self._output: list[CodemodeOutputItem] = []
         self._calls: list[CodemodeCall] = []
@@ -193,19 +193,19 @@ class Execution:
         self.promise.add_done_callback(self._onSettled)
 
         if math.isfinite(options.timeoutMs):
-            self._timer = loop.call_later(
-                options.timeoutMs / 1000,
+            self._timer = setTimeout(
                 lambda: self._finish({
                     "kind": "timeout",
                     "message": f"Execution timed out after {jsString(options.timeoutMs)} ms",
                 }),
+                options.timeoutMs,
             )
 
         if options.signal is not None:
             if read_field(options.signal, "aborted"):
                 self._onAbort()
             else:
-                self._removeAbortListener = onAbort(options.signal, self._onAbort)
+                self._removeAbortListener = addAbortListener(options.signal, self._onAbort)
 
         self._start(options)
 
@@ -408,7 +408,7 @@ class CodemodeSandbox:
         options = options or {}
         self._toolsByName: dict[str, CodemodeTool] = {}
         self._globalsByName: dict[str, CodemodeTool] = {}
-        self._timeoutMs: float = options.get("timeoutMs", DEFAULT_TIMEOUT_MS)
+        self._timeoutMs: float = nullishCoalesce(options.get("timeoutMs"), DEFAULT_TIMEOUT_MS)
         self._memoryLimitBytes = options.get("memoryLimitBytes")
         self._running: set[Execution] = set()
         self._closed = False
@@ -461,7 +461,7 @@ class CodemodeSandbox:
             code=code,
             tools=dict(self._toolsByName),
             globals=self._globalsByName,
-            timeoutMs=options.get("timeoutMs", self._timeoutMs),
+            timeoutMs=nullishCoalesce(options.get("timeoutMs"), self._timeoutMs),
             signal=options.get("signal"),
             memoryLimitBytes=self._memoryLimitBytes,
             store=serializeStore(options.get("store")),
@@ -473,7 +473,9 @@ class CodemodeSandbox:
     async def close(self) -> None:
         """Aborts in-flight executions (they resolve with ``kind: "aborted"``) and rejects new ones."""
         self._closed = True
-        await asyncio.gather(*(execution.abort("Sandbox closed") for execution in list(self._running)))
+        await asyncio.gather(
+            *(execution.abort("Sandbox closed") for execution in list(self._running)), return_exceptions=True
+        )
 
 
 __all__ = ["DEFAULT_TIMEOUT_MS", "CodemodeSandbox", "Execution"]

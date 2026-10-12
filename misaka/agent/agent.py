@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -55,8 +54,6 @@ from misaka.ai.utils.transcript import (
 from misaka.utils.js import AbortController, AbortSignal, errorMessage, liveKeys
 from misaka.utils.values import maybe_await, read_field
 
-logger = logging.getLogger(__name__)
-
 
 def _defaultConvertToLlm(messages: list[AgentMessage]) -> list[MessageValue]:
     return [
@@ -89,16 +86,6 @@ _DEFAULT_MODEL = Model(
 )
 
 
-class _MutableAgentState(AgentState):
-    """MISAKA fork: assigning `tools`, `messages` or `pendingToolCalls` stores a copy, as the accessor properties of
-    upstream's object literal do."""
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name == "pendingToolCalls" and value is not None:
-            value = set(value)
-        super().__setattr__(name, value)
-
-
 # Initial state for `Agent`. `systemPrompt` and `tools` become the leading system message unless `messages` already
 # starts with one. MISAKA fork: a mapping or any object with those attributes (such as an `AgentState`).
 type AgentInitialState = Mapping[str, Any] | Any
@@ -112,7 +99,7 @@ def _normalizeStandardMessage(message: Any) -> AgentMessage:
     return message
 
 
-def _createMutableAgentState(initialState: AgentInitialState | None = None) -> _MutableAgentState:
+def _createMutableAgentState(initialState: AgentInitialState | None = None) -> AgentState:
     tools = list(read_field(initialState, "tools") or [])
     messages = [_normalizeStandardMessage(message) for message in read_field(initialState, "messages") or []]
     initialMessage = createInitialSystemMessage(
@@ -122,7 +109,7 @@ def _createMutableAgentState(initialState: AgentInitialState | None = None) -> _
         messages.insert(0, initialMessage)
 
     model = read_field(initialState, "model")
-    return _MutableAgentState(
+    return AgentState(
         model=(model if isinstance(model, Model) else Model.model_validate(model)) if model is not None else _DEFAULT_MODEL,
         thinkingLevel=read_field(initialState, "thinkingLevel") or "off",
         tools=tools,
@@ -352,7 +339,7 @@ class Agent:
         self.clearSteeringQueue()
 
     @overload
-    async def prompt(self, input: AgentMessage | Sequence[AgentMessage]) -> None: ...
+    async def prompt(self, message: AgentMessage | Sequence[AgentMessage]) -> None: ...
 
     @overload
     async def prompt(self, input: str, images: Sequence[ImageContent] | None = None) -> None: ...
@@ -504,10 +491,6 @@ class Agent:
             self._finishRun()
 
     async def _handleRunFailure(self, error: BaseException, aborted: bool) -> None:
-        if not aborted:
-            # MISAKA fork: the message keeps only the error text; the traceback goes to the log, so a hook's TypeError
-            # can be traced back to its line.
-            logger.warning("agent run failed before an answer: %s", error, exc_info=error)
         failureMessage = AssistantMessage(
             content=[TextContent(text="")],
             api=self._state.model.api,

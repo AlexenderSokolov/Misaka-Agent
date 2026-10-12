@@ -193,7 +193,7 @@ async def web_session(scope, monkeypatch):
                                     'noContextFiles': True, 'noPromptTemplates': True, 'noThemes': True})
     await loader.reload()
     session = (await createAgentSession({'cwd': str(scope), 'agentDir': str(scope),
-        'modelRuntime': await ModelRuntime.create(authStorage=auth, modelsPath=None),
+        'modelRuntime': await ModelRuntime.create({"authStorage": auth, "modelsPath": None}),
         'resourceLoader': loader, 'parts': [owner],
         'customTools': list(owner.tools), 'sessionManager': SessionManager.inMemory(str(scope))}))['session']
     try:

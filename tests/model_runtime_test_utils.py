@@ -20,16 +20,11 @@ def _wrap(runtime: ModelRuntime) -> ModelRegistry:
 
 async def createModelRegistry(authStorage: AuthStorage, modelsPath: str | None = None) -> ModelRegistry:
     """Load optional models.json configuration without file-backed catalog locks."""
-    return _wrap(await ModelRuntime.create(
-        authStorage=authStorage,
-        modelsPath=modelsPath,
-        modelsStore=InMemoryCodingAgentModelsStore(),
-        allowModelNetwork=False,
-    ))
+    return _wrap(await ModelRuntime.create({"authStorage": authStorage, "modelsPath": modelsPath, "modelsStore": InMemoryCodingAgentModelsStore(), "allowModelNetwork": False}))
 
 
 async def createInMemoryModelRegistry(authStorage: AuthStorage) -> ModelRegistry:
-    return _wrap(await ModelRuntime.create(authStorage=authStorage, modelsPath=None, allowModelNetwork=False))
+    return _wrap(await ModelRuntime.create({"authStorage": authStorage, "modelsPath": None, "allowModelNetwork": False}))
 
 
 def getModelRuntime(modelRegistry: ModelRegistry) -> ModelRuntime:

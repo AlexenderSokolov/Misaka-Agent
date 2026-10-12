@@ -35,7 +35,7 @@ def prompt_home(tmp_path, monkeypatch):
     for role in ("last_order", "sisters/10032", "sisters/10033"):
         folder = tmp_path / "profiles" / role
         folder.mkdir(parents=True)
-        (folder / "SOUL.md").write_text(f"Fixture voice for {role}.\n", encoding="utf-8")
+        (folder / "SOUL.md").write_text(f"Fixture voice for {role}.\n", encoding="utf-8", newline="\n")
         if role.startswith("sisters/"):
             (folder / "DESCRIBE.md").write_text("---\ndescription: Fixture historian\n---\n" + "研究" * 120,
                                                 encoding="utf-8")
@@ -67,7 +67,7 @@ async def assembled(home, role, kind, *, research=False, custom=False, prompt_fl
     agent_dir = home / "agent" / f"{role.replace('/', '-')}-{kind}"
     agent_dir.mkdir(parents=True, exist_ok=True)
     if custom:
-        (agent_dir / "SYSTEM.md").write_text("CUSTOM SYSTEM: keep this exact opening.\n", encoding="utf-8")
+        (agent_dir / "SYSTEM.md").write_text("CUSTOM SYSTEM: keep this exact opening.\n", encoding="utf-8", newline="\n")
     spec = SessionSpec(profile_dir=str(profile), role=role, workspace=str(workspace), kind=kind,
                        sender=role.rsplit("/", 1)[-1], mcp_role=role,
                        task_id="fixture-card" if kind == "card" else None,
@@ -209,7 +209,7 @@ async def test_role_entry_keeps_shared_base_and_explicit_tool_ceiling(prompt_hom
 
     shared = home.path("shared_soul")
     content = "# Shared fixture\n\n请用中文。Keep the user's shared conventions.\n"
-    shared.write_text(content, encoding="utf-8")
+    shared.write_text(content, encoding="utf-8", newline="\n")
     profile = prompt_home / "profiles" / "last_order"
     flags, assembly, _env = role_session_setup(
         str(profile), str(prompt_home / "workspace"), research_context=research)

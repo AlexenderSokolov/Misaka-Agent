@@ -1,4 +1,10 @@
-"""Path normalization helpers shared across coding-agent modules."""
+"""Translated from pi's ``packages/coding-agent/src/utils/paths.ts`` (v1.1.0).
+
+MISAKA forks:
+- ``getFileRevision`` is a tuple, compared as pi compares its string, and on Windows it uses the creation time where
+  POSIX uses the change time (``file_revision_from_stat``), so a ``stat`` and an ``fstat`` agree.
+- ``posix_relpath`` and ``sys_platform`` are MISAKA's helpers.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +12,27 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from urllib.parse import unquote, urlparse
-from urllib.request import url2pathname
+from typing import TypedDict
+from urllib.parse import unquote, urlsplit
+
+from misaka.utils import node_path
+from misaka.utils.js import jsTrim
 
 UNICODE_SPACES = re.compile(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]")
 _WINDOWS_SHELL_DRIVE = re.compile(r"^/(?:mnt/|cygdrive/)?([a-zA-Z])(?:/(.*))?$")
+
+
+class PathInputOptions(TypedDict, total=False):
+    trim: bool
+    """Trim leading/trailing whitespace before normalization."""
+    expandTilde: bool
+    """Expand leading `~` to a home directory. Defaults to true."""
+    homeDir: str
+    """Home directory used for `~` expansion. Defaults to `os.homedir()`."""
+    stripAtPrefix: bool
+    """Strip a leading `@`, used for CLI @file paths."""
+    normalizeUnicodeSpaces: bool
+    """Normalize unicode space variants to regular spaces."""
 
 
 def canonicalizePath(path: str) -> str:
@@ -53,81 +75,94 @@ def file_revision_from_stat(stats: os.stat_result) -> tuple[int, int, int, int, 
 
 
 def isLocalPath(value: str) -> bool:
-    """Whether a source names a local file, not a package, URL, or ``builtin:`` extension."""
-    trimmed = value.strip()
+    """Returns true if the value is NOT a package source (npm:, git:, etc.),
+    a built-in extension (builtin:), or a remote URL protocol. Bare names,
+    relative paths, and file: URLs are considered local.
+    """
+    trimmed = jsTrim(value)
+    # Known non-local prefixes. file: URLs are local paths and are intentionally resolved by resolvePath().
     return not trimmed.startswith(("npm:", "git:", "github:", "http:", "https:", "ssh:", "builtin:"))
 
 
-def normalizeWindowsShellPath(file_path: str) -> str:
+def normalizeWindowsShellPath(filePath: str) -> str:
     """Git Bash, MSYS, Cygwin and WSL drive paths in the form native Windows APIs accept (pi paths.ts:66-73)."""
-    if not file_path.startswith("/") or file_path.startswith("//") or "\\" in file_path:
-        return file_path
-    match = _WINDOWS_SHELL_DRIVE.match(file_path)
+    if not filePath.startswith("/") or filePath.startswith("//") or "\\" in filePath:
+        return filePath
+    match = _WINDOWS_SHELL_DRIVE.match(filePath)
     if match is None:
-        return file_path
+        return filePath
     suffix = (match[2] or "").replace("/", "\\")
     return f"{match[1].upper()}:\\{suffix}"
 
 
-def normalizePath(
-    value: str,
-    *,
-    trim: bool = False,
-    expand_tilde: bool = True,
-    home_dir: str | None = None,
-    strip_at_prefix: bool = False,
-    normalize_unicode_spaces: bool = False,
-) -> str:
-    normalized = value.strip() if trim else value
-    if normalize_unicode_spaces:
+def _fileURLToPath(url: str) -> str:
+    """``url.fileURLToPath``: a file URL's host must be empty or ``localhost`` (on Windows another host is a UNC share),
+    an encoded separator is refused, and on Windows the path must start with a drive."""
+    parts = urlsplit(url)
+    hostname = (parts.hostname or "").lower()
+    if hostname == "localhost":
+        hostname = ""
+    pathname = parts.path
+    if os.name == "nt":
+        if "%2f" in pathname.lower() or "%5c" in pathname.lower():
+            raise TypeError("File URL path must not include encoded \\ or / characters")
+        pathname = unquote(pathname).replace("/", "\\")
+        if hostname:
+            return f"\\\\{hostname}{pathname}"
+        if len(pathname) < 3 or not pathname[1].isascii() or not pathname[1].isalpha() or pathname[2] != ":":
+            raise TypeError("File URL path must be absolute")
+        return pathname[1:]
+    if hostname:
+        raise TypeError(f'File URL host must be "localhost" or empty on {sys_platform()}')
+    if "%2f" in pathname.lower():
+        raise TypeError("File URL path must not include encoded / characters")
+    return unquote(pathname)
+
+
+def normalizePath(input: str, options: PathInputOptions | None = None) -> str:
+    options = options if options is not None else {}
+    normalized = jsTrim(input) if options.get("trim") else input
+    if options.get("normalizeUnicodeSpaces"):
         normalized = UNICODE_SPACES.sub(" ", normalized)
-    if strip_at_prefix and normalized.startswith("@"):
+    if options.get("stripAtPrefix") and normalized.startswith("@"):
         normalized = normalized[1:]
-    if os.name == "nt":                       # on POSIX /mnt/c and /c are real directories
+    if os.name == "nt":
         normalized = normalizeWindowsShellPath(normalized)
 
-    if expand_tilde:
-        home = home_dir or str(Path.home())
+    if options.get("expandTilde", True) is not False:
+        home = options.get("homeDir") if options.get("homeDir") is not None else str(Path.home())
         if normalized == "~":
             return home
         if normalized.startswith("~/") or (os.name == "nt" and normalized.startswith("~\\")):
-            return os.path.join(home, normalized[2:])
+            return node_path.join(home, normalized[2:])
 
     if normalized.startswith("file://"):
-        parsed = urlparse(normalized)
-        return url2pathname(unquote(f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path))
+        return _fileURLToPath(normalized)
 
     return normalized
 
 
-def resolvePath(value: str, base_dir: str | None = None, **options: object) -> str:
-    normalized = normalizePath(value, **options)
-    normalized_base_dir = normalizePath(base_dir or os.getcwd())
-    if os.path.isabs(normalized):
-        return os.path.abspath(normalized)
-    return os.path.abspath(os.path.join(normalized_base_dir, normalized))
+def resolvePath(input: str, baseDir: str | None = None, options: PathInputOptions | None = None) -> str:
+    normalized = normalizePath(input, options)
+    normalizedBaseDir = normalizePath(baseDir if baseDir is not None else os.getcwd())
+    return node_path.resolve(normalized) if node_path.isAbsolute(normalized) else node_path.resolve(normalizedBaseDir, normalized)
 
 
-def getCwdRelativePath(file_path: str, cwd: str) -> str | None:
-    resolved_cwd = resolvePath(cwd)
-    resolved_path = resolvePath(file_path, resolved_cwd)
-    try:
-        relative_path = os.path.relpath(resolved_path, resolved_cwd)
-    except ValueError:
-        # Windows: path and cwd sit on different drives. Node's `relative()` hands back an
-        # absolute path here, which pi then rejects via `isAbsolute` — so "not inside cwd"
-        # is the answer, not an exception thrown through a caller that only wanted a label.
-        return None
-    is_inside_cwd = relative_path == "." or (
-        relative_path != ".." and not relative_path.startswith(f"..{os.sep}") and not os.path.isabs(relative_path)
+def getCwdRelativePath(filePath: str, cwd: str) -> str | None:
+    resolvedCwd = resolvePath(cwd)
+    resolvedPath = resolvePath(filePath, resolvedCwd)
+    relativePath = node_path.relative(resolvedCwd, resolvedPath)
+    isInsideCwd = relativePath == "" or (
+        relativePath != ".." and not relativePath.startswith(f"..{node_path.sep}") and not node_path.isAbsolute(relativePath)
     )
-    return relative_path if is_inside_cwd else None
+
+    return (relativePath or ".") if isInsideCwd else None
 
 
-def formatPathRelativeToCwdOrAbsolute(file_path: str, cwd: str) -> str:
-    absolute_path = resolvePath(file_path, cwd)
-    display = getCwdRelativePath(absolute_path, cwd) or absolute_path
-    return display.replace(os.sep, "/")
+def formatPathRelativeToCwdOrAbsolute(filePath: str, cwd: str) -> str:
+    absolutePath = resolvePath(filePath, cwd)
+    found = getCwdRelativePath(absolutePath, cwd)
+    return "/".join((found if found is not None else absolutePath).split(node_path.sep))
 
 
 def markPathIgnoredByCloudSync(path: str) -> None:
@@ -161,6 +196,7 @@ def posix_relpath(path: str | os.PathLike[str], start: str | os.PathLike[str]) -
 
 
 __all__ = [
+    "PathInputOptions",
     "canonicalizePath",
     "file_revision_from_stat",
     "formatPathRelativeToCwdOrAbsolute",

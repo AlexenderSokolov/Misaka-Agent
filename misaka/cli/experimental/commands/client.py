@@ -30,7 +30,7 @@ resumeOption = flagOption("--resume")
 resumeShortOption = flagOption("-r")
 providerOption = stringOption("--provider")
 modelOption = stringOption("--model")
-pluginPackageOption = stringOption("-e", repeatable=True)
+pluginPackageOption = stringOption("-e", {"repeatable": True})
 
 
 def _build(input: ParsedCommandInput) -> dict[str, Any]:

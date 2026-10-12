@@ -580,7 +580,7 @@ def stream(
                     output.responseId = output.responseId or chunk.get("id")
                     if isinstance(chunk.get("model"), str) and len(chunk["model"]) > 0 and chunk["model"] != model.id:
                         output.responseModel = output.responseModel or chunk["model"]
-                    if chunk.get("usage"):
+                    if chunk.get("usage") is not None:
                         output.usage = _parseChunkUsage(chunk["usage"], model)
 
                     choices = chunk.get("choices")
@@ -590,7 +590,7 @@ def stream(
 
                     # Fallback: some providers (e.g., Moonshot) return usage
                     # in choice.usage instead of the standard chunk.usage
-                    if not chunk.get("usage") and choice.get("usage"):
+                    if chunk.get("usage") is None and choice.get("usage") is not None:
                         output.usage = _parseChunkUsage(choice["usage"], model)
 
                     if choice.get("finish_reason"):

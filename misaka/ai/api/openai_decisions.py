@@ -11,7 +11,7 @@ criteria field, so the meanings of true and false are appended to the instructio
 Only OpenAI API keys work: Sign in with ChatGPT tokens are rejected on this route.
 
 MISAKA fork (each is marked where it happens): a plain mapping context is read into ``ClassifierContext``, the request
-URL is a string, and questions keep Python's insertion order, where ``Object.entries`` lists integer-like keys first.
+URL is a string.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from misaka.ai.types import (
     ClassifierScoreAnswer,
 )
 from misaka.ai.utils.error_body import formatProviderError, normalizeProviderError
-from misaka.utils.js import jsonStringify
+from misaka.utils.js import jsonStringify, objectEntries
 from misaka.utils.values import signal_aborted
 
 _LABEL = "OpenAI Decisions"
@@ -76,7 +76,7 @@ def _wireQuestion(name: str, question: ClassifierQuestionValue) -> _DecisionQues
             "instructions": question.instructions,
             "choices": [
                 {"value": value, "description": description} if description else {"value": value}
-                for value, description in question.criteria.items()
+                for value, description in objectEntries(question.criteria)
             ],
         }
     if question.type == "score":
@@ -169,7 +169,7 @@ def _parseAnswers(value: Any, context: ClassifierContext) -> dict[str, Classifie
             raise RuntimeError(f"{_LABEL} did not return an answer for {id}")
         return (id, _parseAnswer(id, question, answer))
 
-    return dict(entryOf(id, question) for id, question in context.questions.items())
+    return dict(entryOf(id, question) for id, question in objectEntries(context.questions))
 
 
 # Cloudflare in front of api.openai.com answers 504 with an HTML page when a request runs longer
@@ -212,7 +212,7 @@ async def classify(
             {
                 "model": model.id,
                 "input": _wireInput(context),
-                "questions": [_wireQuestion(id, question) for id, question in context.questions.items()],
+                "questions": [_wireQuestion(id, question) for id, question in objectEntries(context.questions)],
             },
             options,
             _NO_RETRY_STATUSES,

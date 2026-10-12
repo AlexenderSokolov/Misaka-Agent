@@ -10,7 +10,9 @@ the host's event loop that owns a V8 isolate (``engine.py``). The prelude's ``br
 VM, so no callback ever runs while the script is spinning and every call stays cancellable. Messages
 keep the order the script produced them, as with the port. A "done" also notifies the worker, which
 then ends the run at once, as upstream's host terminates the worker when the script reports done,
-even if the script keeps spinning (for example in a loop that catches the output limit's error).
+even if the script keeps spinning (for example in a loop that catches the output limit's error). Code
+after an ``await`` runs outside any evaluation and cannot be stopped that way; a script that spins
+there after reporting done ends as a sandbox failure (see ``_onDone``).
 
 The bridge and the prelude's API live in the closure of a host object under a non-enumerable
 global, which the worker's own evaluations call. The object is reachable from scripts, as every
@@ -77,8 +79,11 @@ _HOST_SOURCE = f"""((notify) => {{
 }})"""
 
 
-# How long `terminate()` waits for the output a stopped script left in its queue.
-_QUEUED_OUTPUT_TIMEOUT_SECONDS = 1.0
+# How long `terminate()` waits for the output a stopped script left in its queue. Short: upstream's host has the
+# output already and resolves at once; an isolate still running code after an `await` never answers.
+_QUEUED_OUTPUT_TIMEOUT_SECONDS = 0.25
+# How long a script that reported done may keep the isolate busy before the run is stopped (see `_onDone`).
+_DONE_GRACE_SECONDS = 0.25
 
 
 def _hostCode(expression: str) -> str:
@@ -103,6 +108,7 @@ class Worker:
         self._task: asyncio.Task[None] | None = None
         # The evaluation that may run script code, which a "done" ends.
         self._running: asyncio.Future[Any] | None = None
+        self._doneRelayed = False
 
     def start(self) -> None:
         self._task = asyncio.get_running_loop().create_task(self._main())
@@ -142,6 +148,11 @@ class Worker:
         except asyncio.CancelledError:
             raise
         except engine.OutOfMemoryError:
+            vm = self._vm
+            if vm is not None:
+                with contextlib.suppress(Exception):
+                    for item in await asyncio.wait_for(self._queuedOutput(vm), _QUEUED_OUTPUT_TIMEOUT_SECONDS):
+                        self._post({"type": "output", "item": item})
             self._post({"type": "crash", "message": "out of memory"})
         except Exception as error:  # noqa: BLE001 - upstream `main(workerData).catch(crash)`
             self._crash(error)
@@ -150,6 +161,16 @@ class Worker:
         """The prelude reported the script done; a script still spinning is stopped here."""
         if self._running is not None:
             self._running.cancel()
+            return
+        # MISAKA fork: code after an `await` runs once the evaluation that resumed it has returned, outside any
+        # evaluation, and V8 stops it only with the isolate. A done that is not relayed shortly means the script
+        # keeps spinning past it (upstream's host terminates the worker then); the run ends as a sandbox failure,
+        # since what it reported is still in the busy isolate.
+        asyncio.get_running_loop().call_later(_DONE_GRACE_SECONDS, self._stopSpinning)
+
+    def _stopSpinning(self) -> None:
+        if not self._doneRelayed:
+            self._post({"type": "crash", "message": "the script kept running after it finished"})
 
     async def _runScript(self, vm: engine.Vm, code: str, fileName: str | None = None) -> None:
         """Run an evaluation that may run script code. A "done" cancels it, which terminates the script
@@ -168,7 +189,7 @@ class Worker:
         data = self._data
         vm = self._vm = engine.Vm(data["memoryLimitBytes"])
         with vm.notifier(self._onDone) as notify:
-            vm.evaluate(_HOST_SOURCE, "codemode-host.js")(notify)
+            vm.evaluate(_HOST_SOURCE, engine.PRELUDE_FILE_NAME)(notify)
             await self._runVm(vm)
 
     async def _runVm(self, vm: engine.Vm) -> None:
@@ -235,6 +256,7 @@ class Worker:
             case "output":
                 self._post({"type": "output", "item": _outputItem(a, b, c)})
             case "done":
+                self._doneRelayed = True
                 if a:
                     self._post({"type": "done", "ok": True, "value": None if b is None else str(b), "writes": str(c)})
                 else:

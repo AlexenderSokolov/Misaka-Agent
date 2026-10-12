@@ -19,7 +19,7 @@ from misaka.chord import (
 from misaka.chord.context import BACKGROUND_CONTEXT
 from tests.chord_helpers import createLoopbackServiceTransport
 
-LocalGenerationValue = defineService("test.experimental.local-generation-value", local=True)
+LocalGenerationValue = defineService("test.experimental.local-generation-value", {"local": True})
 RemoteGenerationValue = defineService("test.experimental.remote-generation-value")
 
 

@@ -827,12 +827,13 @@ def test_catalog_lists_only_namespaces_with_a_zero_budget():
     assert "codemode tool declaration:" not in description
 
 
-# -- research scopes (user decision 2026-10-03) -------------------------------------------------
+# -- research scopes ---------------------------------------------------------------------------------
 
 
-async def test_research_scopes_add_codemode_and_tool_search_when_mcp_tools_are_registered(tmp_path):
+async def test_a_research_scope_inherits_the_window_s_active_tools_without_adding_codemode(tmp_path):
+    """Last Order's research window inherits the tools active in her session, her directly declared MCP tools
+    among them; codemode and tool_search are Sisters' tools and are not added."""
     from misaka.core.research import planner
-    from misaka.extensions.tool_search import createToolSearchExtension
 
     async def search(*_args):
         return AgentToolResult(content=[TextContent(text="found")], details={})
@@ -840,25 +841,14 @@ async def test_research_scopes_add_codemode_and_tool_search_when_mcp_tools_are_r
     def mcpLike(pi) -> None:
         pi.registerTool(ToolDefinition(
             name="mcp__docs__search", label="docs/search", description="Search the docs.",
-            parameters={"type": "object", "properties": {"q": {"type": "string"}}}, exposure="codemode",
+            parameters={"type": "object", "properties": {"q": {"type": "string"}}}, exposure="direct",
             namespace={"name": "mcp__docs"}, execute=search,
         ))
 
-    async with session_with(tmp_path, [createCodemodeExtension(), createToolSearchExtension()]) as plain:
-        owner = SimpleNamespace(session=plain)
-        assert "codemode" not in planner.session_tools(owner)
-
-    async with session_with(tmp_path, [createCodemodeExtension(), createToolSearchExtension(), mcpLike]) as session:
-        owner = SimpleNamespace(session=session)
-        names = list(planner.session_tools(owner))
-        assert "codemode" in names and "tool_search" in names
-        assert "mcp__docs__search" not in names
-        with session.toolScope(names, callable=planner.MCP_CALLABLE):
-            assert "codemode" in session.getActiveToolNames()
-            assert "mcp__docs__search" not in session.getActiveToolNames()
-            assert "mcp__docs__search" in session.getCallableToolNames()
-        with session.toolScope(names):
-            assert "mcp__docs__search" not in session.getCallableToolNames()
+    async with session_with(tmp_path, [createCodemodeExtension(), mcpLike]) as session:
+        names = list(planner.session_tools(SimpleNamespace(session=session)))
+        assert "mcp__docs__search" in names
+        assert "codemode" not in names and "tool_search" not in names
 
 
 async def test_shows_null_returned_by_a_script(tmp_path):

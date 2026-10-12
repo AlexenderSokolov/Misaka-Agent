@@ -1,13 +1,20 @@
-"""Edit tool for exact and fuzzy-aware search/replace operations."""
+"""Translated from pi's ``packages/coding-agent/src/core/tools/edit.ts`` (v1.1.0).
+
+MISAKA forks:
+- Office packages (.docx/.xlsx/.pptx) are refused and sent to the office tool, as in ``write``.
+- A file that is not valid UTF-8 is refused, where pi's ``toString("utf-8")`` replaces the bad bytes and writes the
+  replacement characters back.
+- The default operations read regular files only, below a size cap, and write through links (``_common``).
+"""
 
 from __future__ import annotations
 
 import asyncio
-import errno as errno_module
+import errno
 import json
-import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,9 +23,8 @@ from misaka.agent.types import AgentTool, AgentToolResult
 from misaka.ai.types import TextContent
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.tools._common import (
-    _drain_worker,
-    abort_race,
     regular_file,
+    settled,
     whole_file_bytes,
     write_file_text,
 )
@@ -35,21 +41,16 @@ from misaka.core.tools.file_mutation_queue import withFileMutationQueue
 from misaka.core.tools.path_utils import resolveToCwd
 from misaka.core.tools.renderers.edit import editRenderers
 from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
+from misaka.core.tools.write import _refuse_office_package
 from misaka.utils.text import splitBom
 from misaka.utils.values import read_field, signal_aborted
 
 
 class ReplaceEditInput(BaseModel):
-    # Upstream's schema does not set additionalProperties: false, and neither do the
-    # other built-in tools.  Rejecting unknown keys would refuse arguments that
-    # extensions legitimately annotate on a tool call.
     model_config = ConfigDict(extra="ignore")
 
     oldText: str = Field(
-        description=(
-            "Exact text for one targeted replacement. It must be unique in the original file "
-            "and must not overlap with any other edits[].oldText in the same call."
-        )
+        description="Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
     )
     newText: str = Field(description="Replacement text for this targeted edit.")
 
@@ -70,258 +71,178 @@ class EditToolInput(BaseModel):
 
     path: str = Field(description="Path to the file to edit (relative or absolute)")
     edits: list[ReplaceEditInput] = Field(
-        description=(
-            "One or more targeted replacements. Each edit is matched against the original file, not incrementally. "
-            "Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, "
-            "merge them into one edit instead."
-        )
+        description="One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
     )
 
 
-def _edit_tool_schema() -> dict[str, Any]:
-    """Inline the one Pydantic ref that TypeBox does not emit in Pi's edit schema."""
-    schema = EditToolInput.model_json_schema()
-    definitions = schema.pop("$defs")
-    schema["properties"]["edits"]["items"] = definitions["ReplaceEditInput"]
-    return schema
+def isSingleEditInput(value: Any) -> bool:
+    if not value or not isinstance(value, dict):
+        return False
+
+    edit = value
+    return isinstance(edit.get("oldText"), str) and isinstance(edit.get("newText"), str)
 
 
 @dataclass(slots=True)
 class EditToolDetails:
+    # Display-oriented diff of the changes made
     diff: str
+    # Standard unified patch of the changes made
     patch: str
+    # Line number of the first change in the new file (for editor navigation)
     firstChangedLine: int | None = None
 
 
 class EditOperations(Protocol):
+    """Pluggable operations for the edit tool.
+    Override these to delegate file editing to remote systems (for example SSH).
+    """
+
+    # Read file contents as a Buffer
     readFile: Callable[[str], Awaitable[bytes]]
+    # Write content to a file
     writeFile: Callable[[str, str], Awaitable[None]]
+    # Check if file is readable and writable (throw if not)
     access: Callable[[str], Awaitable[None]]
+
+
+defaultEditOperations: EditOperations = SimpleNamespace(  # type: ignore[assignment]
+    readFile=lambda path: asyncio.to_thread(whole_file_bytes, path, "edit"),
+    writeFile=lambda path, content: asyncio.to_thread(write_file_text, path, content),
+    access=lambda path: asyncio.to_thread(regular_file, path, writable=True),
+)
 
 
 @dataclass(slots=True)
 class EditToolOptions:
+    # Custom operations for file editing. Default: local filesystem
     operations: EditOperations | None = None
 
 
-
-
-@dataclass(slots=True)
-class _DefaultEditOperations:
-    async def readFile(self, absolute_path: str) -> bytes:
-        return await asyncio.to_thread(whole_file_bytes, absolute_path, "edit")
-
-    async def writeFile(self, absolute_path: str, content: str) -> None:
-        await asyncio.to_thread(write_file_text, absolute_path, content)   # follows symlinks; keeps the file's mode
-
-    async def access(self, absolute_path: str) -> None:
-        await asyncio.to_thread(regular_file, absolute_path, writable=True)
-
-
-def _coerce_options(options: EditToolOptions | Mapping[str, Any] | None) -> EditToolOptions:
-    if options is None:
-        return EditToolOptions()
-    if isinstance(options, EditToolOptions):
+def _coerce_options(options: EditToolOptions | Mapping[str, Any] | None) -> EditToolOptions | None:
+    """An option bag passed as a mapping, as JavaScript callers pass an object literal."""
+    if options is None or isinstance(options, EditToolOptions):
         return options
     return EditToolOptions(operations=options.get("operations"))
 
 
-def prepareEditArguments(input_value: Any) -> Any:
-    if not isinstance(input_value, dict):
-        return input_value
+def prepareEditArguments(input: Any) -> Any:
+    if not input or not isinstance(input, dict):
+        return input
 
-    def _single_edit(value: Any) -> bool:
-        # A single edit object (models often send this): wrap it in a one-element list (upstream #7835/ca21c1686)
-        return (isinstance(value, dict) and isinstance(value.get("oldText"), str)
-                and isinstance(value.get("newText"), str))
+    args = input
 
-    args = input_value
-    edits_value = args.get("edits")
-    if isinstance(edits_value, str):
+    # Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array.
+    # Others send a single edit object instead of a one-element edits array.
+    if isinstance(args.get("edits"), str):
         try:
-            parsed = json.loads(edits_value)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, list):
-            args["edits"] = parsed
-        elif _single_edit(parsed):
-            args["edits"] = [parsed]
-    elif _single_edit(edits_value):
-        args["edits"] = [edits_value]
+            parsed = json.loads(args["edits"])
+            if isinstance(parsed, list):
+                args["edits"] = parsed
+            elif isSingleEditInput(parsed):
+                args["edits"] = [parsed]
+        except ValueError:
+            pass
+    elif isSingleEditInput(args.get("edits")):
+        args["edits"] = [args["edits"]]
 
-    # Legacy single-edit format: a top-level oldText/newText pair instead of edits[].
-    # Fold it onto the end of edits[] and strip it, so replayed transcripts and older
-    # callers still execute.  The pair only counts when both halves are strings.
-    old_text = args.get("oldText")
-    new_text = args.get("newText")
-    if not isinstance(old_text, str) or not isinstance(new_text, str):
+    legacy = args
+    if not isinstance(legacy.get("oldText"), str) or not isinstance(legacy.get("newText"), str):
         return args
 
-    edits = list(args["edits"]) if isinstance(args.get("edits"), list) else []
-    edits.append({"oldText": old_text, "newText": new_text})
-    rest = {key: value for key, value in args.items() if key not in ("oldText", "newText", "edits")}
+    edits = [*legacy["edits"]] if isinstance(legacy.get("edits"), list) else []
+    edits.append({"oldText": legacy["oldText"], "newText": legacy["newText"]})
+    rest = {key: value for key, value in legacy.items() if key not in ("oldText", "newText")}
     return {**rest, "edits": edits}
 
 
-def validateEditInput(input_value: EditToolInput) -> tuple[str, list[Edit]]:
-    if not input_value.edits:
+def validateEditInput(input: EditToolInput) -> tuple[str, list[Edit]]:
+    if not isinstance(input.edits, list) or len(input.edits) == 0:
         raise RuntimeError("Edit tool input is invalid. edits must contain at least one replacement.")
-    return input_value.path, [Edit(oldText=edit.oldText, newText=edit.newText) for edit in input_value.edits]
-
-
-def _format_access_error(error: BaseException) -> str:
-    if isinstance(error, OSError) and error.errno is not None:
-        code = errno_module.errorcode.get(error.errno)
-        if code:
-            return f"Error code: {code}"
-    if isinstance(error, Exception):
-        return f"Error: {error}"
-    return str(error)
-
-
-def _refuse_office_package(absolute_path: str, tool: str) -> None:
-    """Send a .docx/.xlsx/.pptx to the office tool instead of corrupting it.
-
-    These are zip packages. Decoding one as text and writing the result back produces a
-    file no program will open, and both tools would report success -- the model finds out
-    only when someone tries to open the deliverable. A local import: ``documents.office``
-    pulls in openpyxl, and these tools are constructed for every session.
-    """
-    from misaka.core.documents import office
-
-    suffix = os.path.splitext(absolute_path)[1].lower()
-    if suffix in office.SUFFIXES and suffix not in _TEXT_OFFICE_SUFFIXES:
-        raise RuntimeError(
-            f"{tool} cannot write {suffix}: it is a zip package, not text, and writing it "
-            f"as text corrupts it. Use the office tool, which edits it through structured "
-            f"operations. To read it, use read."
-        )
-
-
-# .csv and .tsv are text and both tools have always handled them; only the packages are
-# refused here.
-_TEXT_OFFICE_SUFFIXES = frozenset({".csv", ".tsv"})
+    return input.path, [Edit(oldText=edit.oldText, newText=edit.newText) for edit in input.edits]
 
 
 def createEditToolDefinition(
     cwd: str,
     options: EditToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[EditToolInput | dict[str, Any], EditToolDetails | None]:
-    resolved_options = _coerce_options(options)
-    operations = resolved_options.operations or _DefaultEditOperations()
+    options = _coerce_options(options)
+    ops = (options.operations if options else None) or defaultEditOperations
 
     async def execute(
-        _tool_call_id: str,
-        input_value: EditToolInput | dict[str, Any],
+        _toolCallId: str,
+        input: EditToolInput | dict[str, Any],
         signal: Any | None = None,
-        _on_update: Callable[[AgentToolResult], None] | None = None,
+        _onUpdate: Callable[[AgentToolResult], None] | None = None,
         ctx: Any = None,
     ) -> AgentToolResult:
-        parsed = EditToolInput.model_validate(input_value)
-        path, edits = validateEditInput(parsed)
-        absolute_path = resolveToCwd(path, read_field(ctx, "cwd") or cwd)
-        _refuse_office_package(absolute_path, "edit")
+        path, edits = validateEditInput(EditToolInput.model_validate(input))
+        absolutePath = resolveToCwd(path, read_field(ctx, "cwd") or cwd)
+        # MISAKA fork: Office packages go to the office tool.
+        _refuse_office_package(absolutePath, "edit")
 
         async def mutate() -> AgentToolResult:
-            if signal_aborted(signal):
-                raise RuntimeError("Operation aborted")
+            # Do not reject from an abort event listener here: that would release the
+            # mutation queue while an in-flight filesystem operation may still finish.
+            # Checking signal.aborted after each await observes the same aborts while
+            # keeping the queue locked until the current operation has settled.
+            def throwIfAborted() -> None:
+                if signal_aborted(signal):
+                    raise RuntimeError("Operation aborted")
 
-            aborted = False
+            throwIfAborted()
 
-            async def worker() -> AgentToolResult | None:
-                try:
-                    try:
-                        await operations.access(absolute_path)
-                    except Exception as error:  # noqa: BLE001 - any access failure becomes the user-facing edit error
-                        raise RuntimeError(f"Could not edit file: {path}. {_format_access_error(error)}.") from None
+            # Check if file exists.
+            try:
+                await settled(ops.access(absolutePath))
+            except Exception as error:  # noqa: BLE001 - any access failure becomes the user-facing edit error
+                throwIfAborted()
+                code = errno.errorcode.get(error.errno) if isinstance(error, OSError) and error.errno else None
+                errorMessage = f"Error code: {code}" if code else f"Error: {error}"
+                raise RuntimeError(f"Could not edit file: {path}. {errorMessage}.") from None
+            throwIfAborted()
 
-                    if aborted:
-                        return None
+            # Read the file.
+            buffer = await settled(ops.readFile(absolutePath))
+            try:
+                rawContent = buffer.decode("utf-8")
+            except UnicodeDecodeError as error:
+                # MISAKA fork: refuse a file that is not UTF-8 rather than corrupt it.
+                raise RuntimeError(
+                    f"Could not edit file: {path}. It is not valid UTF-8 text ({error}); "
+                    "editing it as text would corrupt it. Use bash for binary files."
+                ) from None
+            throwIfAborted()
 
-                    buffer = await operations.readFile(absolute_path)
-                    if aborted:
-                        return None
+            # Strip BOM before matching. The model will not include an invisible BOM in oldText.
+            split = splitBom(rawContent)
+            bom, content = split["bom"], split["text"]
+            originalEnding = detectLineEnding(content)
+            normalizedContent = normalizeToLF(content)
+            applied = applyEditsToNormalizedContent(normalizedContent, edits, path)
+            baseContent, newContent = applied.baseContent, applied.newContent
+            throwIfAborted()
 
-                    try:
-                        raw_content = buffer.decode("utf-8")
-                    except UnicodeDecodeError as error:
-                        raise RuntimeError(
-                            f"Could not edit file: {path}. It is not valid UTF-8 text ({error}); "
-                            "editing it as text would corrupt it. Use bash for binary files."
-                        ) from None
-                    split = splitBom(raw_content)
-                    bom, content = split["bom"], split["text"]
-                    original_ending = detectLineEnding(content)
-                    normalized_content = normalizeToLF(content)
-                    applied = applyEditsToNormalizedContent(normalized_content, edits, path)
+            finalContent = bom + restoreLineEndings(newContent, originalEnding)
+            await settled(ops.writeFile(absolutePath, finalContent))
+            throwIfAborted()
 
-                    if aborted:
-                        return None
+            diffResult = generateDiffString(baseContent, newContent)
+            patch = generateUnifiedPatch(path, baseContent, newContent)
+            return AgentToolResult(
+                content=[TextContent(text=f"Successfully replaced {len(edits)} block(s) in {path}.")],
+                details=EditToolDetails(diff=diffResult.diff, patch=patch, firstChangedLine=diffResult.firstChangedLine),
+            )
 
-                    final_content = bom + restoreLineEndings(applied.newContent, original_ending)
-                    await operations.writeFile(absolute_path, final_content)
-                    if aborted:
-                        return None
-
-                    diff_result = generateDiffString(applied.baseContent, applied.newContent)
-                    patch = generateUnifiedPatch(path, applied.baseContent, applied.newContent)
-                    return AgentToolResult(
-                        content=[TextContent(text=f"Successfully replaced {len(edits)} block(s) in {path}.")],
-                        details=EditToolDetails(
-                            diff=diff_result.diff,
-                            patch=patch,
-                            firstChangedLine=diff_result.firstChangedLine,
-                        ),
-                    )
-                except Exception:
-                    if aborted:
-                        return None
-                    raise
-
-            worker_task = asyncio.create_task(worker())
-            async with abort_race(signal) as abort_task:
-                try:
-                    if abort_task is None:
-                        result = await asyncio.shield(worker_task)
-                        if result is None:
-                            raise RuntimeError("Operation aborted")
-                        return result
-
-                    done, _pending = await asyncio.wait({worker_task, abort_task}, return_when=asyncio.FIRST_COMPLETED)
-                    if abort_task in done and worker_task not in done:
-                        aborted = True
-                        # A to-thread/custom write cannot be stopped by cancelling its Task.
-                        # Hold the per-file lock until it really ends so it cannot overtake
-                        # and overwrite a later mutation.
-                        if await _drain_worker(worker_task):
-                            raise asyncio.CancelledError
-                        raise RuntimeError("Operation aborted")
-
-                    result = await asyncio.shield(worker_task)
-                    if aborted or result is None:
-                        raise RuntimeError("Operation aborted")
-                    return result
-                except BaseException as error:
-                    aborted = True
-                    cancelled = await _drain_worker(worker_task)
-                    if cancelled and not isinstance(error, asyncio.CancelledError):
-                        raise asyncio.CancelledError from error
-                    raise
-
-        return await withFileMutationQueue(absolute_path, mutate)
+        return await withFileMutationQueue(absolutePath, mutate)
 
     return ToolDefinition(
         name="edit",
         label="edit",
-        description=(
-            "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, "
-            "non-overlapping region of the original file. If two changes affect the same block or nearby lines, "
-            "merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions "
-            "just to connect distant changes."
-        ),
+        description="Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
         promptSnippet=editToolSystemPromptContribution["snippet"],
         promptGuidelines=[*editToolSystemPromptContribution["guidelines"]],
-        parameters=_edit_tool_schema(),
+        parameters=EditToolInput,
         constrainedSampling={"type": "json_schema", "strict": "prefer"},
         renderShell="self",
         prepareArguments=prepareEditArguments,
@@ -332,7 +253,6 @@ def createEditToolDefinition(
 
 def createEditTool(cwd: str, options: EditToolOptions | Mapping[str, Any] | None = None) -> AgentTool:
     return wrapToolDefinition(createEditToolDefinition(cwd, options))
-
 
 
 __all__ = [

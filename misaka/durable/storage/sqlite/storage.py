@@ -145,7 +145,7 @@ class SqliteStorage:
             raise
 
     @eager
-    async def commit(self, writes: Sequence[dict[str, Any]], context: Context) -> Seq:
+    async def commit(self, writes: Sequence[dict[str, Any]], _context: Context) -> Seq:
         self._assertOpen()
         documentActions = self._prepareDocumentActions(writes)
         candidateNextId = self._candidateNextId(writes)
@@ -181,13 +181,13 @@ class SqliteStorage:
         return idFromNumber(id)
 
     @eager
-    async def conversation(self, id: int, context: Context) -> dict[str, Any] | None:
+    async def conversation(self, id: int, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         row = await self._db.get("SELECT record FROM conversations WHERE id = ?", id)
         return None if row is None else parseJson(row["record"])
 
     @eager
-    async def scanConversations(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Page:
+    async def scanConversations(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> Page:
         self._assertOpen()
         start = scanStart(query.get("order", UNDEFINED), cursor, "ascending")
         scan = scanSql(start)
@@ -211,11 +211,11 @@ class SqliteStorage:
         return self._admitRead(lambda: self._readEntry(*args))
 
     def findLatestHeadMarker(
-        self, conversationId: int, atOrBeforeEntryId: int | None, context: Context
+        self, conversationId: int, atOrBeforeEntryId: int | None, _context: Context
     ) -> asyncio.Future[dict[str, Any] | None]:
         return self._admitRead(lambda: self._readLatestHeadMarker(conversationId, atOrBeforeEntryId))
 
-    def scanEntries(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> asyncio.Future[Page]:
+    def scanEntries(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> asyncio.Future[Page]:
         return self._admitRead(lambda: self._readEntries(query, limit, cursor))
 
     async def _readEntry(self, *args: Any) -> dict[str, Any] | None:
@@ -342,13 +342,13 @@ class SqliteStorage:
         return page(values, limit, "ascending")
 
     @eager
-    async def task(self, id: int, context: Context) -> dict[str, Any] | None:
+    async def task(self, id: int, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         row = await self._db.get("SELECT record FROM tasks WHERE id = ?", id)
         return None if row is None else parseJson(row["record"])
 
     @eager
-    async def scanTasks(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Page:
+    async def scanTasks(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> Page:
         self._assertOpen()
         start = scanStart(query.get("order", UNDEFINED), cursor, "ascending")
         scan = scanSql(start)
@@ -376,13 +376,13 @@ class SqliteStorage:
         return page([parseJson(row["record"]) for row in rows], limit, start["order"])
 
     @eager
-    async def submission(self, id: int, context: Context) -> dict[str, Any] | None:
+    async def submission(self, id: int, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         row = await self._db.get("SELECT record FROM submissions WHERE id = ?", id)
         return None if row is None else parseJson(row["record"])
 
     @eager
-    async def scanSubmissions(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Page:
+    async def scanSubmissions(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> Page:
         self._assertOpen()
         start = scanStart(query.get("order", UNDEFINED), cursor, "ascending")
         scan = scanSql(start)
@@ -401,7 +401,7 @@ class SqliteStorage:
         return page([parseJson(row["record"]) for row in rows], limit, start["order"])
 
     @eager
-    async def submissionByRequest(self, conversationId: int, requestId: str, context: Context) -> dict[str, Any] | None:
+    async def submissionByRequest(self, conversationId: int, requestId: str, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         row = await self._db.get(
             "SELECT record FROM submissions WHERE conversation_id = ? AND request_id = ?",
@@ -411,7 +411,7 @@ class SqliteStorage:
         return None if row is None else parseJson(row["record"])
 
     @eager
-    async def findDocument(self, address: dict[str, Any], at: DocumentPoint, context: Context) -> dict[str, Any] | None:
+    async def findDocument(self, address: dict[str, Any], at: DocumentPoint, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         parts = addressParts(address)
         if at == "current":
@@ -430,13 +430,13 @@ class SqliteStorage:
         return None if row is None else parseJson(row["record"])
 
     @eager
-    async def document(self, id: int, at: DocumentPoint, context: Context) -> dict[str, Any] | None:
+    async def document(self, id: int, at: DocumentPoint, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         # The record and revision queries must observe one committed state; a commit between them can replace the base.
         return await self._db.transaction(lambda transaction: self._materializeDocument(transaction, id, at))
 
     @eager
-    async def scanDocuments(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Page:
+    async def scanDocuments(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> Page:
         self._assertOpen()
         scope = scopeColumns(query["scope"])
         clauses = ["scope_kind = ?", "owner_id = ?", "id > ?"]
@@ -454,7 +454,7 @@ class SqliteStorage:
         rows = await self._db.all(f"SELECT record FROM documents WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?", *params)
         return page([parseJson(row["record"]) for row in rows], limit)
 
-    def close(self, context: Context) -> asyncio.Future[None]:
+    def close(self, _context: Context) -> asyncio.Future[None]:
         if self._closing is None:
             self._closed = True
             self._closing = startTask(self._closeDatabase())
@@ -717,7 +717,7 @@ class SqliteStorage:
                 except StorageRejected:
                     raise
                 except Exception as error:
-                    raise StorageRejected(f"Document copy {id} was rejected", error) from error
+                    raise StorageRejected(f"Document copy {id} was rejected", {"cause": error}) from error
             create = action.get("create")
             if create is not None:
                 record = {**create, "createdAt": seq, **({"retiredAt": seq} if action["retire"] else {})}

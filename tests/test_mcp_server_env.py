@@ -121,7 +121,7 @@ def test_a_role_session_spawns_its_servers_with_the_allowlist_and_its_own_names(
     env = transport.options["env"]
     assert env["HOME"] == "/home/u" and env["MODE"] == "a" and "PATH" in env
     assert env["MISAKA_WHO"] == "10032" and env["MISAKA_MCP_ROLE"] == "10032"
-    assert env["MISAKA_PROFILE_DIR"] == "/roles/a$b" and env["PYTHONUNBUFFERED"] == "1"
+    assert env["MISAKA_PROFILE_DIR"] == "/roles/a$b" and "PYTHONUNBUFFERED" not in env
     assert not {"OPENAI_API_KEY", "EXA_API_KEY", "GITHUB_TOKEN", "MISAKA_USAGE_DB"} & set(env)
 
     seen = {}

@@ -90,20 +90,6 @@ selectTheme = SelectListTheme(
 )
 
 
-def message(error: BaseException) -> str:
-    return errorMessage(error)
-
-
-async def _awaited(value: Any) -> Any:
-    return await value if inspect.isawaitable(value) else value
-
-
-def _valueOf(state: Any) -> Any:
-    """A replicated state's value, or ``None`` before its first one."""
-    value = state.value
-    return None if value is UNDEFINED else value
-
-
 class ExperimentalClientTui:
     """Service-only presentation driven by a replicated main-lane snapshot."""
 
@@ -768,12 +754,7 @@ async def runClientTui(command: dict[str, Any], options: dict[str, Any] | None =
     tui.setClearOnShrink(settingsManager.getClearOnShrink())
     component: ExperimentalClientTui | None = None
     tuiStarted = False
-    themeController = InteractiveThemeController(
-        tui,
-        getSettingsManager=lambda: settingsManager,
-        showError=lambda error: component.showError(error) if component is not None else None,
-        onChanged=lambda: component.refreshTheme() if component is not None else None,
-    )
+    themeController = InteractiveThemeController(tui, {"getSettingsManager": lambda: settingsManager, "showError": lambda error: component.showError(error) if component is not None else None, "onChanged": lambda: component.refreshTheme() if component is not None else None})
     loop = asyncio.get_running_loop()
     finished: asyncio.Future[None] = loop.create_future()
 
@@ -826,4 +807,18 @@ def requireSingleServer(features: list[SimpleNamespace]) -> SimpleNamespace:
     if len(features) != 1:
         raise RuntimeError("Starting a Session requires exactly one server")
     return features[0]
+
+
+def message(error: BaseException) -> str:
+    return errorMessage(error)
+
+
+async def _awaited(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
+def _valueOf(state: Any) -> Any:
+    """A replicated state's value, or ``None`` before its first one."""
+    value = state.value
+    return None if value is UNDEFINED else value
 

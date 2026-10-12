@@ -51,7 +51,6 @@ type FileKind = Literal["file", "directory", "symlink"]
 type FileErrorCode = Literal[
     "aborted", "not_found", "permission_denied", "not_directory", "is_directory", "invalid", "not_supported", "unknown"
 ]
-type ExecutionErrorCode = Literal["aborted", "timeout", "shell_unavailable", "spawn_error", "callback_error", "unknown"]
 
 
 class FileError(Exception):
@@ -64,6 +63,7 @@ class FileError(Exception):
         self.cause = cause
         if cause is not None:
             self.__cause__ = cause
+type ExecutionErrorCode = Literal["aborted", "timeout", "shell_unavailable", "spawn_error", "callback_error", "unknown"]
 
 
 class ExecutionError(Exception):

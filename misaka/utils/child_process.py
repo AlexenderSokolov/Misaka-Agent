@@ -1,4 +1,11 @@
-"""Subprocess helpers shared across coding-agent modules."""
+"""Translated from pi's ``packages/coding-agent/src/utils/child-process.ts`` (v1.1.0).
+
+MISAKA fork: Node's ``ChildProcess`` events are an asyncio subprocess protocol here. ``spawn_child_process`` is
+Node's ``spawn`` with piped stdout/stderr, whose chunks go to ``on_data``; ``waitForChildProcess`` is upstream's
+wait, run by the protocol (exit, then the pipes' end or ``EXIT_STDIO_GRACE_MS`` of quiet), and a consumer still
+draining what it read can hold the pipes open (``set_draining_check``). ``spawnProcess``/``spawnProcessSync`` are not
+ported: their callers (the package manager and the npm prefix probe) are not either.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +14,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from typing import Any
 
-_EXIT_STDIO_GRACE_SECONDS = 0.1
+EXIT_STDIO_GRACE_MS = 100
 
 
 class _ChildProcessProtocol(asyncio.SubprocessProtocol):
@@ -68,7 +75,7 @@ class _ChildProcessProtocol(asyncio.SubprocessProtocol):
         if self._idle_handle is not None:
             self._idle_handle.cancel()
         self._idle_handle = self._loop.call_later(
-            _EXIT_STDIO_GRACE_SECONDS,
+            EXIT_STDIO_GRACE_MS / 1000,
             self._idle_expired,
         )
 
@@ -183,6 +190,16 @@ async def spawn_child_process(
 
 
 async def waitForChildProcess(child: ChildProcess) -> int | None:
+    """Wait for a child process to terminate without hanging on inherited stdio handles.
+
+    A short-lived child can `exit` while a detached descendant keeps its stdout/stderr
+    pipe open. We must not resolve and destroy the streams on a fixed deadline measured
+    from `exit`, or output still being written past that deadline is silently lost
+    (earendil-works/pi#5303). Instead, after `exit` we wait for the pipes to fall idle:
+    the grace timer is re-armed on every chunk, so an actively writing descendant keeps
+    us reading, while a quiet inherited handle (e.g. a Windows daemonized descendant
+    that never lets `close` fire) still releases us after the grace elapses.
+    """
     return await child.wait()
 
 

@@ -58,6 +58,7 @@ class Args:
     noThemes: bool = False
     noContextFiles: bool = False
     listModels: str | bool | None = None
+    offline: bool = False
     verbose: bool = False
     projectTrustOverride: bool | None = None
     messages: list[str] = field(default_factory=list)
@@ -266,6 +267,8 @@ def parseArgs(args: list[str]) -> Args:
                 result.listModels = True
         elif arg == "--verbose":
             result.verbose = True
+        elif arg == "--offline":
+            result.offline = True
         elif arg.startswith("@"):
             result.fileArgs.append(arg[1:])
         elif arg.startswith("--"):
@@ -326,6 +329,7 @@ Options:
   --continue, -c                 Continue previous session
   --approve, -a                  Trust project-local settings and resources for this run
   --no-approve, -na              Ignore project-local settings and resources for this run
+  --offline                      Disable startup network operations (same as MISAKA_OFFLINE=1)
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID
   --session-id <id>              Use exact project session ID, creating it if missing

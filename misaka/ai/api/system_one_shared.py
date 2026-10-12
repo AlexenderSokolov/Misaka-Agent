@@ -1,8 +1,7 @@
 """Translated from pi's ``packages/ai/src/api/system-one-shared.ts`` (v1.1.0).
 
 MISAKA fork (each is marked where it happens): a plain mapping context is read into ``ClassifierContext``, the
-transport interface is a dataclass of callables, and a question model is spread through ``model_dump``. Questions and
-probabilities keep Python's insertion order, where ``Object.entries`` lists integer-like keys first.
+transport interface is a dataclass of callables, and a question model is spread through ``model_dump``.
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ from misaka.ai.types import (
     ClassifierScoreAnswer,
 )
 from misaka.ai.utils.error_body import formatProviderError, normalizeProviderError
+from misaka.utils.js import objectEntries
 from misaka.utils.values import signal_aborted
 
 
@@ -61,7 +61,7 @@ def _probabilities(label: str, value: Any, id: str) -> dict[str, float]:
     if not isRecord(value):
         raise RuntimeError(f"{label} returned invalid probabilities for {id}")
     return {
-        key: requiredNumber(label, probability, f"probability for {id}.{key}") for key, probability in value.items()
+        key: requiredNumber(label, probability, f"probability for {id}.{key}") for key, probability in objectEntries(value)
     }
 
 
@@ -69,7 +69,7 @@ def _parseAnswers(label: str, value: Any, context: ClassifierContext) -> dict[st
     if not isRecord(value):
         raise RuntimeError(f"{label} returned an unexpected response")
     answers: list[tuple[str, ClassifierAnswerValue]] = []
-    for id, question in context.questions.items():
+    for id, question in objectEntries(context.questions):
         answer = value.get(id)
         if not isRecord(answer):
             raise RuntimeError(f"{label} did not return an answer for {id}")
@@ -126,7 +126,7 @@ def _wireRequest(context: ClassifierContext) -> SystemOneWireRequest:
         "state": context.state,
         "questions": {
             id: {**wire(question), "type": "noul"} if question.type == "bool" else wire(question)
-            for id, question in context.questions.items()
+            for id, question in objectEntries(context.questions)
         },
     }
 

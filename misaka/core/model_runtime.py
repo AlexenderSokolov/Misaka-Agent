@@ -11,7 +11,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired, TypedDict
 
 from misaka.ai.api.lazy import lazyStream
 from misaka.ai.auth.resolve import AuthResolutionOverrides
@@ -104,6 +104,7 @@ from misaka.utils._abort_signal import (
     throw_if_aborted,
 )
 from misaka.utils.abort import operationSignal, raceWithAbortSignal
+from misaka.utils.js import ErrorOptions, errorMessage, jsTrim
 from misaka.utils.values import read_field, signal_aborted
 
 _UNSET: Any = object()
@@ -123,6 +124,25 @@ class _ModelRuntimeSnapshot:
     storedProviders: frozenset[str] = frozenset()
     auth: Mapping[str, AuthCheck | None] = field(default_factory=dict)
 
+class CreateModelRuntimeOptions(TypedDict, total=False):
+    credentials: CredentialStore
+    """Credential storage. Defaults to the file at authPath."""
+    authPath: str
+    modelsPath: str | None
+    modelsStore: Any
+    modelsStorePath: str
+    allowModelNetwork: bool
+    """Allow create() to refresh model catalogs over the network. Defaults to false."""
+    modelRefreshTimeoutMs: float
+    """Timeout for the create-time network model refresh."""
+    catalogBaseUrl: str
+    signal: Any
+    """Optional caller cancellation for initial cache restoration and availability checks."""
+    refreshOnCreate: bool
+    """Skip initial catalog and availability refresh. Static models remain available."""
+    authStorage: AuthStorage
+    """MISAKA fork: the auth.json store kept as ``runtime.authStorage``."""
+
 
 ModelRuntimeAuthOverrides = AuthResolutionOverrides
 
@@ -135,7 +155,7 @@ type CredentialSynchronizationOperation = Literal[
 class CredentialSynchronizationError(Exception):
     """Credentials changed successfully, but the local model/auth snapshot could not be synchronized.
 
-    Raised ``from`` the cause, which is upstream's ``{ cause }``.
+    The ``cause`` of ``options`` is also chained as ``__cause__``.
     """
 
     def __init__(
@@ -143,8 +163,13 @@ class CredentialSynchronizationError(Exception):
         providerId: str,
         operation: CredentialSynchronizationOperation,
         credential: Credential | None,
+        options: ErrorOptions,
     ) -> None:
         super().__init__(f"Credential {operation} committed for {providerId}, but local synchronization failed")
+        self.cause = options.get("cause")
+        if self.cause is not None:
+            self.__cause__ = self.cause
+        self.name = "CredentialSynchronizationError"
         self.providerId = providerId
         self.operation = operation
         self.credential = credential
@@ -221,6 +246,15 @@ def _modelsStorePath(modelsPath: str) -> str:
     return os.path.join(os.path.dirname(modelsPath), "models-store.json")
 
 
+
+
+class ResolveModelOptions(TypedDict):
+    reason: ModelRouteReason
+    thinkingLevel: ModelThinkingLevel
+    signal: NotRequired[Any]
+    failed: NotRequired[AssistantMessage | None]
+    state: NotRequired[Any]
+
 class ModelRuntime:
     """Configured ``Models`` collection used by misaka's sessions and SDK consumers."""
 
@@ -235,6 +269,7 @@ class ModelRuntime:
         authStorage: AuthStorage | None = None,
     ) -> None:
         # Private by convention: build one with `ModelRuntime.create`.
+        # MISAKA fork: `authStorage` is the auth.json store kept reachable as `runtime.authStorage`.
         self._credentials = credentials
         self._config = config
         self._modelsPath = modelsPath
@@ -267,29 +302,21 @@ class ModelRuntime:
         self._rebuildProviders()
 
     @classmethod
-    async def create(
-        cls,
-        *,
-        credentials: CredentialStore | None = None,
-        authPath: str | None = None,
-        modelsPath: str | None = _UNSET,
-        modelsStore: Any = None,
-        modelsStorePath: str | None = None,
-        allowModelNetwork: bool = False,
-        modelRefreshTimeoutMs: float | None = None,
-        catalogBaseUrl: str | None = None,
-        signal: Any = None,
-        refreshOnCreate: bool = True,
-        authStorage: AuthStorage | None = None,
-    ) -> ModelRuntime:
-        """``credentials`` defaults to the file at ``authPath``; ``modelsPath=None`` means no
-        models.json; ``allowModelNetwork`` lets create() refresh catalogs over the network,
-        bounded by ``modelRefreshTimeoutMs``; ``signal`` cancels the initial cache restoration and
-        availability checks; ``refreshOnCreate=False`` skips them (static models remain available).
-
-        MISAKA fork: the auth.json store stays reachable as ``runtime.authStorage``, whether it was handed in as
+    async def create(cls, options: CreateModelRuntimeOptions | None = None) -> ModelRuntime:
+        """MISAKA fork: the auth.json store stays reachable as ``runtime.authStorage``, whether it was handed in as
         ``credentials``, as ``authStorage``, or made here from ``authPath``.
         """
+        options = options if options is not None else {}
+        credentials = options.get("credentials")
+        authStorage = options.get("authStorage")
+        authPath = options.get("authPath")
+        # A present `None` is upstream's `null` (no models.json); an absent key takes the default.
+        modelsPath = options.get("modelsPath", _UNSET)
+        modelsStore = options.get("modelsStore")
+        modelsStorePath = options.get("modelsStorePath")
+        catalogBaseUrl = options.get("catalogBaseUrl")
+        signal = options.get("signal")
+        modelRefreshTimeoutMs = options.get("modelRefreshTimeoutMs")
         if credentials is None:
             authStorage = authStorage if authStorage is not None else AuthStorage.create(authPath)
             credentials = authStorage
@@ -335,13 +362,13 @@ class ModelRuntime:
             runtime._coreProviderIds.append(providerId)
             runtime._recomposeProvider(providerId)
         runtime._updateModelSnapshot()
-        refreshFromNetwork = runtime._modelNetworkEnabled and allowModelNetwork is True
+        refreshFromNetwork = runtime._modelNetworkEnabled and options.get("allowModelNetwork") is True
         timeout = (
             TimeoutAbortSignal(modelRefreshTimeoutMs)
             if refreshFromNetwork and modelRefreshTimeoutMs is not None
             else None
         )
-        if refreshOnCreate is not False:
+        if options.get("refreshOnCreate") is not False:
             await runtime.refresh(
                 ModelsRefreshOptions(
                     allowNetwork=refreshFromNetwork,
@@ -403,7 +430,7 @@ class ModelRuntime:
             self._compositionErrors.pop(providerId, None)
             return provider
         except Exception as error:  # noqa: BLE001 - reported through getError(); the base stays usable
-            self._compositionErrors[providerId] = str(error)
+            self._compositionErrors[providerId] = errorMessage(error)
             return base
 
     def _rebuildProviders(self) -> None:
@@ -459,7 +486,7 @@ class ModelRuntime:
                 await self._runAvailabilityRefresh(seq, errorSeq, effectiveSignal)
             except Exception as error:
                 if errorSeq == self._availabilityErrorSeq and not signal_aborted(effectiveSignal):
-                    self._availabilityError = str(error)
+                    self._availabilityError = errorMessage(error)
                 raise
 
         return run()
@@ -521,7 +548,7 @@ class ModelRuntime:
                 and errorSeq == self._availabilityErrorSeq
                 and not signal_aborted(signal)
             ):
-                self._availabilityError = str(error)
+                self._availabilityError = errorMessage(error)
             raise
 
     def getProviders(self) -> list[Any]:
@@ -573,7 +600,7 @@ class ModelRuntime:
                 if errorSeq == self._availabilityErrorSeq and not signal_aborted(
                     options.signal if options is not None else None
                 ):
-                    self._availabilityError = str(error)
+                    self._availabilityError = errorMessage(error)
                 raise
         await self._queueAvailabilityRefresh(options.signal if options is not None else None)
         return list(self._snapshot.available)
@@ -704,7 +731,7 @@ class ModelRuntime:
             self._updateModelSnapshot()
             await self._refreshProviderAvailability(providerId, signal)
         except Exception as cause:
-            raise CredentialSynchronizationError(providerId, operation, credential) from cause
+            raise CredentialSynchronizationError(providerId, operation, credential, {"cause": cause}) from cause
         await self._refreshCoreProviders(providerId, signal)
 
     async def _refreshCoreProviders(self, providerId: str, signal: Any) -> None:
@@ -833,13 +860,7 @@ class ModelRuntime:
             # Requests outside the agent loop are routed here. Callers sized them before routing, so
             # cap the output budget to the routed model.
             async def routed() -> AssistantMessageEventStream:
-                route = await self.resolveModel(
-                    model,
-                    transcript.messages,
-                    reason="direct",
-                    thinkingLevel=read_field(options, "reasoning") or "off",
-                    signal=read_field(options, "signal"),
-                )
+                route = await self.resolveModel(model, transcript.messages, {"reason": "direct", "thinkingLevel": read_field(options, "reasoning") or "off", "signal": read_field(options, "signal")})
                 limit = route.model.maxTokens
                 requested = read_field(options, "maxTokens")
                 maxTokens = min(requested, limit) if requested and limit > 0 else requested
@@ -1015,7 +1036,7 @@ class ModelRuntime:
             task.exception()
 
     def registerNativeProvider(self, provider: Any) -> None:
-        if not provider.id.strip():
+        if not jsTrim(provider.id):
             raise RuntimeError("Provider id must not be empty.")
         self._extensionProviders.pop(provider.id, None)
         self._nativeExtensionProviders[provider.id] = provider
@@ -1092,7 +1113,7 @@ class ModelRuntime:
         models or several virtual models. Re-registering the same provider and id replaces the
         virtual model. Raises when the id belongs to a physical model of that provider."""
         providerId, id = definition.provider, definition.id
-        if not providerId.strip() or not id.strip():
+        if not jsTrim(providerId) or not jsTrim(id):
             raise RuntimeError("Virtual model provider and id must not be empty.")
         existing = self._models.getModel(providerId, id)
         if existing is not None and not isVirtualModel(existing):
@@ -1121,17 +1142,7 @@ class ModelRuntime:
         self._updateModelSnapshot()
         self._spawnRefresh()
 
-    async def resolveModel(
-        self,
-        model: Model,
-        messages: Sequence[Message],
-        *,
-        reason: ModelRouteReason,
-        thinkingLevel: ModelThinkingLevel,
-        signal: Any = None,
-        failed: AssistantMessage | None = None,
-        state: Any = None,
-    ) -> ModelRoute:
+    async def resolveModel(self, model: Model, messages: Sequence[Message], options: ResolveModelOptions) -> ModelRoute:
         """Ask a virtual model's router for the model and thinking level of one request. The
         router must return a physical catalog model whose provider has credentials; the thinking
         level is clamped to that model. Raises when routing fails.
@@ -1144,6 +1155,7 @@ class ModelRuntime:
         virtual = self._virtualModels.get(model.provider, {}).get(model.id)
         if virtual is None:
             raise RuntimeError(f"{name} is not registered.")
+        failed = options.get("failed")
         latest = findLatestResponse(messages)
         previousModel = (
             self.getPhysicalModel(read_field(latest, "provider"), read_field(latest, "model"))
@@ -1155,8 +1167,8 @@ class ModelRuntime:
         routed = virtual.route(
             ModelRouteRequest(
                 model=model,
-                thinkingLevel=thinkingLevel,
-                reason=reason,
+                thinkingLevel=options["thinkingLevel"],
+                reason=options["reason"],
                 messages=messages,
                 previous=(
                     PreviousRoute(model=previousModel, thinkingLevel=read_field(latest, "thinkingLevel"))
@@ -1168,8 +1180,8 @@ class ModelRuntime:
                     if failedModel is not None and failed is not None
                     else None
                 ),
-                state=state,
-                signal=signal,
+                state=options.get("state"),
+                signal=options.get("signal"),
             )
         )
         route = await routed if inspect.isawaitable(routed) else routed

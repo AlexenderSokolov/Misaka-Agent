@@ -31,10 +31,6 @@ from misaka.utils.js import (
 )
 
 
-def toError(error: BaseException) -> Exception:
-    return error if isinstance(error, Exception) else RuntimeError(str(error))
-
-
 class RoutedServiceBinding:
     def __init__(self, options: dict[str, Any]) -> None:
         self._services = createRemoteServiceBinding(
@@ -163,6 +159,10 @@ class ServerServiceSourceImpl:
 
 
 class SessionServiceSourceImpl:
+    @property
+    def acceptsUnavailableServices(self) -> bool:
+        return self._client.attachment is None and self._catalogueValue is None
+
     def __init__(self, client: Any, options: dict[str, Any]) -> None:
         self._client = client
         self._transport = createClientServiceTransport(client, lambda: client.attachment)
@@ -225,10 +225,6 @@ class SessionServiceSourceImpl:
             transition.add_done_callback(settled)
 
         self._removeAttachmentListener = client.onAttachmentChange(onAttachment)
-
-    @property
-    def acceptsUnavailableServices(self) -> bool:
-        return self._client.attachment is None and self._catalogueValue is None
 
     async def catalogue(self, context: Context) -> list[Any]:
         target = self._client.attachment
@@ -360,3 +356,7 @@ def throwFailures(results: list[Any], message: str) -> None:
         raise errors[0]
     if len(errors) > 1:
         raise ExceptionGroup(message, errors)
+
+
+def toError(error: BaseException) -> Exception:
+    return error if isinstance(error, Exception) else RuntimeError(str(error))

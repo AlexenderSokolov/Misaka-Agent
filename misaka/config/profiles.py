@@ -162,6 +162,6 @@ def shared_soul():
     path = str(home.path("shared_soul"))
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(SHARED_SOUL_TEMPLATE)
     return path

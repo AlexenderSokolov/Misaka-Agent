@@ -203,13 +203,6 @@ def _nullish(value: Any, fallback: Any) -> Any:
     """MISAKA fork: ``value ?? fallback``."""
     return fallback if value is None else value
 
-
-# ============================================================================
-# Appearance & Terminal Default Colors
-# ============================================================================
-
-type TerminalTheme = Literal["dark", "light"]
-
 # The background a theme is designed for.
 type ThemeAppearance = TerminalTheme
 
@@ -628,6 +621,13 @@ def getThemeByName(name: str) -> Theme | None:
 class _AutoThemeSetting(TypedDict):
     lightTheme: str
     darkTheme: str
+
+
+# ============================================================================
+# Appearance & Terminal Default Colors
+# ============================================================================
+
+type TerminalTheme = Literal["dark", "light"]
 
 
 def parseAutoThemeSetting(themeSetting: str | None) -> _AutoThemeSetting | None:

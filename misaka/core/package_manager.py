@@ -505,10 +505,10 @@ class DefaultPackageManager:
         return self.cwd
 
     def resolvePathFromBase(self, value: str, base_dir: str) -> str:
-        return resolvePath(value, base_dir, home_dir=getHomeDir(), trim=True)
+        return resolvePath(value, base_dir, {"homeDir": getHomeDir(), "trim": True})
 
     def resolvePath(self, value: str) -> str:
-        return resolvePath(value, self.cwd, home_dir=getHomeDir(), trim=True)
+        return resolvePath(value, self.cwd, {"homeDir": getHomeDir(), "trim": True})
 
 
     def _resolve_local_source(

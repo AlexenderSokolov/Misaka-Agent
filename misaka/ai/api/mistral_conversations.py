@@ -196,7 +196,7 @@ def streamSimple(
     effortMap = model.thinkingLevelMap if model.reasoning else None
     reasoningEffort = (
         (nullishCoalesce(effortMap.get(reasoning), "high") if reasoning else nullishCoalesce(effortMap.get("off"), None))
-        if effortMap
+        if effortMap is not None
         else None
     )
 
@@ -626,7 +626,7 @@ async def _consumeChatStream(
         # mirroring how OpenAI-style streaming exposes a stable response identifier per stream.
         output.responseId = output.responseId or chunk.get("id")
 
-        if chunk.get("usage"):
+        if chunk.get("usage") is not None:
             promptTokens = chunk["usage"].get("prompt_tokens") or 0
             cachedPromptTokens = _getMistralCachedPromptTokens(chunk["usage"], promptTokens)
 

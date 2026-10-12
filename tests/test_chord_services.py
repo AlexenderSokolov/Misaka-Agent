@@ -38,15 +38,15 @@ def modelsImplementation(revision=0, select=noop):
 
 def test_defines_remote_and_local_services():
     assert defineService("test.json-passthrough").local is False
-    assert defineService("test.local-non-json", local=True).local is True
+    assert defineService("test.local-non-json", {"local": True}).local is True
 
 
 def test_marks_services_remotable_by_default_and_reserves_chord_service_ids():
-    local = defineService("test.local", local=True)
+    local = defineService("test.local", {"local": True})
     assert Models.local is False
     assert local.local is True
     with pytest.raises(TypeError, match=r"Service IDs beginning with \$chord\. are reserved"):
-        defineService("$chord.internal", local=True)
+        defineService("$chord.internal", {"local": True})
     with pytest.raises(TypeError, match="cannot be published remotely"):
         RemoteServiceProvider([local])
 

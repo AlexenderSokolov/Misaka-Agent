@@ -63,7 +63,7 @@ async def _opened(home, session_manager):
                                     "appendSystemPrompt": sections})
     await loader.reload()
     model = next(m for m in getModels("anthropic") if m.id == "claude-opus-5")
-    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsPath": None})
     await runtime.setRuntimeApiKey(model.provider, "fixture")
     result = await createAgentSession({**options, "resourceLoader": loader,
                                          "customTools": assembly.custom_tools, "parts": assembly.parts,

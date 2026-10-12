@@ -22,6 +22,7 @@ from pydantic import ValidationError as PydanticValidationError
 from referencing.exceptions import Unresolvable
 
 from misaka.ai.types import Tool, ToolCall
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.utils.js import jsIsInteger, jsNumber, jsonStringify, jsString, jsTrim
 
 # MISAKA fork: keyed by content and bounded, not a WeakMap: schemas are dicts (not weak-referenceable) and the union-arm
@@ -346,7 +347,7 @@ def _receivedArguments(arguments: Any) -> str:
 def _validatePydanticToolArguments(tool: Tool, toolCall: ToolCall) -> Any:
     """MISAKA fork: the TypeBox branch, for a pydantic model class."""
     args = deepcopy(toolCall.arguments)
-    _normalizeOptionalNulls(args, tool.parameters.model_json_schema())
+    _normalizeOptionalNulls(args, typeboxSchema(tool.parameters))
     try:
         validated = tool.parameters.model_validate(args)
     except PydanticValidationError as error:

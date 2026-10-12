@@ -25,6 +25,14 @@ _MAX_SAFE_INTEGER = 2**53 - 1
 _INFINITY = float("inf")
 
 
+def documentDeltaBatches(id: int, version: int, revisions: Sequence[dict[str, Any]], start: int) -> Iterator[Any]:
+    for index in range(start, len(revisions)):
+        revision = revisions[index]
+        if revision["kind"] != "delta" or revision["version"] != version:
+            raise RuntimeError(f"Document {id} crosses a stored version boundary without a base")
+        yield revision["ops"]
+
+
 def clone(value: Any) -> Any:
     if isinstance(value, list):
         return [clone(item) for item in value]
@@ -118,14 +126,6 @@ def scanIndexes(ids: Sequence[int], start: ScanStart) -> Iterator[int]:
         yield from range(end - 1, -1, -1)
 
 
-def documentDeltaBatches(id: int, version: int, revisions: Sequence[dict[str, Any]], start: int) -> Iterator[Any]:
-    for index in range(start, len(revisions)):
-        revision = revisions[index]
-        if revision["kind"] != "delta" or revision["version"] != version:
-            raise RuntimeError(f"Document {id} crosses a stored version boundary without a base")
-        yield revision["ops"]
-
-
 class PreparedMemoryCommit:
     """A fully validated, detached state mutation whose application performs no fallible preparation. ``writes`` are
     detached writes for persistence."""
@@ -167,7 +167,7 @@ class MemoryStorage:
         self._closed = False
 
     @eager
-    async def commit(self, writes: Sequence[dict[str, Any]], context: Context) -> Seq:
+    async def commit(self, writes: Sequence[dict[str, Any]], _context: Context) -> Seq:
         return self.prepareCommit(writes).apply()
 
     def prepareCommit(self, writes: Sequence[dict[str, Any]], seq: Seq | None = None) -> PreparedMemoryCommit:
@@ -233,7 +233,7 @@ class MemoryStorage:
             except StorageRejected:
                 raise
             except Exception as error:
-                raise StorageRejected(f"Document copy {write['record']['id']} was rejected", error) from error
+                raise StorageRejected(f"Document copy {write['record']['id']} was rejected", {"cause": error}) from error
         return resolved
 
     def _applyPreparedCommit(
@@ -322,14 +322,14 @@ class MemoryStorage:
         return id
 
     @eager
-    async def conversation(self, id: int, context: Context) -> dict[str, Any] | None:
+    async def conversation(self, id: int, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         value = self._state.conversations.get(id)
         return None if value is None else clone(value)
 
     @eager
     async def scanConversations(
-        self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context
+        self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context
     ) -> Page:
         self._assertOpen()
         state = self._state
@@ -373,7 +373,7 @@ class MemoryStorage:
 
     @eager
     async def findLatestHeadMarker(
-        self, conversationId: int, atOrBeforeEntryId: int | None, context: Context
+        self, conversationId: int, atOrBeforeEntryId: int | None, _context: Context
     ) -> dict[str, Any] | None:
         self._assertOpen()
         state = self._state
@@ -394,7 +394,7 @@ class MemoryStorage:
             currentId = conversation["parent"]["conversationId"]
 
     @eager
-    async def scanEntries(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Page:
+    async def scanEntries(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> Page:
         self._assertOpen()
         start = scanStart(query.get("order", UNDEFINED), cursor, "descending")
         order, after = start["order"], start["after"]
@@ -418,13 +418,13 @@ class MemoryStorage:
         return page(visible, limit, order)
 
     @eager
-    async def task(self, id: int, context: Context) -> dict[str, Any] | None:
+    async def task(self, id: int, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         value = self._state.tasks.get(id)
         return None if value is None else clone(value)
 
     @eager
-    async def scanTasks(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Page:
+    async def scanTasks(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> Page:
         self._assertOpen()
         state = self._state
         start = scanStart(query.get("order", UNDEFINED), cursor, "ascending")
@@ -446,14 +446,14 @@ class MemoryStorage:
         return page(values, limit, start["order"])
 
     @eager
-    async def submission(self, id: int, context: Context) -> dict[str, Any] | None:
+    async def submission(self, id: int, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         value = self._state.submissions.get(id)
         return None if value is None else clone(value)
 
     @eager
     async def scanSubmissions(
-        self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context
+        self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context
     ) -> Page:
         self._assertOpen()
         state = self._state
@@ -471,7 +471,7 @@ class MemoryStorage:
 
     @eager
     async def submissionByRequest(
-        self, conversationId: int, requestId: str, context: Context
+        self, conversationId: int, requestId: str, _context: Context
     ) -> dict[str, Any] | None:
         self._assertOpen()
         requests = self._state.submissionIdsByRequest.get(conversationId)
@@ -481,7 +481,7 @@ class MemoryStorage:
         return clone(self._state.submissions[id])
 
     @eager
-    async def findDocument(self, address: dict[str, Any], at: DocumentPoint, context: Context) -> dict[str, Any] | None:
+    async def findDocument(self, address: dict[str, Any], at: DocumentPoint, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         index = self._state.documentAddresses.get(addressKey(address))
         if at == "current":
@@ -495,7 +495,7 @@ class MemoryStorage:
         return None
 
     @eager
-    async def document(self, id: int, at: DocumentPoint, context: Context) -> dict[str, Any] | None:
+    async def document(self, id: int, at: DocumentPoint, _context: Context) -> dict[str, Any] | None:
         self._assertOpen()
         stored = self._materializeDocument(id, at)
         if stored is None:
@@ -508,7 +508,7 @@ class MemoryStorage:
         }
 
     @eager
-    async def scanDocuments(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Page:
+    async def scanDocuments(self, query: dict[str, Any], limit: int, cursor: Cursor | None, _context: Context) -> Page:
         self._assertOpen()
         state = self._state
         ids = state.documentIdsByScope.get(scopeKey(query["scope"]), [])
@@ -526,7 +526,7 @@ class MemoryStorage:
         return page(values, limit)
 
     @eager
-    async def close(self, context: Context) -> None:
+    async def close(self, _context: Context) -> None:
         self._closed = True
 
     def _materializeDocument(self, id: int, at: DocumentPoint) -> dict[str, Any] | None:

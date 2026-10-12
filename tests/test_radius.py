@@ -56,14 +56,9 @@ def radiusConfig(baseUrl: str) -> dict[str, Any]:
 
 
 async def test_restores_the_legacy_credential_catalog_without_network_access():
-    runtime = await ModelRuntime.create(
-        credentials=AuthStorage.inMemory({
+    runtime = await ModelRuntime.create({"credentials": AuthStorage.inMemory({
             RADIUS_PROVIDER_ID: radiusOAuthCredential("https://radius.example.com/v1"),
-        }),
-        modelsStore=InMemoryModelsStore(),
-        modelsPath=None,
-        allowModelNetwork=False,
-    )
+        }), "modelsStore": InMemoryModelsStore(), "modelsPath": None, "allowModelNetwork": False})
 
     model = runtime.getModel(RADIUS_PROVIDER_ID, "auto")
     assert (model.api, model.baseUrl) == ("pi-messages", "https://radius.example.com/v1")
@@ -82,12 +77,7 @@ async def test_fetches_and_stores_the_catalog_for_configured_radius_auth(monkeyp
             "expires": _hourFromNowMs(),
         },
     })
-    runtime = await ModelRuntime.create(
-        credentials=credentials,
-        modelsStore=modelsStore,
-        modelsPath=None,
-        allowModelNetwork=True,
-    )
+    runtime = await ModelRuntime.create({"credentials": credentials, "modelsStore": modelsStore, "modelsPath": None, "allowModelNetwork": True})
 
     assert runtime.getModel(RADIUS_PROVIDER_ID, "auto") is not None
     assert len((await modelsStore.read(RADIUS_PROVIDER_ID)).models) == 1
@@ -104,13 +94,9 @@ async def test_does_not_refresh_catalogs_over_the_network_by_default(monkeypatch
         raise RuntimeError("unexpected catalog fetch")
 
     fetchSpy = stubFetch(monkeypatch, radius_config, unexpected)
-    runtime = await ModelRuntime.create(
-        credentials=AuthStorage.inMemory({
+    runtime = await ModelRuntime.create({"credentials": AuthStorage.inMemory({
             RADIUS_PROVIDER_ID: radiusOAuthCredential("https://radius.example.com/v1"),
-        }),
-        modelsStore=InMemoryModelsStore(),
-        modelsPath=None,
-    )
+        }), "modelsStore": InMemoryModelsStore(), "modelsPath": None})
 
     assert runtime.getModel(RADIUS_PROVIDER_ID, "auto") is not None
     assert fetchSpy.calls == []
@@ -121,12 +107,7 @@ async def test_does_not_fetch_or_make_radius_models_available_without_configured
         raise RuntimeError("unexpected Radius config fetch")
 
     fetchSpy = stubFetch(monkeypatch, radius_config, unexpected)
-    runtime = await ModelRuntime.create(
-        credentials=AuthStorage.inMemory(),
-        modelsStore=InMemoryModelsStore(),
-        modelsPath=None,
-        allowModelNetwork=True,
-    )
+    runtime = await ModelRuntime.create({"credentials": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": None, "allowModelNetwork": True})
 
     assert [model for model in runtime.getAvailableSnapshot() if model.provider == RADIUS_PROVIDER_ID] == []
     assert not any("radius.pi.dev/v1/config" in requestUrl(url) for url, _init in fetchSpy.calls)
@@ -145,19 +126,14 @@ async def test_supports_custom_radius_gateways_from_models_json(monkeypatch, tmp
         }),
         encoding="utf-8",
     )
-    runtime = await ModelRuntime.create(
-        credentials=AuthStorage.inMemory({
+    runtime = await ModelRuntime.create({"credentials": AuthStorage.inMemory({
             "radius-dev": {
                 "type": "oauth",
                 "access": "access-token",
                 "refresh": "refresh-token",
                 "expires": _hourFromNowMs(),
             },
-        }),
-        modelsStore=InMemoryModelsStore(),
-        modelsPath=str(modelsPath),
-        allowModelNetwork=True,
-    )
+        }), "modelsStore": InMemoryModelsStore(), "modelsPath": str(modelsPath), "allowModelNetwork": True})
 
     model = runtime.getModel("radius-dev", "auto")
     assert (model.api, model.baseUrl) == ("pi-messages", "http://localhost:8788/v1")
@@ -167,11 +143,6 @@ async def test_supports_custom_radius_gateways_from_models_json(monkeypatch, tmp
 async def test_requires_base_url_for_custom_radius_gateways(tmp_path):
     modelsPath = tmp_path / "models.json"
     modelsPath.write_text(json.dumps({"providers": {"radius-dev": {"oauth": "radius"}}}), encoding="utf-8")
-    runtime = await ModelRuntime.create(
-        credentials=AuthStorage.inMemory(),
-        modelsStore=InMemoryModelsStore(),
-        modelsPath=str(modelsPath),
-        allowModelNetwork=False,
-    )
+    runtime = await ModelRuntime.create({"credentials": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": str(modelsPath), "allowModelNetwork": False})
 
     assert '"baseUrl" is required when "oauth" is set' in runtime.getError()

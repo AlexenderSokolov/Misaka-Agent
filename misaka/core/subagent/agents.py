@@ -933,6 +933,31 @@ def mcp_server_matches(pattern: Any, server: Any) -> bool:
     return pattern.replace("-", "_").casefold() in server.replace("-", "_").casefold()
 
 
+def configured_mcp_servers(profile_dir: Any) -> list[str]:
+    """The enabled servers a role's ``mcp.json`` files name, connected yet or not: the home's for Last Order
+    (or no role), the role's own otherwise. A definition that requires one is not refused while it is still
+    connecting or failed its first attempt."""
+    from misaka.config import profiles
+
+    paths: list[Path] = []
+    if not profile_dir or profiles.is_last_order(profile_dir):
+        paths.append(Path(home.path("mcp_config")))
+    if profile_dir and os.path.realpath(profile_dir) != os.path.realpath(home.home()):
+        paths.append(Path(profile_dir) / "mcp.json")
+    names: list[str] = []
+    for path in paths:
+        try:
+            servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(servers, dict):
+            names.extend(
+                name for name, config in servers.items()
+                if not (isinstance(config, dict) and config.get("enabled") is False) and name not in names
+            )
+    return names
+
+
 def available_mcp_servers(session: Any) -> list[str]:
     """The MCP servers whose tools the parent session registered, hidden ones aside. A child runs as
     the same role and connects the same servers, so this is what a definition may require; the

@@ -19,35 +19,6 @@ from misaka.utils.js import jsonStringify
 from .wire import WireServiceProviderUpdate, WireServiceSubscriptionSnapshot
 
 
-class StateCodecRegistry[C]:
-    def __init__(self, create: Callable[[], C]) -> None:
-        self._create = create
-        # (instance, codec) by state key, in insertion order.
-        self._entries: dict[str, tuple[ServiceInstanceAddress | None, C]] = {}
-
-    def reset(self) -> None:
-        self._entries.clear()
-
-    def add(self, instance: ServiceInstanceAddress | None, member: str) -> C:
-        key = stateKey(instance, member)
-        if key in self._entries:
-            raise RuntimeError(f"Duplicate service state {describeState(instance, member)}")
-        codec = self._create()
-        self._entries[key] = (instance, codec)
-        return codec
-
-    def get(self, instance: ServiceInstanceAddress | None, member: str) -> C:
-        entry = self._entries.get(stateKey(instance, member))
-        if entry is None:
-            raise RuntimeError(f"Unknown service state {describeState(instance, member)}")
-        return entry[1]
-
-    def removeInstance(self, instance: ServiceInstanceAddress) -> None:
-        for key, (address, _codec) in list(self._entries.items()):
-            if sameAddress(address, instance):
-                del self._entries[key]
-
-
 class ServiceStateEncoder:
     """Stateful operation encoders for every replicated state in one service subscription."""
 
@@ -126,6 +97,35 @@ class ServiceStateDecoder:
                 return update  # type: ignore[return-value]
             case _:
                 raise TypeError("Invalid service provider update")
+
+
+class StateCodecRegistry[C]:
+    def __init__(self, create: Callable[[], C]) -> None:
+        self._create = create
+        # (instance, codec) by state key, in insertion order.
+        self._entries: dict[str, tuple[ServiceInstanceAddress | None, C]] = {}
+
+    def reset(self) -> None:
+        self._entries.clear()
+
+    def add(self, instance: ServiceInstanceAddress | None, member: str) -> C:
+        key = stateKey(instance, member)
+        if key in self._entries:
+            raise RuntimeError(f"Duplicate service state {describeState(instance, member)}")
+        codec = self._create()
+        self._entries[key] = (instance, codec)
+        return codec
+
+    def get(self, instance: ServiceInstanceAddress | None, member: str) -> C:
+        entry = self._entries.get(stateKey(instance, member))
+        if entry is None:
+            raise RuntimeError(f"Unknown service state {describeState(instance, member)}")
+        return entry[1]
+
+    def removeInstance(self, instance: ServiceInstanceAddress) -> None:
+        for key, (address, _codec) in list(self._entries.items()):
+            if sameAddress(address, instance):
+                del self._entries[key]
 
 
 def createServiceStateEncoder() -> ServiceStateEncoder:

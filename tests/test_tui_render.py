@@ -2,8 +2,8 @@
 ``test/tui-overlay-style-leak.test.ts``, ``test/overlay-short-content.test.ts``, the ``compositeTuiLine`` cases of
 ``test/regression-overlay-cjk-boundary.test.ts`` and the TUI case of ``test/tab-width.test.ts`` (v1.1.0).
 
-MISAKA forks: the redraw-log case ("writes redraw logs to the provided directory") is not ported (no debug log), and
-the crash dump goes to the given log directory or else MISAKA's home (pi: the OS temp directory).
+MISAKA forks: the redraw log is switched by ``MISAKA_TUI_DEBUG_REDRAW`` (pi: ``PI_TUI_DEBUG_REDRAW``), and the crash dump
+goes to the given log directory or else MISAKA's home (pi: the OS temp directory).
 """
 
 from __future__ import annotations
@@ -171,6 +171,40 @@ async def test_renders_keyboard_input_without_waiting_for_a_throttled_frame():
 
     assert component.renderCount == renderCountBeforeInput + 1
     assert component.lines == ["typed"]
+    tui.stop()
+
+
+# --- TUI debug logging --------------------------------------------------------------------------
+
+
+async def test_writes_redraw_logs_to_the_provided_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("MISAKA_TUI_DEBUG_REDRAW", "1")
+    terminal = VirtualTerminal(40, 10)
+    tui = TuiMainScreen(terminal, None, str(tmp_path))
+    component = TestComponent()
+    tui.addChild(component)
+    component.lines = ["test"]
+    tui.start()
+    await terminal.waitForRender()
+
+    assert "fullRender: first render" in (tmp_path / "pi-tui-debug.log").read_text(encoding="utf-8")
+    tui.stop()
+
+
+async def test_the_debug_key_calls_on_debug():
+    terminal = VirtualTerminal(40, 10)
+    tui = TuiMainScreen(terminal)
+    component = InputComponent()
+    tui.addChild(component)
+    tui.setFocus(component)
+    calls: list[None] = []
+    tui.onDebug = lambda: calls.append(None)
+    tui.start()
+
+    terminal.sendInput("\x1b[100;6u")  # Shift+Ctrl+D (Kitty)
+    await asyncio.sleep(0)
+
+    assert calls == [None]
     tui.stop()
 
 

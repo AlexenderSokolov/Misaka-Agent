@@ -80,10 +80,7 @@ async def createRuntime(tmp_path, modelsJson: dict | None = None) -> ModelRuntim
     if modelsJson is not None:
         modelsPath = str(tmp_path / "models.json")
         (tmp_path / "models.json").write_text(json.dumps(modelsJson), encoding="utf-8")
-    return await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=modelsPath,
-        allowModelNetwork=False,
-    )
+    return await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": modelsPath, "allowModelNetwork": False})
 
 
 async def test_lists_built_in_openrouter_image_models_separately_from_chat_models(tmp_path):

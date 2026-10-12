@@ -22,10 +22,18 @@ import os
 import re
 import sys
 import weakref
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from functools import partial
-from typing import Any, Final
+from typing import Any, Final, TypedDict
 
 from misaka.utils._abort_signal import wait_for_abort
 from misaka.utils.values import signal_aborted
@@ -72,6 +80,8 @@ def jsSplitWhitespace(text: str, limit: int | None = None) -> list[str]:
     """``text.split(/\\s+/, limit)`` with JavaScript's ``\\s``: ``limit`` keeps that many parts."""
     parts = _JS_WHITESPACE_RUN.split(text)
     return parts if limit is None else parts[:limit]
+
+
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -98,9 +108,6 @@ def defined(value: dict[str, Any]) -> dict[str, Any]:
 def jsTrim(text: str) -> str:
     """``String.prototype.trim()``."""
     return text.strip(_ECMASCRIPT_WHITESPACE)
-
-
-_JS_WHITESPACE_RUN = re.compile(f"[{re.escape(_ECMASCRIPT_WHITESPACE)}]+")
 
 
 def jsCollapseWhitespace(text: str) -> str:
@@ -388,6 +395,18 @@ def _isArrayIndex(key: str) -> bool:
     return key.isascii() and key.isdigit() and (key == "0" or not key.startswith("0")) and int(key) <= 4294967294
 
 
+def objectKeys(value: Mapping[Any, Any]) -> list[Any]:
+    """``Object.keys(value)``: array indices (``"0"``, ``"12"``) first in ascending order, then the other keys as
+    inserted."""
+    indices = sorted((key for key in value if isinstance(key, str) and _isArrayIndex(key)), key=int)
+    return [*indices, *(key for key in value if not (isinstance(key, str) and _isArrayIndex(key)))]
+
+
+def objectEntries(value: Mapping[Any, Any]) -> list[tuple[Any, Any]]:
+    """``Object.entries(value)``, in ``Object.keys`` order."""
+    return [(key, value[key]) for key in objectKeys(value)]
+
+
 def jsObjectOrder(value: Any) -> Any:
     """``value`` with every object's keys in JavaScript's property order: array indices (``"0"``, ``"12"``) first in
     ascending order, then the other keys as inserted. ``JSON.parse`` and every later ``Object.keys`` see that order."""
@@ -614,6 +633,12 @@ def liveValues(mapping: dict[Any, Any]) -> Iterator[Any]:
             return
 
 
+
+class ErrorOptions(TypedDict, total=False):
+    """The ``ErrorOptions`` an ``Error`` constructor takes; ``cause`` is also chained as ``__cause__``."""
+
+    cause: Any
+
 def errorMessage(error: Any) -> str:
     """``error instanceof Error ? error.message : String(error)``. An ``ExceptionGroup`` (``AggregateError``) is its
     message alone, without the sub-exception count ``str()`` appends."""
@@ -797,6 +822,14 @@ def clearInterval(interval: Interval | None) -> None:
         interval.cancel()
 
 
+_TIMEOUT_MAX: Final = 2**31 - 1
+
+
+def _timerDelay(ms: Any) -> float:
+    """Node's timer delay: one below 1 ms, NaN, or past the 32-bit signed range runs after 1 ms."""
+    return ms if isNumber(ms) and 1 <= ms <= _TIMEOUT_MAX else 1
+
+
 class Timeout:
     """The handle ``setTimeout`` returns: a one-shot timer on the event loop that was running when it was set, or a
     daemon ``threading.Timer`` when no loop was running."""
@@ -804,7 +837,7 @@ class Timeout:
     def __init__(self, callback: Callable[[], None], ms: float) -> None:
         self._callback = callback
         self._cleared = False
-        seconds = max(ms, 0) / 1000
+        seconds = _timerDelay(ms) / 1000
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -995,10 +1028,17 @@ class AbortSignal:
 
     @staticmethod
     def timeout(ms: float) -> AbortSignal:
-        """``AbortSignal.timeout(ms)``: aborts by itself with a ``TimeoutError`` once ``ms`` have passed."""
+        """``AbortSignal.timeout(ms)``: aborts by itself with a ``TimeoutError`` once ``ms`` have passed. As in Node,
+        ``ms`` is an unsigned 32-bit integer, and its timer runs a delay past the signed range after 1 ms."""
+        if not isNumber(ms) or (isinstance(ms, float) and (math.isnan(ms) or (math.isfinite(ms) and not ms.is_integer()))):
+            raise RangeError(f'The value of "delay" is out of range. It must be an integer. Received {formatNumber(ms)}')
+        if not 0 <= ms <= 4_294_967_295:
+            raise RangeError(
+                f'The value of "delay" is out of range. It must be >= 0 && <= 4294967295. Received {formatNumber(ms)}'
+            )
         controller = AbortController()
         handle = asyncio.get_running_loop().call_later(
-            max(0.0, ms) / 1000,
+            _timerDelay(ms) / 1000,
             lambda: controller.abort(DOMException("The operation was aborted due to timeout", "TimeoutError")),
         )
         controller.signal._timer = handle  # type: ignore[attr-defined]

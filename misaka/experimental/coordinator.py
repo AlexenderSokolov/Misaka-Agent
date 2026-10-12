@@ -51,63 +51,6 @@ CoordinatorMessageSchema = schema.union(
     schema.looseObject({"type": schema.literal("message"), "from": schema.string(), "payload": schema.UNKNOWN}),
 )
 
-# A connection event is a dict: ``{"type": "peer_connected", "peerId"}``, ``{"type": "peer_disconnected", "peerId"}`` or
-# ``{"type": "message", "from", "payload"}``.
-
-
-async def connectSocket(path: str) -> NetSocket:
-    _transport, socket = await asyncio.get_running_loop().create_unix_connection(NetSocket, path)
-    return socket
-
-
-async def tryConnect(path: str) -> NetSocket | None:
-    try:
-        return await connectSocket(path)
-    except (FileNotFoundError, ConnectionRefusedError):
-        # ENOENT or ECONNREFUSED.
-        return None
-
-
-def attachJsonLineReader(socket: NetSocket, onMessage: Callable[[Any], None]) -> None:
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    state = {"buffered": ""}
-
-    def onData(chunk: bytes) -> None:
-        state["buffered"] += decoder.decode(chunk)
-        if len(state["buffered"].encode("utf-8", "surrogatepass")) > MAX_CONTROL_LINE_BYTES:
-            socket.destroy(RuntimeError("Coordinator message is too large"))
-            return
-        while True:
-            newline = state["buffered"].find("\n")
-            if newline == -1:
-                return
-            line = state["buffered"][:newline]
-            state["buffered"] = state["buffered"][newline + 1 :]
-            try:
-                value = jsonParse(line)
-            except ValueError:
-                socket.destroy(RuntimeError("Coordinator sent invalid JSON"))
-                return
-            onMessage(value)
-
-    socket.on("data", onData)
-
-
-@eager
-async def writeJsonLine(socket: NetSocket, message: Any) -> None:
-    done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-
-    def callback(error: Exception | None) -> None:
-        if done.done():
-            return
-        if error is not None:
-            done.set_exception(error)
-        else:
-            done.set_result(None)
-
-    socket.write(encodeControlLine(message).encode("utf-8"), callback)
-    await done
-
 
 class CoordinatorConnection:
     """The server-side endpoint of the coordinator's intentionally opaque message router. ``options`` is ``{"controlPath",
@@ -274,6 +217,63 @@ async def ensureCoordinator(publicPath: str, controlPath: str) -> CoordinatorSta
         if time.time() * 1000 >= deadline:
             raise RuntimeError("Timed out waiting for coordinator startup")
         await asyncio.sleep(COORDINATOR_RETRY_MS / 1000)
+
+# A connection event is a dict: ``{"type": "peer_connected", "peerId"}``, ``{"type": "peer_disconnected", "peerId"}`` or
+# ``{"type": "message", "from", "payload"}``.
+
+
+async def connectSocket(path: str) -> NetSocket:
+    _transport, socket = await asyncio.get_running_loop().create_unix_connection(NetSocket, path)
+    return socket
+
+
+async def tryConnect(path: str) -> NetSocket | None:
+    try:
+        return await connectSocket(path)
+    except (FileNotFoundError, ConnectionRefusedError):
+        # ENOENT or ECONNREFUSED.
+        return None
+
+
+def attachJsonLineReader(socket: NetSocket, onMessage: Callable[[Any], None]) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    state = {"buffered": ""}
+
+    def onData(chunk: bytes) -> None:
+        state["buffered"] += decoder.decode(chunk)
+        if len(state["buffered"].encode("utf-8", "surrogatepass")) > MAX_CONTROL_LINE_BYTES:
+            socket.destroy(RuntimeError("Coordinator message is too large"))
+            return
+        while True:
+            newline = state["buffered"].find("\n")
+            if newline == -1:
+                return
+            line = state["buffered"][:newline]
+            state["buffered"] = state["buffered"][newline + 1 :]
+            try:
+                value = jsonParse(line)
+            except ValueError:
+                socket.destroy(RuntimeError("Coordinator sent invalid JSON"))
+                return
+            onMessage(value)
+
+    socket.on("data", onData)
+
+
+@eager
+async def writeJsonLine(socket: NetSocket, message: Any) -> None:
+    done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    def callback(error: Exception | None) -> None:
+        if done.done():
+            return
+        if error is not None:
+            done.set_exception(error)
+        else:
+            done.set_result(None)
+
+    socket.write(encodeControlLine(message).encode("utf-8"), callback)
+    await done
 
 
 # This process is intentionally a transport shim. It depends only on the standard library and never interprets Pi,
@@ -574,6 +574,35 @@ class _CoordinatorProcess:
             socket.write(encodeControlLine(message).encode("utf-8"))
 
 
+async def runCoordinatorProcess(args: list[str]) -> None:
+    """Run the coordinator until it retires: when no server, peer or connection is left it shuts down by itself, and a
+    ``SIGINT`` or ``SIGTERM`` stops it at once."""
+    global _running
+    if _running:
+        raise RuntimeError("Coordinator process is already running")
+    requestedPublicPath, requestedControlPath = (args + [None, None])[:2]
+    if not requestedPublicPath or not requestedControlPath:
+        raise RuntimeError("Coordinator requires public and control socket paths")
+    _running = True
+    coordinator = _CoordinatorProcess(requestedPublicPath, requestedControlPath)
+    if sys.platform != "win32":
+        onceSignal(signal.SIGINT, coordinator.startShutdown)
+        onceSignal(signal.SIGTERM, coordinator.startShutdown)
+    await coordinator.main()
+    await coordinator.finished
+
+
+def main() -> None:
+    role = consumeInternalProcessRole()
+    if role != "coordinator":
+        raise RuntimeError("Coordinator entrypoint requires an internal coordinator invocation")
+    try:
+        asyncio.run(runCoordinatorProcess(sys.argv[1:]))
+    except Exception:  # noqa: BLE001 - the process reports its failure and exits
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def attachRoutedLineReader(socket: NetSocket, onMessage: Callable[[Any], None]) -> None:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     state = {"buffered": ""}
@@ -647,35 +676,6 @@ async def cleanupSocket(path: str) -> None:
 
 
 _running = False
-
-
-async def runCoordinatorProcess(args: list[str]) -> None:
-    """Run the coordinator until it retires: when no server, peer or connection is left it shuts down by itself, and a
-    ``SIGINT`` or ``SIGTERM`` stops it at once."""
-    global _running
-    if _running:
-        raise RuntimeError("Coordinator process is already running")
-    requestedPublicPath, requestedControlPath = (args + [None, None])[:2]
-    if not requestedPublicPath or not requestedControlPath:
-        raise RuntimeError("Coordinator requires public and control socket paths")
-    _running = True
-    coordinator = _CoordinatorProcess(requestedPublicPath, requestedControlPath)
-    if sys.platform != "win32":
-        onceSignal(signal.SIGINT, coordinator.startShutdown)
-        onceSignal(signal.SIGTERM, coordinator.startShutdown)
-    await coordinator.main()
-    await coordinator.finished
-
-
-def main() -> None:
-    role = consumeInternalProcessRole()
-    if role != "coordinator":
-        raise RuntimeError("Coordinator entrypoint requires an internal coordinator invocation")
-    try:
-        asyncio.run(runCoordinatorProcess(sys.argv[1:]))
-    except Exception:  # noqa: BLE001 - the process reports its failure and exits
-        traceback.print_exc()
-        sys.exit(1)
 
 
 if __name__ == "__main__":

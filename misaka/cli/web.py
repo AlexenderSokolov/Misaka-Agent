@@ -32,8 +32,7 @@ async def _discover(extension_paths):
             "cwd": cwd, "trustStore": ProjectTrustStore(agent_dir),
             "defaultProjectTrust": loader.settingsManager.getDefaultProjectTrust(),
             "extensionsResult": payload["extensionsResult"],
-            "projectTrustContext": createProjectTrustContext(
-                cwd=cwd, mode="print", settingsManager=loader.settingsManager, hasUI=False),
+            "projectTrustContext": createProjectTrustContext({"cwd": cwd, "mode": "print", "settingsManager": loader.settingsManager, "hasUI": False}),
             "onExtensionError": lambda message: print(message, file=sys.stderr),
         })
 

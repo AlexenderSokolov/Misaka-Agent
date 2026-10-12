@@ -376,3 +376,57 @@ def test_detect_install_change_reports_an_updated_install(tmp_path):
     assert detectInstallChange(metadata) == {"kind": "updated", "version": "99.0.0"}
     metadata.write_bytes(f"Metadata-Version: 2.4\nName: misaka\nVersion: {VERSION}\n".encode())
     assert detectInstallChange(metadata) is None
+
+
+def test_offline_is_a_flag_and_an_environment_variable(monkeypatch):
+    from misaka.cli import app
+    from misaka.cli.args import parseArgs
+
+    assert parseArgs(["--offline"]).offline is True
+    monkeypatch.delenv("MISAKA_OFFLINE", raising=False)
+    seen: dict = {}
+    monkeypatch.setattr(app, "_parser", lambda *_a: (_ for _ in ()).throw(SystemExit(0)))
+    monkeypatch.setattr(app.bootstrap, "install", lambda **_k: seen.update(argv=True))
+    try:
+        app.main(["--offline", "--", "--offline"])
+    except SystemExit:
+        pass
+    import os
+
+    assert os.environ.get("MISAKA_OFFLINE") == "1"
+
+
+async def test_a_radius_login_offers_the_radius_mcp_server(tmp_path, monkeypatch):
+    import json
+    import types
+
+    import misaka.ui.tui.interactive.interactive_mode as interactiveMode
+    from misaka.core.radius import RADIUS_MCP_URL
+
+    monkeypatch.setattr(interactiveMode, "get_agent_dir", lambda: str(tmp_path))
+    created: list = []
+    reloads: list = []
+
+    async def handleReloadCommand():
+        reloads.append(True)
+
+    fake = types.SimpleNamespace(
+        sessionManager=types.SimpleNamespace(getCwd=lambda: str(tmp_path)),
+        showSelector=created.append,
+        showError=lambda message: (_ for _ in ()).throw(AssertionError(message)),
+        handleReloadCommand=handleReloadCommand,
+        _backgroundTasks=set(),
+        ui=types.SimpleNamespace(requestRender=lambda: None),
+    )
+    interactiveMode.InteractiveMode.offerRadiusMcpServer(fake, "radius", "Radius")
+    selector = created[0](lambda: None)["component"]
+    selector.onSelectCallback("Yes")
+    await asyncio.sleep(0)
+
+    saved = json.loads((tmp_path / "mcp.json").read_text(encoding="utf-8"))
+    assert saved["mcpServers"]["radius"] == {"url": RADIUS_MCP_URL, "auth": {"provider": "radius"}}
+    assert reloads == [True]
+
+    created.clear()
+    interactiveMode.InteractiveMode.offerRadiusMcpServer(fake, "radius", "Radius")
+    assert created == []

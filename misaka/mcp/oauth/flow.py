@@ -59,6 +59,9 @@ from misaka.utils.js import (
     jsonStringify,
     jsSplitWhitespace,
     jsString,
+    jsTruthy,
+    nullishCoalesce,
+    toWellFormed,
 )
 from misaka.utils.values import maybe_await, signal_aborted
 from misaka.utils.whatwg_url import URL, URLSearchParams
@@ -172,11 +175,11 @@ class RefreshAuthorizationOptions(TokenRequestOptions, total=False):
     refreshToken: Required[str]
 
 
-def _loopback(hostname: str) -> bool:
+def loopback(hostname: str) -> bool:
     return hostname == "localhost" or hostname == "127.0.0.1" or hostname == "[::1]" or hostname == "::1"
 
 
-def _applicationType(redirectUris: list[str]) -> Literal["native", "web"]:
+def applicationType(redirectUris: list[str]) -> Literal["native", "web"]:
     """The OpenID Connect `application_type` for `redirect_uris` (MCP SEP-837). Without one, OpenID Connect servers
     assume `web`, which rejects http loopback redirect URIs. Loopback hosts and custom schemes are native (RFC 8252).
     """
@@ -185,19 +188,19 @@ def _applicationType(redirectUris: list[str]) -> Literal["native", "web"]:
         if not URL.canParse(uri):
             return False
         url = URL(uri)
-        return (url.protocol != "http:" and url.protocol != "https:") or _loopback(url.hostname)
+        return (url.protocol != "http:" and url.protocol != "https:") or loopback(url.hostname)
 
     return "native" if any(native(uri) for uri in redirectUris) else "web"
 
 
-def _secureEndpoint(value: str | URL) -> URL:
+def secureEndpoint(value: str | URL) -> URL:
     url = URL(value)
-    if url.protocol != "https:" and not _loopback(url.hostname):
+    if url.protocol != "https:" and not loopback(url.hostname):
         raise OAuthInsecureEndpointError(url.href)
     return url
 
 
-def _selectClientAuthMethod(information: OAuthClientInformationMixed, supported: list[str]) -> _ClientAuthMethod:
+def selectClientAuthMethod(information: OAuthClientInformationMixed, supported: list[str]) -> _ClientAuthMethod:
     hinted = information.get("token_endpoint_auth_method") if "token_endpoint_auth_method" in information else None
     if (
         hinted
@@ -216,7 +219,7 @@ def _selectClientAuthMethod(information: OAuthClientInformationMixed, supported:
     return "client_secret_post" if information.get("client_secret") else "none"
 
 
-def _applyClientAuthentication(
+def applyClientAuthentication(
     method: _ClientAuthMethod,
     information: OAuthClientInformation,
     headers: httpx.Headers,
@@ -225,7 +228,7 @@ def _applyClientAuthentication(
     if method == "client_secret_basic":
         if not information.get("client_secret"):
             raise RuntimeError("client_secret_basic requires a client secret")
-        credentials = f"{information['client_id']}:{information['client_secret']}".encode()
+        credentials = toWellFormed(f"{information['client_id']}:{information['client_secret']}").encode("utf-8")
         headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('ascii')}"
     else:
         params.set("client_id", information["client_id"])
@@ -233,7 +236,7 @@ def _applyClientAuthentication(
             params.set("client_secret", information["client_secret"])
 
 
-async def _pkce() -> dict[str, str]:
+async def pkce() -> dict[str, str]:
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
     digest = hashlib.sha256(verifier.encode("utf-8")).digest()
     return {"verifier": verifier, "challenge": base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")}
@@ -252,16 +255,17 @@ async def startAuthorization(
             raise RuntimeError("Authorization server does not support authorization codes")
     if (
         metadata is not None
-        and metadata.get("code_challenge_methods_supported") is not None
+        and jsTruthy(metadata.get("code_challenge_methods_supported"))
         and "S256" not in metadata["code_challenge_methods_supported"]
     ):
         raise RuntimeError("Authorization server does not support PKCE S256")
     authorizationEndpoint = metadata.get("authorization_endpoint") if metadata is not None else None
     url = URL(authorizationEndpoint if authorizationEndpoint is not None else URL("/authorize", authorizationServerUrl))
-    pkce = await _pkce()
+    generated = await pkce()
+    verifier, challenge = generated["verifier"], generated["challenge"]
     url.searchParams.set("response_type", "code")
     url.searchParams.set("client_id", options["clientInformation"]["client_id"])
-    url.searchParams.set("code_challenge", pkce["challenge"])
+    url.searchParams.set("code_challenge", challenge)
     url.searchParams.set("code_challenge_method", "S256")
     url.searchParams.set("redirect_uri", jsString(options["redirectUrl"]))
     if options.get("state"):
@@ -273,15 +277,15 @@ async def startAuthorization(
         url.searchParams.set("prompt", "consent")
     if options.get("resource"):
         url.searchParams.set("resource", options["resource"])
-    return {"authorizationUrl": url, "codeVerifier": pkce["verifier"]}
+    return {"authorizationUrl": url, "codeVerifier": verifier}
 
 
-async def _tokenRequest(
+async def tokenRequest(
     authorizationServerUrl: str | URL, options: TokenRequestOptions, params: URLSearchParams
 ) -> OAuthTokens:
     metadata = options.get("metadata")
     tokenEndpoint = metadata.get("token_endpoint") if metadata is not None else None
-    url = _secureEndpoint(tokenEndpoint if tokenEndpoint is not None else URL("/token", authorizationServerUrl))
+    url = secureEndpoint(tokenEndpoint if tokenEndpoint is not None else URL("/token", authorizationServerUrl))
     headers = httpx.Headers({"Accept": "application/json", "content-type": "application/x-www-form-urlencoded"})
     if options.get("resource"):
         params.set("resource", options["resource"])
@@ -290,8 +294,8 @@ async def _tokenRequest(
         await maybe_await(addClientAuthentication(headers, params, url, metadata))
     else:
         supported = metadata.get("token_endpoint_auth_methods_supported") if metadata is not None else None
-        _applyClientAuthentication(
-            _selectClientAuthMethod(options["clientInformation"], supported if supported is not None else []),
+        applyClientAuthentication(
+            selectClientAuthMethod(options["clientInformation"], supported if supported is not None else []),
             options["clientInformation"],
             headers,
             params,
@@ -336,7 +340,7 @@ async def registerClient(
                 "application_type": (
                     options["clientMetadata"]["application_type"]
                     if options["clientMetadata"].get("application_type") is not None
-                    else _applicationType(options["clientMetadata"]["redirect_uris"])
+                    else applicationType(options["clientMetadata"]["redirect_uris"])
                 ),
                 **({"scope": options["scope"]} if options.get("scope") else {}),
             }),
@@ -351,7 +355,7 @@ async def registerClient(
 async def exchangeAuthorizationCode(
     authorizationServerUrl: str | URL, options: ExchangeAuthorizationCodeOptions
 ) -> OAuthTokens:
-    return await _tokenRequest(
+    return await tokenRequest(
         authorizationServerUrl,
         options,
         URLSearchParams([
@@ -366,7 +370,7 @@ async def exchangeAuthorizationCode(
 async def refreshAuthorization(
     authorizationServerUrl: str | URL, options: RefreshAuthorizationOptions
 ) -> OAuthTokens:
-    tokens = await _tokenRequest(
+    tokens = await tokenRequest(
         authorizationServerUrl,
         options,
         URLSearchParams([("grant_type", "refresh_token"), ("refresh_token", options["refreshToken"])]),
@@ -374,7 +378,7 @@ async def refreshAuthorization(
     return {"refresh_token": options["refreshToken"], **tokens}
 
 
-def _withScope(tokens: OAuthTokens, scope: str | None) -> OAuthTokens:
+def withScope(tokens: OAuthTokens, scope: str | None) -> OAuthTokens:
     return {**tokens, "scope": scope} if "scope" not in tokens and scope else tokens
 
 
@@ -388,9 +392,9 @@ def stepUpScope(granted: str | None, challenged: str | None) -> str | None:
     return " ".join(dict.fromkeys(scopes))
 
 
-async def _runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions) -> OAuthFlowResult:
+async def runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions) -> OAuthFlowResult:
     authorizationServerMetadataUrl = options.get("authorizationServerMetadataUrl")
-    metadataUrl = _secureEndpoint(authorizationServerMetadataUrl) if authorizationServerMetadataUrl else None
+    metadataUrl = secureEndpoint(authorizationServerMetadataUrl) if authorizationServerMetadataUrl else None
     # With a configured metadata URL, discovery is not cached, so changing the URL applies at once.
     discoveryState = getattr(provider, "discoveryState", None)
     cached = None if metadataUrl else (await maybe_await(discoveryState()) if discoveryState is not None else None)
@@ -471,7 +475,9 @@ async def _runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions) -> 
         )
         await maybe_await(saveClientInformation(client))
     # The document's redirect URI may differ from the provider's, for example by a server-specific path.
-    redirectUrl = clientDocument["redirectUrl"] if clientDocument is not None else provider.redirectUrl
+    redirectUrl = nullishCoalesce(
+        clientDocument.get("redirectUrl") if clientDocument is not None else None, provider.redirectUrl
+    )
     tokenOptions: TokenRequestOptions = defined({  # type: ignore[assignment]
         "metadata": metadata,
         "clientInformation": client,
@@ -482,11 +488,11 @@ async def _runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions) -> 
     })
     if options.get("authorizationCode"):
         # RFC 9207: never send a code from another authorization server to this one.
-        iss = options.get("iss")
-        if metadata is not None and (iss is not None or metadata.get("authorization_response_iss_parameter_supported")):
+        iss = options.get("iss", UNDEFINED)
+        if metadata is not None and (iss is not UNDEFINED or metadata.get("authorization_response_iss_parameter_supported")):
             issuer = metadata.get("issuer", UNDEFINED)
             if iss != issuer:
-                raise OAuthIssuerMismatchError(issuer, iss)
+                raise OAuthIssuerMismatchError(issuer, None if iss is UNDEFINED else iss)
         tokens = await exchangeAuthorizationCode(
             discovered["authorizationServerUrl"],
             {
@@ -498,7 +504,7 @@ async def _runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions) -> 
         )
         # A response without `scope` grants the requested scope (RFC 6749 §5.1). Recorded so a step-up can
         # keep it. Callers pass the options of the authorization request, so `scope` is what was requested.
-        await maybe_await(provider.saveTokens(_withScope(tokens, scope)))
+        await maybe_await(provider.saveTokens(withScope(tokens, scope)))
         return "AUTHORIZED"
     existing = None if options.get("skipRefresh") else await maybe_await(provider.tokens())
     if existing is not None and existing.get("refresh_token"):
@@ -508,7 +514,7 @@ async def _runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions) -> 
                 {**tokenOptions, "refreshToken": existing["refresh_token"]},
             )
             # A refresh without `scope` keeps the scope of the grant (RFC 6749 §6).
-            await maybe_await(provider.saveTokens(_withScope(tokens, existing.get("scope"))))
+            await maybe_await(provider.saveTokens(withScope(tokens, existing.get("scope"))))
             return "AUTHORIZED"
         except Exception as error:
             if signal_aborted(options.get("signal")) or isinstance(error, OAuthInsecureEndpointError):
@@ -535,22 +541,23 @@ async def _runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions) -> 
 
 async def authorizeMcp(provider: OAuthClientProvider, options: OAuthFlowOptions) -> OAuthFlowResult:
     try:
-        return await _runFlow(provider, options)
+        return await runFlow(provider, options)
     except OAuthError as error:
         invalidateCredentials = getattr(provider, "invalidateCredentials", None)
         if error.code in ("invalid_client", "unauthorized_client"):
             if invalidateCredentials is not None:
                 await maybe_await(invalidateCredentials("all"))
-            return await _runFlow(provider, options)
+            return await runFlow(provider, options)
         if error.code == "invalid_grant":
             if invalidateCredentials is not None:
                 await maybe_await(invalidateCredentials("tokens"))
-            return await _runFlow(provider, options)
+            return await runFlow(provider, options)
         raise
 
 
 class _OAuthAuthProvider:
-    """The ``AuthProvider`` ``adaptOAuthProvider`` returns."""
+    """The ``AuthProvider`` ``adaptOAuthProvider`` returns. MISAKA fork: a class for upstream's object literal
+    over closures, so the shared refresh (``inFlight``) has a home; ``ext/oauth.py``'s provider is built alike."""
 
     def __init__(self, provider: OAuthClientProvider) -> None:
         self._provider = provider

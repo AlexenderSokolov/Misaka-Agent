@@ -22,6 +22,15 @@ from .keybinding_hints import keyHint
 class LoginDialogComponent(Container):
     """Login dialog component - replaces editor during OAuth login flow"""
 
+    @property
+    def focused(self) -> bool:
+        return self._focused
+
+    @focused.setter
+    def focused(self, value: bool) -> None:
+        self._focused = value
+        self.input.focused = value
+
     def __init__(
         self,
         tui: Any,
@@ -82,15 +91,6 @@ class LoginDialogComponent(Container):
         self.addChild(DynamicBorder())
 
     @property
-    def focused(self) -> bool:
-        return self._focused
-
-    @focused.setter
-    def focused(self, value: bool) -> None:
-        self._focused = value
-        self.input.focused = value
-
-    @property
     def signal(self) -> AbortSignal:
         return self.abortController.signal
 
@@ -147,8 +147,6 @@ class LoginDialogComponent(Container):
         self.contentContainer.addChild(Spacer(1))
         self.contentContainer.addChild(Text(theme.fg("warning", f"Enter code: {info.userCode}"), 1, 0))
 
-        # MISAKA fork: the verification page opens as the auth URL does; pi leaves it to a click.
-        openBrowser(info.verificationUri)
         self.tui.requestRender()
 
     def showManualInput(self, prompt: str) -> asyncio.Future[str]:

@@ -12,6 +12,7 @@ MISAKA forks, each marked where it happens:
   ``graphemeWidth`` is memoised, the width cache is larger, and ``asciiVisibleWidth`` uses ``str`` methods.
 - String offsets count code points (Python strings), where upstream counts UTF-16 code units; both are consistent
   within their side.
+- Parameters pi names ``str`` are ``str_``: the functions use the ``str`` type.
 - ``getGraphemeCellRange``, ``getActiveBackgroundAnsi`` and ``AnsiCodeTracker.getActiveBackgroundCode`` serve only
   the fullscreen renderer (``tui-alt-screen.ts``, ``layout.ts``), which is not ported (D1).
 """

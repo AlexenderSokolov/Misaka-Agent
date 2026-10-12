@@ -61,6 +61,15 @@ def formatAuthSelectorProviderStatus(provider: AuthSelectorProvider) -> str:
 class OAuthSelectorComponent(Container):
     """Component that renders an auth provider selector."""
 
+    @property
+    def focused(self) -> bool:
+        return self._focused
+
+    @focused.setter
+    def focused(self, value: bool) -> None:
+        self._focused = value
+        self.searchInput.focused = value
+
     def __init__(
         self,
         mode: Literal["login", "logout"],
@@ -98,15 +107,6 @@ class OAuthSelectorComponent(Container):
         self.addChild(DynamicBorder())
 
         self.filterProviders(initialSearchInput or "")
-
-    @property
-    def focused(self) -> bool:
-        return self._focused
-
-    @focused.setter
-    def focused(self, value: bool) -> None:
-        self._focused = value
-        self.searchInput.focused = value
 
     def filterProviders(self, query: str) -> None:
         self.filteredProviders = (

@@ -91,6 +91,17 @@ MISAKA 的部分文件移植自其它项目。移植代码所附带的许可证�
   （`diff/base.js`、`diff/line.js`）与 `patch/create.js`，只含工具用到的部分；输出以 node 跑真实的
   `diff` 8.0.4 录下的用例校验（`tests/fixtures/jsdiff_cases.json`）。
 
+## grok-mermaid（经 Pi 的 coding-agent）
+
+- 上游：https://github.com/xl0/grok-mermaid ，npm 包 `grok-mermaid` 0.2.3
+- 许可证：Apache-2.0
+- 版权：Copyright 2023-2026 SpaceXAI；Copyright 2026 Alexey Zaytsev
+- 许可证全文：`LICENSES/grok-mermaid.txt`
+- 本仓库位置：`misaka/ui/tui/vendor/grok_mermaid/`
+- 说明：Pi 的 TUI 用它把 Markdown 里的 Mermaid 代码块画成终端里的 Unicode 框线图；MISAKA 逐文件移植全部源码
+  （解析、布局、画布、宽度表、源码框）。改动：边的 `from` 字段改名 `from_`（Python 关键字），模型类型改为
+  dataclass。输出以 node 跑真实的 grok-mermaid 0.2.3 录下的结果逐字节校验（`tests/fixtures/grok_mermaid_oracle.json`）。
+
 ## marked（经 Pi 的 packages/tui）
 
 - 上游：https://github.com/markedjs/marked ，npm 包 `marked` 18.0.11

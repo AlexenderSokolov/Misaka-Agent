@@ -260,6 +260,68 @@ def posixIsAbsolute(path: str) -> bool:
     return len(path) > 0 and path[0] == CHAR_FORWARD_SLASH
 
 
+def posixRelative(from_: str, to: str) -> str:
+    if from_ == to:
+        return ""
+
+    # Trim leading forward slashes.
+    from_ = posixResolve(from_)
+    to = posixResolve(to)
+
+    if from_ == to:
+        return ""
+
+    fromStart = 1
+    fromEnd = len(from_)
+    fromLen = fromEnd - fromStart
+    toStart = 1
+    toLen = len(to) - toStart
+
+    # Compare paths to find the longest common path from root
+    length = min(toLen, fromLen)
+    lastCommonSep = -1
+    i = 0
+    while i < length:
+        fromCode = from_[fromStart + i]
+        if fromCode != to[toStart + i]:
+            break
+        elif fromCode == CHAR_FORWARD_SLASH:
+            lastCommonSep = i
+        i += 1
+    if i == length:
+        if toLen > length:
+            if to[toStart + i] == CHAR_FORWARD_SLASH:
+                # We get here if `from` is the exact base path for `to`.
+                # For example: from='/foo/bar'; to='/foo/bar/baz'
+                return to[toStart + i + 1 :]
+            if i == 0:
+                # We get here if `from` is the root
+                # For example: from='/'; to='/foo'
+                return to[toStart + i :]
+        elif fromLen > length:
+            if from_[fromStart + i] == CHAR_FORWARD_SLASH:
+                # We get here if `to` is the exact base path for `from`.
+                # For example: from='/foo/bar/baz'; to='/foo/bar'
+                lastCommonSep = i
+            elif i == 0:
+                # We get here if `to` is the root.
+                # For example: from='/foo/bar'; to='/'
+                lastCommonSep = 0
+
+    out = ""
+    # Generate the relative path based on the path difference between `to`
+    # and `from`.
+    i = fromStart + lastCommonSep + 1
+    while i <= fromEnd:
+        if i == fromEnd or from_[i] == CHAR_FORWARD_SLASH:
+            out += ".." if len(out) == 0 else "/.."
+        i += 1
+
+    # Lastly, append the rest of the destination (`to`) path that comes after
+    # the common path parts.
+    return f"{out}{to[toStart + lastCommonSep :]}"
+
+
 # --- win32 ----------------------------------------------------------------------------------------
 
 
@@ -691,6 +753,131 @@ def win32IsAbsolute(path: str) -> bool:
     )
 
 
+def win32Relative(from_: str, to: str) -> str:
+    if from_ == to:
+        return ""
+
+    fromOrig = win32Resolve(from_)
+    toOrig = win32Resolve(to)
+
+    if fromOrig == toOrig:
+        return ""
+
+    from_ = fromOrig.lower()
+    to = toOrig.lower()
+
+    if from_ == to:
+        return ""
+
+    if len(fromOrig) != len(from_) or len(toOrig) != len(to):
+        fromSplit = fromOrig.split("\\")
+        toSplit = toOrig.split("\\")
+        if fromSplit[-1] == "":
+            fromSplit.pop()
+        if toSplit[-1] == "":
+            toSplit.pop()
+
+        fromLen = len(fromSplit)
+        toLen = len(toSplit)
+        length = min(toLen, fromLen)
+
+        i = 0
+        while i < length:
+            if fromSplit[i].lower() != toSplit[i].lower():
+                break
+            i += 1
+
+        if i == 0:
+            return toOrig
+        elif i == length:
+            if toLen > length:
+                return "\\".join(toSplit[i:])
+            if fromLen > length:
+                return "..\\" * (fromLen - 1 - i) + ".."
+            return ""
+
+        return "..\\" * (fromLen - i) + "\\".join(toSplit[i:])
+
+    # Trim any leading backslashes
+    fromStart = 0
+    while fromStart < len(from_) and from_[fromStart] == CHAR_BACKWARD_SLASH:
+        fromStart += 1
+    # Trim trailing backslashes (applicable to UNC paths only)
+    fromEnd = len(from_)
+    while fromEnd - 1 > fromStart and from_[fromEnd - 1] == CHAR_BACKWARD_SLASH:
+        fromEnd -= 1
+    fromLen = fromEnd - fromStart
+
+    # Trim any leading backslashes
+    toStart = 0
+    while toStart < len(to) and to[toStart] == CHAR_BACKWARD_SLASH:
+        toStart += 1
+    # Trim trailing backslashes (applicable to UNC paths only)
+    toEnd = len(to)
+    while toEnd - 1 > toStart and to[toEnd - 1] == CHAR_BACKWARD_SLASH:
+        toEnd -= 1
+    toLen = toEnd - toStart
+
+    # Compare paths to find the longest common path from root
+    length = min(toLen, fromLen)
+    lastCommonSep = -1
+    i = 0
+    while i < length:
+        fromCode = from_[fromStart + i]
+        if fromCode != to[toStart + i]:
+            break
+        elif fromCode == CHAR_BACKWARD_SLASH:
+            lastCommonSep = i
+        i += 1
+
+    # We found a mismatch before the first common path separator was seen, so
+    # return the original `to`.
+    if i != length:
+        if lastCommonSep == -1:
+            return toOrig
+    else:
+        if toLen > length:
+            if to[toStart + i] == CHAR_BACKWARD_SLASH:
+                # We get here if `from` is the exact base path for `to`.
+                # For example: from='C:\foo\bar'; to='C:\foo\bar\baz'
+                return toOrig[toStart + i + 1 :]
+            if i == 2:
+                # We get here if `from` is the device root.
+                # For example: from='C:\'; to='C:\foo'
+                return toOrig[toStart + i :]
+        if fromLen > length:
+            if from_[fromStart + i] == CHAR_BACKWARD_SLASH:
+                # We get here if `to` is the exact base path for `from`.
+                # For example: from='C:\foo\bar'; to='C:\foo'
+                lastCommonSep = i
+            elif i == 2:
+                # We get here if `to` is the device root.
+                # For example: from='C:\foo\bar'; to='C:\'
+                lastCommonSep = 3
+        if lastCommonSep == -1:
+            lastCommonSep = 0
+
+    out = ""
+    # Generate the relative path based on the path difference between `to` and
+    # `from`
+    i = fromStart + lastCommonSep + 1
+    while i <= fromEnd:
+        if i == fromEnd or from_[i] == CHAR_BACKWARD_SLASH:
+            out += ".." if len(out) == 0 else "\\.."
+        i += 1
+
+    toStart += lastCommonSep
+
+    # Lastly, append the rest of the destination (`to`) path that comes after
+    # the common path parts
+    if len(out) > 0:
+        return f"{out}{toOrig[toStart:toEnd]}"
+
+    if _charAt(toOrig, toStart) == CHAR_BACKWARD_SLASH:
+        toStart += 1
+    return toOrig[toStart:toEnd]
+
+
 posix = SimpleNamespace(
     normalize=posixNormalize,
     join=posixJoin,
@@ -698,6 +885,8 @@ posix = SimpleNamespace(
     basename=posixBasename,
     resolve=posixResolve,
     isAbsolute=posixIsAbsolute,
+    relative=posixRelative,
+    sep="/",
 )
 win32 = SimpleNamespace(
     normalize=win32Normalize,
@@ -706,6 +895,8 @@ win32 = SimpleNamespace(
     basename=win32Basename,
     resolve=win32Resolve,
     isAbsolute=win32IsAbsolute,
+    relative=win32Relative,
+    sep="\\",
 )
 
 _platform = win32 if sys.platform == "win32" else posix
@@ -714,6 +905,8 @@ join: Callable[..., str] = _platform.join
 dirname: Callable[[str], str] = _platform.dirname
 basename: Callable[[str], str] = _platform.basename
 resolve: Callable[..., str] = _platform.resolve
+relative: Callable[[str, str], str] = _platform.relative
+isAbsolute: Callable[[str], bool] = _platform.isAbsolute
 sep = "\\" if sys.platform == "win32" else "/"
 
-__all__ = ["basename", "dirname", "join", "normalize", "posix", "resolve", "sep", "win32"]
+__all__ = ["basename", "dirname", "isAbsolute", "join", "normalize", "posix", "relative", "resolve", "sep", "win32"]

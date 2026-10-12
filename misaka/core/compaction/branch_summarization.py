@@ -10,6 +10,7 @@ from typing import Any, TypedDict
 from misaka.agent.types import AgentMessage, StreamFn
 from misaka.ai.types import Context, Model, SimpleStreamOptions, Usage, UserMessage
 from misaka.ai.utils.retry import RetryCallbacks, RetryPolicy
+from misaka.ai.utils.text import contentText
 from misaka.ai.utils.transcript import normalizeContext
 from misaka.ai.utils.uuid import uuidv7
 from misaka.core.compaction.compaction import (
@@ -20,7 +21,6 @@ from misaka.core.compaction.compaction import (
 from misaka.core.compaction.utils import (
     SUMMARIZATION_SYSTEM_PROMPT,
     FileOperations,
-    _assistant_text,
     computeFileLists,
     createFileOps,
     extractFileOpsFromMessage,
@@ -251,7 +251,7 @@ async def generateBranchSummary(
     if any(read_field(block, "type") == "toolCall" for block in response.content):
         return BranchSummaryResult(error="Branch summarization attempted to call a tool")
 
-    summary = _BRANCH_SUMMARY_PREAMBLE + _assistant_text(response)
+    summary = _BRANCH_SUMMARY_PREAMBLE + contentText(response.content)
     file_lists = computeFileLists(preparation.fileOps)
     summary += formatFileOperations(file_lists["readFiles"], file_lists["modifiedFiles"])
     return BranchSummaryResult(

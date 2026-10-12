@@ -393,6 +393,33 @@ def test_writes_a_valid_osc_9_4_clear_sequence():
     assert recorder.writes == ["\x1b]9;4;0\x07"]
 
 
+# --- ProcessTerminal write log --------------------------------------------------------------------
+
+
+def test_appends_every_write_to_the_write_log_file(tmp_path, monkeypatch):
+    logPath = tmp_path / "tui.log"
+    monkeypatch.setenv("MISAKA_TUI_WRITE_LOG", str(logPath))
+    terminal = ProcessTerminal()
+    terminal.stdout = Recorder()
+
+    terminal.write("first\n")
+    terminal.write("second")
+
+    assert logPath.read_text(encoding="utf-8") == "first\nsecond"
+
+
+def test_a_write_log_directory_gets_a_file_per_process(tmp_path, monkeypatch):
+    monkeypatch.setenv("MISAKA_TUI_WRITE_LOG", str(tmp_path))
+    terminal = ProcessTerminal()
+    terminal.stdout = Recorder()
+
+    terminal.write("data")
+
+    [logFile] = list(tmp_path.iterdir())
+    assert logFile.name.startswith("tui-") and logFile.name.endswith(f"-{os.getpid()}.log")
+    assert logFile.read_text(encoding="utf-8") == "data"
+
+
 # --- ProcessTerminal dimensions -------------------------------------------------------------------
 
 

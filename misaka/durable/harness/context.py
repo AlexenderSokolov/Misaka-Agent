@@ -208,14 +208,14 @@ def _detach(value: Any, memo: dict[int, Any]) -> Any:
 
 
 def settle(
-    settled: list[dict[str, Any]], open_: list[dict[str, Any]]
+    settled: list[dict[str, Any]], open: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Move the ordered messages before the last assistant message of ``open_`` to ``settled``. ``orderToolResults()``
     of a sequence equals the concatenation over its parts when each later part starts with an assistant message."""
-    last = next((index for index in range(len(open_) - 1, -1, -1) if open_[index]["role"] == "assistant"), -1)
+    last = next((index for index in range(len(open) - 1, -1, -1) if open[index]["role"] == "assistant"), -1)
     if last <= 0:
-        return settled, open_
-    return [*settled, *orderToolResults(open_[:last])], open_[last:]
+        return settled, open
+    return [*settled, *orderToolResults(open[:last])], open[last:]
 
 
 async def activeEntries(
@@ -234,13 +234,13 @@ def rangeQuery(bounds: ContextBounds) -> dict[str, Any]:
 
 
 async def scanRange(
-    storage: Storage, conversationId: ConversationId, range_: dict[str, Any], context: Context
+    storage: Storage, conversationId: ConversationId, range: dict[str, Any], context: Context
 ) -> list[EntryRecord]:
     """Visible entries within ``range_``, oldest first."""
     entries: list[EntryRecord] = []
     cursor: Cursor | None = None
     while True:
-        page = await storage.scanEntries({"conversationId": conversationId, **range_}, SCAN_PAGE_SIZE, cursor, context)
+        page = await storage.scanEntries({"conversationId": conversationId, **range}, SCAN_PAGE_SIZE, cursor, context)
         entries.extend(page["items"])
         cursor = page.get("next")
         if cursor is None:
@@ -249,9 +249,9 @@ async def scanRange(
     return entries
 
 
-def selectActive(head: EntryRecord | None, range_: list[EntryRecord]) -> list[EntryRecord]:
+def selectActive(head: EntryRecord | None, range: list[EntryRecord]) -> list[EntryRecord]:
     """The head marker followed by the range's non-head entries, or the whole range without a marker."""
-    return range_ if head is None else [head, *[entry for entry in range_ if entry.get("head") is None]]
+    return range if head is None else [head, *[entry for entry in range if entry.get("head") is None]]
 
 
 def orderToolResults(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

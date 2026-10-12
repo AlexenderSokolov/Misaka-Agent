@@ -18,12 +18,7 @@ def kimiCodingProvider() -> Provider:
             baseUrl="https://api.kimi.com/coding",
             auth=ProviderAuth(
                 apiKey=envApiKeyAuth("Kimi API key", ["KIMI_API_KEY"]),
-                oauth=lazyOAuth(
-                    name="Kimi Code (subscription)",
-                    isSubscription=True,
-                    loginLabel="Sign in with Kimi Code",
-                    load=loadKimiCodingOAuth,
-                ),
+                oauth=lazyOAuth({"name": "Kimi Code (subscription)", "isSubscription": True, "loginLabel": "Sign in with Kimi Code", "load": loadKimiCodingOAuth}),
             ),
             models=list(KIMI_CODING_MODELS.values()),
             api=anthropicMessagesApi(),

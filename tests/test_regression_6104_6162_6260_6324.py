@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import ntpath
-import posixpath
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +17,7 @@ from misaka.ai.utils.transcript import getCurrentSystemPrompt, getCurrentTools
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.resource_loader import DefaultResourceLoader
 from misaka.core.tools.find import createFindToolDefinition, relativizeFindResultPath
+from misaka.utils import node_path
 from misaka.utils.values import read_field
 from tests.suite_harness import createHarness
 from tests.utilities import assistantMsg, userMsg
@@ -29,8 +28,8 @@ from tests.utilities import assistantMsg, userMsg
 # find tool used to slice absolute results at searchPath.length + 1, which dropped the first character of the first
 # path segment for root searches. Windows directory results that ended in backslash also gained an extra slash.
 
-win32 = ntpath
-posix = posixpath
+win32 = node_path.win32
+posix = node_path.posix
 searchRoot = "I:\\"
 
 

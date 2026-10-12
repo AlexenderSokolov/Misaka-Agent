@@ -12,11 +12,6 @@ from pathlib import Path
 
 from misaka.ai.utils._output_limit import hit_output_limit
 from misaka.config import home
-from misaka.core.mcp_servers import (
-    LIST_MCP_RESOURCE_TEMPLATES_TOOL,
-    LIST_MCP_RESOURCES_TOOL,
-    READ_MCP_RESOURCE_TOOL,
-)
 from misaka.core.network.card_contract import format_deliverable, split_deliverable
 from misaka.core.platform import prompt_guard
 from misaka.core.platform import tasks as task_store
@@ -132,31 +127,12 @@ You are one researcher on a research graph that Last Order coordinates. How to w
 """
 
 
-def _registered_tools(worker):
-    """Names of every tool the session has registered, active or not (none for a session that cannot say)."""
-    getAllTools = getattr(getattr(worker, "session", None), "getAllTools", None)
-    return [tool.name for tool in getAllTools()] if getAllTools is not None else []
-
-
 def session_tools(worker, tools=RESEARCH_TOOLS):
-    """Inherit enabled tools in session order; new registrations join the next phase. With MCP servers
-    connected, `codemode` and `tool_search` come along: MCP tools reach the model through scripts
-    (user decision, 2026-10-03)."""
+    """Inherit enabled tools in session order; new registrations join the next phase."""
     from misaka.core.research.tool_policy import research_tools
 
     session = getattr(worker, "session", None)
-    if session is None:
-        return research_tools(tools)
-    names = list(session.getActiveToolNames())
-    registered = _registered_tools(worker)
-    if any(name.startswith("mcp__") for name in registered):
-        names.extend(name for name in ("codemode", "tool_search") if name in registered and name not in names)
-    return research_tools(names)
-
-
-# What a research scope lets codemode scripts call without declaring it: every MCP server tool and the
-# resource tools, also those of servers that connect after the phase starts.
-MCP_CALLABLE = ("mcp__*", LIST_MCP_RESOURCES_TOOL, LIST_MCP_RESOURCE_TEMPLATES_TOOL, READ_MCP_RESOURCE_TOOL)
+    return research_tools(session.getActiveToolNames() if session is not None else tools)
 
 SOURCES_FOOTER = """
 End with a `## Sources` section listing every source this text rests on, one per line: the file's path inside the

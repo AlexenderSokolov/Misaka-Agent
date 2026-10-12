@@ -10,6 +10,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.config import CFG, current_config, sisters
 from misaka.config.identity import (
     COORDINATOR_APPROVAL,
@@ -118,7 +119,7 @@ def _text(s):
 
 def _schema(model):
     "Convert a Pydantic model to the JSON schema expected by the harness."
-    return model.model_json_schema()
+    return typeboxSchema(model)
 
 
 def _task_ids(args):

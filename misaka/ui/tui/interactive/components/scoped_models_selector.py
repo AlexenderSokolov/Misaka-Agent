@@ -131,6 +131,15 @@ class ScopedModelsSelectorComponent(Container):
     Changes are session-only until explicitly persisted with Ctrl+S.
     """
 
+    @property
+    def focused(self) -> bool:
+        return self._focused
+
+    @focused.setter
+    def focused(self, value: bool) -> None:
+        self._focused = value
+        self.searchInput.focused = value
+
     def __init__(self, config: ModelsConfig, callbacks: ModelsCallbacks) -> None:
         super().__init__()
         self.modelsById: dict[str, Model] = {}
@@ -181,15 +190,6 @@ class ScopedModelsSelectorComponent(Container):
 
         self.addChild(DynamicBorder())
         self.updateList()
-
-    @property
-    def focused(self) -> bool:
-        return self._focused
-
-    @focused.setter
-    def focused(self, value: bool) -> None:
-        self._focused = value
-        self.searchInput.focused = value
 
     def updateModels(self, models: Sequence[Model], enabledModelIds: list[str] | None | object = _UNSET) -> None:
         selectedId = (

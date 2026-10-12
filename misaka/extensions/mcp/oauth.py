@@ -64,7 +64,7 @@ from misaka.utils.js import (
     jsTrim,
     startTask,
 )
-from misaka.utils.values import maybe_await, signal_aborted
+from misaka.utils.values import maybe_await, read_field, signal_aborted
 from misaka.utils.whatwg_url import URL
 
 CALLBACK_HOST = "127.0.0.1"
@@ -104,7 +104,7 @@ class McpOAuthSettings(TypedDict, total=False):
 
 
 @dataclass(slots=True)
-class _CallbackSettings:
+class CallbackSettings:
     """Where the loopback callback server listens and the redirect URI it serves."""
 
     # Address to listen on.
@@ -117,7 +117,7 @@ class _CallbackSettings:
     fixedRedirectUrl: str | None
 
 
-def _callbackSettings(settings: McpOAuthSettings) -> _CallbackSettings:
+def callbackSettings(settings: McpOAuthSettings) -> CallbackSettings:
     callbackUrl = settings.get("callbackUrl")
     url = URL(callbackUrl if callbackUrl is not None else f"http://{CALLBACK_HOST}{CALLBACK_PATH}")
     address = re.sub(r"^\[|\]$", "", url.hostname)
@@ -132,7 +132,7 @@ def _callbackSettings(settings: McpOAuthSettings) -> _CallbackSettings:
     elif port is not None:
         url.port = jsString(port)
         fixedRedirectUrl = url.href
-    return _CallbackSettings(
+    return CallbackSettings(
         # `localhost` is served on 127.0.0.1; browsers fall back to it when ::1 refuses.
         host=CALLBACK_HOST if address == "localhost" else address,
         redirectHost=address,
@@ -142,7 +142,7 @@ def _callbackSettings(settings: McpOAuthSettings) -> _CallbackSettings:
     )
 
 
-def _mergeScopes(*scopes: str | None) -> str | None:
+def mergeScopes(*scopes: str | None) -> str | None:
     """Scopes of both lists, each once."""
     merged = list(dict.fromkeys(
         item for scope in scopes for item in (jsSplitWhitespace(scope) if scope else []) if item
@@ -153,18 +153,18 @@ def _mergeScopes(*scopes: str | None) -> str | None:
 type _StoredStates = dict[str, McpOAuthState]
 
 
-def _parseStates(content: str | None) -> _StoredStates:
+def parseStates(content: str | None) -> _StoredStates:
     if not content or not jsTrim(content):
         return {}
     parsed: Any = jsonParse(content)
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _serializeStates(states: _StoredStates) -> str:
+def serializeStates(states: _StoredStates) -> str:
     return f"{jsonStringify(states, 2)}\n"
 
 
-def _storeKeys(name: str, serverUrl: str) -> tuple[str, str]:
+def storeKeys(name: str, serverUrl: str) -> tuple[str, str]:
     """Keys of a server's state: by name and URL, so servers sharing a URL keep separate accounts, and the
     legacy key by URL alone, written by older versions."""
     legacyKey = jsString(URL(serverUrl))
@@ -190,13 +190,13 @@ class _ServerStore:
 
         # The first server to load legacy state takes it over; others with the same URL sign in again.
         def takeOver(current: str | None) -> LockResult:
-            states = _parseStates(current)
+            states = parseStates(current)
             # `states[key]` as a JavaScript condition: an object is truthy, a missing or null entry is not.
             if states.get(key) is not None or states.get(legacyKey) is None:
                 return LockResult(result=states.get(key))
             states[key] = states[legacyKey]
             del states[legacyKey]
-            return LockResult(result=states[key], next=_serializeStates(states))
+            return LockResult(result=states[key], next=serializeStates(states))
 
         return self._store._backend.withLock(takeOver)
 
@@ -223,7 +223,7 @@ class McpOAuthCredentialStore:
         self._lockDir: str | None = lockDir if backend is not None else str(home.path("locks"))
 
     def forServer(self, name: str, serverUrl: str) -> McpOAuthServerStore:
-        key, legacyKey = _storeKeys(name, serverUrl)
+        key, legacyKey = storeKeys(name, serverUrl)
         return _ServerStore(self, key, legacyKey)
 
     async def _withRefreshLock(self, key: str, fn: Callable[[], Awaitable[Any]]) -> Any:
@@ -257,36 +257,36 @@ class McpOAuthCredentialStore:
     def tokens(self, name: str, serverUrl: str) -> Any:
         """The stored tokens of a server, for noticing sign-ins done by another process. Does not take over
         legacy state."""
-        key, legacyKey = _storeKeys(name, serverUrl)
-        states: _StoredStates = self._backend.withLock(lambda current: LockResult(result=_parseStates(current)))
+        key, legacyKey = storeKeys(name, serverUrl)
+        states: _StoredStates = self._backend.withLock(lambda current: LockResult(result=parseStates(current)))
         state = states.get(key) if states.get(key) is not None else states.get(legacyKey)
-        return state.get("tokens") if state is not None else None
+        return read_field(state, "tokens")
 
     def remove(self, name: str, serverUrl: str) -> bool:
         """Returns whether credentials were stored for the server. Removes legacy state the server would
         take over."""
-        key, legacyKey = _storeKeys(name, serverUrl)
+        key, legacyKey = storeKeys(name, serverUrl)
 
         def removeStored(current: str | None) -> LockResult:
-            states = _parseStates(current)
+            states = parseStates(current)
             stored = key if key in states else (legacyKey if legacyKey in states else None)
             if not stored:
                 return LockResult(result=False)
             del states[stored]
-            return LockResult(result=True, next=_serializeStates(states))
+            return LockResult(result=True, next=serializeStates(states))
 
         return self._backend.withLock(removeStored)
 
     def _write(self, update: Callable[[_StoredStates], None]) -> None:
         def write(current: str | None) -> LockResult:
-            states = _parseStates(current)
+            states = parseStates(current)
             update(states)
-            return LockResult(result=None, next=_serializeStates(states))
+            return LockResult(result=None, next=serializeStates(states))
 
         self._backend.withLock(write)
 
 
-def _timedFetch(fetch: McpFetch | None = None) -> McpFetch:
+def timedFetch(fetch: McpFetch | None = None) -> McpFetch:
     """``fetch`` with ``OAUTH_REQUEST_TIMEOUT_MS`` per request, on top of the request's own signal."""
     resolved = fetch if fetch is not None else _fetch.fetch
 
@@ -301,18 +301,18 @@ def _timedFetch(fetch: McpFetch | None = None) -> McpFetch:
     return timed
 
 
-def _registeredRedirectUrls(client: OAuthClientInformationMixed | None) -> list[str]:
+def registeredRedirectUrls(client: OAuthClientInformationMixed | None) -> list[str]:
     return client["redirect_uris"] if client is not None and "redirect_uris" in client else []  # type: ignore[typeddict-item]
 
 
-def _callbackId(serverUrl: str) -> str:
+def callbackId(serverUrl: str) -> str:
     """12 characters identifying an MCP server URL in callback paths, computed like Codex does."""
     url = URL(serverUrl)
     url.hash = ""
     return base64.urlsafe_b64encode(hashlib.sha256(url.href.encode("utf-8")).digest()[:9]).decode("ascii")
 
 
-def _clientMetadataDocument(
+def clientMetadataDocument(
     serverUrl: str, redirectUrl: str, metadata: AuthorizationServerMetadata | None
 ) -> OAuthClientMetadataDocument:
     """pi's Client ID Metadata Document, for ``clientRegistration: "cimd"``, chosen like Codex chooses its own.
@@ -330,13 +330,13 @@ def _clientMetadataDocument(
         )
     if metadata.get("authorization_response_iss_parameter_supported"):
         return {"url": f"{CLIENT_METADATA_BASE_URL}/client.json", "redirectUrl": redirectUrl}
-    id = _callbackId(serverUrl)
+    id = callbackId(serverUrl)
     redirect = URL(redirectUrl)
     redirect.pathname = f"{CALLBACK_PATH}/{id}"
     return {"url": f"{CLIENT_METADATA_BASE_URL}/{id}/client.json", "redirectUrl": redirect.href}
 
 
-def _createProvider(
+def createProvider(
     serverUrl: str,
     store: McpOAuthStateStore,
     settings: McpOAuthSettings,
@@ -350,7 +350,7 @@ def _createProvider(
             "redirectUrl": redirectUrl,
             "clientMetadata": {"client_name": clientName if clientName is not None else APP_NAME},
             "clientMetadataDocument": (
-                (lambda metadata: _clientMetadataDocument(serverUrl, redirectUrl, metadata))
+                (lambda metadata: clientMetadataDocument(serverUrl, redirectUrl, metadata))
                 if settings.get("clientRegistration") == "cimd"
                 else None
             ),
@@ -391,17 +391,17 @@ class _McpAuthProvider:
 
         async def refresh() -> None:
             state = await maybe_await(store.load())
-            tokens = state.get("tokens") if state is not None else None
-            if (tokens.get("access_token") if tokens is not None else None) != staleToken:
+            tokens = read_field(state, "tokens")
+            if read_field(tokens, "access_token") != staleToken:
                 return
             if not (tokens is not None and tokens.get("refresh_token")):
                 raise McpOAuthAuthorizationRequiredError()
             settings = self._options["settings"]()
-            redirectUrl = _callbackSettings(settings).fixedRedirectUrl
+            redirectUrl = callbackSettings(settings).fixedRedirectUrl
             if redirectUrl is None:
-                registered = _registeredRedirectUrls(state.get("clientInformation") if state is not None else None)
+                registered = registeredRedirectUrls(read_field(state, "clientInformation"))
                 redirectUrl = registered[0] if len(registered) > 0 else FALLBACK_REDIRECT_URL
-            provider = _createProvider(serverUrl, store, settings, redirectUrl, lambda _url: None)
+            provider = createProvider(serverUrl, store, settings, redirectUrl, lambda _url: None)
             # Refreshes the tokens, or reports that a new sign-in is needed. Not cancellable: a refresh the
             # server answered may have rotated the refresh token, so its answer must be saved.
             result = await authorizeMcp(
@@ -411,7 +411,7 @@ class _McpAuthProvider:
                     "resourceMetadataUrl": challenge.get("resourceMetadataUrl") if challenge is not None else None,
                     "authorizationServerMetadataUrl": settings.get("authServerMetadataUrl"),
                     "scope": challenge.get("scope") if challenge is not None else None,
-                    "fetch": _timedFetch(fetch),
+                    "fetch": timedFetch(fetch),
                 }),
             )
             if result == "REDIRECT":
@@ -438,8 +438,8 @@ class _McpAuthProvider:
             with contextlib.suppress(Exception):
                 await asyncio.shield(self._refreshing)
         state = await maybe_await(store.load())
-        tokens = state.get("tokens") if state is not None else None
-        token = tokens.get("access_token") if tokens is not None else None
+        tokens = read_field(state, "tokens")
+        token = read_field(tokens, "access_token")
         # `state?.tokensExpireAt !== undefined`: a stored null counts, and reads as 0.
         expired = (
             state is not None
@@ -452,8 +452,8 @@ class _McpAuthProvider:
         with contextlib.suppress(Exception):
             await asyncio.shield(self._refresh(token))
         state = await maybe_await(store.load())
-        tokens = state.get("tokens") if state is not None else None
-        return tokens.get("access_token") if tokens is not None else None
+        tokens = read_field(state, "tokens")
+        return read_field(tokens, "access_token")
 
     async def onUnauthorized(self, context: UnauthorizedContext) -> None:
         challenge = parseWwwAuthenticate(context["response"].headers.get("www-authenticate"))
@@ -504,12 +504,12 @@ class McpSignInCancelledError(Exception):
         self.name = "McpSignInCancelledError"
 
 
-class _AuthorizationResponse(TypedDict):
+class AuthorizationResponse(TypedDict):
     code: str
     iss: NotRequired[str]
 
 
-def _responseFromRedirectUrl(input: str, state: str, redirectUrl: URL) -> _AuthorizationResponse:
+def responseFromRedirectUrl(input: str, state: str, redirectUrl: URL) -> AuthorizationResponse:
     try:
         url = URL(jsTrim(input))
     except Exception:  # noqa: BLE001 - upstream `catch {}`
@@ -527,19 +527,19 @@ def _responseFromRedirectUrl(input: str, state: str, redirectUrl: URL) -> _Autho
     if not code:
         raise RuntimeError("The redirect URL does not contain an authorization code")
     iss = url.searchParams.get("iss")
-    response: _AuthorizationResponse = {"code": code}
+    response: AuthorizationResponse = {"code": code}
     if iss is not None:
         response["iss"] = iss
     return response
 
 
-async def _waitForAuthorizationResponse(
+async def waitForAuthorizationResponse(
     callback: OAuthCallbackServer,
     state: str,
     redirectUrl: URL,
     prompt: McpSignInPrompt,
     signal: Any,
-) -> _AuthorizationResponse | OAuthCallback:
+) -> AuthorizationResponse | OAuthCallback:
     """Wait for the browser callback or a pasted redirect URL, whichever comes first. Aborting ``signal``
     aborts the prompt, which then cancels the sign-in."""
     controller = AbortController()
@@ -547,11 +547,11 @@ async def _waitForAuthorizationResponse(
     fromBrowser = callback.waitForCallback(state, redirectUrl.pathname)
     asked = prompt.promptForRedirectUrl(promptSignal)
 
-    async def fromUserInput() -> _AuthorizationResponse:
+    async def fromUserInput() -> AuthorizationResponse:
         input = await maybe_await(asked)
         if not input or not jsTrim(input):
             raise McpSignInCancelledError()
-        return _responseFromRedirectUrl(input, state, redirectUrl)
+        return responseFromRedirectUrl(input, state, redirectUrl)
 
     fromUser = startTask(fromUserInput())
     try:
@@ -566,8 +566,8 @@ async def _waitForAuthorizationResponse(
         fromUser.add_done_callback(lambda future: future.cancelled() or future.exception())
 
 
-async def _listenForCallback(
-    settings: _CallbackSettings, extraPaths: list[str], port: int | None, required: bool
+async def listenForCallback(
+    settings: CallbackSettings, extraPaths: list[str], port: int | None, required: bool
 ) -> OAuthCallbackServer:
     """Listen on ``port``, or on a free port when it is taken and not ``required``."""
 
@@ -611,9 +611,9 @@ async def signInMcpServer(options: SignInMcpServerOptions) -> None:
     stored = await maybe_await(store.load())
     challenge = options.get("challenge")
     stepUp = challenge is not None and challenge.get("error") == "insufficient_scope"
-    callbackOptions = _callbackSettings(settings)
+    callbackOptions = callbackSettings(settings)
     # Reuse the port of the registered redirect URI so the registered client stays valid.
-    registeredUrls = _registeredRedirectUrls(stored.get("clientInformation") if stored is not None else None)
+    registeredUrls = registeredRedirectUrls(read_field(stored, "clientInformation"))
     registered = registeredUrls[0] if len(registeredUrls) > 0 else None
     preferredPort = (
         callbackOptions.port
@@ -621,10 +621,10 @@ async def signInMcpServer(options: SignInMcpServerOptions) -> None:
         else ((jsNumber(URL(registered).port) or None) if registered else None)
     )
     cimd = settings.get("clientRegistration") == "cimd"
-    callback = await _listenForCallback(
+    callback = await listenForCallback(
         callbackOptions,
         # The redirect URI of a server-specific Client ID Metadata Document.
-        [f"{CALLBACK_PATH}/{_callbackId(serverUrl)}"] if cimd else [],
+        [f"{CALLBACK_PATH}/{callbackId(serverUrl)}"] if cimd else [],
         preferredPort,
         callbackOptions.port is not None,
     )
@@ -637,9 +637,9 @@ async def signInMcpServer(options: SignInMcpServerOptions) -> None:
             # A registered client cannot use another redirect URI, and its tokens belong to it. A Client ID
             # Metadata Document is not stored, so with one, a stored client was registered before and is replaced.
             keepClient = settings.get("clientId") or (
-                stored.get("clientInformation") is None
+                read_field(stored, "clientInformation") is None
                 if cimd
-                else redirectUrl in _registeredRedirectUrls(stored.get("clientInformation"))
+                else redirectUrl in registeredRedirectUrls(read_field(stored, "clientInformation"))
             )
             if not keepClient:
                 next.pop("clientInformation", None)
@@ -653,17 +653,17 @@ async def signInMcpServer(options: SignInMcpServerOptions) -> None:
             nonlocal authorizationUrl
             authorizationUrl = url
 
-        provider = _createProvider(serverUrl, store, settings, redirectUrl, onRedirect)
-        storedTokens = stored.get("tokens") if stored is not None else None
+        provider = createProvider(serverUrl, store, settings, redirectUrl, onRedirect)
+        storedTokens = read_field(stored, "tokens")
         flow = defined({
             "serverUrl": serverUrl,
-            "fetch": _timedFetch(),
+            "fetch": timedFetch(),
             "signal": signal,
             "resourceMetadataUrl": challenge.get("resourceMetadataUrl") if challenge is not None else None,
             "authorizationServerMetadataUrl": settings.get("authServerMetadataUrl"),
             # A server asking for more scope gets it on top of the configured scope and, since the challenge
             # may list only the missing scopes, on top of the scope granted so far.
-            "scope": _mergeScopes(
+            "scope": mergeScopes(
                 settings.get("scope"),
                 stepUpScope(
                     storedTokens.get("scope") if storedTokens is not None else None,
@@ -685,7 +685,7 @@ async def signInMcpServer(options: SignInMcpServerOptions) -> None:
         redirectUri = authorizationUrl.searchParams.get("redirect_uri")
         authorizationRedirectUrl = URL(redirectUri if redirectUri is not None else redirectUrl)
         options["prompt"].showAuthorizationUrl(authorizationUrl)
-        response = await _waitForAuthorizationResponse(
+        response = await waitForAuthorizationResponse(
             callback,
             state,
             authorizationRedirectUrl,

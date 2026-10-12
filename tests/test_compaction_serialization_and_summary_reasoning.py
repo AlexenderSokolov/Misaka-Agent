@@ -21,7 +21,7 @@ from misaka.core.compaction import (
 )
 from misaka.core.compaction import compaction as compaction_module
 from misaka.core.compaction.utils import FileOperations, serializeConversation
-from misaka.modes.jsonl import to_jsonable
+from misaka.modes.json_event import to_jsonable
 from misaka.utils.js import jsonStringify
 from misaka.utils.values import read_field
 

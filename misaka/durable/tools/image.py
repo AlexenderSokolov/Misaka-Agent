@@ -143,6 +143,7 @@ def readUint32LE(buffer: bytes, offset: int) -> int:
     )
 
 
+# The second parameter is pi's `bytes`; Python needs that name for the type.
 def startsWith(buffer: bytes, prefix: bytes) -> bool:
     return buffer[: len(prefix)] == prefix
 

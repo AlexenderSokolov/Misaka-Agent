@@ -26,6 +26,55 @@ from misaka.utils.js import (
     toUtf16Units,
 )
 
+
+def isObj(value: Any) -> bool:
+    return isinstance(value, list | dict)
+
+
+def _key(segment: Seg) -> str:
+    """The property key a segment names: ``String(segment)``, which prints 1e21 as ``1e+21``."""
+    return segment if isinstance(segment, str) else jsString(segment)
+
+
+def _hasOwn(node: Any, segment: Seg) -> bool:
+    """`Object.hasOwn(node, segment)` for a container: an array index in range, an object key (a number
+    names the key written with its digits)."""
+    if isinstance(node, list):
+        if isinstance(segment, str):
+            # An array owns its index keys and `length`, so a string spelling of either is found here; the
+            # caller refuses it, as an array is addressed by number.
+            return segment == "length" or (
+                segment.isascii() and segment.isdigit() and str(int(segment)) == segment and int(segment) < len(node)
+            )
+        return isinstance(segment, int) and not isinstance(segment, bool) and 0 <= segment < len(node)
+    return _key(segment) in node
+
+
+def _own(node: Any, segment: Seg) -> Any:
+    if isinstance(node, list):
+        return node[segment]  # type: ignore[index]
+    return node[_key(segment)]
+
+
+def _integralNumber(value: Any) -> Any:
+    return int(value) if isinstance(value, float) and value.is_integer() else value
+
+
+def _integral(op: Op) -> Op:
+    """The op with every integral float as an ``int``. JavaScript has one number type, so a peer may spell
+    an index or a count ``2.0`` or ``1e9``; Python slices and indexes with ``int`` only."""
+    verb = op[0]
+    if verb == "r":
+        return op
+    path = [_integralNumber(seg) for seg in op[1]]
+    if verb == "p":
+        return [verb, path, _integralNumber(op[2]), _integralNumber(op[3]), op[4]]
+    if verb == "m":
+        return [verb, path, [_integralNumber(index) for index in op[2]]]
+    if verb == "t":
+        return [verb, path, _integralNumber(op[2])]
+    return [verb, path, *op[2:]]
+
 type Seg = str | int
 type Path = Sequence[Seg]
 type NonEmptyPath = Sequence[Seg]
@@ -345,55 +394,6 @@ def apply(target: Any, ops: Sequence[Op]) -> Any:
     from a boundary.
     """
     return applyOps(target, ops)
-
-
-def isObj(value: Any) -> bool:
-    return isinstance(value, list | dict)
-
-
-def _key(segment: Seg) -> str:
-    """The property key a segment names: ``String(segment)``, which prints 1e21 as ``1e+21``."""
-    return segment if isinstance(segment, str) else jsString(segment)
-
-
-def _hasOwn(node: Any, segment: Seg) -> bool:
-    """`Object.hasOwn(node, segment)` for a container: an array index in range, an object key (a number
-    names the key written with its digits)."""
-    if isinstance(node, list):
-        if isinstance(segment, str):
-            # An array owns its index keys and `length`, so a string spelling of either is found here; the
-            # caller refuses it, as an array is addressed by number.
-            return segment == "length" or (
-                segment.isascii() and segment.isdigit() and str(int(segment)) == segment and int(segment) < len(node)
-            )
-        return isinstance(segment, int) and not isinstance(segment, bool) and 0 <= segment < len(node)
-    return _key(segment) in node
-
-
-def _own(node: Any, segment: Seg) -> Any:
-    if isinstance(node, list):
-        return node[segment]  # type: ignore[index]
-    return node[_key(segment)]
-
-
-def _integralNumber(value: Any) -> Any:
-    return int(value) if isinstance(value, float) and value.is_integer() else value
-
-
-def _integral(op: Op) -> Op:
-    """The op with every integral float as an ``int``. JavaScript has one number type, so a peer may spell
-    an index or a count ``2.0`` or ``1e9``; Python slices and indexes with ``int`` only."""
-    verb = op[0]
-    if verb == "r":
-        return op
-    path = [_integralNumber(seg) for seg in op[1]]
-    if verb == "p":
-        return [verb, path, _integralNumber(op[2]), _integralNumber(op[3]), op[4]]
-    if verb == "m":
-        return [verb, path, [_integralNumber(index) for index in op[2]]]
-    if verb == "t":
-        return [verb, path, _integralNumber(op[2])]
-    return [verb, path, *op[2:]]
 
 
 def applyOps(target: Any, ops: Sequence[Op]) -> Any:

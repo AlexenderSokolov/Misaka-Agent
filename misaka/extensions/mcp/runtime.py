@@ -81,27 +81,27 @@ type ServerState = Literal["connecting", "connected", "disconnected", "needs-aut
 type McpTransportFactory = Callable[[McpServerEntry, str, AuthProvider | None], McpTransport]
 
 
-def _isTransientError(error: Any) -> bool:
+def isTransientError(error: Any) -> bool:
     """Network failures and overloaded or restarting servers, which are worth another attempt."""
     if isinstance(error, McpHttpError):
         return error.status == 408 or error.status == 429 or (error.status >= 500 and error.status != 501)
     return isinstance(error, TypeError)
 
 
-def _signInRequiredMessage(entry: McpServerEntry) -> str:
+def signInRequiredMessage(entry: McpServerEntry) -> str:
     provider = (entry["config"].get("auth") or {}).get("provider") if "url" in entry["config"] else None  # type: ignore[typeddict-item]
     return f'MCP server "{entry["name"]}" requires sign-in. Run {f"/login {provider}" if provider else "/mcp"} to sign in.'
 
 
-def _usesOAuth(entry: McpServerEntry) -> bool:
+def usesOAuth(entry: McpServerEntry) -> bool:
     """HTTP servers authenticate with OAuth unless the config supplies an ``Authorization`` header or ``auth``."""
     config = entry["config"]
-    if "url" not in config or config.get("auth"):  # type: ignore[typeddict-item]
+    if "url" not in config or config.get("auth") is not None:  # type: ignore[typeddict-item]
         return False
     return not any(header.lower() == "authorization" for header in (config.get("headers") or {}))  # type: ignore[typeddict-item]
 
 
-def _expandHome(value: str) -> str:
+def expandHome(value: str) -> str:
     """``~`` and ``~/…`` (also ``~\\…`` on Windows) name the home directory, like in a shell."""
     if value == "~":
         return os.path.expanduser("~")
@@ -124,9 +124,9 @@ def createDefaultTransport(entry: McpServerEntry, cwd: str, authProvider: AuthPr
     args = config.get("args")  # type: ignore[typeddict-item]
     configCwd = config.get("cwd")  # type: ignore[typeddict-item]
     return StdioTransport({
-        "command": _expandHome(config["command"]),  # type: ignore[typeddict-item]
-        **({"args": [_expandHome(arg) for arg in args]} if args is not None else {}),
-        "cwd": node_path.resolve(cwd, _expandHome(configCwd if configCwd is not None else ".")),
+        "command": expandHome(config["command"]),  # type: ignore[typeddict-item]
+        **({"args": [expandHome(arg) for arg in args]} if args is not None else {}),
+        "cwd": node_path.resolve(cwd, expandHome(configCwd if configCwd is not None else ".")),
         # MISAKA fork: a stdio server inherits only the names it needs from MISAKA's environment,
         # which holds API keys (issue #10; see .environment); what else it needs is named in its env.
         "env": {**inheritedEnvironment(), **env},
@@ -135,7 +135,7 @@ def createDefaultTransport(entry: McpServerEntry, cwd: str, authProvider: AuthPr
     })
 
 
-async def _withoutTemplates[T](list: Callable[[], Awaitable[T]], empty: T) -> T:
+async def withoutTemplates[T](list: Callable[[], Awaitable[T]], empty: T) -> T:
     """Servers that do not implement ``resources/templates/list`` have no templates."""
     try:
         return await list()
@@ -145,8 +145,8 @@ async def _withoutTemplates[T](list: Callable[[], Awaitable[T]], empty: T) -> T:
         raise
 
 
-def _listTemplates(client: McpClient, options: McpRequestOptions | None = None) -> Awaitable[list[ResourceTemplate]]:
-    return _withoutTemplates(lambda: client.listResourceTemplates(options if options is not None else {}), [])
+def listTemplates(client: McpClient, options: McpRequestOptions | None = None) -> Awaitable[list[ResourceTemplate]]:
+    return withoutTemplates(lambda: client.listResourceTemplates(options if options is not None else {}), [])
 
 
 class _Resources(TypedDict):
@@ -154,7 +154,7 @@ class _Resources(TypedDict):
     resourceTemplates: list[ResourceTemplate]
 
 
-async def _fetchResources(client: McpClient) -> _Resources:
+async def fetchResources(client: McpClient) -> _Resources:
     """Resources and templates at connect time, for the counts in ``/mcp`` and ``misaka mcp list``. A
     server whose lists fail still connects: the resource tools list and read its resources on demand."""
 
@@ -165,7 +165,7 @@ async def _fetchResources(client: McpClient) -> _Resources:
         except Exception:  # noqa: BLE001 - upstream `.catch(() => [])`
             return []
 
-    resources, resourceTemplates = await asyncio.gather(caught(client.listResources()), caught(_listTemplates(client)))
+    resources, resourceTemplates = await asyncio.gather(caught(client.listResources()), caught(listTemplates(client)))
     return {
         "resources": [resource for resource in resources if not isMcpAppResource(resource)],
         "resourceTemplates": [template for template in resourceTemplates if not isMcpAppResource(template)],
@@ -278,7 +278,7 @@ class McpServerConnection:
     @property
     def oauthUrl(self) -> str | None:
         """Server URL when the server authenticates with OAuth."""
-        return self.entry["config"]["url"] if _usesOAuth(self.entry) and "url" in self.entry["config"] else None  # type: ignore[typeddict-item]
+        return self.entry["config"]["url"] if usesOAuth(self.entry) and "url" in self.entry["config"] else None  # type: ignore[typeddict-item]
 
     def oauthSettings(self) -> McpOAuthSettings:
         oauth = self.entry["config"].get("oauth") if "url" in self.entry["config"] else None  # type: ignore[typeddict-item]
@@ -330,7 +330,7 @@ class McpServerConnection:
         self, cursor: str | None, options: McpRequestOptions
     ) -> asyncio.Future[ListResourceTemplatesResult]:
         return self._withClient(
-            lambda client: _withoutTemplates(lambda: client.listResourceTemplatesPage(cursor, options), {"resourceTemplates": []}),
+            lambda client: withoutTemplates(lambda: client.listResourceTemplatesPage(cursor, options), {"resourceTemplates": []}),
             True,
         )
 
@@ -338,7 +338,7 @@ class McpServerConnection:
         return self._withClient(lambda client: client.listResources(options), True)
 
     def allResourceTemplates(self, options: McpRequestOptions) -> asyncio.Future[list[ResourceTemplate]]:
-        return self._withClient(lambda client: _listTemplates(client, options), True)
+        return self._withClient(lambda client: listTemplates(client, options), True)
 
     @eager
     async def _withClient[T](self, run: Callable[[McpClient], Awaitable[T]], readOnly: bool = False) -> T:
@@ -350,7 +350,7 @@ class McpServerConnection:
             try:
                 return await run(client)
             except Exception as error:
-                if readOnly and attempt == 1 and isinstance(error, McpHttpError) and _isTransientError(error):
+                if readOnly and attempt == 1 and isinstance(error, McpHttpError) and isTransientError(error):
                     await asyncio.sleep(CONNECT_RETRY_DELAYS_MS[0] / 1000)
                     attempt += 1
                     continue
@@ -366,7 +366,7 @@ class McpServerConnection:
                     raise
                 await self._dropClient(client)
                 self._markNeedsAuth()
-                raise RuntimeError(_signInRequiredMessage(self.entry))
+                raise RuntimeError(signInRequiredMessage(self.entry))
 
     async def reconnect(self) -> None:
         """Connect again with fresh credentials, for example after signing in."""
@@ -416,7 +416,7 @@ class McpServerConnection:
                 return await self._connectOnce()
             except Exception as error:  # noqa: BLE001 - upstream `catch (error)`: rethrown as the connect failure
                 delay = retries[attempt] if attempt < len(retries) else None
-                if self._closed or delay is None or not _isTransientError(error):
+                if self._closed or delay is None or not isTransientError(error):
                     raise self._connectFailed(error)
                 # MISAKA fork: `sleep(delay, undefined, { signal })` from node:timers/promises, whose
                 # rejection on abort is ignored.
@@ -467,7 +467,7 @@ class McpServerConnection:
                 client.listTools()
                 if client.serverCapabilities is not None and jsTruthy(client.serverCapabilities.get("tools"))
                 else _resolved([]),
-                _fetchResources(client) if hasResources else _resolved({"resources": [], "resourceTemplates": []}),
+                fetchResources(client) if hasResources else _resolved({"resources": [], "resourceTemplates": []}),
             )
             if self._closed:
                 raise RuntimeError("shut down while connecting")
@@ -495,7 +495,7 @@ class McpServerConnection:
     def _connectFailed(self, error: Any) -> Exception:
         if self._needsSignIn(error) and not self._closed:
             self._markNeedsAuth()
-            return RuntimeError(_signInRequiredMessage(self.entry))
+            return RuntimeError(signInRequiredMessage(self.entry))
         self.state = "closed" if self._closed else "failed"
         self.error = f"{errorMessage(error)}\n{self._stderrTail}" if self._stderrTail else errorMessage(error)
         self._changed()
@@ -523,7 +523,7 @@ class McpServerConnection:
         self._changed()
 
     async def _refreshResources(self, client: McpClient) -> None:
-        resources = await _fetchResources(client)
+        resources = await fetchResources(client)
         if self._client is not client or self._closed:
             return
         self.resources = resources["resources"]

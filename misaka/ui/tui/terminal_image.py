@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, TypedDict
 
 from misaka.ui.tui.colors import TerminalColorMode
+from misaka.utils import node_path
 from misaka.utils.js import UNDEFINED, bufferFromBase64, toWellFormed
 
 type ImageProtocol = Literal["kitty", "iterm2"] | None
@@ -617,7 +618,14 @@ URL_PATH_SAFE = frozenset("!$&'()*+,-./:;=@_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij
 def pathToFileURL(filename: str) -> str:
     """MISAKA fork: Node's ``pathToFileURL(filename).href``: the resolved path with every character outside
     ``URL_PATH_SAFE`` percent-encoded as UTF-8 (Windows: drive paths become ``/C:/...``, UNC paths name the host)."""
-    resolved = os.path.abspath(filename)
+    resolved = node_path.resolve(filename)
+    # `path.resolve` drops a trailing separator; it is put back.
+    if (
+        filename
+        and (filename[-1] == "/" or (sys.platform == "win32" and filename[-1] == chr(92)))
+        and not resolved.endswith(node_path.sep)
+    ):
+        resolved += "/"
     host = ""
     if sys.platform == "win32":
         resolved = resolved.replace("\\", "/")

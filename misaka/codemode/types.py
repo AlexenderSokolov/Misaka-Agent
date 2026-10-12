@@ -97,7 +97,7 @@ class CodemodeStoreWrites(TypedDict):
 
 class CodemodeSuccess(TypedDict):
     ok: Literal[True]
-    # `exit()` completes with `value: None`.
+    # `exit()` completes with `value: UNDEFINED`.
     value: Any
     output: list[CodemodeOutputItem]
     calls: list[CodemodeCall]

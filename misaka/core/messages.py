@@ -1,9 +1,15 @@
-"""Coding-agent message helpers and LLM conversion adapters (pi ``core/messages.ts``)."""
+"""Translated from pi's ``packages/coding-agent/src/core/messages.ts`` (v1.1.0).
+
+Custom message types and transformers for the coding agent.
+
+Extends the base AgentMessage type with coding-agent specific message types,
+and provides a transformer to convert them to LLM-compatible messages.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 from misaka.agent.types import AgentMessage
@@ -33,6 +39,8 @@ TDetails = TypeVar("TDetails")
 
 @dataclass(slots=True)
 class BashExecutionMessage:
+    """Message type for bash executions via the ! command."""
+
     command: str
     output: str
     exitCode: int | None
@@ -40,12 +48,17 @@ class BashExecutionMessage:
     truncated: bool
     timestamp: int
     fullOutputPath: str | None = None
+    # If true, this message is excluded from LLM context (!! prefix)
     excludeFromContext: bool | None = None
     role: str = field(default="bashExecution", init=False)
 
 
 @dataclass(slots=True)
 class CustomMessage[TDetails]:
+    """Message type for extension-injected messages via sendMessage().
+    These are custom messages that extensions can inject into the conversation.
+    """
+
     customType: str
     content: str | list[TextContent | ImageContent]
     display: bool
@@ -57,7 +70,7 @@ class CustomMessage[TDetails]:
 @dataclass(slots=True)
 class BranchSummaryMessage:
     summary: str
-    fromId: str
+    fromId: str | None
     timestamp: int
     role: str = field(default="branchSummary", init=False)
 
@@ -71,6 +84,7 @@ class CompactionSummaryMessage:
 
 
 def bashExecutionToText(msg: BashExecutionMessage) -> str:
+    """Convert a BashExecutionMessage to user message text for LLM context."""
     text = f"Ran `{msg.command}`\n"
     if msg.output:
         text += f"```\n{msg.output}\n```"
@@ -87,33 +101,34 @@ def bashExecutionToText(msg: BashExecutionMessage) -> str:
 
 def createBranchSummaryMessage(
     summary: str,
-    from_id: str,
+    fromId: str,
     timestamp: str | int | datetime,
 ) -> BranchSummaryMessage:
-    return BranchSummaryMessage(summary=summary, fromId=from_id, timestamp=_timestamp_ms(timestamp))
+    return BranchSummaryMessage(summary=summary, fromId=fromId, timestamp=_timestamp_ms(timestamp))
 
 
 def createCompactionSummaryMessage(
     summary: str,
-    tokens_before: int,
+    tokensBefore: int,
     timestamp: str | int | datetime,
 ) -> CompactionSummaryMessage:
     return CompactionSummaryMessage(
         summary=summary,
-        tokensBefore=tokens_before,
+        tokensBefore=tokensBefore,
         timestamp=_timestamp_ms(timestamp),
     )
 
 
 def createCustomMessage(
-    custom_type: str,
+    customType: str,
     content: str | list[TextContent | ImageContent],
     display: bool,
     details: Any,
     timestamp: str | int | datetime,
 ) -> CustomMessage[Any]:
+    """Convert CustomMessageEntry to AgentMessage format"""
     return CustomMessage(
-        customType=custom_type,
+        customType=customType,
         content=content,
         display=display,
         details=details,
@@ -122,10 +137,18 @@ def createCustomMessage(
 
 
 def convertToLlm(messages: list[AgentMessage]) -> list[MessageValue]:
+    """Transform AgentMessages (including custom types) to LLM-compatible Messages.
+
+    This is used by:
+    - Agent's transormToLlm option (for prompt calls and queued messages)
+    - Compaction's generateSummary (for summarization)
+    - Custom extensions and tools
+    """
     converted: list[MessageValue] = []
     for message in messages:
         role = read_field(message, "role")
         if role == "bashExecution":
+            # Skip messages excluded from context (!! prefix)
             if read_field(message, "excludeFromContext"):
                 continue
             payload = {
@@ -197,6 +220,8 @@ def _coerce_bash_execution(message: Any) -> BashExecutionMessage:
 
 
 def _timestamp_ms(timestamp: str | int | datetime) -> int:
+    """``new Date(timestamp).getTime()``: a date-only ISO string is UTC midnight, a date-time without an offset is
+    local time."""
     if isinstance(timestamp, bool):
         raise TypeError("timestamp must be an ISO string, datetime, or Unix milliseconds")
     if isinstance(timestamp, int):
@@ -204,10 +229,10 @@ def _timestamp_ms(timestamp: str | int | datetime) -> int:
     if isinstance(timestamp, datetime):
         dt = timestamp
     else:
-        normalized = timestamp.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(normalized)
+        dt = datetime.fromisoformat(timestamp)
+        if "T" not in timestamp and " " not in timestamp.strip():
+            dt = dt.replace(tzinfo=UTC)
     return int(dt.timestamp() * 1000)
-
 
 
 __all__ = [

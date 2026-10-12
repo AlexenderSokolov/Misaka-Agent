@@ -94,7 +94,7 @@ def snapshot_path(task: Any) -> Path:
 def capture(task: Any, session: Any, *, seed: bool) -> None:
     from misaka.core.session_manager import SessionManager
     from misaka.core.subagent.runtime import _atomic_text
-    from misaka.modes.jsonl import to_jsonable
+    from misaka.modes.json_event import to_jsonable
 
     if seed and task.transcript.exists():
         raise ValueError("Fork seed transcript already exists")

@@ -71,6 +71,16 @@ def default_tui_keybindings():
 
 
 @pytest.fixture(autouse=True)
+def fresh_shared_auth_read_state():
+    """Each test starts with no auth.json read state shared between stores, as each of pi's test files does in its own
+    process: the first store a test builds on a path claims the shared slot (``_sharedAuthFileReadState``)."""
+    from misaka.core import auth_storage
+
+    auth_storage._sharedAuthFileReadState = None
+    yield
+
+
+@pytest.fixture(autouse=True)
 def default_http_dispatcher():
     """Each test starts with the default HTTP idle timeout: a session under test configures the process-wide
     dispatcher from its settings (``configureHttpDispatcher``), as pi's does in its own process."""

@@ -26,7 +26,6 @@ Translated from pi's ``coding-agent/src/extensions/codemode/tool.ts``.
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +33,7 @@ from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 from misaka.agent.types import AgentTool, AgentToolResult
 from misaka.ai.types import GrammarConstrainedSamplingConfig
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.codemode.declarations import (
     MCP_TYPESCRIPT_PREAMBLE,
     mcpStructuredContentSchema,
@@ -52,7 +52,7 @@ from misaka.core.extensions.types import (
 from misaka.core.settings_manager import CodemodeMode
 from misaka.core.tools.tool_definition_wrapper import wrapToolDefinition
 from misaka.utils.collation import localeSortKey
-from misaka.utils.js import jsLength, jsTrim
+from misaka.utils.js import jsCollapseWhitespace, jsLength, jsTrim, nullishCoalesce
 from misaka.utils.values import read_field
 
 from .execute_lazy import loadCodemodeExecutor
@@ -105,10 +105,11 @@ class CodemodeToolOptions:
 
 TEXT_OUTPUT_SCHEMA: CodemodeJsonSchema = {"type": "string"}
 
+# `Type.Object(...)` as TypeBox emits it (key order `type`, `required`, `properties`): the bytes the model sees.
 codemodeSchema: dict[str, Any] = {
     "type": "object",
-    "properties": {"code": {"type": "string", "description": "Raw JavaScript source."}},
     "required": ["code"],
+    "properties": {"code": {"type": "string", "description": "Raw JavaScript source."}},
 }
 
 
@@ -196,7 +197,7 @@ def _inputSchema(tool: Any) -> CodemodeJsonSchema:
     # MISAKA fork: misaka tools may declare their parameters as a pydantic model class (pi's are
     # always TypeBox objects); the declaration renders the JSON schema it produces.
     if isinstance(parameters, type) and hasattr(parameters, "model_json_schema"):
-        return parameters.model_json_schema()
+        return typeboxSchema(parameters)
     return parameters
 
 
@@ -347,7 +348,7 @@ def describeOutput(schema: CodemodeJsonSchema | None) -> str:
         required = set(required_) if isinstance(required_, list) else set()
         fields = [name if name in required else f"{name}?" for name in properties]
         return f"`{{ {', '.join(fields)} }}`"
-    collapsed = re.sub(r"\s+", " ", type)
+    collapsed = jsCollapseWhitespace(type)
     return f"`{collapsed}`"
 
 
@@ -371,7 +372,7 @@ def prepareCodemodeLoadout(loadout: ToolLoadout, options: CodemodeToolOptions) -
 
     Listing by exposure, not by the active set, keeps the codemode description unchanged when
     ``tool_search`` loads a tool, so loads do not redeclare codemode."""
-    mode = options.getMode() if options.getMode is not None else "on"
+    mode = nullishCoalesce(options.getMode() if options.getMode is not None else None, "on")
 
     def isDirect(tool: Any) -> bool:
         return loadout.getExposure(tool.name) == "direct"
@@ -439,9 +440,10 @@ def createCodemodeTool(tools: Sequence[Any] = (), options: CodemodeToolOptions |
     options = options or CodemodeToolOptions()
     definition = createCodemodeToolDefinition(options)
     tool = wrapToolDefinition(definition)
-    # MISAKA fork: misaka's AgentTool carries no prompt snippet or guidelines (the session reads them
-    # off the ToolDefinition), so only the description is replaced.
-    return tool.model_copy(update={"description": createCodemodeDescription(tools, {"models": options.models is True})})
+    object.__setattr__(tool, "description", createCodemodeDescription(tools, {"models": options.models is True}))
+    object.__setattr__(tool, "promptSnippet", definition.promptSnippet)
+    object.__setattr__(tool, "promptGuidelines", definition.promptGuidelines)
+    return tool
 
 
 __all__ = [

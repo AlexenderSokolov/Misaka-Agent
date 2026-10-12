@@ -60,7 +60,7 @@ async def createSession(dirs: SimpleNamespace, extensionFactories: list[Any]) ->
         return ApiKeyCredential(type="api_key", key="test-key")
 
     await authStorage.modify("anthropic", apiKey)
-    modelRuntime = await ModelRuntime.create(authStorage=authStorage, modelsPath=str(dirs.agentDir / "models.json"))
+    modelRuntime = await ModelRuntime.create({"authStorage": authStorage, "modelsPath": str(dirs.agentDir / "models.json")})
     resourceLoader = DefaultResourceLoader({
         "cwd": dirs.tempDir,
         "agentDir": str(dirs.agentDir),

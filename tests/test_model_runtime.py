@@ -117,7 +117,7 @@ def authOptions(runtime: ModelRuntime, type=None):
 
 async def _create(**kwargs) -> ModelRuntime:
     kwargs.setdefault("modelsPath", None)
-    return await ModelRuntime.create(**kwargs)
+    return await ModelRuntime.create(kwargs)
 
 
 # -- model-runtime-auth-options.test.ts ------------------------------------------------------
@@ -828,10 +828,7 @@ async def test_preserves_native_deferred_methods_through_provider_overlays(tmp_p
     modelsPath.write_text(json.dumps({
         "providers": {"extension-native-deferred": {"baseUrl": "https://overlay.test/v1"}},
     }), encoding="utf-8")
-    runtime = await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=str(modelsPath),
-        allowModelNetwork=False,
-    )
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": str(modelsPath), "allowModelNetwork": False})
     nativeModel = _model("extension-native-deferred", "native-deferred", baseUrl="https://native.test/v1")
     seen = {}
 
@@ -888,10 +885,7 @@ async def test_applies_models_json_overrides_above_native_providers(tmp_path):
     modelsPath.write_text(json.dumps({
         "providers": {"extension-native": {"modelOverrides": {"native": {"contextWindow": 4242}}}},
     }), encoding="utf-8")
-    runtime = await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=str(modelsPath),
-        allowModelNetwork=False,
-    )
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": str(modelsPath), "allowModelNetwork": False})
     nativeModel = _model("extension-native", "native", baseUrl="https://native.test/v1")
 
     async def resolve(*, ctx, credential, signal):
@@ -1067,13 +1061,13 @@ async def test_lists_a_virtual_model_and_routes_it_with_a_clamped_thinking_level
     large = runtime.getModel("faux", "large")
     messages = [_user("first", 1), _message(large, "answer", thinkingLevel="medium"), _user("second", 2)]
 
-    low = await runtime.resolveModel(virtual, messages, reason="user", thinkingLevel="low")
+    low = await runtime.resolveModel(virtual, messages, {"reason": "user", "thinkingLevel": "low"})
     assert low.model.id == "small"
     # The router asked for "high", but the small model does not reason.
     assert low.thinkingLevel == "off"
     assert (requests[0].previous.model, requests[0].previous.thinkingLevel) == (large, "medium")
 
-    high = await runtime.resolveModel(virtual, messages, reason="user", thinkingLevel="high")
+    high = await runtime.resolveModel(virtual, messages, {"reason": "user", "thinkingLevel": "high"})
     assert (high.model, high.thinkingLevel) == (large, "high")
 
 
@@ -1085,10 +1079,10 @@ async def test_reports_the_failed_request_of_a_retry_separately_from_the_latest_
     failed = _message(large, "", thinkingLevel="high", stopReason="error", errorMessage="overloaded_error")
     messages = [_user("first", 1), _message(small, "answer"), _user("second", 2)]
 
-    await runtime.resolveModel(virtual, messages, reason="retry", thinkingLevel="low", failed=failed)
+    await runtime.resolveModel(virtual, messages, {"reason": "retry", "thinkingLevel": "low", "failed": failed})
     # A routing failure names the virtual model, so there is no failed physical request to report.
     failedRoute = _message(virtual, "", stopReason="error")
-    await runtime.resolveModel(virtual, messages, reason="retry", thinkingLevel="low", failed=failedRoute)
+    await runtime.resolveModel(virtual, messages, {"reason": "retry", "thinkingLevel": "low", "failed": failedRoute})
 
     assert requests[0].previous.model is small
     assert (requests[0].failed.model, requests[0].failed.thinkingLevel, requests[0].failed.message) == (
@@ -1114,7 +1108,7 @@ async def test_lists_several_virtual_models_under_a_provider_with_physical_model
     available = await runtime.getAvailable()
     assert [model.id for model in available if model.provider == "faux"] == ["small", "large", "auto", "fast"]
     fast = runtime.getModel("faux", "fast")
-    routed = await runtime.resolveModel(fast, [], reason="user", thinkingLevel="off")
+    routed = await runtime.resolveModel(fast, [], {"reason": "user", "thinkingLevel": "off"})
     assert (routed.model.provider, routed.model.id) == ("faux", "small")
 
     with pytest.raises(RuntimeError, match="conflicts with a physical model"):
@@ -1134,7 +1128,7 @@ async def test_rejects_routes_to_virtual_or_unknown_models():
         runtime.registerVirtualModel(_with(definition, route=lambda _request, model=model: ModelRoute(
             model=model, thinkingLevel="off")))
         with pytest.raises(RuntimeError, match="which is not a physical model"):
-            await runtime.resolveModel(virtual, [], reason="user", thinkingLevel="low")
+            await runtime.resolveModel(virtual, [], {"reason": "user", "thinkingLevel": "low"})
 
 
 async def test_routes_direct_stream_simple_calls_within_the_routed_models_limits():
@@ -1349,7 +1343,7 @@ async def test_moa_presets_follow_a_login_of_their_aggregators_provider(monkeypa
     monkeypatch.setattr(moa_provider, "load_moa_config", lambda: {"presets": {
         "default": {"aggregator": {"provider": "anthropic", "model": "claude-sonnet-4-5"}, "references": []},
     }})
-    runtime = await ModelRuntime.create(authStorage=AuthStorage.inMemory(), modelsPath=None)
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsPath": None})
     assert [model.id for model in runtime.getModels("moa")] == []
 
     await runtime.setRuntimeApiKey("anthropic", "sk-test")

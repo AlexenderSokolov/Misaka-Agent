@@ -25,11 +25,7 @@ def openrouterProvider() -> Provider:
             baseUrl="https://openrouter.ai/api/v1",
             auth=ProviderAuth(
                 apiKey=envApiKeyAuth("OpenRouter API key", ["OPENROUTER_API_KEY"]),
-                oauth=lazyOAuth(
-                    name="OpenRouter OAuth",
-                    loginLabel="Sign in with OpenRouter",
-                    load=loadOpenRouterOAuth,
-                ),
+                oauth=lazyOAuth({"name": "OpenRouter OAuth", "loginLabel": "Sign in with OpenRouter", "load": loadOpenRouterOAuth}),
             ),
             models=[
                 *OPENROUTER_MODELS.values(),

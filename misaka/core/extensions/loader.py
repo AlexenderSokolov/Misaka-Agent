@@ -718,7 +718,7 @@ async def discoverAndLoadExtensions(
     add_paths(discoverExtensionsInDir(os.path.join(resolved_agent_dir, "extensions")))
 
     for raw_path in configured_paths:
-        resolved = resolvePath(raw_path, resolved_cwd, normalize_unicode_spaces=True)
+        resolved = resolvePath(raw_path, resolved_cwd, {"normalizeUnicodeSpaces": True})
         if os.path.isdir(resolved):
             entries = resolveExtensionEntries(resolved)
             if entries:
@@ -805,7 +805,7 @@ async def loadExtension(
     runtime: ExtensionRuntime,
     cacheToken: ExtensionCacheToken | None = None,
 ) -> tuple[Extension | None, str | None]:
-    resolved_path = resolvePath(path, cwd, normalize_unicode_spaces=True)
+    resolved_path = resolvePath(path, cwd, {"normalizeUnicodeSpaces": True})
     try:
         factory = loadExtensionModule(resolved_path, cacheToken)
         time(f"{path} module import", "extensions")

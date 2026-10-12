@@ -36,24 +36,6 @@ from misaka.chord.types import (
 )
 from misaka.utils.js import awaitValue, eager
 
-type Disposal = Callable[[], Any]
-
-
-def _serviceId(service: Any) -> str:
-    return service["id"] if isinstance(service, Mapping) else service.id
-
-
-def _isLocal(service: Any) -> bool:
-    local = service.get("local") if isinstance(service, Mapping) else getattr(service, "local", None)
-    return local is True
-
-
-def _isPlainObject(value: Any) -> bool:
-    # ``typeof`` calls a function (and a class) a "function", not an "object".
-    if inspect.isroutine(value) or inspect.isclass(value) or isinstance(value, functools.partial):
-        return False
-    return not (value is None or isinstance(value, str | bytes | int | float | bool | list | tuple | set))
-
 
 class FacetServiceReference:
     __slots__ = ("mode", "service", "serviceId")
@@ -71,6 +53,118 @@ class ExternalService:
         self.service = service
         self.mode = mode
         self.source = source
+
+
+class FacetRuntime:
+    """The record of one facet generation: what it requires and provides, and its lifecycle.
+
+    MISAKA fork: upstream's `interface FacetRuntime`, built by `FacetKernel.#createFacetRuntime`; here the
+    constructor builds it."""
+
+    def __init__(self, facetId: str) -> None:
+        self.facetId = facetId
+        self.requires: list[FacetServiceReference] = []
+        self.provides: list[FacetServiceReference] = []
+        self.lifecycle = FacetLifecycle(facetId)
+        self.provisions: list[FacetProvision] = []
+        self.singletonViews: dict[str, Any] = {}
+
+
+class _Environment:
+    """The ``FacetEnvironment`` one facet's ``setup`` receives.
+
+    MISAKA fork: upstream's `FacetKernel.#environment(runtime)` returns an object literal closing over the kernel;
+    this class holds the kernel and the runtime instead."""
+
+    def __init__(self, kernel: FacetKernel, runtime: FacetRuntime) -> None:
+        self._kernel = kernel
+        self._runtime = runtime
+
+    def provide(self, service: Any, implementation: Any) -> None:
+        runtime = self._runtime
+        runtime.lifecycle.assertSettingUp("provide services")
+        if not _isPlainObject(implementation):
+            raise TypeError(f"Service {_serviceId(service)} implementation must be an object")
+        recordServiceReference(runtime.provides, service, "singleton")
+        provision = FacetProvision("singleton", service)
+        provision.implementation = implementation
+        provision.install = lambda provider: provider.provide(service, implementation)
+        provision.validateReplacement = lambda provider: provider.validateReplacement(service, implementation)
+        provision.replace = lambda provider: provider.replace(service, implementation)
+        runtime.provisions.append(provision)
+
+    def provideMany(self, service: Any) -> StagedServiceSpawner:
+        runtime = self._runtime
+        runtime.lifecycle.assertSettingUp("provide service instances")
+        recordServiceReference(runtime.provides, service, "keyed")
+
+        def validate(key: str, implementation: Any) -> None:
+            if len(key) == 0:
+                raise TypeError("Facet service instance key must not be empty")
+            if not _isPlainObject(implementation):
+                raise TypeError(f"Facet service {_serviceId(service)} implementation must be an object")
+            if not _isLocal(service):
+                validateRemoteServiceImplementation(_serviceId(service), implementation)
+
+        instances = StagedServiceSpawner(runtime.lifecycle, validate)
+        provision = FacetProvision("keyed", service)
+        provision.connectLocal = lambda registry: instances.connect(
+            lambda key, implementation: registry.spawn(service, key, implementation)
+        )
+        provision.connectRemote = lambda provider: instances.connect(
+            lambda key, implementation: provider.spawn(service, key, implementation)
+        )
+        runtime.provisions.append(provision)
+        return instances
+
+    def use(self, service: Any) -> Any:
+        runtime = self._runtime
+        runtime.lifecycle.assertSettingUp("acquire services")
+        recordServiceReference(runtime.requires, service, "singleton")
+        view = runtime.singletonViews.get(_serviceId(service))
+        if view is None:
+            view = self._kernel.serviceSlots.getSingleton(service, runtime.lifecycle.assertServiceAccess)
+            runtime.singletonViews[_serviceId(service)] = view
+        return view
+
+    def observe(self, service: Any, handler: Callable[[Any, Context], Any]) -> None:
+        runtime = self._runtime
+        runtime.lifecycle.assertSettingUp("observe services")
+        recordServiceReference(runtime.requires, service, "keyed")
+        runtime.lifecycle.observe(
+            lambda: self._kernel.serviceSlots.observe(service, runtime.lifecycle.assertServiceAccess, handler)
+        )
+
+    def replicatedState(self, initial: Any) -> MutableReplicatedStateImpl[Any]:
+        self._runtime.lifecycle.assertRunning("create replicated state")
+        return MutableReplicatedStateImpl(initial)
+
+    def own(self, disposal: Disposal) -> None:
+        self._runtime.lifecycle.own(disposal)
+
+    def onActivate(self, callback: Callable[[], Any]) -> None:
+        self._runtime.lifecycle.onActivate(callback)
+
+    def onDeactivate(self, callback: Callable[[], Any]) -> None:
+        self._runtime.lifecycle.own(callback)
+
+type Disposal = Callable[[], Any]
+
+
+def _serviceId(service: Any) -> str:
+    return service["id"] if isinstance(service, Mapping) else service.id
+
+
+def _isLocal(service: Any) -> bool:
+    local = service.get("local") if isinstance(service, Mapping) else getattr(service, "local", None)
+    return local is True
+
+
+def _isPlainObject(value: Any) -> bool:
+    # ``typeof`` calls a function (and a class) a "function", not an "object".
+    if inspect.isroutine(value) or inspect.isclass(value) or isinstance(value, functools.partial):
+        return False
+    return not (value is None or isinstance(value, str | bytes | int | float | bool | list | tuple | set))
 
 
 class FacetLifecycle:
@@ -148,38 +242,6 @@ class FacetLifecycle:
             raise ExceptionGroup(f"Failed to dispose facet {self.id}", errors)
 
 
-class FacetProvision:
-    """One thing a facet provides: a singleton implementation or the spawning of keyed instances."""
-
-    __slots__ = ("connectLocal", "connectRemote", "implementation", "install", "kind", "replace", "service", "validateReplacement")
-
-    def __init__(self, kind: str, service: Any) -> None:
-        self.kind = kind
-        self.service = service
-        self.implementation: Any = None
-        self.install: Callable[[RemoteServiceProvider], None] = _unsupported
-        self.validateReplacement: Callable[[RemoteServiceProvider], None] = _unsupported
-        self.replace: Callable[[RemoteServiceProvider], None] = _unsupported
-        self.connectLocal: Callable[[LocalKeyedServiceRegistry], None] = _unsupported
-        self.connectRemote: Callable[[RemoteServiceProvider], None] = _unsupported
-
-
-def _unsupported(_target: Any) -> None:
-    raise RuntimeError("Unsupported facet provision operation")
-
-
-class _LocalInstance:
-    __slots__ = ("generation", "key", "service")
-
-    def __init__(self, key: str, generation: int, service: Any) -> None:
-        self.key = key
-        self.generation = generation
-        self.service = service
-
-    def deactivate(self) -> None:
-        pass
-
-
 class LocalKeyedServiceRegistry:
     def __init__(self, services: Sequence[Any], onError: Callable[[Exception], None]) -> None:
         ids = [_serviceId(service) for service in services]
@@ -188,7 +250,7 @@ class LocalKeyedServiceRegistry:
         self._registrations: dict[str, tuple[dict[str, int], InstanceDirectory[_LocalInstance]]] = {}
         self._disposed = False
         for serviceId in ids:
-            self._registrations[serviceId] = ({}, InstanceDirectory(ready=True, onError=onError))
+            self._registrations[serviceId] = ({}, InstanceDirectory({"ready": True, "onError": onError}))
 
     def spawn(self, service: Any, key: str, implementation: Any) -> Callable[[], None]:
         self._assertActive()
@@ -342,98 +404,36 @@ class StagedServiceSpawner:
         return close
 
 
-class FacetRuntime:
-    """The record of one facet generation: what it requires and provides, and its lifecycle.
+class FacetProvision:
+    """One thing a facet provides: a singleton implementation or the spawning of keyed instances."""
 
-    MISAKA fork: upstream's `interface FacetRuntime`, built by `FacetKernel.#createFacetRuntime`; here the
-    constructor builds it."""
+    __slots__ = ("connectLocal", "connectRemote", "implementation", "install", "kind", "replace", "service", "validateReplacement")
 
-    def __init__(self, facetId: str) -> None:
-        self.facetId = facetId
-        self.requires: list[FacetServiceReference] = []
-        self.provides: list[FacetServiceReference] = []
-        self.lifecycle = FacetLifecycle(facetId)
-        self.provisions: list[FacetProvision] = []
-        self.singletonViews: dict[str, Any] = {}
+    def __init__(self, kind: str, service: Any) -> None:
+        self.kind = kind
+        self.service = service
+        self.implementation: Any = None
+        self.install: Callable[[RemoteServiceProvider], None] = _unsupported
+        self.validateReplacement: Callable[[RemoteServiceProvider], None] = _unsupported
+        self.replace: Callable[[RemoteServiceProvider], None] = _unsupported
+        self.connectLocal: Callable[[LocalKeyedServiceRegistry], None] = _unsupported
+        self.connectRemote: Callable[[RemoteServiceProvider], None] = _unsupported
 
 
-class _Environment:
-    """The ``FacetEnvironment`` one facet's ``setup`` receives.
+def _unsupported(_target: Any) -> None:
+    raise RuntimeError("Unsupported facet provision operation")
 
-    MISAKA fork: upstream's `FacetKernel.#environment(runtime)` returns an object literal closing over the kernel;
-    this class holds the kernel and the runtime instead."""
 
-    def __init__(self, kernel: FacetKernel, runtime: FacetRuntime) -> None:
-        self._kernel = kernel
-        self._runtime = runtime
+class _LocalInstance:
+    __slots__ = ("generation", "key", "service")
 
-    def provide(self, service: Any, implementation: Any) -> None:
-        runtime = self._runtime
-        runtime.lifecycle.assertSettingUp("provide services")
-        if not _isPlainObject(implementation):
-            raise TypeError(f"Service {_serviceId(service)} implementation must be an object")
-        recordServiceReference(runtime.provides, service, "singleton")
-        provision = FacetProvision("singleton", service)
-        provision.implementation = implementation
-        provision.install = lambda provider: provider.provide(service, implementation)
-        provision.validateReplacement = lambda provider: provider.validateReplacement(service, implementation)
-        provision.replace = lambda provider: provider.replace(service, implementation)
-        runtime.provisions.append(provision)
+    def __init__(self, key: str, generation: int, service: Any) -> None:
+        self.key = key
+        self.generation = generation
+        self.service = service
 
-    def provideMany(self, service: Any) -> StagedServiceSpawner:
-        runtime = self._runtime
-        runtime.lifecycle.assertSettingUp("provide service instances")
-        recordServiceReference(runtime.provides, service, "keyed")
-
-        def validate(key: str, implementation: Any) -> None:
-            if len(key) == 0:
-                raise TypeError("Facet service instance key must not be empty")
-            if not _isPlainObject(implementation):
-                raise TypeError(f"Facet service {_serviceId(service)} implementation must be an object")
-            if not _isLocal(service):
-                validateRemoteServiceImplementation(_serviceId(service), implementation)
-
-        instances = StagedServiceSpawner(runtime.lifecycle, validate)
-        provision = FacetProvision("keyed", service)
-        provision.connectLocal = lambda registry: instances.connect(
-            lambda key, implementation: registry.spawn(service, key, implementation)
-        )
-        provision.connectRemote = lambda provider: instances.connect(
-            lambda key, implementation: provider.spawn(service, key, implementation)
-        )
-        runtime.provisions.append(provision)
-        return instances
-
-    def use(self, service: Any) -> Any:
-        runtime = self._runtime
-        runtime.lifecycle.assertSettingUp("acquire services")
-        recordServiceReference(runtime.requires, service, "singleton")
-        view = runtime.singletonViews.get(_serviceId(service))
-        if view is None:
-            view = self._kernel.serviceSlots.getSingleton(service, runtime.lifecycle.assertServiceAccess)
-            runtime.singletonViews[_serviceId(service)] = view
-        return view
-
-    def observe(self, service: Any, handler: Callable[[Any, Context], Any]) -> None:
-        runtime = self._runtime
-        runtime.lifecycle.assertSettingUp("observe services")
-        recordServiceReference(runtime.requires, service, "keyed")
-        runtime.lifecycle.observe(
-            lambda: self._kernel.serviceSlots.observe(service, runtime.lifecycle.assertServiceAccess, handler)
-        )
-
-    def replicatedState(self, initial: Any) -> MutableReplicatedStateImpl[Any]:
-        self._runtime.lifecycle.assertRunning("create replicated state")
-        return MutableReplicatedStateImpl(initial)
-
-    def own(self, disposal: Disposal) -> None:
-        self._runtime.lifecycle.own(disposal)
-
-    def onActivate(self, callback: Callable[[], Any]) -> None:
-        self._runtime.lifecycle.onActivate(callback)
-
-    def onDeactivate(self, callback: Callable[[], Any]) -> None:
-        self._runtime.lifecycle.own(callback)
+    def deactivate(self) -> None:
+        pass
 
 
 class FacetKernel:

@@ -242,6 +242,8 @@ class Pool:
                     if await _quota_restored(self.registry, runtime_keys[ref], endpoint, signal) is True:
                         restored.add(ref)
 
+        written = []   # the data a write leaves on disk, which the store's snapshot then takes
+
         async def mutate(raw):
             data = _coerce_storage_object(self.storage.parseStorageData(raw))
             if any(data.get(ref) != snapshot.get(ref) for ref in self.refs):
@@ -282,10 +284,13 @@ class Pool:
             } for item in selected._entries}
             data[STATE_KEY] = states
             self._unmatched_rotation_streak = selected._unmatched_rotation_streak
-            return LockResult(result=entry, next=json.dumps(data, indent=2),
-                              publish=lambda: self.storage._replace_cached_data(data))
+            written.append(data)
+            return LockResult(result=entry, next=json.dumps(data, indent=2))
 
-        return await _with_lock_async(self.storage.storage, mutate, options)
+        result = await _with_lock_async(self.storage.storage, mutate, options)
+        if written:
+            self.storage.updateReadState(written[-1])
+        return result
 
     async def acquire(self, model, *, failed_key=None, error=None, signal=None):
         """Resolve a usable candidate; one bad initial refresh must not block its peers."""

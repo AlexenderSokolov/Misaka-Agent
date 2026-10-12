@@ -19,7 +19,7 @@ import httpx
 
 from misaka.ai.auth.resolve import AuthResolutionOverrides
 from misaka.ai.providers.radius_config import DEFAULT_RADIUS_GATEWAY
-from misaka.cli.auth import get_auth_credential
+from misaka.cli.auth_command import getAuthCredential
 from misaka.core.session_export import exportSessionToJsonl
 from misaka.ui.tui import hyperlink
 from misaka.utils.abort import raceWithAbortSignal
@@ -115,7 +115,7 @@ async def tryShareViaRadius(tmpFile: str, context: SessionShareContext) -> bool:
     if not provider:
         return False
 
-    token = get_auth_credential(
+    token = getAuthCredential(
         await context.session.modelRuntime.getAuth("radius", AuthResolutionOverrides(minOAuthValidityMs=5 * 60_000))
     )
     if not token:

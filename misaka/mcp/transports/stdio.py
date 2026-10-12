@@ -22,7 +22,7 @@ from misaka.mcp.protocol.jsonrpc import (
 )
 from misaka.mcp.transports import _cross_spawn as crossSpawn
 from misaka.mcp.transports.transport import DEFAULT_MAX_MESSAGE_BYTES, TransportEvents
-from misaka.utils.js import jsonParse, jsonStringify, jsTrim
+from misaka.utils.js import Timeout, jsonParse, jsonStringify, jsTrim, setTimeout
 
 DEFAULT_MAX_STDERR_BYTES: Final = 64 * 1024
 DEFAULT_CLOSE_TIMEOUT_MS: Final = 2_000
@@ -31,8 +31,8 @@ STDIN_CLOSE_GRACE_MS: Final = 500
 USE_PROCESS_GROUPS: Final = sys.platform != "win32"
 
 # Process groups of running servers, killed if the host exits without closing them.
-_liveProcessGroups: set[int] = set()
-_exitHookInstalled = False
+liveProcessGroups: set[int] = set()
+exitHookInstalled = False
 
 
 def _taskkill() -> str:
@@ -41,7 +41,7 @@ def _taskkill() -> str:
     return os.path.join(systemRoot, "System32", "taskkill.exe")
 
 
-def _killProcessTree(child: crossSpawn.ChildProcess, signal: Literal["SIGTERM", "SIGKILL"]) -> None:
+def killProcessTree(child: crossSpawn.ChildProcess, signal: Literal["SIGTERM", "SIGKILL"]) -> None:
     pid = child.pid
     if sys.platform == "win32" and pid is not None:
         if child.exitCode is not None:
@@ -77,16 +77,16 @@ def _killProcessTree(child: crossSpawn.ChildProcess, signal: Literal["SIGTERM", 
         pass
 
 
-def _installExitHook() -> None:
-    global _exitHookInstalled
-    if _exitHookInstalled:
+def installExitHook() -> None:
+    global exitHookInstalled
+    if exitHookInstalled:
         return
-    _exitHookInstalled = True
+    exitHookInstalled = True
 
     def killGroups() -> None:
         import signal as signals
 
-        for pid in list(_liveProcessGroups):
+        for pid in list(liveProcessGroups):
             try:
                 os.killpg(pid, signals.SIGTERM)  # windows-footgun: ok - only installed on POSIX
             except OSError:
@@ -151,9 +151,9 @@ class StdioTransport(TransportEvents):
         self._child = child
         pid = child.pid
         if USE_PROCESS_GROUPS and pid is not None:
-            _installExitHook()
-            _liveProcessGroups.add(pid)
-            child.once("exit", lambda *_args: _liveProcessGroups.discard(pid))
+            installExitHook()
+            liveProcessGroups.add(pid)
+            child.once("exit", lambda *_args: liveProcessGroups.discard(pid))
         if child.stdout is not None:
             child.stdout.on("data", self._handleStdout)
             child.stdout.on("error", self._emitError)
@@ -225,20 +225,20 @@ class StdioTransport(TransportEvents):
             closeTimeoutMs = DEFAULT_CLOSE_TIMEOUT_MS
         loop = asyncio.get_running_loop()
         closed: asyncio.Future[None] = loop.create_future()
-        timers: list[asyncio.TimerHandle] = []
+        timers: list[Timeout] = []
 
         def onClose(*_args: Any) -> None:
             for timer in timers:
                 timer.cancel()
             # Children of the server that ignored stdin closing would otherwise outlive it.
-            _killProcessTree(child, "SIGTERM")
+            killProcessTree(child, "SIGTERM")
             if not closed.done():
                 closed.set_result(None)
 
         child.once("close", onClose)
         grace = min(STDIN_CLOSE_GRACE_MS, closeTimeoutMs)
-        timers.append(loop.call_later(grace / 1000, _killProcessTree, child, "SIGTERM"))
-        timers.append(loop.call_later((grace + closeTimeoutMs) / 1000, _killProcessTree, child, "SIGKILL"))
+        timers.append(setTimeout(lambda: killProcessTree(child, "SIGTERM"), grace))
+        timers.append(setTimeout(lambda: killProcessTree(child, "SIGKILL"), grace + closeTimeoutMs))
         if child.stdin is not None:
             child.stdin.end()
         await closed

@@ -1,4 +1,11 @@
-"""Read tool for text and image files."""
+"""Translated from pi's ``packages/coding-agent/src/core/tools/read.ts`` (v1.1.0).
+
+MISAKA forks:
+- Office documents (xlsx, xlsm, csv, tsv, docx, docm, pptx, pptm) are rendered as markdown through the corpus'
+  own renderer, with a ``cell_range`` parameter for one region of a spreadsheet; the description says so.
+- Text is streamed (``_scan_text``) rather than read whole and split, so a multi-gigabyte log pages with
+  offset/limit in bounded memory; the default operations read regular files only, below a size cap (``_common``).
+"""
 
 from __future__ import annotations
 
@@ -8,6 +15,7 @@ import io
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any, Protocol, TextIO
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,8 +41,13 @@ from misaka.core.tools.truncate import (
 )
 from misaka.utils.image_process import ProcessImageOptions, processImage
 from misaka.utils.image_resize import ImageResizeOptions
+from misaka.utils.js import formatNumber
 from misaka.utils.mime import detectSupportedImageMimeTypeFromFile
 from misaka.utils.values import read_field, signal_aborted
+
+# `Type.Number`: the schema says number; the value is read as an integer.
+_NUMBER = {"type": "number"}
+
 
 readToolSystemPromptContribution = {
     "snippet": "Read file contents",
@@ -46,8 +59,9 @@ class ReadToolInput(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     path: str = Field(description="Path to the file to read (relative or absolute)")
-    offset: int | None = Field(default=None, description="Line number to start reading from (1-indexed)")
-    limit: int | None = Field(default=None, description="Maximum number of lines to read")
+    offset: int | None = Field(default=None, description="Line number to start reading from (1-indexed)", json_schema_extra=_NUMBER)
+    limit: int | None = Field(default=None, description="Maximum number of lines to read", json_schema_extra=_NUMBER)
+    # MISAKA fork: one region of a spreadsheet.
     cell_range: str | None = Field(
         default=None,
         description=(
@@ -87,35 +101,41 @@ class ReadToolDetails:
 
 
 class ReadOperations(Protocol):
+    """Pluggable operations for the read tool.
+    Override these to delegate file reading to remote systems (for example SSH).
+    """
+
+    # Read file contents as a Buffer
     readFile: Callable[[str], Awaitable[bytes]]
+    # Check if file is readable (throw if not)
     access: Callable[[str], Awaitable[None]]
+    # Detect image MIME type, return null or undefined for non-images
     detectImageMimeType: Callable[[str], Awaitable[str | None | Any]] | None
+
+
+def _openText(path: str) -> TextIO:
+    # MISAKA fork: pi reads the whole file and splits it. Text is streamed instead (see
+    # ``_scan_text``), decoded exactly as ``bytes.decode("utf-8", "replace")`` would be and
+    # split only on "\n", so a multi-gigabyte log pages with offset/limit in bounded memory.
+    return open(path, encoding="utf-8", errors="replace", newline="\n")
+
+
+defaultReadOperations: ReadOperations = SimpleNamespace(  # type: ignore[assignment]
+    readFile=lambda path: asyncio.to_thread(whole_file_bytes, path, "read"),
+    access=lambda path: asyncio.to_thread(regular_file, path),
+    detectImageMimeType=detectSupportedImageMimeTypeFromFile,
+    openText=_openText,
+)
 
 
 @dataclass(slots=True)
 class ReadToolOptions:
-    autoResizeImages: bool = True
-    # Used when the session's model declares no `inputLimits.images.resize` of its own.
+    # Whether to auto-resize images. Default: true
+    autoResizeImages: bool | None = None
+    # Fallback resize profile when the execution context has no model metadata.
     resizeOptions: ImageResizeOptions | None = None
+    # Custom operations for file reading. Default: local filesystem
     operations: ReadOperations | None = None
-
-
-@dataclass(slots=True)
-class _DefaultReadOperations:
-    async def readFile(self, absolute_path: str) -> bytes:
-        return await asyncio.to_thread(whole_file_bytes, absolute_path, "read")
-
-    async def access(self, absolute_path: str) -> None:
-        await asyncio.to_thread(regular_file, absolute_path)
-
-    async def detectImageMimeType(self, absolute_path: str) -> str | None:
-        return await detectSupportedImageMimeTypeFromFile(absolute_path)
-
-    def openText(self, absolute_path: str) -> TextIO:
-        # MISAKA fork: pi reads the whole file and splits it. Text is streamed instead (see
-        # ``_scan_text``), decoded exactly as ``bytes.decode("utf-8", "replace")`` would be and
-        # split only on "\n", so a multi-gigabyte log pages with offset/limit in bounded memory.
-        return open(absolute_path, encoding="utf-8", errors="replace", newline="\n")
 
 
 # MISAKA fork: an Office file is rendered in memory; past this size the rendering is refused.
@@ -188,13 +208,13 @@ def _scan_text(stream: Any, start_line: int, limit: int | None, signal: Any = No
     return _TextScan(line + 1, "".join(window), selected_bytes, first_line_bytes, last_char)
 
 
-def _coerce_options(options: ReadToolOptions | Mapping[str, Any] | None) -> ReadToolOptions:
-    if options is None:
-        return ReadToolOptions()
-    if isinstance(options, ReadToolOptions):
+def _coerce_options(options: ReadToolOptions | Mapping[str, Any] | None) -> ReadToolOptions | None:
+    """An option bag passed as a mapping, as JavaScript callers pass an object literal."""
+    if options is None or isinstance(options, ReadToolOptions):
         return options
     return ReadToolOptions(
-        autoResizeImages=options.get("autoResizeImages", True),
+        autoResizeImages=options.get("autoResizeImages"),
+        resizeOptions=options.get("resizeOptions"),
         operations=options.get("operations"),
     )
 
@@ -210,6 +230,9 @@ def getNonVisionImageNote(model: Model[Api] | None) -> str | None:
     if model is None or "image" in model.input:
         return None
     return "[Current model does not support images. The image will be omitted from this request.]"
+
+
+# MISAKA fork: Office documents.
 
 
 def _office_format(absolute_path: str) -> str | None:
@@ -245,7 +268,7 @@ async def _render_office(absolute_path: str, cell_range: str | None, workspace: 
 
 
 def _model_resize_options(model: Any) -> ImageResizeOptions | None:
-    """The session model's `inputLimits.images.resize`, as the resizer's own options."""
+    """``ctx?.model?.inputLimits?.images?.resize``, as the resizer's own options."""
     images = getattr(getattr(model, "inputLimits", None), "images", None)
     resize = getattr(images, "resize", None)
     if resize is None:
@@ -259,16 +282,16 @@ def createReadToolDefinition(
     cwd: str,
     options: ReadToolOptions | Mapping[str, Any] | None = None,
 ) -> ToolDefinition[ReadToolInput | dict[str, Any], ReadToolDetails | None]:
-    resolved_options = _coerce_options(options)
-    auto_resize_images = resolved_options.autoResizeImages
-    fallback_resize_options = resolved_options.resizeOptions
-    operations = resolved_options.operations or _DefaultReadOperations()
+    options = _coerce_options(options)
+    autoResizeImages = options.autoResizeImages if options and options.autoResizeImages is not None else True
+    fallbackResizeOptions = options.resizeOptions if options else None
+    ops = (options.operations if options else None) or defaultReadOperations
 
     async def execute(
-        _tool_call_id: str,
+        _toolCallId: str,
         params: ReadToolInput | dict[str, Any],
         signal: Any | None = None,
-        _on_update: Callable[[AgentToolResult], None] | None = None,
+        _onUpdate: Callable[[AgentToolResult], None] | None = None,
         ctx: Any = None,
     ) -> AgentToolResult:
         parsed = ReadToolInput.model_validate(params)
@@ -277,157 +300,162 @@ def createReadToolDefinition(
             raise RuntimeError("Operation aborted")
 
         async def worker() -> AgentToolResult:
-            absolute_path = await resolveReadPathAsync(parsed.path, read_field(ctx, "cwd") or cwd)
+            absolutePath = await resolveReadPathAsync(parsed.path, read_field(ctx, "cwd") or cwd)
             if signal_aborted(signal):
                 return AgentToolResult(content=[], details=None)
-            await operations.access(absolute_path)
+            # Check if file exists and is readable.
+            await ops.access(absolutePath)
             if signal_aborted(signal):
                 return AgentToolResult(content=[], details=None)
 
-            detect_mime = getattr(operations, "detectImageMimeType", None)
-            mime_type = await detect_mime(absolute_path) if callable(detect_mime) else None
+            detectImageMimeType = getattr(ops, "detectImageMimeType", None)
+            mimeType = await detectImageMimeType(absolutePath) if callable(detectImageMimeType) else None
             content: list[TextContent | ImageContent]
             details: ReadToolDetails | None = None
-            non_vision_image_note = getNonVisionImageNote(getattr(ctx, "model", None))
+            nonVisionImageNote = getNonVisionImageNote(getattr(ctx, "model", None))
 
-            if mime_type:
-                buffer = await operations.readFile(absolute_path)
+            if mimeType:
+                # Read image as binary.
+                buffer = await ops.readFile(absolutePath)
                 processed = await processImage(
                     buffer,
-                    mime_type,
+                    mimeType,
                     ProcessImageOptions(
-                        autoResizeImages=auto_resize_images,
-                        resizeOptions=_model_resize_options(getattr(ctx, "model", None)) or fallback_resize_options,
+                        autoResizeImages=autoResizeImages,
+                        resizeOptions=_model_resize_options(getattr(ctx, "model", None)) or fallbackResizeOptions,
                     ),
                 )
                 if not processed.ok:
-                    text_note = f"Read image file [{mime_type}]\n{processed.message}"
-                    if non_vision_image_note:
-                        text_note += f"\n{non_vision_image_note}"
-                    content = [TextContent(text=text_note)]
+                    textNote = f"Read image file [{mimeType}]\n{processed.message}"
+                    if nonVisionImageNote:
+                        textNote += f"\n{nonVisionImageNote}"
+                    content = [TextContent(text=textNote)]
                 else:
-                    text_note = f"Read image file [{processed.mimeType}]"
+                    textNote = f"Read image file [{processed.mimeType}]"
                     if processed.hints:
-                        text_note += "\n" + "\n".join(processed.hints)
-                    if non_vision_image_note:
-                        text_note += f"\n{non_vision_image_note}"
+                        textNote += "\n" + "\n".join(processed.hints)
+                    if nonVisionImageNote:
+                        textNote += f"\n{nonVisionImageNote}"
                     content = [
-                        TextContent(text=text_note),
+                        TextContent(text=textNote),
                         ImageContent(data=processed.data, mimeType=processed.mimeType),
                     ]
             else:
-                # An Office file is rendered rather than decoded: its bytes are a zip, and
+                # Read text content.
+                # MISAKA fork: an Office file is rendered rather than decoded: its bytes are a zip, and
                 # ``errors="replace"`` on them produces pages of replacement characters that
                 # look like content and quote against nothing. The rendering is the corpus'
                 # own (``documents/office``), so what is shown here is what ``doc_read``
                 # would show -- a quotation copied out of this verifies against the indexed
                 # document. Everything below is unchanged: offset/limit page the rendering
                 # exactly as they page a text file.
-                start_line = max(0, parsed.offset - 1) if parsed.offset else 0
-                open_text = getattr(operations, "openText", None)
-                if _office_format(absolute_path) is not None:
-                    text_stream: Any = io.StringIO(await _render_office(absolute_path, parsed.cell_range, read_field(ctx, "cwd") or cwd))
+                startLine = max(0, parsed.offset - 1) if parsed.offset else 0
+                openText = getattr(ops, "openText", None)
+                if _office_format(absolutePath) is not None:
+                    rendered = await _render_office(absolutePath, parsed.cell_range, read_field(ctx, "cwd") or cwd)
+                    textStream: Any = io.StringIO(rendered)
                 elif parsed.cell_range:
                     raise RuntimeError(
                         "cell_range names a sheet and a range, and this is not a spreadsheet. "
                         "Call read again without it."
                     )
-                elif callable(open_text):
-                    text_stream = await asyncio.to_thread(open_text, absolute_path)
+                elif callable(openText):
+                    textStream = await asyncio.to_thread(openText, absolutePath)
                 else:
-                    buffer = await operations.readFile(absolute_path)
-                    text_stream = io.StringIO(buffer.decode("utf-8", errors="replace"))
-                with text_stream:
-                    scan = await asyncio.to_thread(_scan_text, text_stream, start_line, parsed.limit, signal)
-                total_file_lines = scan.total_lines
-                start_line_display = start_line + 1
-                if start_line >= total_file_lines:
-                    raise RuntimeError(f"Offset {parsed.offset} is beyond end of file ({total_file_lines} lines total)")
+                    buffer = await ops.readFile(absolutePath)
+                    textStream = io.StringIO(buffer.decode("utf-8", errors="replace"))
+                with textStream:
+                    scan = await asyncio.to_thread(_scan_text, textStream, startLine, parsed.limit, signal)
+                totalFileLines = scan.total_lines
+                startLineDisplay = startLine + 1
+                if startLine >= totalFileLines:
+                    raise RuntimeError(f"Offset {parsed.offset} is beyond end of file ({totalFileLines} lines total)")
 
-                user_limited_lines: int | None = None
-                end_line = total_file_lines
+                userLimitedLines: int | None = None
+                endLine = totalFileLines
                 if parsed.limit is not None:
-                    end_line = min(start_line + parsed.limit, total_file_lines)
-                    user_limited_lines = end_line - start_line
+                    endLine = min(startLine + parsed.limit, totalFileLines)
+                    userLimitedLines = endLine - startLine
 
                 # What truncate_head reports about the whole selection, from the window it needs
                 # plus the scan's measurements (the same numbers it would count on the full text:
                 # a selection ending in "\n" has no last line, an empty one has no lines).
-                counted_lines = end_line - start_line - (scan.last_char == "\n") if scan.selected_bytes else 0
+                countedLines = endLine - startLine - (scan.last_char == "\n") if scan.selected_bytes else 0
                 truncation = dataclasses.replace(
-                    truncateHead(scan.window), totalLines=counted_lines, totalBytes=scan.selected_bytes)
+                    truncateHead(scan.window), totalLines=countedLines, totalBytes=scan.selected_bytes)
                 if truncation.firstLineExceedsLimit:
-                    first_line_size = formatSize(scan.first_line_bytes)
-                    output_text = (
-                        f"[Line {start_line_display} is {first_line_size}, exceeds {formatSize(DEFAULT_MAX_BYTES)} limit. "
-                        f"Use bash: sed -n '{start_line_display}p' {parsed.path} | head -c {DEFAULT_MAX_BYTES}]"
+                    firstLineSize = formatSize(scan.first_line_bytes)
+                    outputText = (
+                        f"[Line {startLineDisplay} is {firstLineSize}, exceeds {formatSize(DEFAULT_MAX_BYTES)} limit. "
+                        f"Use bash: sed -n '{startLineDisplay}p' {parsed.path} | head -c {DEFAULT_MAX_BYTES}]"
                     )
                     details = ReadToolDetails(truncation=truncation)
                 elif truncation.truncated:
-                    end_line_display = start_line_display + truncation.outputLines - 1
-                    next_offset = end_line_display + 1
-                    output_text = truncation.content
+                    endLineDisplay = startLineDisplay + truncation.outputLines - 1
+                    nextOffset = endLineDisplay + 1
+                    outputText = truncation.content
                     if truncation.truncatedBy == "lines":
-                        output_text += (
-                            f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_file_lines}. "
-                            f"Use offset={next_offset} to continue.]"
+                        outputText += (
+                            f"\n\n[Showing lines {startLineDisplay}-{endLineDisplay} of {totalFileLines}. "
+                            f"Use offset={nextOffset} to continue.]"
                         )
                     else:
-                        output_text += (
-                            f"\n\n[Showing lines {start_line_display}-{end_line_display} of {total_file_lines} "
-                            f"({formatSize(DEFAULT_MAX_BYTES)} limit). Use offset={next_offset} to continue.]"
+                        outputText += (
+                            f"\n\n[Showing lines {startLineDisplay}-{endLineDisplay} of {totalFileLines} "
+                            f"({formatSize(DEFAULT_MAX_BYTES)} limit). Use offset={nextOffset} to continue.]"
                         )
                     details = ReadToolDetails(truncation=truncation)
-                elif user_limited_lines is not None and start_line + user_limited_lines < total_file_lines:
-                    remaining = total_file_lines - (start_line + user_limited_lines)
-                    next_offset = start_line + user_limited_lines + 1
-                    output_text = (
-                        f"{truncation.content}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
+                elif userLimitedLines is not None and startLine + userLimitedLines < totalFileLines:
+                    remaining = totalFileLines - (startLine + userLimitedLines)
+                    nextOffset = startLine + userLimitedLines + 1
+                    outputText = (
+                        f"{truncation.content}\n\n[{remaining} more lines in file. Use offset={nextOffset} to continue.]"
                     )
                 else:
-                    output_text = truncation.content
+                    outputText = truncation.content
 
-                content = [TextContent(text=output_text)]
+                content = [TextContent(text=outputText)]
 
             if signal_aborted(signal):
                 return AgentToolResult(content=[], details=None)
             return AgentToolResult(content=content, details=details)
 
-        worker_task = asyncio.create_task(worker())
-        async with abort_race(signal) as abort_task:
-            if abort_task is None:
-                return await worker_task
+        workerTask = asyncio.create_task(worker())
+        async with abort_race(signal) as abortTask:
+            if abortTask is None:
+                return await workerTask
 
-            done, _pending = await asyncio.wait({worker_task, abort_task}, return_when=asyncio.FIRST_COMPLETED)
-            if abort_task in done and worker_task not in done:
-                _ignore_background_task_result(worker_task)
+            done, _pending = await asyncio.wait({workerTask, abortTask}, return_when=asyncio.FIRST_COMPLETED)
+            if abortTask in done and workerTask not in done:
+                _ignore_background_task_result(workerTask)
                 raise RuntimeError("Operation aborted")
 
-            result = await worker_task
+            result = await workerTask
             if signal_aborted(signal):
                 raise RuntimeError("Operation aborted")
             return result
 
-    async def execute_with_output(
-        tool_call_id: str,
+    async def executeWithOutput(
+        toolCallId: str,
         params: ReadToolInput | dict[str, Any],
         signal: Any | None = None,
-        on_update: Callable[[AgentToolResult], None] | None = None,
+        onUpdate: Callable[[AgentToolResult], None] | None = None,
         ctx: Any = None,
     ) -> AgentToolResult:
         # Every result carries `structuredContent` for programmatic callers (upstream's `.then()` on execute).
-        result = await execute(tool_call_id, params, signal, on_update, ctx)
+        result = await execute(toolCallId, params, signal, onUpdate, ctx)
         return replace(result, structuredContent=toReadOutput(result.content))
 
     return ToolDefinition(
         name="read",
         label="read",
         description=(
+            # MISAKA fork: Office documents are named, and how each kind is rendered.
             "Read the contents of a file. Supports text files, Office documents "
             "(xlsx, xlsm, csv, tsv, docx, docm, pptx, pptm), and images "
             "(jpg, png, gif, webp, bmp). "
             f"Images are sent as attachments. For text files, output is truncated to {DEFAULT_MAX_LINES} "
-            f"lines or {DEFAULT_MAX_BYTES // 1024}KB (whichever is hit first). Use offset/limit for large files. "
+            f"lines or {formatNumber(DEFAULT_MAX_BYTES / 1024)}KB (whichever is hit first). Use offset/limit for large files. "
             "When you need the full file, continue with offset until complete. A spreadsheet "
             "is rendered with real cell coordinates, its formulas and its sheet-level "
             "formatting; pass cell_range to re-read one region of a large sheet. A Word "
@@ -439,7 +467,7 @@ def createReadToolDefinition(
         parameters=ReadToolInput,
         outputSchema=readOutputSchema,
         constrainedSampling={"type": "json_schema", "strict": "prefer"},
-        execute=execute_with_output,
+        execute=executeWithOutput,
         **readRenderers,
     )
 

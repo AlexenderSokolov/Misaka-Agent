@@ -111,7 +111,7 @@ def test_renders_arrays_and_tuples():
 def test_renders_types_over_the_budget_as_unknown():
     properties = {f"field{i}": {"type": "string"} for i in range(50)}
     schema = {"type": "object", "properties": properties}
-    assert schemaToType(schema, 100) == "unknown"
+    assert schemaToType(schema, {"maxChars": 100}) == "unknown"
     assert "field49?: string;" in schemaToType(schema)
 
 

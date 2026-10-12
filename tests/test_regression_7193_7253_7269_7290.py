@@ -20,7 +20,7 @@ from misaka.core.extensions.loader import (
     loadExtensionFromFactory,
 )
 from misaka.core.extensions.types import LoadExtensionsResult
-from misaka.modes.jsonl import toJsonEvent
+from misaka.modes.json_event import toJsonEvent
 from misaka.utils.js import jsonStringify
 from misaka.utils.values import read_field
 from tests.experimental_support import flush

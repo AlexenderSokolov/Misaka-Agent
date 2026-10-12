@@ -70,24 +70,24 @@ class AuthorizationServerDiscoveryUrl(TypedDict):
     type: Literal["oauth", "oidc"]
 
 
-async def _discard(response: _fetch.Response | None) -> None:
+async def discard(response: _fetch.Response | None) -> None:
     # MISAKA fork: awaited, since an unread httpx body holds its pooled connection until it closes.
     if response is not None and response.body is not None:
         with contextlib.suppress(Exception):
             await response.body.cancel()
 
 
-def _isDiscoveryMiss(status: int) -> bool:
+def isDiscoveryMiss(status: int) -> bool:
     """4xx and 502 mean "not here", so discovery tries the next candidate URL."""
     return (status >= 400 and status < 500) or status == 502
 
 
-def _pathSuffix(pathname: str) -> str:
+def pathSuffix(pathname: str) -> str:
     """Path suffix for ``/.well-known/<kind><path>``; empty for the root path."""
     return pathname.removesuffix("/")
 
 
-def _field(header: str, name: str) -> str | None:
+def field(header: str, name: str) -> str | None:
     # JavaScript's `\s`, and a case-insensitive match that never maps a non-ASCII letter to an ASCII one.
     match = re.search(
         rf'(?:^|[,{JS_WHITESPACE_CLASS}]){name}=(?:"([^"]*)"|([^{JS_WHITESPACE_CLASS},]+))',
@@ -104,20 +104,20 @@ def parseWwwAuthenticate(header: str | None) -> OAuthChallenge:
     scheme = jsSplitWhitespace(jsTrimStart(header), 1)[0].lower()
     if scheme != "bearer" and scheme != "dpop":
         return {}
-    resourceMetadata = _field(header, "resource_metadata")
+    resourceMetadata = field(header, "resource_metadata")
     resourceMetadataUrl: URL | None = None
     if resourceMetadata:
         with contextlib.suppress(Exception):
             resourceMetadataUrl = URL(resourceMetadata)
     return defined({  # type: ignore[return-value]
         "resourceMetadataUrl": resourceMetadataUrl,
-        "scope": _field(header, "scope"),
-        "error": _field(header, "error"),
-        "errorDescription": _field(header, "error_description"),
+        "scope": field(header, "scope"),
+        "error": field(header, "error"),
+        "errorDescription": field(header, "error_description"),
     })
 
 
-async def _fetchMetadata(url: URL, fetch: McpFetch, protocolVersion: str, signal: Any) -> _fetch.Response:
+async def fetchMetadata(url: URL, fetch: McpFetch, protocolVersion: str, signal: Any) -> _fetch.Response:
     return await fetch(
         url,
         defined({"headers": {"Accept": "application/json", "MCP-Protocol-Version": protocolVersion}, "signal": signal}),  # type: ignore[arg-type]
@@ -136,31 +136,31 @@ async def discoverProtectedResourceMetadata(
     if version is None:
         version = LATEST_PROTOCOL_VERSION
     resourceMetadataUrl = options.get("resourceMetadataUrl")
-    response = await _fetchMetadata(
+    response = await fetchMetadata(
         URL(resourceMetadataUrl)
         if resourceMetadataUrl
-        else URL(f"/.well-known/oauth-protected-resource{_pathSuffix(server.pathname)}", server.origin),
+        else URL(f"/.well-known/oauth-protected-resource{pathSuffix(server.pathname)}", server.origin),
         fetch,
         version,
         options.get("signal"),
     )
-    if not resourceMetadataUrl and server.pathname != "/" and _isDiscoveryMiss(response.status):
-        await _discard(response)
-        response = await _fetchMetadata(
+    if not resourceMetadataUrl and server.pathname != "/" and isDiscoveryMiss(response.status):
+        await discard(response)
+        response = await fetchMetadata(
             URL("/.well-known/oauth-protected-resource", server.origin),
             fetch,
             version,
             options.get("signal"),
         )
     if not response.ok:
-        await _discard(response)
+        await discard(response)
         raise RuntimeError(f"HTTP {response.status} loading OAuth protected resource metadata")
     return parseProtectedResourceMetadata(await response.json())
 
 
 def buildAuthorizationServerDiscoveryUrls(authorizationServerUrl: str | URL) -> list[AuthorizationServerDiscoveryUrl]:
     issuer = URL(authorizationServerUrl)
-    path = _pathSuffix(issuer.pathname)
+    path = pathSuffix(issuer.pathname)
     urls: list[AuthorizationServerDiscoveryUrl] = [
         {"url": URL(f"/.well-known/oauth-authorization-server{path}", issuer.origin), "type": "oauth"},
         {"url": URL(f"/.well-known/openid-configuration{path}", issuer.origin), "type": "oidc"},
@@ -180,15 +180,15 @@ async def discoverAuthorizationServerMetadata(
     for candidate in buildAuthorizationServerDiscoveryUrls(authorizationServerUrl):
         url = candidate["url"]
         protocolVersion = options.get("protocolVersion")
-        response = await _fetchMetadata(
+        response = await fetchMetadata(
             url,
             fetch,
             protocolVersion if protocolVersion is not None else LATEST_PROTOCOL_VERSION,
             options.get("signal"),
         )
         if not response.ok:
-            await _discard(response)
-            if _isDiscoveryMiss(response.status):
+            await discard(response)
+            if isDiscoveryMiss(response.status):
                 continue
             raise RuntimeError(f"HTTP {response.status} loading authorization server metadata from {url}")
         metadata = parseAuthorizationServerMetadata(await response.json())
@@ -226,14 +226,14 @@ async def discoverOAuthServerInfo(
     if authorizationServerMetadataUrl:
         url = authorizationServerMetadataUrl
         fetch = options.get("fetch")
-        response = await _fetchMetadata(
+        response = await fetchMetadata(
             url,
             fetch if fetch is not None else _fetch.fetch,
             LATEST_PROTOCOL_VERSION,
             options.get("signal"),
         )
         if not response.ok:
-            await _discard(response)
+            await discard(response)
             raise RuntimeError(f"HTTP {response.status} loading authorization server metadata from {url}")
         metadata = parseAuthorizationServerMetadata(await response.json())
         return defined({  # type: ignore[return-value]

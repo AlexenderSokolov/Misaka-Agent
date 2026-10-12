@@ -51,17 +51,6 @@ def agentOf(view: dict[str, Any]) -> dict[str, Any]:
     return {} if agent is None else agent
 
 
-def titleOf(entry: dict[str, Any] | None) -> dict[str, str]:
-    """The text of a user entry, as a one-line title."""
-    model = None if entry is None else entry.get("model")
-    message = model[0] if model else None
-    if message is None or message.get("role") != "user":
-        return {}
-    content = message["content"]
-    text = content if isinstance(content, str) else " ".join(block["text"] for block in content if block["type"] == "text")
-    return {"title": jsCollapseWhitespace(text).strip(" ")}
-
-
 async def firstInput(harness: Any, id: int) -> dict[str, str]:
     """A subagent's task: the oldest user message of its conversation. The main conversation needs no title."""
     if id == ROOT_CONVERSATION_ID:
@@ -83,6 +72,17 @@ def _resolved() -> asyncio.Future[None]:
     future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     future.set_result(None)
     return future
+
+
+def titleOf(entry: dict[str, Any] | None) -> dict[str, str]:
+    """The text of a user entry, as a one-line title."""
+    model = None if entry is None else entry.get("model")
+    message = model[0] if model else None
+    if message is None or message.get("role") != "user":
+        return {}
+    content = message["content"]
+    text = content if isinstance(content, str) else " ".join(block["text"] for block in content if block["type"] == "text")
+    return {"title": jsCollapseWhitespace(text).strip(" ")}
 
 
 async def openDurable(options: dict[str, Any] | None = None) -> SimpleNamespace:

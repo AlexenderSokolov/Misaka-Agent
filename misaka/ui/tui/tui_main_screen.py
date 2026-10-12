@@ -4,7 +4,7 @@ MISAKA forks, each marked where it happens:
 
 - D1: ``TuiMainScreenRenderState``, ``captureRenderState``/``restoreRenderState`` and ``mode`` serve the switch to the
   fullscreen renderer, which is not ported.
-- The debug output (``PI_TUI_DEBUG_REDRAW`` redraw log, ``PI_TUI_DEBUG`` frame dumps) is not ported.
+- ``PI_TUI_DEBUG_REDRAW`` and ``PI_TUI_DEBUG`` are ``MISAKA_TUI_DEBUG_REDRAW`` and ``MISAKA_TUI_DEBUG``.
 - ``doRender`` runs on the loop that owns rendering, under a lock (a loop-less embedder renders from timer threads),
   and records the frame's cost for the frame pacing (``TuiBase.scheduleRender``); the body is ``_doRenderInner``.
 - A resize repaints the visible screen from the transcript's tail first (``_try_viewport_render``) and rebuilds the
@@ -15,6 +15,7 @@ MISAKA forks, each marked where it happens:
 from __future__ import annotations
 
 import os
+import secrets
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -25,7 +26,7 @@ from typing import Any
 from misaka.ui.tui.terminal_image import deleteKittyImage, isImageLine
 from misaka.ui.tui.tui import Container, TuiBase, TuiStopOptions
 from misaka.ui.tui.utils import visibleWidth
-from misaka.utils.js import jsNumber
+from misaka.utils.js import jsNumber, jsonStringify
 
 KITTY_SEQUENCE_PREFIX = "\x1b_G"
 MAX_RENDER_WRITE_CHARS = 1024 * 1024
@@ -358,7 +359,19 @@ class TuiMainScreen(TuiBase):
             self.previousWidth = width
             self.previousHeight = height
 
-        # MISAKA fork: upstream's redraw log (`PI_TUI_DEBUG_REDRAW`, `logRedraw`) is not ported.
+        redrawLogDirectory = self.logDirectory if os.environ.get("MISAKA_TUI_DEBUG_REDRAW") == "1" else None
+
+        def logRedraw(reason: str) -> None:
+            if redrawLogDirectory is None:
+                return
+            logPath = os.path.join(redrawLogDirectory, "pi-tui-debug.log")
+            msg = (
+                f"[{toISOString()}] fullRender: {reason} "
+                f"(prev={len(self.previousLines)}, new={len(newLines)}, height={height})\n"
+            )
+            os.makedirs(os.path.dirname(logPath), exist_ok=True)
+            with open(logPath, "a", encoding="utf-8", newline="") as handle:
+                handle.write(msg)
 
         # MISAKA fork: after one or more fast viewport frames the size has settled; rebuild the whole buffer once, so
         # the scrollback and the diff model are correct again.
@@ -369,11 +382,13 @@ class TuiMainScreen(TuiBase):
 
         # First render - just output everything without clearing (assumes clean screen)
         if len(self.previousLines) == 0 and not widthChanged and not heightChanged:
+            logRedraw("first render")
             fullRender(False)
             return
 
         # Width changes always need a full re-render because wrapping changes.
         if widthChanged:
+            logRedraw(f"terminal width changed ({self.previousWidth} -> {width})")
             fullRender(True)
             return
 
@@ -381,6 +396,7 @@ class TuiMainScreen(TuiBase):
         # but Termux changes height when the software keyboard shows or hides.
         # In that environment, a full redraw causes the entire history to replay on every toggle.
         if heightChanged and not isTermuxSession():
+            logRedraw(f"terminal height changed ({self.previousHeight} -> {height})")
             fullRender(True)
             return
 
@@ -388,6 +404,7 @@ class TuiMainScreen(TuiBase):
         # (overlays need the padding, so only do this when no overlays are active)
         # Configurable via setClearOnShrink()
         if self.getClearOnShrink() and len(newLines) < self.maxLinesRendered and not self.hasOverlayEntries:
+            logRedraw(f"clearOnShrink (maxLinesRendered={self.maxLinesRendered})")
             fullRender(True)
             return
 
@@ -430,6 +447,7 @@ class TuiMainScreen(TuiBase):
                 # Move to end of new content (clamp to 0 for empty content)
                 targetRow = max(0, len(newLines) - 1)
                 if targetRow < prevViewportTop:
+                    logRedraw(f"deleted lines moved viewport up ({targetRow} < {prevViewportTop})")
                     fullRender(True)
                     return
                 lineDiff = computeLineDiff(targetRow)
@@ -441,6 +459,7 @@ class TuiMainScreen(TuiBase):
                 # Clear extra lines without scrolling
                 extraLines = len(self.previousLines) - len(newLines)
                 if extraLines > height:
+                    logRedraw(f"extraLines > height ({extraLines} > {height})")
                     fullRender(True)
                     return
                 clearStartOffset = 0 if len(newLines) == 0 else 1
@@ -468,6 +487,7 @@ class TuiMainScreen(TuiBase):
         # Differential rendering can only touch what was actually visible.
         # If the first changed line is above the previous viewport, we need a full redraw.
         if firstChanged < prevViewportTop:
+            logRedraw(f"firstChanged < viewportTop ({firstChanged} < {prevViewportTop})")
             fullRender(True)
             return
 
@@ -511,6 +531,9 @@ class TuiMainScreen(TuiBase):
             if imageReservedRows > 1:
                 imageStartScreenRow = i - viewportTop
                 if imageStartScreenRow < 0 or imageStartScreenRow + imageReservedRows > height:
+                    logRedraw(
+                        f"kitty image pre-clear would scroll ({imageStartScreenRow} + {imageReservedRows} > {height})"
+                    )
                     fullRender(True)
                     return
 
@@ -578,7 +601,38 @@ class TuiMainScreen(TuiBase):
 
         output.append("\x1b[?2026l")  # End synchronized output
 
-        # MISAKA fork: upstream's frame dump (`PI_TUI_DEBUG`) is not ported.
+        if os.environ.get("MISAKA_TUI_DEBUG") == "1":
+            debugDir = "/tmp/tui"
+            os.makedirs(debugDir, exist_ok=True)
+            # `Math.random().toString(36).slice(2)`: a random suffix.
+            debugPath = os.path.join(debugDir, f"render-{int(time.time() * 1000)}-{secrets.token_hex(6)}.log")
+            debugData = "\n".join(
+                [
+                    f"firstChanged: {firstChanged}",
+                    f"viewportTop: {viewportTop}",
+                    f"cursorRow: {self.cursorRow}",
+                    f"height: {height}",
+                    f"lineDiff: {lineDiff}",
+                    f"hardwareCursorRow: {hardwareCursorRow}",
+                    f"renderEnd: {renderEnd}",
+                    f"finalCursorRow: {finalCursorRow}",
+                    # `JSON.stringify(undefined)` is undefined, which the template prints as "undefined".
+                    f"cursorPos: {'undefined' if cursorPos is None else jsonStringify(cursorPos)}",
+                    f"newLines.length: {len(newLines)}",
+                    f"previousLines.length: {len(self.previousLines)}",
+                    "",
+                    "=== newLines ===",
+                    jsonStringify(newLines, 2),
+                    "",
+                    "=== previousLines ===",
+                    jsonStringify(self.previousLines, 2),
+                    "",
+                    "=== buffer ===",
+                    f"[{output.length} chars written in bounded chunks]",
+                ]
+            )
+            with open(debugPath, "w", encoding="utf-8", newline="") as handle:
+                handle.write(debugData)
 
         output.flush()
 

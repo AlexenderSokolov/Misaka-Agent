@@ -66,11 +66,6 @@ from misaka.utils.js import (
     spawn,
 )
 
-SESSION_WORKER_CONTROL_ADDRESS_ENV = "PI_SESSION_WORKER_CONTROL_ADDRESS"
-SESSION_WORKER_CONTROL_TOKEN_ENV = "PI_SESSION_WORKER_CONTROL_TOKEN"
-SESSION_WORKER_SESSION_KEY_ENV = "PI_SESSION_WORKER_SESSION_KEY_BASE64"
-SESSION_WORKER_PEER_ID_ENV = "PI_SESSION_WORKER_PEER_ID"
-
 ServiceCallSchema = schema.strictObject(
     {
         "serviceId": schema.string(1),
@@ -81,6 +76,11 @@ ServiceCallSchema = schema.strictObject(
     optional=("instance",),
 )
 RemoteServiceErrorCodeSchema = {"type": "string", "pattern": f"^(?:{'|'.join(REMOTE_SERVICE_ERROR_CODES)})$"}
+
+SESSION_WORKER_CONTROL_ADDRESS_ENV = "PI_SESSION_WORKER_CONTROL_ADDRESS"
+SESSION_WORKER_CONTROL_TOKEN_ENV = "PI_SESSION_WORKER_CONTROL_TOKEN"
+SESSION_WORKER_SESSION_KEY_ENV = "PI_SESSION_WORKER_SESSION_KEY_BASE64"
+SESSION_WORKER_PEER_ID_ENV = "PI_SESSION_WORKER_PEER_ID"
 
 SessionWorkerMetadataSchema = schema.strictObject(
     {"id": schema.string(1), "createdAt": schema.NUMBER, "cwd": schema.string(), "path": schema.string()}
@@ -339,63 +339,6 @@ CoordinatorInputSchema = schema.union(
 )
 
 
-def createJsonLineMessages(socket: Any) -> AsyncIterable[Any]:
-    queued: list[Any] = []
-    waiters: list[Callable[[Any], None]] = []
-    buffered = ""
-    # ``socket.setEncoding("utf8")``: a character split across chunks waits for the rest of its bytes.
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-
-    def onData(chunk: bytes) -> None:
-        nonlocal buffered
-        buffered += decoder.decode(chunk)
-        if len(buffered.encode("utf-8", "surrogatepass")) > MAX_CONTROL_LINE_BYTES:
-            socket.destroy(RuntimeError("Session worker control message is too large"))
-            return
-        while True:
-            newline = buffered.find("\n")
-            if newline == -1:
-                return
-            line = buffered[:newline]
-            buffered = buffered[newline + 1 :]
-            try:
-                value = jsonParse(line)
-                waiter = waiters.pop(0) if waiters else None
-                if waiter:
-                    waiter(value)
-                else:
-                    queued.append(value)
-            except Exception:  # noqa: BLE001 - upstream's bare catch
-                socket.destroy(RuntimeError("Session worker received invalid control JSON"))
-                return
-
-    socket.on("data", onData)
-
-    async def iterate() -> AsyncIterator[Any]:
-        while True:
-            # ``queued.shift() ?? await ...``: a queued ``null`` is dropped too.
-            value = queued.pop(0) if queued else None
-            if value is not None:
-                yield value
-                continue
-            future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-            waiters.append(future.set_result)
-            try:
-                value = await future
-            except asyncio.CancelledError:
-                # MISAKA fork: a cancelled `next()` withdraws its waiter; a promise cannot be cancelled.
-                if future.set_result in waiters:
-                    waiters.remove(future.set_result)
-                raise
-            yield value
-
-    class Messages:
-        def __aiter__(self) -> AsyncIterator[Any]:
-            return iterate()
-
-    return Messages()
-
-
 class WorkerControl:
     def __init__(self, initialServerConnectionId: str | None, messages: AsyncIterable[Any], socket: Any) -> None:
         self.initialServerConnectionId = initialServerConnectionId
@@ -461,6 +404,63 @@ async def readCommands(control: WorkerControl, handlers: dict[str, Any]) -> None
             handlers["onOperationCancel"](command)
         else:
             handlers["onOperation"](command)
+
+
+def createJsonLineMessages(socket: Any) -> AsyncIterable[Any]:
+    queued: list[Any] = []
+    waiters: list[Callable[[Any], None]] = []
+    buffered = ""
+    # ``socket.setEncoding("utf8")``: a character split across chunks waits for the rest of its bytes.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def onData(chunk: bytes) -> None:
+        nonlocal buffered
+        buffered += decoder.decode(chunk)
+        if len(buffered.encode("utf-8", "surrogatepass")) > MAX_CONTROL_LINE_BYTES:
+            socket.destroy(RuntimeError("Session worker control message is too large"))
+            return
+        while True:
+            newline = buffered.find("\n")
+            if newline == -1:
+                return
+            line = buffered[:newline]
+            buffered = buffered[newline + 1 :]
+            try:
+                value = jsonParse(line)
+                waiter = waiters.pop(0) if waiters else None
+                if waiter:
+                    waiter(value)
+                else:
+                    queued.append(value)
+            except Exception:  # noqa: BLE001 - upstream's bare catch
+                socket.destroy(RuntimeError("Session worker received invalid control JSON"))
+                return
+
+    socket.on("data", onData)
+
+    async def iterate() -> AsyncIterator[Any]:
+        while True:
+            # ``queued.shift() ?? await ...``: a queued ``null`` is dropped too.
+            value = queued.pop(0) if queued else None
+            if value is not None:
+                yield value
+                continue
+            future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            waiters.append(future.set_result)
+            try:
+                value = await future
+            except asyncio.CancelledError:
+                # MISAKA fork: a cancelled `next()` withdraws its waiter; a promise cannot be cancelled.
+                if future.set_result in waiters:
+                    waiters.remove(future.set_result)
+                raise
+            yield value
+
+    class Messages:
+        def __aiter__(self) -> AsyncIterator[Any]:
+            return iterate()
+
+    return Messages()
 
 
 def toWorkerServiceUpdate(update: dict[str, Any]) -> dict[str, Any]:

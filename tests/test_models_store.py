@@ -45,13 +45,13 @@ def _raw(provider: str, id: str) -> dict:
 
 def _count_locks(monkeypatch) -> list[int]:
     calls: list[int] = []
-    acquire = FileAuthStorageBackend._acquire_lock_async_with_retry
+    acquire = FileAuthStorageBackend.acquireLockAsync
 
     async def counting(self, options=None):
         calls.append(1)
         return await acquire(self, options)
 
-    monkeypatch.setattr(FileAuthStorageBackend, "_acquire_lock_async_with_retry", counting)
+    monkeypatch.setattr(FileAuthStorageBackend, "acquireLockAsync", counting)
     return calls
 
 
@@ -127,7 +127,7 @@ async def test_keeps_a_coalesced_reload_alive_while_another_reader_is_still_wait
         await lock_granted.wait()
         return Lock()
 
-    monkeypatch.setattr(FileAuthStorageBackend, "_acquire_lock_async_with_retry", held_lock)
+    monkeypatch.setattr(FileAuthStorageBackend, "acquireLockAsync", held_lock)
     first_controller = AbortController()
     second_controller = AbortController()
     first = asyncio.ensure_future(store.read("one", _signal(first_controller)))

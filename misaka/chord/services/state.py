@@ -39,8 +39,6 @@ from .state_internals import registerReplicatedStateInternals
 
 _MAX_SAFE_INTEGER = 2**53 - 1
 
-type SourceListener = Callable[[Sequence[Op], int, Context], None]
-
 
 class StateDelivery[T]:
     __slots__ = ("context", "delivery", "value")
@@ -114,6 +112,8 @@ class StateSubscriber[T]:
             self._reportError(toError(error))
         except Exception as reportError:  # noqa: BLE001 - a reporter that fails goes to the loop's handler
             reportErrorAsync(toError(reportError))
+
+type SourceListener = Callable[[Sequence[Op], int, Context], None]
 
 
 class Publication[T]:

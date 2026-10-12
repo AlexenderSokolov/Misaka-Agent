@@ -75,7 +75,7 @@ class InitializeResult(TypedDict):
 
 
 class ProgressNotification(TypedDict):
-    progressToken: str | int
+    progressToken: str | int | float
     progress: float
     total: NotRequired[float]
     message: NotRequired[str]

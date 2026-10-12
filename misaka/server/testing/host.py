@@ -70,7 +70,7 @@ class TestHarness:
         self._nextCloseGate: OpenGate | None = None
         self._nextServiceGate: OpenGate | None = None
 
-    def attachClient(self, context: Context | None = None) -> _HarnessLease:
+    def attachClient(self, _context: Context | None = None) -> _HarnessLease:
         self.attachedClients += 1
         return _HarnessLease(self)
 
@@ -89,7 +89,7 @@ class TestHarness:
         self.nextServiceResult = {"ok": True}
         return result
 
-    async def close(self, context: Context | None = None) -> None:
+    async def close(self, _context: Context | None = None) -> None:
         self.closeCount += 1
         gate = self._nextCloseGate
         if gate is not None:
@@ -167,13 +167,13 @@ class TestServerHost:
         self.nextHarnessCloseError: Exception | None = None
         self._nextOpenSessionGate: OpenGate | None = None
 
-    async def resolveSession(self, sessionId: str, context: Context | None = None) -> SessionMetadata:
+    async def resolveSession(self, sessionId: str, _context: Context | None = None) -> SessionMetadata:
         metadata = self.sessions.get(sessionId)
         if metadata is None:
             raise SessionNotFoundError(f"Unknown session: {sessionId}")
         return metadata
 
-    async def openSession(self, metadata: SessionMetadata, context: Context | None = None) -> TestHarness:
+    async def openSession(self, metadata: SessionMetadata, _context: Context | None = None) -> TestHarness:
         self.openSessionCount += 1
         gate = self._nextOpenSessionGate
         if gate is not None:

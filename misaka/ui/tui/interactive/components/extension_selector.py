@@ -55,9 +55,7 @@ class ExtensionSelectorComponent(Container):
 
         timeout = opts.get("timeout") if opts else None
         tui = opts.get("tui") if opts else None
-        # MISAKA fork: extensions send the timeout through JSON, so a bool (an `int` subclass) or a string can arrive
-        # where a number belongs; only a real number starts the countdown.
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0 and tui:
+        if timeout and timeout > 0 and tui:
             self.countdown = CountdownTimer(
                 timeout,
                 tui,
@@ -90,31 +88,31 @@ class ExtensionSelectorComponent(Container):
     def updateList(self) -> None:
         self.listContainer.clear()
         for index, option in enumerate(self.options):
-            is_selected = index == self.selectedIndex
+            isSelected = index == self.selectedIndex
             text = (
                 theme.fg("accent", "→ ") + theme.fg("accent", option)
-                if is_selected
+                if isSelected
                 else f"  {theme.fg('text', option)}"
             )
             self.listContainer.addChild(Text(text, 1, 0))
 
-    def handleInput(self, data: str) -> None:
+    def handleInput(self, keyData: str) -> None:
         kb = getKeybindings()
-        if kb.matches(data, "app.tools.expand"):
+        if kb.matches(keyData, "app.tools.expand"):
             callback = self.onToggleToolsExpanded
             if callable(callback):
                 callback()
-        elif kb.matches(data, "tui.select.up") or data == "k":
+        elif kb.matches(keyData, "tui.select.up") or keyData == "k":
             self.selectedIndex = max(0, self.selectedIndex - 1)
             self.updateList()
-        elif kb.matches(data, "tui.select.down") or data == "j":
+        elif kb.matches(keyData, "tui.select.down") or keyData == "j":
             self.selectedIndex = min(len(self.options) - 1, self.selectedIndex + 1)
             self.updateList()
-        elif kb.matches(data, "tui.select.confirm") or data == "\n":
+        elif kb.matches(keyData, "tui.select.confirm") or keyData == "\n":
             selected = self.options[self.selectedIndex] if 0 <= self.selectedIndex < len(self.options) else None
             if selected:
                 self.onSelectCallback(selected)
-        elif kb.matches(data, "tui.select.cancel"):
+        elif kb.matches(keyData, "tui.select.cancel"):
             self.onCancelCallback()
 
     def dispose(self) -> None:

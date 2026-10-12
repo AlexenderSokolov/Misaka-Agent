@@ -78,11 +78,11 @@ def toToolExposure(exposure: McpExposure) -> ToolExposure:
 
 
 # Provider tool names are limited to 64 characters of `[A-Za-z0-9_-]`.
-_MAX_TOOL_NAME_LENGTH = 64
+MAX_TOOL_NAME_LENGTH = 64
 # Model-facing text of an MCP result beyond this is cut in the middle.
 MCP_OUTPUT_MAX_BYTES = 20 * 1024
 # Visual (wrapped) result lines shown before the output is expanded.
-_OUTPUT_PREVIEW_LINES = 5
+OUTPUT_PREVIEW_LINES = 5
 
 
 class McpToolDetails(TypedDict):
@@ -113,13 +113,13 @@ def createMcpToolName(server: str, tool: str, isTaken: Callable[[str], bool] = l
     one name (``a-b`` and ``a_b``), which then get the hash suffix."""
     # Without the `u` flag the pattern replaces UTF-16 code units: a character outside the BMP becomes two `_`.
     name = re.sub(r"[^A-Za-z0-9_]", "_", toUtf16Units(f"mcp__{server}__{tool}"))
-    if len(name) <= _MAX_TOOL_NAME_LENGTH and not isTaken(name):
+    if len(name) <= MAX_TOOL_NAME_LENGTH and not isTaken(name):
         return name
     hash = hashlib.sha256(toWellFormed(f"{server}\0{tool}").encode("utf-8")).hexdigest()[:8]
-    return f"{name[: _MAX_TOOL_NAME_LENGTH - len(hash) - 1]}_{hash}"
+    return f"{name[: MAX_TOOL_NAME_LENGTH - len(hash) - 1]}_{hash}"
 
 
-def _textOf(content: Sequence[TextContent | ImageContent]) -> str:
+def textOf(content: Sequence[TextContent | ImageContent]) -> str:
     return "\n".join(block.text for block in content if isinstance(block, TextContent))
 
 
@@ -168,7 +168,7 @@ async def limitMcpContent(
     Codex's truncation format, followed by the path of the file with the full text; images follow it."""
     if saveOutput is None:
         saveOutput = saveToTempFile
-    combined = _textOf(content)
+    combined = textOf(content)
     truncation = truncateMiddle(combined, MCP_OUTPUT_MAX_BYTES)
     if not truncation.truncated:
         return {"content": content}
@@ -198,14 +198,14 @@ class ConvertMcpResultOptions(TypedDict, total=False):
     readableResources: bool
 
 
-def _extensionOf(uri: str) -> str:
+def extensionOf(uri: str) -> str:
     """File extension for a saved binary resource: the one its URI ends in, else ``.bin``."""
     path = URL(uri).pathname if URL.canParse(uri) else uri
     match = re.search(r"\.[A-Za-z0-9]{1,8}\Z", path)
     return match.group(0) if match is not None else ".bin"
 
 
-def _isTextMimeType(mimeType: str | None) -> bool:
+def isTextMimeType(mimeType: str | None) -> bool:
     """Blobs of these types are shown as text."""
     if not mimeType:
         return False
@@ -213,7 +213,7 @@ def _isTextMimeType(mimeType: str | None) -> bool:
     return type.startswith("text/") or type == "application/json" or type.endswith(("+json", "+xml"))
 
 
-async def _blockToContent(
+async def blockToContent(
     server: str, block: ContentBlock, options: ConvertMcpResultOptions
 ) -> list[TextContent | ImageContent]:
     """Model-facing content of one block of ``server``'s result."""
@@ -222,9 +222,9 @@ async def _blockToContent(
     resource = fields.get("resource")
     if fields.get("type") == "resource_link":
         size = fields.get("size", UNDEFINED)
-        details = [jsString(item) for item in (fields.get("mimeType"), UNDEFINED if size is UNDEFINED else _formatSize(size)) if item]
+        details = [jsString(item) for item in (fields.get("mimeType"), UNDEFINED if size is UNDEFINED else _formatSize(size)) if jsTruthy(item)]
         read = f'. Read it with {READ_MCP_RESOURCE_TOOL} (server "{server}")' if options.get("readableResources") else ""
-        description = f": {jsString(fields['description'])}" if fields.get("description") else ""
+        description = f": {jsString(fields['description'])}" if jsTruthy(fields.get("description")) else ""
         title = fields["title"] if fields.get("title") is not None else fields.get("name", UNDEFINED)
         joined = f" ({', '.join(details)})" if len(details) > 0 else ""
         uri = jsString(fields.get("uri", UNDEFINED))
@@ -239,12 +239,12 @@ async def _blockToContent(
     ):
         uri, mimeType, blob = jsString(resource.get("uri", UNDEFINED)), resource.get("mimeType"), resource["blob"]
         data = bufferFromBase64(blob)
-        if _isTextMimeType(mimeType):
+        if isTextMimeType(mimeType):
             return [TextContent(text=data.decode("utf-8", "replace"))]
         kind = f"{mimeType if mimeType is not None else 'unknown type'}, {formatSize(len(data))}"
         try:
             saveOutput = options.get("saveOutput")
-            path = await (saveOutput if saveOutput is not None else saveToTempFile)(data, _extensionOf(uri))
+            path = await (saveOutput if saveOutput is not None else saveToTempFile)(data, extensionOf(uri))
             return [TextContent(text=f"[Binary resource {uri} ({kind}) saved to {path}]")]
         except Exception as error:  # noqa: BLE001 - upstream `catch (error)`: reported in the text
             reason = errorMessage(error)
@@ -264,7 +264,7 @@ async def toModelContent(
 ) -> list[TextContent | ImageContent]:
     """Model-facing content of ``server``'s content blocks, before the output limit."""
     options = options if options is not None else {}
-    converted = await asyncio.gather(*(_blockToContent(server, block, options) for block in blocks))
+    converted = await asyncio.gather(*(blockToContent(server, block, options) for block in blocks))
     return [item for items in converted for item in items]
 
 
@@ -279,7 +279,7 @@ async def convertMcpResult(
         if len(result["content"]) > 0
         else _toContent(toLlmContent(result))
     )
-    if result.get("isError") and _textOf(converted) == "":
+    if jsTruthy(result.get("isError")) and textOf(converted) == "":
         converted.append(TextContent(text=f"MCP tool {server}/{tool} returned an error"))
     limited = await limitMcpContent(converted, options.get("saveOutput"))
     scriptResult = {key: value for key, value in result.items() if key != "_meta"}
@@ -290,11 +290,11 @@ async def convertMcpResult(
         content=limited["content"],
         details=details,
         structuredContent=scriptResult,
-        isError=True if result.get("isError") else None,
+        isError=True if jsTruthy(result.get("isError")) else None,
     )
 
 
-def _toParameters(schema: dict[str, Any]) -> dict[str, Any]:
+def toParameters(schema: dict[str, Any]) -> dict[str, Any]:
     """Tool input schemas must be objects. MCP servers may omit ``type``, and some providers reject object
     schemas without ``properties``."""
     return {
@@ -304,14 +304,14 @@ def _toParameters(schema: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 
 
-def _toToolAnnotations(tool: Tool) -> ToolAnnotations | None:
+def toToolAnnotations(tool: Tool) -> ToolAnnotations | None:
     """The boolean hints of an MCP tool's annotations, or ``None`` when it has none."""
     annotations: ToolAnnotations = {}
     hints = tool.get("annotations")
-    for hint in _ANNOTATION_HINTS:
+    for hint in ANNOTATION_HINTS:
         # `tool.annotations?.[hint]`: annotations that are not an object have no hints.
         value = hints.get(hint) if isinstance(hints, dict) else None
         if isinstance(value, bool):
@@ -331,11 +331,20 @@ class CreateMcpToolDefinitionOptions(TypedDict):
     readableResources: NotRequired[Callable[[], bool]]
 
 
+def _toolDescription(tool: Any, title: Any, server: str) -> Any:
+    """``tool.description?.trim() || title || `MCP tool ${tool.name} from server ${server}```."""
+    description = tool.get("description")
+    trimmed = jsTrim(description) if description is not None else None
+    if jsTruthy(trimmed):
+        return trimmed
+    return title if jsTruthy(title) else f"MCP tool {tool['name']} from server {server}"
+
+
 def createMcpToolDefinition(options: CreateMcpToolDefinitionOptions) -> ToolDefinition[Any, McpToolDetails]:
     server, tool = options["server"], options["tool"]
     hints = tool.get("annotations")
     title = tool["title"] if tool.get("title") is not None else (hints.get("title") if isinstance(hints, dict) else None)
-    annotations = _toToolAnnotations(tool)
+    annotations = toToolAnnotations(tool)
     label = f"{server}/{tool['name']}"
 
     async def execute(
@@ -369,8 +378,8 @@ def createMcpToolDefinition(options: CreateMcpToolDefinitionOptions) -> ToolDefi
     return ToolDefinition(
         name=options["name"],
         label=label,
-        description=jsTrim(tool.get("description") or "") or title or f"MCP tool {tool['name']} from server {server}",
-        parameters=_toParameters(tool["inputSchema"]),
+        description=_toolDescription(tool, title, server),
+        parameters=toParameters(tool["inputSchema"]),
         outputSchema=createMcpResultSchema(tool.get("outputSchema")),
         exposure=toToolExposure(options["exposure"]),
         namespace=options["namespace"],
@@ -405,7 +414,7 @@ def createMcpToolRenderers(label: str) -> ToolRenderers:
                 VisualLinePreview(
                     VisualLinePreviewOptions(
                         text=styled,
-                        maxVisualLines=_OUTPUT_PREVIEW_LINES,
+                        maxVisualLines=OUTPUT_PREVIEW_LINES,
                         keep="start",
                         formatHint=lambda hidden: (
                             f"{theme.fg('muted', f'... ({hidden} more lines,')} "

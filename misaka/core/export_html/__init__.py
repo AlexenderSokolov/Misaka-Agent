@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypedDict, cast
 
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.config import APP_NAME, get_export_template_dir
 from misaka.core.export_html.tool_renderer import (
     ToolHtmlRenderer,
 )
 from misaka.core.session_manager import SessionManager
-from misaka.modes.jsonl import to_jsonable
+from misaka.modes.json_event import to_jsonable
 from misaka.ui.tui.interactive.theme.theme import (
     getResolvedThemeColors,
     getThemeExportColors,
@@ -304,7 +305,7 @@ def _serialize_tool(tool: Any) -> dict[str, Any]:
         "description": _get_value(tool, "description"),
         # MISAKA fork: parameters may be a pydantic model class, which the export writes as its JSON schema.
         "parameters": (
-            parameters.model_json_schema()
+            typeboxSchema(parameters)
             if isinstance(parameters, type) and hasattr(parameters, "model_json_schema")
             else parameters
         ),

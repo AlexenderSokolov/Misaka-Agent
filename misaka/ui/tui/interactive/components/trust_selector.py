@@ -5,11 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from misaka.core.project_trust import (
+from misaka.core.trust_manager import (
     ProjectTrustOption,
     ProjectTrustStoreEntry,
     ProjectTrustUpdate,
-    get_project_trust_options,
+    getProjectTrustOptions,
 )
 from misaka.ui.tui import Container, Spacer, Text, getKeybindings
 from misaka.ui.tui.interactive.theme.theme import theme
@@ -50,7 +50,7 @@ class TrustSelectorComponent(Container):
         super().__init__()
 
         self.savedDecision = options.savedDecision
-        self.trustOptions: list[ProjectTrustOption] = get_project_trust_options(options.cwd)
+        self.trustOptions: list[ProjectTrustOption] = getProjectTrustOptions(options.cwd)
         self.selectedIndex = max(
             0,
             next((index for index, option in enumerate(self.trustOptions) if self.isSavedOption(option)), -1),

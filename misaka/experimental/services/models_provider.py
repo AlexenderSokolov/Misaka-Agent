@@ -19,7 +19,7 @@ from misaka.chord import Context, defineFacet
 from misaka.chord.context import BACKGROUND_CONTEXT
 from misaka.durable import AgentDoc
 from misaka.experimental.services.models import Models
-from misaka.utils.js import errorMessage
+from misaka.utils.js import errorMessage, nullishCoalesce
 
 
 def createModelsService(
@@ -39,7 +39,7 @@ def createModelsService(
         model = (value or {}).get("model")
         return {
             "model": None if model is None else {"provider": model["provider"], "modelId": model["modelId"]},
-            "thinkingLevel": (value or {}).get("thinkingLevel") or "off",
+            "thinkingLevel": nullishCoalesce((value or {}).get("thinkingLevel"), "off"),
         }
 
     state = createState(

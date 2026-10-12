@@ -38,7 +38,7 @@ def githubCopilotProvider() -> Provider:
             baseUrl="https://api.individual.githubcopilot.com",
             auth=ProviderAuth(
                 apiKey=envApiKeyAuth("GitHub Copilot token", ["COPILOT_GITHUB_TOKEN"]),
-                oauth=lazyOAuth(name="GitHub Copilot", isSubscription=True, load=loadGitHubCopilotOAuth),
+                oauth=lazyOAuth({"name": "GitHub Copilot", "isSubscription": True, "load": loadGitHubCopilotOAuth}),
             ),
             models=list(GITHUB_COPILOT_MODELS.values()),
             filterModels=_filterModels,

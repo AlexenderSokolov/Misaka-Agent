@@ -11,7 +11,7 @@ import math
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypedDict
 
 from misaka.ui.tui import (
     Container,
@@ -38,6 +38,7 @@ from misaka.utils.js import (
     jsNumber,
     jsRound,
     jsString,
+    jsTrim,
     setTimeout,
     spawn,
     toFixed,
@@ -320,7 +321,7 @@ class HuggingFaceSearch(Container):
             self.close(None)
             return
         self.input.handleInput(data)
-        query = self.input.getValue().strip()
+        query = jsTrim(self.input.getValue())
         if query == self.query:
             return
         self.query = query
@@ -535,19 +536,19 @@ class ProgressResult:
     value: Any = None
 
 
-async def runWithProgress(
-    ui: LlamaUi,
-    *,
-    title: str,
-    model: str,
-    initialMessage: str,
-    cancelTitle: str,
-    cancelMessage: str,
-    run: Callable[[Any, Callable[[LlamaProgress], None]], Awaitable[Any]],
-    cancel: Callable[[], Awaitable[None]],
-) -> ProgressResult:
+class RunWithProgressOptions(TypedDict):
+    title: str
+    model: str
+    initialMessage: str
+    cancelTitle: str
+    cancelMessage: str
+    run: Callable[[Any, Callable[[LlamaProgress], None]], Awaitable[Any]]
+    cancel: Callable[[], Awaitable[None]]
+
+
+async def runWithProgress(ui: LlamaUi, options: RunWithProgressOptions) -> ProgressResult:
     controller = AbortController()
-    state = ProgressState(title=title, model=model, message=initialMessage, ratio=None, detail=None)
+    state = ProgressState(title=options["title"], model=options["model"], message=options["initialMessage"], ratio=None, detail=None)
 
     def onProgress(progress: LlamaProgress) -> None:
         # `Object.assign(state, progress)`: a field the progress leaves out keeps its value.
@@ -559,7 +560,7 @@ async def runWithProgress(
 
     async def outcome() -> dict[str, Any]:
         try:
-            return {"ok": True, "value": await run(controller.signal, onProgress)}
+            return {"ok": True, "value": await options["run"](controller.signal, onProgress)}
         except Exception as error:  # noqa: BLE001 - rethrown below
             return {"ok": False, "error": error}
 
@@ -575,10 +576,10 @@ async def runWithProgress(
             if stop is not progress:
                 stop.cancel()
             break
-        if not (await ui.confirm(cancelTitle, cancelMessage)) or settled.done():
+        if not (await ui.confirm(options["cancelTitle"], options["cancelMessage"])) or settled.done():
             continue
         try:
-            await cancel()
+            await options["cancel"]()
         finally:
             controller.abort(RuntimeError("Cancelled"))
         await settled

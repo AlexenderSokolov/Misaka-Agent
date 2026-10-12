@@ -23,7 +23,8 @@ from misaka.utils.whatwg_url import URL
 def _toolPatternRegExp(pattern: str) -> re.Pattern[str]:
     """Regular expression for a tool name pattern where `*` matches any characters, as `toolExposure`,
     `--tools`, and `--exclude-tools` accept them."""
-    source = ".*".join(re.escape(part) for part in pattern.split("*"))
+    # A JavaScript `.` stops at every line terminator, where Python's stops only at a line feed.
+    source = "[^\n\r\u2028\u2029]*".join(re.escape(part) for part in pattern.split("*"))
     # `\Z`, not `$`: a JavaScript `$` does not match before a trailing newline.
     return re.compile(f"^{source}\\Z")
 
@@ -238,6 +239,8 @@ def _resolveExposureAliases(value: Mapping[str, Any]) -> dict[str, Any]:
 def getMcpToolExposure(config: McpServerConfig, toolName: str) -> McpExposure:
     """Exposure of one tool of a server: its ``toolExposure`` entry, else the server's ``exposure``."""
     overrides = config.get("toolExposure") or {}
+    # MISAKA fork: a plain dict lookup; pi's `overrides[toolName]` also finds Object.prototype keys
+    # (a tool named "constructor" or "toString").
     exact = overrides.get(toolName)
     if exact is not None:
         return exact

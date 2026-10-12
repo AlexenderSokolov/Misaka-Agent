@@ -3,7 +3,8 @@
 Translated from pi's ``packages/durable/src/harness/output.ts`` (v1.1.0). Text is bounded as UTF-8 bytes. Slices decode
 exactly: a U+FEFF at a slice's start is text, not a byte-order mark. ``Progress`` reads the time and sets its timer through
 a clock object (``now()``, ``setTimeout(callback, ms)``, ``clearTimeout(handle)``), the system clock by default, so a
-test can drive it with a fake one, as the upstream test does with fake timers.
+test can drive it with a fake one, as the upstream test does with fake timers. Parameters pi names ``bytes`` are
+``data`` here: the annotations need the ``bytes`` type.
 """
 
 from __future__ import annotations

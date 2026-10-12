@@ -6,6 +6,7 @@ import secrets
 import time
 from pathlib import Path
 
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.utils.paths import posix_relpath
 
 STATUSES = ("open", "doing", "done", "blocked")
@@ -390,7 +391,7 @@ class TodoPart:
                             "is what Last Order will read. The card is submitted when the turn then ends. A turn that "
                             "ends without this call leaves the card running: use that for replies to Last Order and "
                             "progress reports.",
-                parameters=CompleteParams.model_json_schema(), execute=complete_exec,
+                parameters=typeboxSchema(CompleteParams), execute=complete_exec,
                 promptSnippet="Declare the card finished and submit it",
                 promptGuidelines=[
                     ("Call `misaka_card_complete` only when the contract deliverable exists in the card's output "
@@ -401,7 +402,7 @@ class TodoPart:
             ToolDefinition(
                 name="misaka_todo", label="Update task to-do list",
                 description="Add, assign, and update the task card's nested to-do items; progress appears in the global execution tree.",
-                parameters=TodoParams.model_json_schema(), execute=todo_exec,
+                parameters=typeboxSchema(TodoParams), execute=todo_exec,
                 promptSnippet="Create or update this task card's to-do list",
                 promptGuidelines=[
                     "Before substantial work, create a short to-do list and mark one or two immediate items doing.",
@@ -413,14 +414,14 @@ class TodoPart:
             ToolDefinition(
                 name="misaka_todo_list", label="View task to-do list",
                 description="Show this task card's nested to-do items, owners, statuses, and blocker notes.",
-                parameters=ListParams.model_json_schema(), execute=list_exec,
+                parameters=typeboxSchema(ListParams), execute=list_exec,
                 promptSnippet='Check the list of sub-tasks for this card',
                 promptGuidelines=["After context compaction, use `misaka_todo_list` to recover the task's current work state."]),
             ToolDefinition(
                 name="misaka_my_card", label="View my card",
                 description="This card as the board sees it: status, dependencies and whether they are done, the reviewer "
                             "if one is named, a block reason, and the last lines of the card's log.",
-                parameters=MyCardParams.model_json_schema(), execute=my_card_exec,
+                parameters=typeboxSchema(MyCardParams), execute=my_card_exec,
                 promptSnippet="Check this card's status, dependencies, and log",
                 promptGuidelines=["Check the card before waiting on something: a blocked dependency or a named reviewer changes what to do next."]),
             ToolDefinition(

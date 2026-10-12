@@ -180,10 +180,7 @@ def setup(tmp_path):
         from misaka.core.auth_storage import AuthStorage
         from misaka.core.model_runtime import ModelRuntime
 
-        runtime = await ModelRuntime.create(
-            authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=None,
-            allowModelNetwork=False,
-        )
+        runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": None, "allowModelNetwork": False})
         session_manager = _in_memory(tmp_path)
         session = (await _open(tmp_path, runtime, session_manager, None, [providers, jevRouter]))["session"]
         sessions.append(session)

@@ -19,6 +19,12 @@ from misaka.chord.delta import Op
 type JsonObject = dict[str, Any]
 """JSON object used as the root of every durable document."""
 
+
+# --- The rest of types.ts: shapes this port passes as dicts, named as upstream names them. ---
+
+type Id = int
+"""``Id<Kind, Type>``: a number with a nominal brand; the brand is erased here."""
+
 type ConversationId = int
 type EntryId = int
 type TaskId = int
@@ -30,12 +36,103 @@ type Seq = int
 ROOT_CONVERSATION_ID: ConversationId = 1
 """The root conversation always uses this reserved ID."""
 
+type LatestConversationSemantics = dict[str, Any]
+"""``{"scope": "conversation", "history": "latest", "fork": "copy" | "fresh"}``."""
+type RewindableConversationSemantics = dict[str, Any]
+"""``{"scope": "conversation", "history": "rewindable", "fork": "copy" | "fresh"}``."""
+type DocumentSemantics = dict[str, Any]
+"""``{"scope": "session"}``, latest or rewindable conversation semantics, or ``{"scope": "task"}``."""
+
+
+class CheckpointInfo(TypedDict):
+    """Stored replay state supplied to a document's checkpoint predicate."""
+
+    deltasSinceBase: int  # Deltas already stored after the newest base, excluding the change being evaluated.
+type CommonDocDefinition = dict[str, Any]
+"""``kind`` (stable persisted kind), ``version``, ``initial()``, and optional ``migrate``/``checkpointWhen``."""
+type DocDefinition = dict[str, Any]
+"""A common definition with its semantics."""
+type DocFamilyDefinition = dict[str, Any]
+"""Keyed document family definition; ``initial(seed)`` runs only when a member is absent; ``family`` is true."""
+
 type DocToken = dict[str, Any]
 """``{"definition": definition}``: a typed singleton or family document token passed explicitly to typed access."""
+type DocFamilyToken = dict[str, Any]
+"""``{"definition": familyDefinition}``."""
+type SessionDocToken = DocToken
+type ConversationDocToken = DocToken
+type RewindableConversationDocToken = DocToken
+type TaskDocToken = DocToken
+type SessionDocFamilyToken = DocFamilyToken
+type ConversationDocFamilyToken = DocFamilyToken
+type RewindableConversationDocFamilyToken = DocFamilyToken
+type TaskDocFamilyToken = DocFamilyToken
+type RunningTask = dict[str, Any]
+"""A task record whose state is running."""
+type NextTaskState = TaskState
+"""A task state a phase may move to: running, waiting, or terminal."""
+type PhaseHandler = Callable[..., Any]
+"""``(task: RunningTask, runtime: TaskRuntime, context: Context) -> NextTaskState | Awaitable[NextTaskState]``."""
+
+
+class HookRunner(Protocol):
+    def each(self, name: str, invoke: Callable[[Any], Any]) -> Awaitable[None]:
+        """Call ``invoke`` with each matching handler named ``name``. An ordinary error from ``invoke`` is reported and
+        the next handler runs; once the invocation is signalled, the error propagates."""
+        ...
+type TaskDefinition = dict[str, Any]
+"""``name`` (registered kind persisted in ``TaskRecord.kind``), ``initial``, ``phases``, optional ``abort``."""
+type Task = dict[str, Any]
+"""``{"definition": taskDefinition}``."""
+type TaskOwnership = dict[str, Any]
+"""``{"kind": "conversation"}`` or ``{"kind": "task", "taskId"}``."""
 type JoinPolicy = Literal["failFast", "allSettled"]
 """How a waiting task treats the tasks it waits on (spec section 5.5)."""
-type DocumentPoint = int | Literal["current"]
-"""Current state or one historical commit sequence used for document membership and content reads."""
+type TaskOptions = dict[str, Any]
+"""``ownership`` (required: a task always names its owner), and optional ``conversationId``/``join``."""
+type ConversationOwnership = dict[str, Any]
+"""``{"kind": "ownerless"}`` or ``{"kind": "task", "taskId"}``."""
+type ConversationRecord = dict[str, Any]
+
+type ContextEdit = dict[str, Any]
+"""``{"target": EntryId, ...}``: an entry whose model messages are omitted or replaced."""
+type EntryRecord = dict[str, Any]
+type EntryDraft = dict[str, Any]
+"""An entry record without ``id``/``conversationId``/``byTaskId``; ``head`` may be ``"self"``."""
+type TypedEntry = EntryRecord
+type TypedEntryDraft = EntryDraft
+
+
+class Entry(Protocol):
+    """A typed entry kind (``misaka.durable.entries.Entry``); ``is`` is ``is_`` here, a keyword in Python."""
+
+    kind: str
+
+    def is_(self, entry: EntryRecord | None) -> bool: ...
+type SubmissionRecord = dict[str, Any]
+
+type SubmissionSettlement = dict[str, Any]
+"""``{"status": "done", "answer": EntryId}`` or ``{"status": "unanswered", "reason", "detail"?}``."""
+type SubmissionCreate = dict[str, Any]
+"""A submission record without its ``id``."""
+type TaskOutcomeError = dict[str, Any]
+"""``{"message": str, "data"?: JsonValue}``."""
+type TaskOutcome = dict[str, Any]
+"""``{"status": "completed", "result"}``, ``{"status": "failed", "error"}``, or ``{"status": "aborted"}``."""
+
+type TaskState = dict[str, Any]
+"""``{"status": "ready" | "running" | "waiting" | "terminal", ...}``: the scheduling state of a task, with its
+phase state, waits, or outcome."""
+type TaskRecord = dict[str, Any]
+"""``startedAt``: wall-clock milliseconds of the first change to ``running``, stamped by the Session; kept through waits
+and recovery, so the span to ``endedAt`` includes them; absent before the task first runs, and on records written by
+earlier versions. ``endedAt``: wall-clock milliseconds of the change to ``terminal``, stamped by the Session; absent
+while live."""
+type DocumentRecord = dict[str, Any]
+type DocumentCreate = dict[str, Any]
+"""A document record without ``createdAt``/``retiredAt``."""
+type Page = dict[str, Any]
+"""One ordered scan result: ``{"items": [...], "next": cursor}``; ``next`` is absent on the last page."""
 type Cursor = dict[str, Any]
 """Backend-owned JSON continuation state that callers only round-trip to the same scan. It carries the scan's order: a
 scan given a cursor continues in that order, and rejects a different ``order`` in its query."""
@@ -43,27 +140,38 @@ scan given a cursor continues in that order, and rejects a different ``order`` i
 type ScanOrder = Literal["ascending", "descending"]
 """ID order of a scan: ``ascending`` is oldest first, ``descending`` newest first."""
 """Backend-owned JSON continuation state that callers only round-trip to the same scan."""
-type TaskRecord = dict[str, Any]
-"""``startedAt``: wall-clock milliseconds of the first change to ``running``, stamped by the Session; kept through waits
-and recovery, so the span to ``endedAt`` includes them; absent before the task first runs, and on records written by
-earlier versions. ``endedAt``: wall-clock milliseconds of the change to ``terminal``, stamped by the Session; absent
-while live."""
-type EntryRecord = dict[str, Any]
-type SubmissionRecord = dict[str, Any]
-type DocumentRecord = dict[str, Any]
-type ConversationRecord = dict[str, Any]
-type StorageWrite = dict[str, Any]
-type Page = dict[str, Any]
-"""One ordered scan result: ``{"items": [...], "next": cursor}``; ``next`` is absent on the last page."""
+
+type ConversationQuery = dict[str, Any]
+"""Optional ``ownerConversationId``/``ownerTaskId``/``order``/``after``/``limit``."""
+type EntryQuery = dict[str, Any]
+"""``conversationId`` and optional bounds, ``kinds``, ``order``, ``after``, ``limit``."""
+type TaskQuery = dict[str, Any]
+"""Optional ``conversationId``/``kind``/``status``/``order``/``after``/``limit``."""
+type SubmissionQuery = dict[str, Any]
+"""Optional ``conversationId``/``status``/``order``/``after``/``limit``."""
+type DocumentPoint = int | Literal["current"]
+"""Current state or one historical commit sequence used for document membership and content reads."""
 
 
 type DocumentAddress = dict[str, Any]
 """Exact logical identity of a singleton (no ``key``) or one keyed family member: ``{"kind", "scope", "key"?}``."""
+type DocumentQuery = dict[str, Any]
+"""``scope``, ``at`` (a document point), optional ``kind``/``order``/``after``/``limit``."""
+type DocumentContent = dict[str, Any]
+"""``{"version", "content"}`` of a stored document read."""
 type DocumentCopySource = dict[str, Any]
 """Exact persisted source selected for a definition-free document copy: ``{"id", "at"}``."""
 type StoredDocument = dict[str, Any]
 """Detached materialized value and stored definition version at a selected point: ``{"record", "version", "value",
 "deltasSinceBase"}`` (the number of deltas replayed after the selected base)."""
+type StorageWrite = dict[str, Any]
+type DocumentCommitChange = dict[str, Any]
+"""``{"type": "document", ...}``: one document change of a commit."""
+
+type TableCommitChange = StorageWrite
+"""A conversation, entry, task, or submission write of one commit."""
+type CommitChange = TableCommitChange | DocumentCommitChange
+"""Every immutable change from one successful Session commit. Change order is unspecified."""
 
 
 class CommitPublication(TypedDict):
@@ -71,42 +179,6 @@ class CommitPublication(TypedDict):
 
     seq: Seq
     changes: Sequence[dict[str, Any]]
-
-
-class WatchEnd(TypedDict):
-    """Terminal result of one document watch: ``reason`` is ``stopped``, ``cancelled``, ``session_closed``,
-    ``retired`` or ``listener_error`` (with the ``error``)."""
-
-    reason: str
-    error: NotRequired[Exception]
-
-
-class WatchHandle(Protocol):
-    """Serialized exact-frame observation of an immutable value with bounded pending delivery."""
-
-    @property
-    def value(self) -> Any:
-        """Acquisition revision before start; latest delivered immutable revision afterward."""
-        ...
-
-    def start(self, listener: Callable[[Any, Sequence[Op], Context], Awaitable[None]]) -> None:
-        """Install the sole asynchronous listener. Never invokes it inline."""
-        ...
-
-    def stop(self) -> Awaitable[WatchEnd]:
-        """Idempotently stop future callbacks and return this watch's terminal result."""
-        ...
-
-    @property
-    def closed(self) -> Awaitable[WatchEnd]:
-        """Settles when the watch terminates; an already-running callback remains caller-owned."""
-        ...
-
-
-class CheckpointInfo(TypedDict):
-    """Stored replay state supplied to a document's checkpoint predicate."""
-
-    deltasSinceBase: int  # Deltas already stored after the newest base, excluding the change being evaluated.
 
 
 class Tx(Protocol):
@@ -151,6 +223,95 @@ class Tx(Protocol):
     def doc(self, token: DocToken, *args: Any) -> Awaitable[Any]: ...
 
     def retireDoc(self, token: DocToken, *args: Any) -> Awaitable[None]: ...
+
+type DocumentState = Any
+"""``AttachedReplicatedState<Readonly<T> | null>``: the replicated state of one watched document."""
+
+
+class WatchEnd(TypedDict):
+    """Terminal result of one document watch: ``reason`` is ``stopped``, ``cancelled``, ``session_closed``,
+    ``retired`` or ``listener_error`` (with the ``error``)."""
+
+    reason: str
+    error: NotRequired[Exception]
+
+
+class WatchHandle(Protocol):
+    """Serialized exact-frame observation of an immutable value with bounded pending delivery."""
+
+    @property
+    def value(self) -> Any:
+        """Acquisition revision before start; latest delivered immutable revision afterward."""
+        ...
+
+    def start(self, listener: Callable[[Any, Sequence[Op], Context], Awaitable[None]]) -> None:
+        """Install the sole asynchronous listener. Never invokes it inline."""
+        ...
+
+    def stop(self) -> Awaitable[WatchEnd]:
+        """Idempotently stop future callbacks and return this watch's terminal result."""
+        ...
+
+    @property
+    def closed(self) -> Awaitable[WatchEnd]:
+        """Settles when the watch terminates; an already-running callback remains caller-owned."""
+        ...
+type DocumentWatch = WatchHandle
+"""``WatchHandle<Readonly<T> | null>``."""
+
+
+class DocumentReader(Protocol):
+    """Committed document reads: ``Pick<Session, "snapshot" | "snapshotAsOf">``."""
+
+    def snapshot(self, token: DocToken, *args: Any) -> Awaitable[Any]: ...
+
+    def snapshotAsOf(self, token: DocToken, *args: Any) -> Awaitable[Any]: ...
+
+
+class DocumentObserver(Protocol):
+    """Non-creating document watch acquisition shared by Session and later invocation APIs: ``watchDoc(token,
+    context)`` for session documents, ``watchDoc(token, conversationId | taskId, context)`` otherwise."""
+
+    def watchDoc(self, token: DocToken, *args: Any) -> Awaitable[Any]: ...
+
+
+class TaskRuntime(DocumentObserver, DocumentReader, Protocol):
+    """Operations of one task invocation. Every operation rejects after the invocation ends; watches acquired through
+    it stop at invocation end."""
+
+    taskId: TaskId
+    conversationId: ConversationId
+    signal: Any
+    registry: Any
+    settings: Any
+    models: Any
+    hooks: HookRunner
+
+    def agent(self, context: Context) -> Awaitable[Any]: ...
+
+    def env(self, context: Context) -> Awaitable[Any]: ...
+
+    def commit(self, change: Callable[[Tx, RunningTask], Any], context: Context) -> Awaitable[None]: ...
+
+    def memo(self, name: str, *args: Any) -> Awaitable[Any]: ...
+
+    def getTask(self, id: TaskId, context: Context) -> Awaitable[TaskRecord | None]: ...
+
+    def waitForTask(self, id: TaskId, context: Context) -> Awaitable[Any]: ...
+
+    def outcomes(self, ids: Sequence[TaskId], context: Context) -> Awaitable[list[TaskOutcome]]: ...
+
+    def conversation(self, id: ConversationId, context: Context) -> Awaitable[Any]: ...
+
+    def entry(self, *args: Any) -> Awaitable[EntryRecord | None]: ...
+
+    def context(self, conversationId: ConversationId, context: Context, options: Any = None) -> Awaitable[Any]: ...
+
+    def now(self) -> float: ...
+
+    def report(self, error: Any) -> None: ...
+
+    def sleep(self, until: float, context: Context) -> Awaitable[None]: ...
 
 
 class Session(Protocol):
@@ -226,167 +387,6 @@ class Storage(Protocol):
     def scanDocuments(self, query: dict[str, Any], limit: int, cursor: Cursor | None, context: Context) -> Awaitable[Page]: ...
 
     def close(self, context: Context) -> Awaitable[None]: ...
-
-
-# --- The rest of types.ts: shapes this port passes as dicts, named as upstream names them. ---
-
-type Id = int
-"""``Id<Kind, Type>``: a number with a nominal brand; the brand is erased here."""
-
-type LatestConversationSemantics = dict[str, Any]
-"""``{"scope": "conversation", "history": "latest", "fork": "copy" | "fresh"}``."""
-type RewindableConversationSemantics = dict[str, Any]
-"""``{"scope": "conversation", "history": "rewindable", "fork": "copy" | "fresh"}``."""
-type DocumentSemantics = dict[str, Any]
-"""``{"scope": "session"}``, latest or rewindable conversation semantics, or ``{"scope": "task"}``."""
-type CommonDocDefinition = dict[str, Any]
-"""``kind`` (stable persisted kind), ``version``, ``initial()``, and optional ``migrate``/``checkpointWhen``."""
-type DocDefinition = dict[str, Any]
-"""A common definition with its semantics."""
-type DocFamilyDefinition = dict[str, Any]
-"""Keyed document family definition; ``initial(seed)`` runs only when a member is absent; ``family`` is true."""
-type DocFamilyToken = dict[str, Any]
-"""``{"definition": familyDefinition}``."""
-type SessionDocToken = DocToken
-type ConversationDocToken = DocToken
-type RewindableConversationDocToken = DocToken
-type TaskDocToken = DocToken
-type SessionDocFamilyToken = DocFamilyToken
-type ConversationDocFamilyToken = DocFamilyToken
-type RewindableConversationDocFamilyToken = DocFamilyToken
-type TaskDocFamilyToken = DocFamilyToken
-
-type TaskState = dict[str, Any]
-"""``{"status": "ready" | "running" | "waiting" | "terminal", ...}``: the scheduling state of a task, with its
-phase state, waits, or outcome."""
-type NextTaskState = TaskState
-"""A task state a phase may move to: running, waiting, or terminal."""
-type RunningTask = dict[str, Any]
-"""A task record whose state is running."""
-type TaskOutcomeError = dict[str, Any]
-"""``{"message": str, "data"?: JsonValue}``."""
-type TaskOutcome = dict[str, Any]
-"""``{"status": "completed", "result"}``, ``{"status": "failed", "error"}``, or ``{"status": "aborted"}``."""
-type TaskOwnership = dict[str, Any]
-"""``{"kind": "conversation"}`` or ``{"kind": "task", "taskId"}``."""
-type ConversationOwnership = dict[str, Any]
-"""``{"kind": "ownerless"}`` or ``{"kind": "task", "taskId"}``."""
-type TaskOptions = dict[str, Any]
-"""``ownership`` (required: a task always names its owner), and optional ``conversationId``/``join``."""
-type TaskDefinition = dict[str, Any]
-"""``name`` (registered kind persisted in ``TaskRecord.kind``), ``initial``, ``phases``, optional ``abort``."""
-type Task = dict[str, Any]
-"""``{"definition": taskDefinition}``."""
-type PhaseHandler = Callable[..., Any]
-"""``(task: RunningTask, runtime: TaskRuntime, context: Context) -> NextTaskState | Awaitable[NextTaskState]``."""
-
-type ContextEdit = dict[str, Any]
-"""``{"target": EntryId, ...}``: an entry whose model messages are omitted or replaced."""
-type EntryDraft = dict[str, Any]
-"""An entry record without ``id``/``conversationId``/``byTaskId``; ``head`` may be ``"self"``."""
-type TypedEntry = EntryRecord
-type TypedEntryDraft = EntryDraft
-
-type SubmissionSettlement = dict[str, Any]
-"""``{"status": "done", "answer": EntryId}`` or ``{"status": "unanswered", "reason", "detail"?}``."""
-type SubmissionCreate = dict[str, Any]
-"""A submission record without its ``id``."""
-type DocumentCreate = dict[str, Any]
-"""A document record without ``createdAt``/``retiredAt``."""
-
-type ConversationQuery = dict[str, Any]
-"""Optional ``ownerConversationId``/``ownerTaskId``/``order``/``after``/``limit``."""
-type EntryQuery = dict[str, Any]
-"""``conversationId`` and optional bounds, ``kinds``, ``order``, ``after``, ``limit``."""
-type TaskQuery = dict[str, Any]
-"""Optional ``conversationId``/``kind``/``status``/``order``/``after``/``limit``."""
-type SubmissionQuery = dict[str, Any]
-"""Optional ``conversationId``/``status``/``order``/``after``/``limit``."""
-type DocumentQuery = dict[str, Any]
-"""``scope``, ``at`` (a document point), optional ``kind``/``order``/``after``/``limit``."""
-type DocumentContent = dict[str, Any]
-"""``{"version", "content"}`` of a stored document read."""
-
-type TableCommitChange = StorageWrite
-"""A conversation, entry, task, or submission write of one commit."""
-type DocumentCommitChange = dict[str, Any]
-"""``{"type": "document", ...}``: one document change of a commit."""
-type CommitChange = TableCommitChange | DocumentCommitChange
-"""Every immutable change from one successful Session commit. Change order is unspecified."""
-
-type DocumentState = Any
-"""``AttachedReplicatedState<Readonly<T> | null>``: the replicated state of one watched document."""
-type DocumentWatch = WatchHandle
-"""``WatchHandle<Readonly<T> | null>``."""
-
-
-class DocumentReader(Protocol):
-    """Committed document reads: ``Pick<Session, "snapshot" | "snapshotAsOf">``."""
-
-    def snapshot(self, token: DocToken, *args: Any) -> Awaitable[Any]: ...
-
-    def snapshotAsOf(self, token: DocToken, *args: Any) -> Awaitable[Any]: ...
-
-
-class DocumentObserver(Protocol):
-    """Non-creating document watch acquisition shared by Session and later invocation APIs: ``watchDoc(token,
-    context)`` for session documents, ``watchDoc(token, conversationId | taskId, context)`` otherwise."""
-
-    def watchDoc(self, token: DocToken, *args: Any) -> Awaitable[Any]: ...
-
-
-class HookRunner(Protocol):
-    def each(self, name: str, invoke: Callable[[Any], Any]) -> Awaitable[None]:
-        """Call ``invoke`` with each matching handler named ``name``. An ordinary error from ``invoke`` is reported and
-        the next handler runs; once the invocation is signalled, the error propagates."""
-        ...
-
-
-class TaskRuntime(DocumentObserver, DocumentReader, Protocol):
-    """Operations of one task invocation. Every operation rejects after the invocation ends; watches acquired through
-    it stop at invocation end."""
-
-    taskId: TaskId
-    conversationId: ConversationId
-    signal: Any
-    registry: Any
-    settings: Any
-    models: Any
-    hooks: HookRunner
-
-    def agent(self, context: Context) -> Awaitable[Any]: ...
-
-    def env(self, context: Context) -> Awaitable[Any]: ...
-
-    def commit(self, change: Callable[[Tx, RunningTask], Any], context: Context) -> Awaitable[None]: ...
-
-    def memo(self, name: str, *args: Any) -> Awaitable[Any]: ...
-
-    def getTask(self, id: TaskId, context: Context) -> Awaitable[TaskRecord | None]: ...
-
-    def waitForTask(self, id: TaskId, context: Context) -> Awaitable[Any]: ...
-
-    def outcomes(self, ids: Sequence[TaskId], context: Context) -> Awaitable[list[TaskOutcome]]: ...
-
-    def conversation(self, id: ConversationId, context: Context) -> Awaitable[Any]: ...
-
-    def entry(self, *args: Any) -> Awaitable[EntryRecord | None]: ...
-
-    def context(self, conversationId: ConversationId, context: Context, options: Any = None) -> Awaitable[Any]: ...
-
-    def now(self) -> float: ...
-
-    def report(self, error: Any) -> None: ...
-
-    def sleep(self, until: float, context: Context) -> Awaitable[None]: ...
-
-
-class Entry(Protocol):
-    """A typed entry kind (``misaka.durable.entries.Entry``); ``is`` is ``is_`` here, a keyword in Python."""
-
-    kind: str
-
-    def is_(self, entry: EntryRecord | None) -> bool: ...
 
 
 __all__ = [

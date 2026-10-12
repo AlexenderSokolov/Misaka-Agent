@@ -120,3 +120,21 @@ def test_path_resolve_collapses_two_leading_slashes_like_node():
         assert pathResolve("///home/u/plugin") == "/home/u/plugin"
         assert pathResolve("/home/u/../plugin") == "/home/plugin"
     assert pathResolve("relative") == os.path.join(os.getcwd(), "relative")
+
+
+async def test_timers_follow_nodes_delay_rules():
+    import asyncio
+
+    import pytest
+
+    from misaka.utils.js import AbortSignal, RangeError, setTimeout
+
+    fired: list[str] = []
+    # A delay past the 32-bit range, as one below 1 ms, runs after 1 ms.
+    setTimeout(lambda: fired.append("overflow"), 2**31)
+    await asyncio.sleep(0.05)
+    assert fired == ["overflow"]
+    with pytest.raises(RangeError, match="must be an integer"):
+        AbortSignal.timeout(1.5)
+    with pytest.raises(RangeError, match=">= 0 && <= 4294967295"):
+        AbortSignal.timeout(-1)

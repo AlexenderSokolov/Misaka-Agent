@@ -2,7 +2,6 @@
 
 MISAKA fork, kept to what the Python SDK forces (each is marked where it happens; the SDK glue is ``_google_sdk``):
 
-- A caller may hand in a ready SDK client (``client``).
 - The SDK sends the request when the stream is first read and takes no abort signal: the stream is opened inside the
   retried call, the wait for it races the signal, and so does each read.
 - Response objects are read through ``coalesce_attr``; a thought signature arrives as bytes and a finish reason as
@@ -156,15 +155,11 @@ def stream(
             stopReason="pending",
             timestamp=time.time_ns() // 1_000_000,
         )
-        # MISAKA fork: a caller may hand in a ready SDK client (the tests do).
-        client: Any = _option(options, "client")
-
         try:
-            if client is None:
-                apiKey = _option(options, "apiKey")
-                if not apiKey:
-                    raise RuntimeError(f"No API key for provider: {model.provider}")
-                client = _createClient(model, apiKey, _option(options, "headers"))
+            apiKey = _option(options, "apiKey")
+            if not apiKey:
+                raise RuntimeError(f"No API key for provider: {model.provider}")
+            client = _createClient(model, apiKey, _option(options, "headers"))
             params = _buildParams(model, normalizedContext, options)
             onPayload = _option(options, "onPayload")
             nextParams = await maybe_await(onPayload(params, model)) if onPayload else None

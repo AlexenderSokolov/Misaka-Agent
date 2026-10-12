@@ -17,6 +17,7 @@ import secrets
 from contextlib import closing
 from types import SimpleNamespace
 
+from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.core.network import messages, todo
 from misaka.core.platform import tasks as db
 
@@ -55,7 +56,7 @@ def definitions():
 
 
 def _schema(parameters):
-    return parameters.model_json_schema() if isinstance(parameters, type) else parameters
+    return typeboxSchema(parameters) if isinstance(parameters, type) else parameters
 
 
 def _description(tool):

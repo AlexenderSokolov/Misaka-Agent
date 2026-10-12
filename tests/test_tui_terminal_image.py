@@ -836,7 +836,11 @@ def test_file_links_encode_paths_as_node_does(monkeypatch):
     from misaka.ui.tui import terminal_image
 
     monkeypatch.setattr(terminal_image.sys, "platform", "linux")
-    monkeypatch.setattr(terminal_image.os.path, "abspath", lambda path: path)
+    monkeypatch.setattr(terminal_image.node_path, "resolve", terminal_image.node_path.posixResolve)
+    monkeypatch.setattr(terminal_image.node_path, "sep", "/")
     assert terminal_image.pathToFileURL("/tmp/a b/(c)!#?%.png") == "file:///tmp/a%20b/(c)!%23%3F%25.png"
     assert terminal_image.pathToFileURL("/tmp/日本.png") == "file:///tmp/%E6%97%A5%E6%9C%AC.png"
     assert terminal_image.pathToFileURL("/tmp/~[x]^.png") == "file:///tmp/%7E%5Bx%5D%5E.png"
+    # `path.resolve` drops the trailing separator; `pathToFileURL` keeps it, and collapses a leading `//`.
+    assert terminal_image.pathToFileURL("/tmp/dir/") == "file:///tmp/dir/"
+    assert terminal_image.pathToFileURL("//tmp/dir") == "file:///tmp/dir"

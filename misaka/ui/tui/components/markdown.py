@@ -1,8 +1,7 @@
 """Translated from pi-tui's ``components/markdown.ts`` (v1.1.0), on the vendored marked lexer.
 
 MISAKA forks, each marked where it happens: C0/C1 control characters are dropped before lexing; the token cache is a
-strong reference (``WeakRef`` would be collected as soon as ``render`` returns under CPython's reference counting);
-``invalidate`` also forgets the default style prefix, so a theme switch takes effect.
+strong reference (``WeakRef`` would be collected as soon as ``render`` returns under CPython's reference counting).
 """
 
 from __future__ import annotations
@@ -297,8 +296,6 @@ class Markdown(Component):
         self.cachedText = None
         self.cachedWidth = None
         self.cachedLines = None
-        # MISAKA fork: the prefix depends on the theme, which may have changed.
-        self.defaultStylePrefix = None
 
     def render(self, width: int) -> list[str]:
         # Check cache

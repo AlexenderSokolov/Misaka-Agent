@@ -40,7 +40,7 @@ async def test_applies_updated_top_level_prompt_settings_on_reload_after_startup
         return ApiKeyCredential(type="api_key", key="faux-key")
 
     await authStorage.modify(faux.getModel().provider, apiKey)
-    modelRuntime = await ModelRuntime.create(authStorage=authStorage, modelsPath=os.path.join(agentDir, "models.json"))
+    modelRuntime = await ModelRuntime.create({"authStorage": authStorage, "modelsPath": os.path.join(agentDir, "models.json")})
 
     def registerFaux(pi: Any) -> None:
         pi.registerProvider(faux.getModel().provider, {

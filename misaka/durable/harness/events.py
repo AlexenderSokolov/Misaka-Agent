@@ -26,17 +26,6 @@ from .usage import UsageDoc
 from .util import scanAll
 from .view import conversationViews
 
-PARTIAL_PATH = ["docs", "pi.live", "generation", "message"]
-
-
-class _Observer:
-    """The view observer of one event stream. A mount holds its observers in an identity set, so it is a plain class
-    rather than a namespace, which compares by value."""
-
-    def __init__(self, publication: Callable[..., None], closeSession: Callable[[], None]) -> None:
-        self.publication = publication
-        self.closeSession = closeSession
-
 
 class AgentEventStream:
     """Serialized stream of one conversation's event batches, one per commit. ``snapshot`` is the ``snapshot`` event at
@@ -339,6 +328,17 @@ def translate(
 
 def firstInput(run: dict[str, Any] | None) -> Any:
     return run["inputs"][0] if run is not None and len(run["inputs"]) > 0 else None
+
+PARTIAL_PATH = ["docs", "pi.live", "generation", "message"]
+
+
+class _Observer:
+    """The view observer of one event stream. A mount holds its observers in an identity set, so it is a plain class
+    rather than a namespace, which compares by value."""
+
+    def __init__(self, publication: Callable[..., None], closeSession: Callable[[], None]) -> None:
+        self.publication = publication
+        self.closeSession = closeSession
 
 
 def messageChanges(viewOps: list[Any], message: dict[str, Any]) -> list[dict[str, Any]]:

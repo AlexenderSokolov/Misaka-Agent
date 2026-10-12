@@ -54,7 +54,8 @@ from misaka.core.mcp_servers import (
     mcpNamespace,
     validateMcpServerConfig,
 )
-from misaka.utils.js import errorMessage, jsObjectOrder, jsonParse, jsonStringify
+from misaka.utils import v8_json
+from misaka.utils.js import errorMessage, jsObjectOrder, jsonStringify
 from misaka.utils.js_regexp import RegExp
 from misaka.utils.node_errors import withSyscall
 
@@ -83,15 +84,15 @@ class LoadedMcpConfig(TypedDict):
     projectConfig: NotRequired[str]
 
 
-_OVERRIDE_KEYS = ["enabled", "exposure", "toolExposure"]
+OVERRIDE_KEYS = ["enabled", "exposure", "toolExposure"]
 
 
-def _isOverride(value: dict[str, Any]) -> bool:
+def isOverride(value: dict[str, Any]) -> bool:
     """Whether an entry overrides a server defined elsewhere instead of defining one."""
     return "command" not in value and "url" not in value and "type" not in value
 
 
-def _isRecord(value: Any) -> TypeGuard[dict[str, Any]]:
+def isRecord(value: Any) -> TypeGuard[dict[str, Any]]:
     return isinstance(value, dict)
 
 
@@ -106,8 +107,8 @@ def _readFile(path: str) -> str:
 
 
 def _parse(text: str) -> Any:
-    # `JSON.parse`, whose objects list integer keys first. MISAKA fork: a syntax error reads as Python's, not V8's.
-    return jsObjectOrder(jsonParse(text))
+    # `JSON.parse`, whose objects list integer keys first and whose syntax errors read as V8's.
+    return jsObjectOrder(v8_json.jsonParse(text))
 
 
 def _message(error: BaseException) -> str:
@@ -115,13 +116,13 @@ def _message(error: BaseException) -> str:
 
 
 @dataclass(slots=True)
-class _McpConfigState:
+class McpConfigState:
     servers: dict[str, McpServerEntry]
     autoEnableCodemode: bool | None
     errors: list[str]
 
 
-def _readConfigFile(path: str, scope: Literal["global", "role", "project"], state: _McpConfigState) -> None:
+def readConfigFile(path: str, scope: Literal["global", "role", "project"], state: McpConfigState) -> None:
     servers, errors = state.servers, state.errors
     if not os.path.exists(path):
         return
@@ -130,7 +131,7 @@ def _readConfigFile(path: str, scope: Literal["global", "role", "project"], stat
     except Exception as error:  # noqa: BLE001 - upstream `catch (error)`: recorded as a config error
         errors.append(f"{path}: {_message(error)}")
         return
-    if not _isRecord(parsed) or ("mcpServers" in parsed and not _isRecord(parsed["mcpServers"])):
+    if not isRecord(parsed) or ("mcpServers" in parsed and not isRecord(parsed["mcpServers"])):
         errors.append(f'{path}: expected an object with an "mcpServers" object')
         return
     if isinstance(parsed.get("autoEnableCodemode"), bool):
@@ -139,13 +140,13 @@ def _readConfigFile(path: str, scope: Literal["global", "role", "project"], stat
         errors.append(f"{path}: autoEnableCodemode must be a boolean")
     mcpServers = parsed.get("mcpServers")
     for name, value in (mcpServers if mcpServers is not None else {}).items():
-        if scope == "project" and _isRecord(value) and _isOverride(value):
+        if scope == "project" and isRecord(value) and isOverride(value):
             base = servers.get(name)
-            extra = [key for key in value if key not in _OVERRIDE_KEYS]
+            extra = [key for key in value if key not in OVERRIDE_KEYS]
             if not base:
                 errors.append(f'{path}: server "{name}" needs "command" or "url", or a global server to override')
             elif len(extra) > 0:
-                errors.append(f'{path}: server "{name}": an override can only set {", ".join(_OVERRIDE_KEYS)}')
+                errors.append(f'{path}: server "{name}": an override can only set {", ".join(OVERRIDE_KEYS)}')
             else:
                 config = validateMcpServerConfig(name, {**base["config"], **value})
                 if isinstance(config, str):
@@ -180,21 +181,21 @@ class LoadMcpConfigOptions(TypedDict):
 def loadMcpConfig(options: LoadMcpConfigOptions) -> LoadedMcpConfig:
     """Load global and (when trusted) project MCP configuration. Disabled servers are included with
     ``enabled: false``, so they can be enabled again."""
-    state = _McpConfigState(servers={}, autoEnableCodemode=None, errors=[])
+    state = McpConfigState(servers={}, autoEnableCodemode=None, errors=[])
     # MISAKA fork: roles are isolated. The global file is Last Order's: she reads it with her own
     # `profiles/last_order/mcp.json` over it, while a Sister reads only her own `profiles/<role>/mcp.json`.
     # The project file below applies to every role, as in pi.
     roleDir = options.get("roleDir")
     roleFile = bool(roleDir) and os.path.realpath(roleDir) != os.path.realpath(options["agentDir"])
     if not roleFile or profiles.is_last_order(roleDir):
-        _readConfigFile(os.path.join(options["agentDir"], "mcp.json"), "global", state)
+        readConfigFile(os.path.join(options["agentDir"], "mcp.json"), "global", state)
     if roleFile:
-        _readConfigFile(os.path.join(roleDir, "mcp.json"), "role", state)
+        readConfigFile(os.path.join(roleDir, "mcp.json"), "role", state)
     # MISAKA fork: `home.project_dir` names the project's config directory, and none at `$HOME`.
     projectDir = home.project_dir(options["cwd"]) if options["projectTrusted"] else None
     projectConfig = str(projectDir / "mcp.json") if projectDir is not None else None
     if projectConfig:
-        _readConfigFile(projectConfig, "project", state)
+        readConfigFile(projectConfig, "project", state)
     loaded: LoadedMcpConfig = {"servers": list(state.servers.values()), "errors": state.errors}
     if state.autoEnableCodemode is not None:
         loaded = {
@@ -236,9 +237,9 @@ def updateMcpServerConfig(
         if (servers is None or name not in servers) and options.get("override"):
             server = {}
             parsed["mcpServers"] = {**(servers if servers is not None else {}), name: server}
-        if not _isRecord(server):
+        if not isRecord(server):
             raise RuntimeError(f'{path} does not define MCP server "{name}"')
-        keepDefaults = _isOverride(server)
+        keepDefaults = isOverride(server)
         if patch.get("enabled") is not None:
             if patch["enabled"] and not keepDefaults:
                 server.pop("enabled", None)
@@ -251,7 +252,7 @@ def updateMcpServerConfig(
                 server["exposure"] = patch["exposure"]
         return True
 
-    _editMcpServers(path, edit)
+    editMcpServers(path, edit)
 
 
 def addMcpServerConfig(path: str, name: str, config: McpServerConfig) -> bool:
@@ -267,7 +268,7 @@ def addMcpServerConfig(path: str, name: str, config: McpServerConfig) -> bool:
         parsed["mcpServers"] = target
         return True
 
-    _editMcpServers(path, edit)
+    editMcpServers(path, edit)
     return replaced
 
 
@@ -285,24 +286,25 @@ def removeMcpServerConfig(path: str, name: str) -> bool:
         removed = True
         return True
 
-    _editMcpServers(path, edit)
+    editMcpServers(path, edit)
     return removed
 
 
-def _editMcpServers(path: str, edit: Callable[[dict[str, Any] | None, dict[str, Any]], bool]) -> None:
+def editMcpServers(path: str, edit: Callable[[dict[str, Any] | None, dict[str, Any]], bool]) -> None:
     """Read an ``mcp.json`` (an empty config when missing), let ``edit`` change its ``mcpServers``, and
     write it back with its indentation when ``edit`` returns true. Other content is kept."""
     text = _readFile(path) if os.path.exists(path) else None
     parsed: Any = {} if text is None else _parse(text)
-    if not _isRecord(parsed) or ("mcpServers" in parsed and not _isRecord(parsed["mcpServers"])):
+    if not isRecord(parsed) or ("mcpServers" in parsed and not isRecord(parsed["mcpServers"])):
         raise RuntimeError(f'{path}: expected an object with an "mcpServers" object')
-    servers = parsed["mcpServers"] if _isRecord(parsed.get("mcpServers")) else None
+    servers = parsed["mcpServers"] if isRecord(parsed.get("mcpServers")) else None
     if not edit(servers, parsed):
         return
     match = RegExp(r"^([ \t]+)\S", "m").exec(text) if text else None
     indent = (match[1] if match is not None else None) or "  "
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(f"{jsonStringify(jsObjectOrder(parsed), indent)}\n", encoding="utf-8", newline="\n")
+    withSyscall("mkdir", lambda: Path(path).parent.mkdir(parents=True, exist_ok=True), path=os.path.dirname(path))
+    serialized = f"{jsonStringify(jsObjectOrder(parsed), indent)}\n"
+    withSyscall("open", lambda: Path(path).write_text(serialized, encoding="utf-8", newline="\n"), path=path)
 
 
 __all__ = [

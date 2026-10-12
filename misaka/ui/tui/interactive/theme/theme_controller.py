@@ -12,7 +12,7 @@ to the system theme, MISAKA falls back to the built-in theme matching the termin
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from .theme import (
     SetThemeResult,
@@ -32,23 +32,22 @@ if TYPE_CHECKING:
 type ThemeResult = SetThemeResult
 
 
+class InteractiveThemeControllerOptions(TypedDict):
+    getSettingsManager: Callable[[], SettingsManager]
+    showError: Callable[[str], None]
+    onChanged: Callable[[], None]
+    initialThemeSetting: NotRequired[str | None]
+
+
 class InteractiveThemeController:
     """Applies the theme setting."""
 
-    def __init__(
-        self,
-        ui: TUI,
-        *,
-        getSettingsManager: Callable[[], SettingsManager],
-        showError: Callable[[str], None],
-        onChanged: Callable[[], None],
-        initialThemeSetting: str | None = None,
-    ) -> None:
+    def __init__(self, ui: TUI, options: InteractiveThemeControllerOptions) -> None:
         self.ui = ui
-        self.getSettingsManager = getSettingsManager
-        self.showError = showError
-        self.onChanged = onChanged
-        self.currentThemeSetting: str | None = initialThemeSetting
+        self.getSettingsManager = options["getSettingsManager"]
+        self.showError = options["showError"]
+        self.onChanged = options["onChanged"]
+        self.currentThemeSetting: str | None = options.get("initialThemeSetting")
         self.activeThemeName: str | None = self.resolveThemeName()
         initTheme(self.activeThemeName, True)
 

@@ -28,12 +28,10 @@ from misaka.ui.tui.interactive.model_search import (
 )
 from misaka.ui.tui.interactive.theme.theme import theme
 from misaka.utils.collation import localeSortKey
-from misaka.utils.js import AbortController
+from misaka.utils.js import AbortController, jsTrim
 
 from .dynamic_border import DynamicBorder
 from .keybinding_hints import keyDisplayText, keyHint
-
-type ModelScope = Literal["all", "scoped"]
 
 
 @dataclass(slots=True)
@@ -54,9 +52,25 @@ class DefaultModelReference:
     provider: str
     id: str
 
+type ModelScope = Literal["all", "scoped"]
+
 
 class ModelSelectorComponent(Container):
     """Component that renders a model selector with search"""
+
+    @property
+    def focused(self) -> bool:
+        return self._focused
+
+    @focused.setter
+    def focused(self, value: bool) -> None:
+        self._focused = value
+        self.searchInput.focused = value
+
+    def _request_render(self) -> None:
+        requestRender = getattr(self.tui, "requestRender", None)
+        if callable(requestRender):
+            requestRender()
 
     def __init__(
         self,
@@ -164,20 +178,6 @@ class ModelSelectorComponent(Container):
             asyncio.get_running_loop().create_task(self.refreshModels())
         except RuntimeError:
             pass
-
-    @property
-    def focused(self) -> bool:
-        return self._focused
-
-    @focused.setter
-    def focused(self, value: bool) -> None:
-        self._focused = value
-        self.searchInput.focused = value
-
-    def _request_render(self) -> None:
-        request_render = getattr(self.tui, "requestRender", None)
-        if callable(request_render):
-            request_render()
 
     def loadModelsFromSnapshot(self) -> None:
         models = [
@@ -288,7 +288,7 @@ class ModelSelectorComponent(Container):
         )
 
     def isDefaultSearch(self, query: str) -> bool:
-        normalized = query.strip().lower()
+        normalized = jsTrim(query).lower()
         return len(normalized) > 0 and "default".startswith(normalized)
 
     def setScope(self, scope: ModelScope) -> None:

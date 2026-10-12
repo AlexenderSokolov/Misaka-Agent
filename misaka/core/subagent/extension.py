@@ -564,18 +564,16 @@ class SubagentPart:
 
                 await asyncio.to_thread(_log_warning, f"Agent definition {path}: {error}")
             self._catalog_diagnostics = diagnostics
-        available_servers = agent_roster.available_mcp_servers(self.session)
+        available_servers = [
+            *agent_roster.configured_mcp_servers(self.role_context.profile_dir),
+            *agent_roster.available_mcp_servers(self.session),
+        ]
         from misaka.core.subagent.configuration import denied_agent_types
 
         denied_agents = denied_agent_types(self.session, cwd=cwd, include_project=trusted)
         eligible = {
             name: agent for name, agent in catalog.active_agents.items()
-            if agent.name not in denied_agents and agent_roster.has_required_mcp_servers(agent, [
-                *available_servers,
-                # An isolated MISAKA worker owns inline clients; the parent
-                # cannot connect those in advance. Its ready barrier is final.
-                *(server for server, _ in agent_roster.inline_mcp_entries(agent.mcp_servers)),
-            ])
+            if agent.name not in denied_agents and agent_roster.has_required_mcp_servers(agent, available_servers)
         }
         if self.role_context.allowed_agent_types:
             allowed = {agent_roster._canonical_name(name) for name in self.role_context.allowed_agent_types}

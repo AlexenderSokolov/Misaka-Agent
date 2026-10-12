@@ -46,17 +46,11 @@ async def pathExists(file_path: str) -> bool:
 
 
 def expandPath(file_path: str) -> str:
-    return normalizePath(
-        file_path,
-        normalize_unicode_spaces=True,
-        strip_at_prefix=True,
-    )
+    return normalizePath(file_path, {"normalizeUnicodeSpaces": True, "stripAtPrefix": True})
 
 
 def resolveToCwd(file_path: str, cwd: str) -> str:
-    return resolvePath(
-        file_path, cwd, normalize_unicode_spaces=True, strip_at_prefix=True
-    )
+    return resolvePath(file_path, cwd, {"normalizeUnicodeSpaces": True, "stripAtPrefix": True})
 
 
 def resolveReadPath(file_path: str, cwd: str) -> str:

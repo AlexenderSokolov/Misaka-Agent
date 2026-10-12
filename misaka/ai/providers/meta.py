@@ -18,12 +18,7 @@ def metaProvider() -> Provider:
             baseUrl="https://api.meta.ai/v1",
             auth=ProviderAuth(
                 apiKey=envApiKeyAuth("Meta Model API key", ["META_API_KEY"]),
-                oauth=lazyOAuth(
-                    name="Meta (Muse subscription)",
-                    isSubscription=True,
-                    loginLabel="Sign in with Meta",
-                    load=loadMetaOAuth,
-                ),
+                oauth=lazyOAuth({"name": "Meta (Muse subscription)", "isSubscription": True, "loginLabel": "Sign in with Meta", "load": loadMetaOAuth}),
             ),
             models=list(META_MODELS.values()),
             api=openAIResponsesApi(),

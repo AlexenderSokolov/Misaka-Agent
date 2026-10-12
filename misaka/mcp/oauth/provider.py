@@ -134,7 +134,12 @@ class McpOAuthProvider:
         return (await self._load()).get("tokens")
 
     async def saveTokens(self, tokens: OAuthTokens) -> None:
-        expiresAt = None if "expires_in" not in tokens else int(time.time() * 1000) + tokens["expires_in"] * 1000
+        expiresAt = (
+            None
+            if "expires_in" not in tokens
+            # `null * 1000` is 0.
+            else int(time.time() * 1000) + (tokens["expires_in"] if tokens["expires_in"] is not None else 0) * 1000
+        )
 
         def update(value: McpOAuthState) -> McpOAuthState:
             next: McpOAuthState = {**value, "tokens": tokens}

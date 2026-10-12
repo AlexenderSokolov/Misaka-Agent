@@ -23,7 +23,7 @@ from misaka.core.system_prompt import (
     buildSystemPromptState,
     diffSystemPromptSections,
 )
-from misaka.modes.jsonl import to_jsonable
+from misaka.modes.json_event import to_jsonable
 from misaka.utils.values import read_field
 from tests.suite_harness import createHarness
 

@@ -173,7 +173,7 @@ servers of `~/.misaka/mcp.json`. They write such an entry, and later changes to 
 |---|---|
 | `command`, `args`, `env`, `cwd` | a server started as a process, speaking on its standard streams; `~` expands, `cwd` is relative to the working directory |
 | `url`, `headers` | a Streamable HTTP server. Without an `Authorization` header it signs in with OAuth when the server asks (`/mcp login`, `misaka mcp login`); `oauth` holds a pre-registered client (`clientId`, `clientSecret`, `callbackUrl`, `callbackPort`, `scope`, `clientName`, `authServerMetadataUrl`); `auth: {"provider": "..."}` sends a `/login` provider's token instead (home and role files only) |
-| `exposure` | how the model reaches the tools: `codemode` (default: from codemode scripts), `deferred` (declared once `tool_search` loads them), `direct` (declared like built-in tools) or `hidden` |
+| `exposure` | how the model reaches the tools: `codemode` (from codemode scripts; the default for a Sister's servers), `deferred` (declared once `tool_search` loads them), `direct` (declared like built-in tools; Last Order's servers are always reached this way) or `hidden` |
 | `toolExposure` | the exposure of single tools, by name or `*` pattern |
 | `description` | one line about what the server offers; the model sees it |
 | `enabled` | `false` keeps the entry without connecting it |
@@ -190,8 +190,10 @@ Sign-ins are kept in `~/.misaka/credentials/mcp-auth.json`. What servers log goe
 
 With the `codemode` tool the model writes a JavaScript script that calls the other tools, so it can
 run calls in parallel and filter large results before it reads them. MCP tools reach the model this
-way by default. The tool is off until something names it: `defaultTools` (`["+codemode"]`) or an MCP
-server with `codemode` exposure. Scripts run in a V8 sandbox with no
+way by default. Codemode is a Sister's tool: Last Order coordinates and does not have it, so every tool
+of her MCP servers is declared to her directly, whatever `exposure` says (`hidden` still hides it). For a Sister the tool is off
+until something names it: `defaultTools` (`["+codemode"]`) or an MCP server with `codemode` exposure.
+Scripts run in a V8 sandbox with no
 file system, network or timers; they call tools through `tools.<name>(args)`. The reference the
 model reads is shipped with MISAKA as `codemode.md`.
 
@@ -204,7 +206,8 @@ model reads is shipped with MISAKA as `codemode.md`.
 
 The `tool_search` tool lets the model find tools that are not declared to it up front and load the
 ones it needs for its next request. MCP servers with `deferred` exposure reach the model this way,
-and `tool_search` is turned on for them. Otherwise it is off until something names it:
+and `tool_search` is turned on for them. Like codemode, it is a Sister's tool; Last Order does not have it. Otherwise it is off
+until something names it:
 `defaultTools` (`["+tool_search"]`) or `--tools`. It searches the names and descriptions of the
 deferred tools; a tool it loads is then called like any other.
 
@@ -285,6 +288,9 @@ Variables for MISAKA itself:
 | `MISAKA_GHOSTTY_VT` | the bundled library | a terminal library you built yourself, for platforms without a bundled one |
 | `MISAKA_ALLOW_NESTED` | off | `1` lets the panel open inside one of its own panes |
 | `MISAKA_PROGRAM_STATUS` | ask the terminal | `1` always sends program status reports (OSC 7501), `0` never does |
+| `MISAKA_TUI_WRITE_LOG` | off | a file, or a folder, that gets a copy of everything written to the terminal; for tracking down display problems |
+| `MISAKA_TUI_DEBUG_REDRAW` | off | `1` records why each full redraw happened, in `pi-tui-debug.log` in the home |
+| `MISAKA_TUI_DEBUG` | off | `1` writes the state of every screen update to `/tmp/tui` |
 | `GITHUB_TOKEN` / `GH_TOKEN` | none | a GitHub token for `misaka update` (it also asks `gh auth token`): for a private copy of the repository, or a higher rate limit |
 
 Other `MISAKA_*` names are set by MISAKA for its own processes; leave them alone.

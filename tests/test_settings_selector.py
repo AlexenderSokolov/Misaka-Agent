@@ -47,6 +47,7 @@ def makeConfig(**overrides: Any) -> SettingsConfig:
         "terminalTheme": "dark",
         "availableThemes": [],
         "hideThinkingBlock": False,
+        "mermaidRenderingMode": "streaming",
         "showCacheMissNotices": False,
         "collapseChangelog": False,
         "enableInstallTelemetry": False,

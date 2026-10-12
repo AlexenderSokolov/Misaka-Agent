@@ -128,7 +128,7 @@ def test_the_home_is_never_a_project(tmp_path, monkeypatch):
 
 
 def test_project_scope_is_absent_when_the_working_directory_is_the_users_home(tmp_path, monkeypatch):
-    from misaka.core import project_trust
+    from misaka.core import trust_manager as project_trust
     from misaka.core.settings_manager import SettingsManager
     from misaka.core.subagent.agents import _project_agent_dirs
     from misaka.core.subagent.configuration import project_settings

@@ -502,7 +502,7 @@ async def _streamAssistantResponse(
                 partialMessage = event.partial
                 context.messages.append(partialMessage)
                 addedPartial = True
-                await _emit(emit, MessageStartEvent(message=_copyForListeners(partialMessage)))
+                await _emit(emit, MessageStartEvent(message=partialMessage.model_copy()))
 
             case (
                 "text_start"
@@ -522,7 +522,7 @@ async def _streamAssistantResponse(
                         emit,
                         MessageUpdateEvent(
                             assistantMessageEvent=event,
-                            message=_copyForListeners(partialMessage),
+                            message=partialMessage.model_copy(),
                         ),
                     )
 
@@ -533,7 +533,7 @@ async def _streamAssistantResponse(
                 else:
                     context.messages.append(finalMessage)
                 if not addedPartial:
-                    await _emit(emit, MessageStartEvent(message=_copyForListeners(finalMessage)))
+                    await _emit(emit, MessageStartEvent(message=finalMessage.model_copy()))
                 await _emit(emit, MessageEndEvent(message=finalMessage))
                 return finalMessage
 
@@ -542,17 +542,9 @@ async def _streamAssistantResponse(
         context.messages[-1] = finalMessage
     else:
         context.messages.append(finalMessage)
-        await _emit(emit, MessageStartEvent(message=_copyForListeners(finalMessage)))
+        await _emit(emit, MessageStartEvent(message=finalMessage.model_copy()))
     await _emit(emit, MessageEndEvent(message=finalMessage))
     return finalMessage
-
-
-def _copyForListeners(message: AssistantMessage) -> AssistantMessage:
-    """MISAKA fork: upstream emits ``{ ...partialMessage }``; here the copy is deep. The extension runner hands the
-    message to third-party handlers and the TUI keeps it as ``streamingMessage`` and passes an inner ``arguments``
-    dict to a component by reference, so a shallow copy of a pydantic message would let either write through into
-    the message the context holds."""
-    return message.model_copy(deep=True)
 
 
 def _uniquifyToolCallIds(message: AssistantMessage) -> AssistantMessage:
@@ -594,9 +586,7 @@ async def _failToolCallsFromTruncatedMessage(
             toolCall=toolCall,
             result=_createErrorToolResult(
                 f'Tool call "{toolCall.name}" was not executed: the response hit the output token limit, so its '
-                "arguments may be truncated. Re-issue the tool call with complete arguments"
-                # MISAKA fork: the hint to split a payload that keeps hitting the limit.
-                "; split large payloads into smaller calls if necessary."
+                "arguments may be truncated. Re-issue the tool call with complete arguments."
             ),
             isError=True,
         )
@@ -678,13 +668,6 @@ async def _executeToolCallsSequential(
         if signal_aborted(signal):
             break
 
-    # MISAKA fork: every tool call in the message gets a result, abort or not (see `_answerUnreachedToolCalls`).
-    for finalized in await _answerUnreachedToolCalls(toolCalls, len(finalizedCalls), emit):
-        toolResultMessage = _createToolResultMessage(finalized)
-        await _emitToolResultMessage(toolResultMessage, emit)
-        finalizedCalls.append(finalized)
-        messages.append(toolResultMessage)
-
     return _ExecutedToolCallBatch(
         messages=messages,
         terminate=_shouldTerminateToolBatch(finalizedCalls),
@@ -747,9 +730,6 @@ async def _executeToolCallsParallel(
         if signal_aborted(signal):
             break
 
-    # MISAKA fork: every tool call in the message gets a result, abort or not (see `_answerUnreachedToolCalls`).
-    finalizedCalls.extend(await _answerUnreachedToolCalls(toolCalls, len(finalizedCalls), emit))
-
     orderedFinalizedCalls = await asyncio.gather(
         *(entry() if callable(entry) else _resolved(entry) for entry in finalizedCalls)
     )
@@ -768,33 +748,6 @@ async def _executeToolCallsParallel(
 async def _resolved(value: _FinalizedToolCallOutcome) -> _FinalizedToolCallOutcome:
     """``Promise.resolve(entry)``."""
     return value
-
-
-async def _answerUnreachedToolCalls(
-    toolCalls: list[AgentToolCall],
-    done: int,
-    emit: AgentEventSink,
-) -> list[_FinalizedToolCallOutcome]:
-    """MISAKA fork: every tool call in the assistant message needs a result, abort or not.
-
-    Upstream breaks out of the batch and leaves the tail unanswered; a conversation whose assistant message has tool
-    calls without matching results is rejected by the provider on the next request, so the abort would surface as a
-    broken session one turn later.
-    """
-    answered: list[_FinalizedToolCallOutcome] = []
-    for toolCall in toolCalls[done:]:
-        await _emit(
-            emit,
-            ToolExecutionStartEvent(toolCallId=toolCall.id, toolName=toolCall.name, args=toolCall.arguments),
-        )
-        finalized = _FinalizedToolCallOutcome(
-            toolCall=toolCall,
-            result=_createErrorToolResult("Operation aborted"),
-            isError=True,
-        )
-        await _emitToolExecutionEnd(finalized, emit)
-        answered.append(finalized)
-    return answered
 
 
 @dataclass(slots=True)

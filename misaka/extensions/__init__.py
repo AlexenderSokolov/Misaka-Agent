@@ -9,8 +9,9 @@ session through the extension API alone -- with one thing Pi does not have: role
 the folder a module sits in decides who gets it. A module takes part by defining
 ``activate(spec) -> register | None``: ``register(harn)`` installs the extension into the
 harness, ``None`` skips it for this session. A module may override its descriptor name
-with ``EXTENSION_NAME``, hide it with ``HIDDEN``, or restrict itself to session kinds
-with ``SESSION_KINDS = {...}``; the default is every kind except ``bare``. A module may also
+with ``EXTENSION_NAME``, hide it with ``HIDDEN``, restrict itself to session kinds
+with ``SESSION_KINDS = {...}`` (the default is every kind except ``bare``), or to roles with
+``ROLES = {"last_order" | "sisters", ...}`` (the default is both). A module may also
 offer a top-level command, ``misaka <COMMAND> ...``, by defining ``COMMAND`` and
 ``command(argv)``; the first line of that function's docstring is its help.
 
@@ -30,11 +31,17 @@ from misaka.config import profiles
 from misaka.core.wiring import DEFAULT_KINDS, inline
 
 _ROLE_DIRS = ("last_order", "sisters")
+# pi's `builtInExtensions`, in its order; misaka's own bundled extensions follow, by name.
+_PI_BUILTINS = ("llama", "codemode", "tool_search", "mcp")
+
+
+def _order(name: str) -> tuple[int, str]:
+    return (_PI_BUILTINS.index(name), "") if name in _PI_BUILTINS else (len(_PI_BUILTINS), name)
 
 
 def _modules(package: str):
     pkg = importlib.import_module(package)
-    for info in sorted(pkgutil.iter_modules(pkg.__path__), key=lambda i: i.name):
+    for info in sorted(pkgutil.iter_modules(pkg.__path__), key=lambda i: _order(i.name)):
         if info.name.startswith("_") or (package == __name__ and info.name in _ROLE_DIRS):
             continue
         yield importlib.import_module(f"{package}.{info.name}")
@@ -49,6 +56,8 @@ def discover(spec) -> list[dict[str, Any]]:
         for mod in _modules(package):
             activate = getattr(mod, "activate", None)
             if activate is None or kind not in getattr(mod, "SESSION_KINDS", DEFAULT_KINDS):
+                continue
+            if ("last_order" if last_order else "sisters") not in getattr(mod, "ROLES", _ROLE_DIRS):
                 continue
             register = activate(spec)
             if register is not None:

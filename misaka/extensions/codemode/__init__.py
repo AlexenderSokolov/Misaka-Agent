@@ -22,11 +22,15 @@ from misaka.utils.values import read_field
 from .tool import CodemodeToolOptions, createCodemodeToolDefinition
 
 EXTENSION_NAME = "codemode"
+# MISAKA fork: bundled-extension metadata for misaka's loader.
 # `builtin:codemode`, as upstream bundles it. Replaceable: an extension that registers `codemode` takes
 # over instead of running alongside it.
 BUILTIN = True
 REPLACEABLE = True
 SESSION_KINDS = KINDS
+# MISAKA fork: Sisters only. Last Order coordinates and does not batch work through scripts; her MCP tools
+# are declared to her directly (the MCP glue makes her servers `direct`).
+ROLES = {"sisters"}
 
 
 @dataclass(slots=True)
@@ -79,6 +83,7 @@ __all__ = [
     "BUILTIN",
     "EXTENSION_NAME",
     "REPLACEABLE",
+    "ROLES",
     "SESSION_KINDS",
     "CodemodeExtensionOptions",
     "activate",

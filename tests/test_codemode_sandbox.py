@@ -978,3 +978,51 @@ async def test_the_globals_quickjs_adds_behave_as_they_do_upstream(code, expecte
     finally:
         await sandbox.close()
     assert result["ok"] is True and result["value"] == expected
+
+
+# -- pi-alignment fixes (MISAKA) ---------------------------------------------------------------
+
+
+async def test_a_top_level_throw_after_closing_the_wrapper_is_a_script_error(sandboxes):
+    result = await createSandbox(sandboxes).execute("}); throw new Error('x'); (() => {")
+    assertMatches(result, {"ok": False, "error": {"kind": "script", "name": "Error", "message": "x"}})
+
+
+async def test_stacks_hold_no_host_frames(sandboxes):
+    result = await createSandbox(sandboxes).execute("throw new Error('boom');")
+    assert "codemode-host" not in result["error"]["stack"]
+
+
+async def test_output_made_before_running_out_of_memory_is_kept(sandboxes):
+    sandbox = CodemodeSandbox({"timeoutMs": 20_000, "memoryLimitBytes": 64 * 1024 * 1024})
+    sandboxes.append(sandbox)
+    result = await sandbox.execute("text('before'); const a = []; while (true) a.push(new Array(100000).fill(1));")
+    assertMatches(result, {"ok": False, "error": {"kind": "sandbox", "message": "out of memory"}, "output": [{"type": "text", "text": "before"}]})
+
+
+async def test_a_tool_that_aborts_the_execution_records_its_call_as_cancelled(sandboxes):
+    controller = AbortController()
+
+    def stop(_args, _context):
+        controller.abort()
+        return 1
+
+    sandbox = createSandbox(sandboxes, [CodemodeTool(name="stop", execute=stop)])
+    result = await sandbox.execute("return await tools.stop();", {"signal": controller.signal})
+    assertMatches(result, {"ok": False, "error": {"kind": "aborted"}, "calls": [{"name": "stop", "status": "cancelled"}]})
+
+
+async def test_closing_after_a_caller_cancelled_its_execution_does_not_raise(sandboxes):
+    sandbox = createSandbox(sandboxes)
+    pending = sandbox.execute("await new Promise(() => {});")
+    pending.cancel()
+    await sandbox.close()
+
+
+async def test_a_script_spinning_after_it_reported_done_past_an_await_is_stopped(sandboxes):
+    started = time.monotonic()
+    result = await createSandbox(sandboxes, [echo], timeoutMs=30_000).execute(
+        "await tools.echo(1); try { exit(); } catch {} for (;;) {}"
+    )
+    assertMatches(result, {"ok": False, "error": {"kind": "sandbox", "message": "the script kept running after it finished"}})
+    assert time.monotonic() - started < 5

@@ -724,7 +724,7 @@ async def amain() -> int:
     subagent_hooks.set_hook_evaluator(evaluate_model_hook)
 
     async def classify_auto_permission(payload: dict[str, Any]) -> bool:
-        from misaka.modes.jsonl import to_jsonable
+        from misaka.modes.json_event import to_jsonable
 
         transcript = json.dumps(
             to_jsonable(session.state.messages),

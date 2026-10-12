@@ -123,7 +123,7 @@ def radiusProvider(options: RadiusProviderOptions | None = None) -> Provider:
         name=name,
         auth=ProviderAuth(
             apiKey=envApiKeyAuth("Radius API key", ["RADIUS_API_KEY"]),
-            oauth=lazyOAuth(name=name, load=_loadOAuth),
+            oauth=lazyOAuth({"name": name, "load": _loadOAuth}),
         ),
         getModels=lambda: dynamicModels if dynamicModels is not None else baselineModels,
         refreshModels=refreshModels,

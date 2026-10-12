@@ -137,9 +137,7 @@ class Faux:
 
 async def createRuntime(requests=None):
     requests = requests if requests is not None else []
-    runtime = await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=None, allowModelNetwork=False
-    )
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": None, "allowModelNetwork": False})
     faux = Faux([
         {"id": "small", "contextWindow": 1000, "maxTokens": 100, "input": ["text"]},
         {"id": "large", "contextWindow": 50_000, "maxTokens": 5000, "input": ["text", "image"], "reasoning": True},
@@ -401,9 +399,7 @@ async def routed_harness(tmp_path, route=defaultRoute, *, settings=None, extensi
         {"id": "small", "contextWindow": 1000},
         {"id": "large", "contextWindow": 50_000, "maxTokens": 4000, "reasoning": True},
     ])
-    runtime = await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=None, allowModelNetwork=False
-    )
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": None, "allowModelNetwork": False})
     runtime.registerNativeProvider(faux.provider)
     await runtime.refresh(ModelsRefreshOptions(allowNetwork=False))
 
@@ -771,9 +767,7 @@ async def test_extensions_register_virtual_models_before_and_after_the_runner_bi
         # Unregistering before the runner binds drops the queued registration.
         pi.unregisterVirtualModel("router", "dropped")
 
-    runtime = await ModelRuntime.create(
-        authStorage=AuthStorage.inMemory(), modelsStore=InMemoryModelsStore(), modelsPath=None, allowModelNetwork=False
-    )
+    runtime = await ModelRuntime.create({"authStorage": AuthStorage.inMemory(), "modelsStore": InMemoryModelsStore(), "modelsPath": None, "allowModelNetwork": False})
     runtime.registerNativeProvider(Faux([{"id": "small"}, {"id": "large"}]).provider)
     await runtime.refresh(ModelsRefreshOptions(allowNetwork=False))
     session = (await _open(tmp_path, runtime, _in_memory(tmp_path), runtime.getModel("faux", "small"), [factory]))[

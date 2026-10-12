@@ -35,7 +35,7 @@ from misaka.chord.node import (
     readFacetBundleManifest,
 )
 
-GenerationValue = defineService("test.bundle.generation", local=True)
+GenerationValue = defineService("test.bundle.generation", {"local": True})
 
 
 @pytest.fixture
@@ -56,7 +56,7 @@ def writeGeneration(path: Path, generation: str) -> None:
         "from types import SimpleNamespace\n"
         "from misaka.chord import defineService\n"
         "from .helper import decorate\n"
-        'Value = defineService("test.bundle.generation", local=True)\n'
+        'Value = defineService("test.bundle.generation", {"local": True})\n'
         "def setup(env):\n"
         f"    env.provide(Value, {{'read': lambda *_: decorate({generation!r})}})\n"
         'default = SimpleNamespace(id="bundle-provider", setup=setup)\n',

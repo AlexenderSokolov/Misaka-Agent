@@ -505,7 +505,7 @@ def writeTemplate(testDir: Path, name: str, content: str) -> None:
 
 
 def loadFrom(testDir: Path) -> list[PromptTemplate]:
-    return loadPromptTemplates({"cwd": os.getcwd(), "agentDir": get_agent_dir(), "promptPaths": [str(testDir)]}).templates
+    return loadPromptTemplates({"cwd": os.getcwd(), "agentDir": get_agent_dir(), "promptPaths": [str(testDir)], "includeDefaults": False}).templates
 
 
 def test_should_parse_required_argument_hint_from_frontmatter(testDir: Path):
@@ -602,7 +602,7 @@ def test_reports_invalid_yaml_frontmatter_and_keeps_valid_siblings(tmp_path: Pat
     invalidPromptPath.write_text("---\ndescription: Broken: unquoted colon\n---\nDo something.\n", encoding="utf-8")
     (testDir / "valid.md").write_text("Valid prompt content.", encoding="utf-8")
 
-    result = loadPromptTemplates({"cwd": os.getcwd(), "agentDir": get_agent_dir(), "promptPaths": [str(testDir)]})
+    result = loadPromptTemplates({"cwd": os.getcwd(), "agentDir": get_agent_dir(), "promptPaths": [str(testDir)], "includeDefaults": False})
 
     assert [template.name for template in result.templates] == ["valid"]
     assert len(result.diagnostics) == 1

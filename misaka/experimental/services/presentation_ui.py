@@ -9,6 +9,6 @@ from __future__ import annotations
 
 from misaka.chord import defineService
 
-PresentationUI = defineService("pi.local.presentation-ui", local=True)
+PresentationUI = defineService("pi.local.presentation-ui", {"local": True})
 
 __all__ = ["PresentationUI"]

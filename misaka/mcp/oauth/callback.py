@@ -54,7 +54,7 @@ class OAuthCallbackServerOptions(TypedDict, total=False):
     renderPage: Callable[[OAuthCallbackPage], str]
 
 
-def _plainText(page: OAuthCallbackPage) -> str:
+def plainText(page: OAuthCallbackPage) -> str:
     if page["ok"]:
         return "Authorization complete. You may close this window."
     return f"{page['message']}\n\n{page['details']}" if page.get("details") else page["message"]
@@ -105,8 +105,6 @@ class OAuthCallbackServer:
         async def serve(request: asyncio.StreamReader, response: asyncio.StreamWriter) -> None:
             if instance is not None:
                 await instance._serve(request, response)
-            else:
-                response.transport.abort()
 
         loop = asyncio.get_running_loop()
         # MISAKA fork: bind only the first address the host resolves to, as `listen(port, host)` does.
@@ -115,7 +113,6 @@ class OAuthCallbackServer:
         server = await asyncio.start_server(serve, str(sockaddr[0]), port, family=family)
         address = server.sockets[0].getsockname() if server.sockets else None
         if not address:
-            server.close()
             raise RuntimeError("OAuth callback server did not bind to TCP")
         timeoutMs = options.get("timeoutMs")
         instance = cls(
@@ -154,6 +151,11 @@ class OAuthCallbackServer:
             if not pending.future.done():
                 pending.future.set_exception(RuntimeError("OAuth callback server closed"))
         self._pending.clear()
+        if not self._server.is_serving():
+            # `server.close(callback)` on a server that is not listening.
+            notRunning = RuntimeError("Server is not running.")
+            notRunning.code = "ERR_SERVER_NOT_RUNNING"  # type: ignore[attr-defined]
+            raise notRunning
         self._server.close()
         # MISAKA fork: `wait_closed()` (3.12.1+) waits for every connection, browser preconnects
         # included; Node's `server.close()` closes idle sockets itself.
@@ -167,7 +169,7 @@ class OAuthCallbackServer:
             body = self._renderPage(page).encode("utf-8")
             headers = "content-type: text/html; charset=utf-8\r\ncache-control: no-store\r\n"
         else:
-            body = _plainText(page).encode("utf-8")
+            body = plainText(page).encode("utf-8")
             headers = "content-type: text/plain; charset=utf-8\r\n"
         start = (
             f"HTTP/1.1 {status} {HTTPStatus(status).phrase}\r\n"
@@ -180,12 +182,7 @@ class OAuthCallbackServer:
             response.close()
 
     def _handle(self, rawUrl: str, response: asyncio.StreamWriter, *, head: bool = False) -> None:
-        try:
-            url = URL(rawUrl, self.redirectUrl)
-        except TypeError:
-            # MISAKA fork: node:http never hands the handler a target `new URL` rejects.
-            self._reply(response, 404, {"ok": False, "message": "Not found"}, head)
-            return
+        url = URL(rawUrl, self.redirectUrl)
         if url.pathname not in self._paths:
             self._reply(response, 404, {"ok": False, "message": "Not found"}, head)
             return

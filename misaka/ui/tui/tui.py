@@ -7,7 +7,6 @@ MISAKA forks, each marked where it happens:
   renderer, which is not ported. ``TuiMainScreen`` lives in ``tui_main_screen.py``.
 - D11: ``queryTerminalColors`` (OSC 10/11/4 with a DA1 sentinel) belongs to pi's system theme, which is not ported.
   MISAKA's own background probe (``queryTerminalBackgroundColor``, OSC 11 only) takes its place.
-- The debug key (``onDebug``, Shift+Ctrl+D) is not ported: it wrote the whole transcript to disk, past the keybindings.
 - Node runs every callback on one thread. Here requests can come from worker threads (streaming, timers), so
   ``start``/``stop``/``requestRender``/``renderNow``/``doRender`` run on the loop that started the TUI, and
   ``process.nextTick``/``setTimeout`` are callbacks on that loop (a thread timer without a loop).
@@ -26,7 +25,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal, Protocol, TypedDict, cast
 
-from misaka.ui.tui.keys import isKeyRelease
+from misaka.ui.tui.keys import isKeyRelease, matchesKey
 from misaka.ui.tui.terminal import Terminal
 from misaka.ui.tui.terminal_colors import (
     RgbColor,
@@ -279,6 +278,11 @@ type OverlayFocusRestoreState = InactiveOverlayFocusRestoreState | ActiveOverlay
 type OverlayFocusRestorePolicy = Literal["clear", "preserve"]
 
 
+class SetFocusInternalOptions(TypedDict):
+    component: Component | None
+    overlayFocusRestore: OverlayFocusRestorePolicy
+
+
 class Container:
     """Container - a component that contains other components"""
 
@@ -355,6 +359,7 @@ class TuiStopOptions(TypedDict, total=False):
 class TUI(Component, Protocol):
     children: list[Component]
     terminal: Terminal
+    onDebug: Callable[[], None] | None
 
     @property
     def fullRedraws(self) -> int: ...
@@ -390,13 +395,17 @@ def performanceNow() -> float:
 class TuiBase(Container):
     MIN_RENDER_INTERVAL_MS = 16
 
+    @property
+    def hasOverlayEntries(self) -> bool:
+        return len(self.overlayStack) > 0
+
     def __init__(self, terminal: Terminal, showHardwareCursor: bool | None = None, logDirectory: str | None = None):
         super().__init__()
         self.terminal = terminal
         self.focusedComponent: Component | None = None
         self.inputListeners: dict[TuiInputListener, None] = {}
 
-        # MISAKA fork: upstream's `onDebug` (Shift+Ctrl+D) is not ported.
+        self.onDebug: Callable[[], None] | None = None
         self.renderRequested = False
         self.immediateRenderScheduled = False
         self.renderTimer: asyncio.TimerHandle | threading.Timer | None = None
@@ -429,10 +438,6 @@ class TuiBase(Container):
 
         if showHardwareCursor is not None:
             self.showHardwareCursor = showHardwareCursor
-
-    @property
-    def hasOverlayEntries(self) -> bool:
-        return len(self.overlayStack) > 0
 
     def doRender(self) -> None:
         raise NotImplementedError
@@ -481,9 +486,11 @@ class TuiBase(Container):
         return self.focusedComponent
 
     def setFocus(self, component: Component | None) -> None:
-        self.setFocusInternal(component=component, overlayFocusRestore="clear")
+        self.setFocusInternal({"component": component, "overlayFocusRestore": "clear"})
 
-    def setFocusInternal(self, *, component: Component | None, overlayFocusRestore: OverlayFocusRestorePolicy) -> None:
+    def setFocusInternal(self, options: SetFocusInternalOptions) -> None:
+        component = options["component"]
+        overlayFocusRestore = options["overlayFocusRestore"]
         previousFocus = self.focusedComponent
         nextFocus = component
         previousFocusedOverlay = (
@@ -957,7 +964,10 @@ class TuiBase(Container):
         if self.consumeCellSizeResponse(data):
             return
 
-        # MISAKA fork: upstream's debug key (Shift+Ctrl+D -> onDebug) is not ported.
+        # Global debug key handler (Shift+Ctrl+D)
+        if matchesKey(data, "shift+ctrl+d") and self.onDebug:
+            self.onDebug()
+            return
 
         # If focused component is an overlay, verify it's still visible
         # (visibility can change due to terminal resize or visible() callback)
@@ -968,7 +978,7 @@ class TuiBase(Container):
             if topVisible:
                 self.setFocus(topVisible.component)
             else:
-                self.setFocusInternal(component=focusedOverlay.preFocus, overlayFocusRestore="preserve")
+                self.setFocusInternal({"component": focusedOverlay.preFocus, "overlayFocusRestore": "preserve"})
 
         focusIsOverlay = any(o.component is self.focusedComponent for o in self.overlayStack)
         if not focusIsOverlay:

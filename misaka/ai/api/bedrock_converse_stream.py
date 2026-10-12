@@ -658,7 +658,7 @@ def _handleContentBlockStart(
     index = event["contentBlockIndex"]
     start = event.get("start")
 
-    if start and start.get("toolUse"):
+    if start is not None and start.get("toolUse") is not None:
         output.content.append(
             ToolCall(
                 type="toolCall",
@@ -693,14 +693,14 @@ def _handleContentBlockDelta(
         if block.type == "text":
             block.text += delta["text"]
             stream.push(TextDeltaEvent(contentIndex=index, delta=delta["text"], partial=output))
-    elif delta.get("toolUse") and block and block.type == "toolCall":
+    elif delta.get("toolUse") is not None and block and block.type == "toolCall":
         # MISAKA fork: the buffer is a StreamingArgs (sparing re-parses); `arguments` is its current view.
         partialJson = blocks.scratchOf(index).partialJson or StreamingArgs()
         blocks.scratchOf(index).partialJson = partialJson
         partialJson.append(delta["toolUse"].get("input") or "")
         block.arguments = partialJson.arguments
         stream.push(ToolCallDeltaEvent(contentIndex=index, delta=delta["toolUse"].get("input") or "", partial=output))
-    elif delta.get("reasoningContent"):
+    elif delta.get("reasoningContent") is not None:
         thinkingBlock = block
         thinkingIndex = index
 

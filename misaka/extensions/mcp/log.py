@@ -20,11 +20,11 @@ from misaka.utils.js import UNDEFINED, jsonStringify, jsString, toWellFormed
 MAX_LOG_BYTES = 5 * 1024 * 1024
 
 
-def _isRecord(value: Any) -> bool:
+def isRecord(value: Any) -> bool:
     return isinstance(value, dict)
 
 
-def _formatData(data: Any) -> str:
+def formatData(data: Any) -> str:
     if isinstance(data, str):
         return data
     try:
@@ -44,10 +44,10 @@ def formatMcpLogMessage(server: str, params: Any, now: datetime | None = None) -
     """Format one ``notifications/message`` from ``server`` as a log line; continuation lines are indented."""
     if now is None:
         now = datetime.now(UTC)
-    message = params if _isRecord(params) else {"data": params}
+    message = params if isRecord(params) else {"data": params}
     level = message["level"] if isinstance(message.get("level"), str) else "info"
     logger = f" {message['logger']}:" if isinstance(message.get("logger"), str) and message["logger"] else ""
-    text = re.sub(r"\r?\n", "\n    ", _formatData(message.get("data", UNDEFINED)))
+    text = re.sub(r"\r?\n", "\n    ", formatData(message.get("data", UNDEFINED)))
     return f"{_toISOString(now)} [{server}] {level}{logger} {text}\n"
 
 

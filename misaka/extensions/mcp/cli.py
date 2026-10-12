@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import math
 import os
-import re
 import sys
 import threading
 from collections.abc import Callable
@@ -22,17 +21,18 @@ from typing import Any, Literal, NotRequired, TypedDict, cast
 from misaka.config import home
 from misaka.config.engine import APP_NAME
 from misaka.core.mcp_servers import validateMcpServerConfig
-from misaka.core.project_trust import ProjectTrustStore
+from misaka.core.trust_manager import ProjectTrustStore
 from misaka.utils._abort_signal import wait_for_abort
+from misaka.utils.chalk import chalk
 from misaka.utils.js import (
     AbortSignal,
-    errorMessage,
     jsNumber,
     jsObjectOrder,
     jsonStringify,
     jsRound,
     raceAbort,
 )
+from misaka.utils.js import errorMessage as _errorMessage
 from misaka.utils.open_browser import openBrowser
 from misaka.utils.values import signal_aborted
 
@@ -54,55 +54,6 @@ from .runtime import (
 )
 
 
-def _envForceColor() -> int | None:
-    """supports-color's ``FORCE_COLOR``: ``true`` is 1, ``false`` 0, empty 1, else its integer, at most 3."""
-    if "FORCE_COLOR" not in os.environ:
-        return None
-    force = os.environ["FORCE_COLOR"]
-    if force == "true":
-        return 1
-    if force == "false":
-        return 0
-    if len(force) == 0:
-        return 1
-    digits = re.match(r"\s*[+-]?\d+", force)
-    # `Math.min(Number.parseInt(value, 10), 3)`: NaN when it does not start with a number.
-    return min(int(digits.group(0)), 3) if digits is not None else -1
-
-
-def _colour() -> bool:
-    """chalk's level for stdout, as supports-color decides it: ``FORCE_COLOR``, then ``--no-color`` or
-    ``--color`` among the arguments, a terminal, and ``TERM=dumb``. MISAKA fork: ``NO_COLOR`` turns it
-    off too, unless colour is forced."""
-    argv = sys.argv[1 : sys.argv.index("--")] if "--" in sys.argv else sys.argv[1:]
-    force: int | None = None
-    if any(flag in argv for flag in ("--no-color", "--no-colors", "--color=false", "--color=never")):
-        force = 0
-    elif any(flag in argv for flag in ("--color", "--colors", "--color=true", "--color=always")):
-        force = 1
-    fromEnv = _envForceColor()
-    if fromEnv is not None:
-        force = fromEnv
-    if force == 0:
-        return False
-    if force is None and "NO_COLOR" in os.environ:
-        return False
-    if force is None and not (sys.stdout is not None and sys.stdout.isatty()):
-        return False
-    minimum = force if force is not None and force > 0 else 0
-    if os.environ.get("TERM") == "dumb":
-        return minimum > 0
-    return True
-
-
-def _bold(text: str) -> str:
-    return f"\x1b[1m{text}\x1b[22m" if _colour() else text
-
-
-def _dim(text: str) -> str:
-    return f"\x1b[2m{text}\x1b[22m" if _colour() else text
-
-
 def _logPath(agentDir: str) -> str:
     # MISAKA fork: the home keeps the server log with the other logs; another agent directory keeps it inside.
     if os.path.realpath(agentDir) == os.path.realpath(home.home()):
@@ -110,7 +61,8 @@ def _logPath(agentDir: str) -> str:
     return os.path.join(agentDir, "mcp.log")
 
 
-HELP = f"""{_bold("Usage:")}
+# MISAKA fork: the paths name the MISAKA home (`home.display`, `home.DIR_NAME`) where pi names ~/.pi.
+HELP = f"""{chalk.bold("Usage:")}
   {APP_NAME} mcp add <server> [options] -- <command> [args...]
   {APP_NAME} mcp add <server> [options] --url <url>
   {APP_NAME} mcp remove <server> [-l]
@@ -152,7 +104,7 @@ Other options:
   --json                  Print the list as JSON
   --timeout <seconds>     How long login waits for the browser (default: 300)"""
 
-HELP_HINT = _dim(f'Use "{APP_NAME} mcp --help" for usage.')
+HELP_HINT = chalk.dim(f'Use "{APP_NAME} mcp --help" for usage.')
 
 DEFAULT_LOGIN_TIMEOUT_SECONDS = 300
 
@@ -169,7 +121,7 @@ class McpCommandOptions(TypedDict):
     error: NotRequired[Callable[[str], None]]
 
 
-class _ServerReport(TypedDict):
+class ServerReport(TypedDict):
     name: str
     scope: str
     source: str
@@ -187,14 +139,21 @@ class _ServerReport(TypedDict):
     error: NotRequired[str]
 
 
-def _describeTransport(entry: McpServerEntry) -> str:
+
+def errorMessage(error: Any) -> str:
+    """``error instanceof Error ? error.message : String(error)``. A file system error's message is Node's
+    (``uvMessage``)."""
+    return getattr(error, "uvMessage", None) or _errorMessage(error)
+
+
+def describeTransport(entry: McpServerEntry) -> str:
     config = entry["config"]
     if "url" in config:
         return config["url"]  # type: ignore[typeddict-item]
     return " ".join([config["command"], *(config.get("args") or [])])  # type: ignore[typeddict-item]
 
 
-def _createConnection(
+def createConnection(
     entry: McpServerEntry, options: McpCommandOptions, credentials: McpOAuthCredentialStore
 ) -> McpServerConnection:
     return McpServerConnection({
@@ -208,32 +167,32 @@ def _createConnection(
 
 
 # Short spellings of options. `-l`/`--local` match `pi install`; MISAKA fork: misaka has no `install`.
-_OPTION_ALIASES = {"-l": "--local"}
+OPTION_ALIASES = {"-l": "--local"}
 
 type _OptionKind = Literal["flag", "value", "list"]
 
 
 @dataclass(slots=True)
-class _ParsedOptions:
+class ParsedOptions:
     positional: list[str] = field(default_factory=list)
     values: dict[str, str | Literal[True]] = field(default_factory=dict)
     # Values of `list` options, in order.
     lists: dict[str, list[str]] = field(default_factory=dict)
 
 
-def _parseOptions(
+def parseOptions(
     args: list[str],
     known: dict[str, _OptionKind],
     error: Callable[[str], None],
     maxPositionals: float = math.inf,
-) -> _ParsedOptions | None:
+) -> ParsedOptions | None:
     """Parse ``--name value`` options; returns ``None`` and reports unknown ones. ``--`` ends the options,
     as does reaching ``maxPositionals`` positional arguments: the remaining arguments are positional,
     so a command's own options (``add <server> <command> --flag``) are passed through."""
-    parsed = _ParsedOptions()
+    parsed = ParsedOptions()
     index = 0
     while index < len(args):
-        arg = _OPTION_ALIASES.get(args[index], args[index])
+        arg = OPTION_ALIASES.get(args[index], args[index])
         if arg == "--" or len(parsed.positional) >= maxPositionals:
             parsed.positional.extend(args[index + 1 if arg == "--" else index :])
             break
@@ -287,9 +246,9 @@ async def runMcpCommand(args: list[str], options: McpCommandOptions) -> int:
     projectConfig = str(projectDir / "mcp.json") if projectDir is not None else None
     if command == "add" or command == "remove":
         return (
-            _add(rest, projectConfig, options, log, error)
+            add(rest, projectConfig, options, log, error)
             if command == "add"
-            else _remove(rest, projectConfig, options, log, error)
+            else remove(rest, projectConfig, options, log, error)
         )
     projectTrusted = ProjectTrustStore(options["agentDir"]).get(options["cwd"]) is True
     loaded = loadMcpConfig({"agentDir": options["agentDir"], "cwd": options["cwd"], "projectTrusted": projectTrusted})
@@ -303,7 +262,7 @@ async def runMcpCommand(args: list[str], options: McpCommandOptions) -> int:
         credentials = McpOAuthCredentialStore()
 
     if command == "list":
-        parsed = _parseOptions(rest, {"json": "flag"}, error)
+        parsed = parseOptions(rest, {"json": "flag"}, error)
         if parsed is None:
             return 1
         if len(parsed.positional) > 0:
@@ -311,7 +270,7 @@ async def runMcpCommand(args: list[str], options: McpCommandOptions) -> int:
             return 1
         return await _list(loaded, "json" in parsed.values, untrustedNote, options, credentials, log)
     if command == "login" or command == "logout":
-        parsed = _parseOptions(rest, {"timeout": "value"} if command == "login" else {}, error)
+        parsed = parseOptions(rest, {"timeout": "value"} if command == "login" else {}, error)
         if parsed is None:
             return 1
         name = parsed.positional[0] if len(parsed.positional) > 0 else None
@@ -324,7 +283,7 @@ async def runMcpCommand(args: list[str], options: McpCommandOptions) -> int:
             configured = ", ".join(server["name"] for server in loaded["servers"]) or "none"
             error(f'No MCP server named "{name}".{f" {untrustedNote}" if untrustedNote else ""} Configured: {configured}.')
             return 1
-        connection = _createConnection(entry, options, credentials)
+        connection = createConnection(entry, options, credentials)
         url = connection.oauthUrl
         if not url:
             error(f'MCP server "{name}" does not use OAuth. Only HTTP servers without an Authorization header do.')
@@ -339,14 +298,14 @@ async def runMcpCommand(args: list[str], options: McpCommandOptions) -> int:
             error("--timeout must be a positive number of seconds.")
             return 1
         try:
-            return await _login(entry, connection, url, timeout * 1000, options, credentials, log, error)
+            return await login(entry, connection, url, timeout * 1000, options, credentials, log, error)
         finally:
             await connection.close()
     error(f'Unknown mcp command "{command}".\n{HELP_HINT}')
     return 1
 
 
-def _parsePairs(option: str, pairs: list[str] | None, error: Callable[[str], None]) -> dict[str, str] | None:
+def parsePairs(option: str, pairs: list[str] | None, error: Callable[[str], None]) -> dict[str, str] | None:
     """Parse ``KEY=VALUE`` pairs of a repeatable option into a record."""
     if pairs is None:
         return {}
@@ -361,7 +320,7 @@ def _parsePairs(option: str, pairs: list[str] | None, error: Callable[[str], Non
     return jsObjectOrder(record)
 
 
-def _add(
+def add(
     args: list[str],
     projectConfig: str | None,
     options: McpCommandOptions,
@@ -369,7 +328,7 @@ def _add(
     error: Callable[[str], None],
 ) -> int:
     usage = f"Usage: {APP_NAME} mcp add <server> [options] (--url <url> | -- <command> [args...])\n{HELP_HINT}"
-    parsed = _parseOptions(
+    parsed = parseOptions(
         args,
         {
             "local": "flag",
@@ -421,7 +380,7 @@ def _add(
 
     config: dict[str, Any]
     if isinstance(url, str):
-        headers = _parsePairs("header", lists.get("header"), error)
+        headers = parsePairs("header", lists.get("header"), error)
         if headers is None:
             return 1
         bearer = value("bearer-token-env-var")
@@ -440,7 +399,7 @@ def _add(
             **({"oauth": oauth} if len(oauth) > 0 else {}),
         }
     else:
-        env = _parsePairs("env", lists.get("env"), error)
+        env = parsePairs("env", lists.get("env"), error)
         if env is None:
             return 1
         executable, commandArgs = command[0], command[1:]
@@ -486,14 +445,14 @@ def _add(
     return 0
 
 
-def _remove(
+def remove(
     args: list[str],
     projectConfig: str | None,
     options: McpCommandOptions,
     log: Callable[[str], None],
     error: Callable[[str], None],
 ) -> int:
-    parsed = _parseOptions(args, {"local": "flag"}, error)
+    parsed = parseOptions(args, {"local": "flag"}, error)
     if parsed is None:
         return 1
     name = parsed.positional[0] if len(parsed.positional) > 0 else None
@@ -504,7 +463,7 @@ def _remove(
     project = "local" in parsed.values
     globalConfig = os.path.join(options["agentDir"], "mcp.json")
     if project and projectConfig is None:
-        # MISAKA fork: see `_add`.
+        # MISAKA fork: see `add`.
         error(f"There is no project at {options['cwd']} to hold a {home.DIR_NAME}/mcp.json.")
         return 1
     path = projectConfig if project and projectConfig is not None else globalConfig
@@ -544,22 +503,22 @@ async def _list(
     credentials: McpOAuthCredentialStore,
     log: Callable[[str], None],
 ) -> int:
-    async def reportOf(entry: McpServerEntry) -> _ServerReport:
+    async def reportOf(entry: McpServerEntry) -> ServerReport:
         config = entry["config"]
-        report = cast(_ServerReport, {
+        report = cast(ServerReport, {
             "name": entry["name"],
             "scope": entry.get("scope") or "global",
             "source": entry["source"],
             **({"override": entry["override"]} if entry.get("override") else {}),
             "enabled": config.get("enabled") is not False,
             "exposure": config.get("exposure") or "codemode",
-            "transport": _describeTransport(entry),
+            "transport": describeTransport(entry),
             "state": "disabled",
             "tools": [],
         })
         if not report["enabled"]:
             return report
-        connection = _createConnection(entry, options, credentials)
+        connection = createConnection(entry, options, credentials)
         try:
             await connection.getClient()
         except Exception:  # noqa: BLE001, S110 - the connection records the state and error
@@ -629,7 +588,7 @@ async def _list(
     return 1 if failed else 0
 
 
-async def _login(
+async def login(
     entry: McpServerEntry,
     connection: McpServerConnection,
     url: str,
@@ -660,7 +619,7 @@ async def _login(
             openUrl(authorizationUrl.href)
 
         def promptForRedirectUrl(self, signal: Any) -> Any:
-            return _waitForRedirectUrl(signal, interactive)
+            return waitForRedirectUrl(signal, interactive)
 
     try:
         await signInMcpServer({
@@ -688,7 +647,7 @@ async def _login(
     return 0
 
 
-async def _waitForRedirectUrl(signal: Any, interactive: bool) -> str | None:
+async def waitForRedirectUrl(signal: Any, interactive: bool) -> str | None:
     """The pasted redirect URL in a terminal; otherwise only the browser callback can finish the sign-in.
     Resolves to ``None`` when ``signal`` aborts: the callback arrived, or the sign-in timed out."""
     if not interactive:

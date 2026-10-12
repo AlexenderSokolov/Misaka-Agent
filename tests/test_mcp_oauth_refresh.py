@@ -347,9 +347,9 @@ def test_the_default_store_lives_with_the_other_credentials(tmp_path, monkeypatc
 
 
 def test_a_callback_port_written_as_a_float_is_a_port_number():
-    from misaka.extensions.mcp.oauth import _callbackSettings
+    from misaka.extensions.mcp.oauth import callbackSettings
 
-    settings = _callbackSettings({"callbackPort": 8080.0})
+    settings = callbackSettings({"callbackPort": 8080.0})
 
     assert settings.port == 8080 and isinstance(settings.port, int)
     assert settings.fixedRedirectUrl == "http://127.0.0.1:8080/callback"

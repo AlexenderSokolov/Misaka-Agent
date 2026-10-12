@@ -1,4 +1,7 @@
-"""Shared mode exports for coding-agent."""
+"""Translated from pi's ``packages/coding-agent/src/modes/index.ts`` (v1.1.0).
+
+Shared mode exports for coding-agent.
+"""
 
 from __future__ import annotations
 

@@ -752,7 +752,9 @@ class Tool(RuntimeModel):
     def parameters_json_schema(self) -> dict[str, Any]:
         """MISAKA fork: the parameters as a JSON schema, whichever form they were given in."""
         if _is_pydantic_model_type(self.parameters):
-            return self.parameters.model_json_schema()
+            from misaka.ai.utils.typebox_helpers import typeboxSchema
+
+            return typeboxSchema(self.parameters)
         return deepcopy(self.parameters)
 
 

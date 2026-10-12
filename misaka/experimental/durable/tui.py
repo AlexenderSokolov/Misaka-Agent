@@ -6,8 +6,7 @@ MISAKA fork:
 
 - pi's demo runs in the alternate screen with a scrollable transcript and a docked editor (``TuiAltScreen``, ``ScrollView``,
   ``VStack``); MISAKA has only the regular renderer, so the parts are stacked in the order they are docked in pi (transcript,
-  tasks, queue, notices, status, editor, footer) and the terminal scrolls.
-- The working status is shown above the editor; pi embeds it in the editor's border.
+  tasks, queue, notices, editor, footer) and the terminal scrolls.
 """
 
 from __future__ import annotations
@@ -27,7 +26,6 @@ from misaka.ui.tui import (
     Box,
     Container,
     DefaultTextStyle,
-    EditorOptions,
     Input,
     Markdown,
     ProcessTerminal,
@@ -46,7 +44,10 @@ from misaka.ui.tui import (
 from misaka.ui.tui.interactive.components.assistant_message import (
     AssistantMessageComponent,
 )
-from misaka.ui.tui.interactive.components.custom_editor import CustomEditor
+from misaka.ui.tui.interactive.components.custom_editor import (
+    CustomEditor,
+    CustomEditorOptions,
+)
 from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
 from misaka.ui.tui.interactive.components.footer import formatTokens
 from misaka.ui.tui.interactive.components.keybinding_hints import keyText
@@ -168,7 +169,6 @@ class DurableTui:
         self._tasks = Container()
         self._queue = Container()
         self._notices = Container()
-        self._status = Container()
         self._footer = Container()
         self._footerStats = Text("", 1, 0)
         self._footerHints = Text("", 1, 0)
@@ -186,9 +186,11 @@ class DurableTui:
         self._streaming: AssistantMessageComponent | None = None
         self._indicator: WorkingStatusIndicator | None = None
         self._statusText = ""
+        # Set when the transcript was rebuilt: the next render repaints the screen.
+        self._rebuilt = False
         keybindings = KeybindingsManager.create()
         setKeybindings(keybindings)
-        self._editor = CustomEditor(self._ui, getEditorTheme(), keybindings, EditorOptions(paddingX=1))
+        self._editor = CustomEditor(self._ui, getEditorTheme(), keybindings, CustomEditorOptions(paddingX=1, embedWorkingStatus=True))
         self._editor.onSubmit = handlers["submit"]
         self._editor.onEscape = handlers["abort"]
         self._editor.onCtrlD = handlers["exit"]
@@ -219,7 +221,7 @@ class DurableTui:
         # One empty line between the transcript and everything below it.
         self._ui.addChild(self._chat)
         self._ui.addChild(Spacer(1))
-        for component in (self._tasks, self._queue, self._notices, self._status, self._editorContainer, self._footer):
+        for component in (self._tasks, self._queue, self._notices, self._editorContainer, self._footer):
             self._ui.addChild(component)
         self._ui.setFocus(self._editor)
 
@@ -291,7 +293,8 @@ class DurableTui:
         self._editor.borderColor = theme.getThinkingBorderColor(agentOf(conversation).get("thinkingLevel") or "off")
         self._syncStatus(live)
         self._syncFooter(view)
-        self._ui.requestRender()
+        self._ui.requestRender(self._rebuilt)
+        self._rebuilt = False
 
     def _syncTasks(self, graph: dict[str, Any] | None) -> None:
         self._tasks.clear()
@@ -358,12 +361,10 @@ class DurableTui:
         self._statusText = text
         if self._indicator is not None:
             self._indicator.dispose()
-        self._status.clear()
         self._indicator = (
             WorkingStatusIndicator(self._ui, text, None, lambda part: self._editor.borderColor(part)) if text else None
         )
-        if self._indicator is not None:
-            self._status.addChild(self._indicator)
+        self._editor.setWorkingStatusIndicator(self._indicator)
 
     def _syncFooter(self, view: dict[str, Any]) -> None:
         conversation = view["conversation"]
@@ -424,6 +425,7 @@ class DurableTui:
         self._chat.clear()
         self._discardTools()
         self._summaries.clear()
+        self._rebuilt = True
         self._renderedEntryIds = []
         self._streaming = None
         for entry in entries:
@@ -638,12 +640,7 @@ async def runDurableTui(source: Any, controller: Any, settings: Any) -> None:
     holder["view"] = view
 
     # pi's theme handling: the theme setting (also light/dark pairs) resolved against the terminal.
-    themes = InteractiveThemeController(
-        view.ui,
-        getSettingsManager=lambda: settings,
-        showError=lambda message: print(message, file=sys.stderr),
-        onChanged=lambda: view.ui.requestRender(),
-    )
+    themes = InteractiveThemeController(view.ui, {"getSettingsManager": lambda: settings, "showError": lambda message: print(message, file=sys.stderr), "onChanged": lambda: view.ui.requestRender()})
     unsubscribe = source.subscribe(lambda: view.apply(source.current()))
     view.start()
     themes.applyFromSettings()

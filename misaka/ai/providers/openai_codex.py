@@ -17,11 +17,7 @@ def openaiCodexProvider() -> Provider:
             name="OpenAI Codex (legacy)",
             baseUrl="https://chatgpt.com/backend-api",
             auth=ProviderAuth(
-                oauth=lazyOAuth(
-                    name="OpenAI (ChatGPT Plus/Pro)",
-                    isSubscription=True,
-                    load=loadOpenAICodexOAuth,
-                ),
+                oauth=lazyOAuth({"name": "OpenAI (ChatGPT Plus/Pro)", "isSubscription": True, "load": loadOpenAICodexOAuth}),
             ),
             models=list(OPENAI_CODEX_MODELS.values()),
             api=openAICodexResponsesApi(),

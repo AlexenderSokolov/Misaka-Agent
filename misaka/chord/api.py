@@ -1,13 +1,12 @@
 """Chord's entry points.
 
-Translated from pi's ``packages/chord/src/api.ts``. ``defineService(id, local=True)`` takes the keyword where
-upstream takes an options object.
+Translated from pi's ``packages/chord/src/api.ts``.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from misaka.chord.facets.host import FacetKernel
@@ -117,12 +116,14 @@ def defineFacet(facet: Facet) -> Facet:
     return facet
 
 
-def defineService[T](id: str, *, local: bool = False) -> Service[T]:
+def defineService[T](id: str, options: Mapping[str, bool] | None = None) -> Service[T]:
     if len(id) == 0:
         raise TypeError("Service ID must not be empty")
+    # TODO: check if the reserved namespace should be part of Chord.
     if id.startswith("$chord."):
         raise TypeError("Service IDs beginning with $chord. are reserved")
-    return Service(id, local)
+    local = options.get("local") if options is not None else None
+    return Service(id, local if local is not None else False)
 
 
 def createRemoteServiceBinding(options: RemoteServiceBindingOptions) -> RemoteServiceBinding:

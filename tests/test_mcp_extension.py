@@ -403,9 +403,9 @@ async def test_blocks_missing_fields_convert_as_javascript_reads_them():
 
 
 def test_tool_annotations_that_are_not_an_object_have_no_hints():
-    from misaka.extensions.mcp.tools import _toToolAnnotations
+    from misaka.extensions.mcp.tools import toToolAnnotations
 
-    assert _toToolAnnotations({"name": "t", "inputSchema": {}, "annotations": "readOnly"}) is None  # type: ignore[typeddict-item]
+    assert toToolAnnotations({"name": "t", "inputSchema": {}, "annotations": "readOnly"}) is None  # type: ignore[typeddict-item]
 
 
 def test_a_json_rpc_id_past_the_double_range_is_not_an_id():

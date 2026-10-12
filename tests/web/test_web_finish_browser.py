@@ -240,7 +240,7 @@ async def test_nous_device_code_real_auth_store(monkeypatch, isolated, capsys):
     from misaka.cli.web import login_and_store
     await login_and_store(gateway.nousOAuth, gateway._auth_path(), 'nous')
     assert 'Device code: ABCD' in capsys.readouterr().out
-    assert gateway.storage().data.get('nous')['access'] == 'new-token'
+    assert gateway.storage().readState.data.get('nous')['access'] == 'new-token'
     assert [r.url.path for r in requests] == ['/api/oauth/device/code', '/api/oauth/token']
     assert b'client_id=hermes-cli' in requests[0].content
 
@@ -465,7 +465,7 @@ async def test_real_session_empty_ceiling_and_browser_use_readonly_fallback(monk
                                     'noContextFiles': True, 'noPromptTemplates': True, 'noThemes': True})
     await loader.reload()
     session = (await createAgentSession({'cwd': str(isolated), 'agentDir': str(isolated),
-        'modelRuntime': await ModelRuntime.create(authStorage=auth, modelsPath=None),
+        'modelRuntime': await ModelRuntime.create({"authStorage": auth, "modelsPath": None}),
         'resourceLoader': loader, 'parts': [owner],
         'customTools': list(owner.tools), 'sessionManager': SessionManager.inMemory(str(isolated))}))['session']
     try:

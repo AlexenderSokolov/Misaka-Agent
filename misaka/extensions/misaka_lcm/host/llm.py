@@ -53,7 +53,7 @@ def _stored(registry, provider):
     synchronous paths here cannot await the store's ``read``."""
     from misaka.core.auth_storage import _coerce_storage_object
 
-    return _coerce_storage_object(registry.authStorage.data).get(provider)
+    return _coerce_storage_object(registry.authStorage.readState.data).get(provider)
 
 
 def usage_dict(usage) -> dict:

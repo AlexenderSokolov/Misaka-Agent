@@ -325,7 +325,7 @@ async def make_session(tmp_path, factories, *, allowed=None):
                                     "extensionFactories": factories, "noExtensions": True})
     await loader.reload()
     options = {"cwd": str(tmp_path), "agentDir": str(tmp_path / "agent"),
-               "modelRuntime": await ModelRuntime.create(authStorage=storage, modelsPath=None),
+               "modelRuntime": await ModelRuntime.create({"authStorage": storage, "modelsPath": None}),
                "resourceLoader": loader,
                "sessionManager": SessionManager.inMemory(str(tmp_path)),
                "parts": [owner], "customTools": list(owner.tools)}
@@ -482,7 +482,7 @@ def test_cli_discovers_explicit_plugin_once_and_does_not_leak_it(tmp_path, capsy
 
 def test_cli_project_extension_requires_explicit_selection_even_when_trusted(tmp_path, capsys):
     from misaka.config import CONFIG_DIR_NAME
-    from misaka.core.project_trust import ProjectTrustStore
+    from misaka.core.trust_manager import ProjectTrustStore
 
     path, marker = tmp_path / CONFIG_DIR_NAME / "extensions" / "plugin.py", tmp_path / "executed"
     plugin_file(path, marker)

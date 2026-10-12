@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypedDict, TypeGuard
 from urllib.parse import unquote
 
-from misaka.utils.js import UNDEFINED, jsLength, jsonStringify, jsTrim
+from misaka.utils.js import UNDEFINED, jsLength, jsonStringify, jsTrim, nullishCoalesce
 from misaka.utils.values import read_field
 
 from .identifier import toCodemodeIdentifier
@@ -134,8 +134,7 @@ def renderDeclarations(options: RenderDeclarationsOptions) -> str:
     return "\n\n".join(sections)
 
 
-def renderToolSignature(tool: Any, inputMaxChars: int | None = None) -> str:
-    # MISAKA fork: `inputMaxChars` is a positional argument, where upstream takes `{ inputMaxChars }`.
+def renderToolSignature(tool: Any, options: Mapping[str, int] | None = None) -> str:
     """One tool as a member of the ``tools`` object: ``name(args: T): Promise<R>;`` with the name as
     the identifier scripts use. Input types longer than ``inputMaxChars`` render as ``unknown``. Tools
     whose output schema is an MCP ``CallToolResult`` render as ``Promise<CallToolResult<T>>``, which
@@ -144,17 +143,19 @@ def renderToolSignature(tool: Any, inputMaxChars: int | None = None) -> str:
     input = (
         "unknown"
         if inputSchema is None
-        else schemaToType(inputSchema, inputMaxChars if inputMaxChars is not None else DEFAULT_INPUT_SCHEMA_MAX_CHARS)
+        else schemaToType(
+            inputSchema,
+            {"maxChars": nullishCoalesce((options or {}).get("inputMaxChars"), DEFAULT_INPUT_SCHEMA_MAX_CHARS)},
+        )
     )
     output = renderToolOutputType(read_field(tool, "outputSchema"))
     return f"{toCodemodeIdentifier(read_field(tool, 'name'))}(args: {input}): Promise<{output}>;"
 
 
-def renderToolSample(tool: Any, inputMaxChars: int | None = None) -> str:
-    # MISAKA fork: `inputMaxChars` is a positional argument, where upstream takes `{ inputMaxChars }`.
+def renderToolSample(tool: Any, options: Mapping[str, int] | None = None) -> str:
     """A tool's sample: the description followed by the tool's declaration. Used for tool listings
     and ``ALL_TOOLS`` entries."""
-    declaration = f"declare const tools: {{ {renderToolSignature(tool, inputMaxChars)} }};"
+    declaration = f"declare const tools: {{ {renderToolSignature(tool, options)} }};"
     description = read_field(tool, "description")
     return f"{jsTrim(description) if description is not None else ''}\n\ncodemode tool declaration:\n```ts\n{declaration}\n```"
 
@@ -227,14 +228,14 @@ def union(types: Sequence[str]) -> str:
     return "never" if len(unique) == 0 else " | ".join(unique)
 
 
-def schemaToType(schema: CodemodeJsonSchema, maxChars: int | None = None) -> str:
+def schemaToType(schema: CodemodeJsonSchema, options: Mapping[str, int] | None = None) -> str:
     """Convert a JSON Schema to a TypeScript type expression: objects on one line
     (``{ a: string; b?: number; }``) with properties sorted by name, or one property per line with
     ``//`` comments when a property has a description; ``Array<T>`` for arrays. Local references
     (``#/$defs/...``, ``#/definitions/...``) resolve against ``schema``; recursive and remote
     references render as ``unknown``. A result longer than ``maxChars`` renders as ``unknown``."""
-    # MISAKA fork: `maxChars` is a positional argument, where upstream takes `{ maxChars }`.
     type = toType(schema, SchemaContext(root=schema))
+    maxChars = (options or {}).get("maxChars")
     return "unknown" if maxChars is not None and jsLength(type) > maxChars else type
 
 
@@ -333,13 +334,11 @@ def toType(schema: Any, context: SchemaContext) -> str:
 
 
 def _stringifyOrUnknown(value: Any) -> str:
-    """``JSON.stringify(value) ?? "unknown"``."""
-    if value is UNDEFINED:
+    """``JSON.stringify(value) ?? "unknown"``: undefined and functions have no JSON; a value that cannot be
+    serialized (circular) throws."""
+    if value is UNDEFINED or callable(value):
         return "unknown"
-    try:
-        return jsonStringify(value)
-    except (TypeError, ValueError):
-        return "unknown"
+    return jsonStringify(value)
 
 
 def arrayType(schema: dict[str, Any], context: SchemaContext) -> str:

@@ -133,8 +133,9 @@ class OutOfMemoryError(RuntimeError):
 
 
 class ScriptSyntaxError(Exception):
-    """A script (or the prelude) did not parse. ``describe()`` is the `{ name, message, stack }` the
-    worker reports, in the shape QuickJS reported it."""
+    """A script (or the prelude) did not parse, or threw at the top level while it was compiled (its source
+    can close the wrapper function). ``describe()`` is the `{ name, message, stack }` the worker reports, in
+    the shape QuickJS reported it."""
 
     def __init__(self, name: str, message: str, line: int | None, fileName: str) -> None:
         super().__init__(f"{name}: {message}")
@@ -171,6 +172,9 @@ class Vm:
         racer = _module()
         self._parseError = racer.JSParseException
         self._outOfMemory = racer.JSOOMException
+        self._evalError = racer.JSEvalException
+        # Termination and timeouts end a run; they are not the script's exception (`_exc` is where 0.14 keeps the first).
+        self._stopped = (racer._exc.JSTerminatedException, racer.JSTimeoutException)
         try:
             self._racer = racer.MiniRacer()
         except Exception as error:
@@ -190,13 +194,13 @@ class Vm:
     async def run(self, code: str, fileName: str | None = None) -> Any:
         """Evaluate ``code``, which may run script code. Cancelling the awaiting task terminates the
         script; the result is the value of the last expression. With a ``fileName`` the code is a
-        script's source and a parse error raises :class:`ScriptSyntaxError`."""
+        script's source, and a parse error or an exception it throws raises :class:`ScriptSyntaxError`."""
         try:
             return await self._racer.eval_cancelable(code if fileName is None else f"{code}\n//# sourceURL={fileName}")
         except self._outOfMemory as error:
             raise OutOfMemoryError(str(error)) from error
-        except self._parseError as error:
-            if fileName is None:
+        except self._evalError as error:
+            if fileName is None or isinstance(error, self._stopped):
                 raise
             raise _syntaxError(error, fileName) from None
 

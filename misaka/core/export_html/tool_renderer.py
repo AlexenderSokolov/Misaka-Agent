@@ -115,7 +115,7 @@ class _Renderer:
 
     def _getState(self, toolCallId: str) -> Any:
         state = self._renderedStates.get(toolCallId)
-        if not state:
+        if state is None:
             state = {}
             self._renderedStates[toolCallId] = state
         return state

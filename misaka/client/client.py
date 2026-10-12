@@ -157,14 +157,14 @@ class Client:
         self._attachment: SessionTarget | None = None
         self._disposed = False
         self._disposePromise: asyncio.Future[None] | None = None
-        self._connection = Connection(
-            transportFactory=options["transportFactory"],
-            serverId=options["serverId"],
-            maxFrameLength=options.get("maxFrameLength"),
-            onHandshake=self._onHandshake,
-            onMessage=self._handleMessage,
-            onStateChange=self._handleConnectionStateChange,
-        )
+        self._connection = Connection({
+            "transportFactory": options["transportFactory"],
+            "serverId": options["serverId"],
+            "maxFrameLength": options.get("maxFrameLength"),
+            "onHandshake": self._onHandshake,
+            "onMessage": self._handleMessage,
+            "onStateChange": self._handleConnectionStateChange,
+        })
 
     def _onHandshake(self, hello: ServerHello) -> None:
         self._hello = hello
@@ -491,6 +491,11 @@ def _sameTarget(left: SessionTarget | None, right: SessionTarget | None) -> bool
     )
 
 
+def createClientServiceTransport(client: Client, getTarget: Callable[[], RpcTarget | None]) -> RemoteServiceTransport:
+    """Adapts a lazily resolved routed client target to a Chord service transport."""
+    return _ClientServiceTransport(client, getTarget)  # type: ignore[return-value]
+
+
 
 def abortError(signal: Any) -> Exception:
     reason = getattr(signal, "reason", None)
@@ -531,11 +536,6 @@ class _TransportSubscription:
     def close(self, context: Any = None) -> Awaitable[None]:
         # An async function runs at once, so the unsubscribe request is sent before this returns.
         return startTask(self._subscription.dispose())
-
-
-def createClientServiceTransport(client: Client, getTarget: Callable[[], RpcTarget | None]) -> RemoteServiceTransport:
-    """Adapts a lazily resolved routed client target to a Chord service transport."""
-    return _ClientServiceTransport(client, getTarget)  # type: ignore[return-value]
 
 
 __all__ = ["Client", "connectClient", "createClientServiceTransport"]

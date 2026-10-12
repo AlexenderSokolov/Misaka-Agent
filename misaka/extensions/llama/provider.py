@@ -82,7 +82,7 @@ async def routerAutoloadEnabled(
     ):
         return False
     try:
-        return (await client.props(signal=signal)).models_autoload is True
+        return (await client.props({"signal": signal})).models_autoload is True
     except Exception:  # noqa: BLE001 - old/erroring servers fail closed
         return False
 
@@ -225,7 +225,7 @@ def createLlamaProvider() -> LlamaProviderController:
             jsTrim(enteredUrl) or os.environ.get("LLAMA_BASE_URL") or DEFAULT_LLAMA_SERVER_URL
         )
         apiKey = jsTrim(await interaction.prompt(SecretPrompt(message="API key (optional)")))
-        await LlamaClient(serverUrl, apiKey or None).list(signal=interaction.signal)
+        await LlamaClient(serverUrl, apiKey or None).list({"signal": interaction.signal})
         return ApiKeyCredential(key=apiKey or None, env={"LLAMA_BASE_URL": serverUrl})
 
     async def check(*, ctx: Any, credential: ApiKeyCredential | None = None, signal: Any = None) -> AuthCheck | None:
@@ -279,7 +279,7 @@ def createLlamaProvider() -> LlamaProviderController:
         if not serverUrl:
             return
         client = LlamaClient(serverUrl, context.credential.key)
-        catalog = await client.list(signal=context.signal)
+        catalog = await client.list({"signal": context.signal})
         if signal_aborted(context.signal):
             return
         routerAutoload = await routerAutoloadEnabled(client, catalog, context.signal)
@@ -295,7 +295,7 @@ def createLlamaProvider() -> LlamaProviderController:
             cachedContextWindow = cachedContextWindows.get(model.id)
             if model.status.value != "loaded":
                 return toPiModel(model, serverUrl, None, cachedContextWindow)
-            props = await client.props(model=model.id, signal=context.signal)
+            props = await client.props({"model": model.id, "signal": context.signal})
             return toPiModel(model, serverUrl, props, cachedContextWindow)
 
         refreshed = list(await asyncio.gather(*(refresh(model) for model in selectable if isChatModel(model))))

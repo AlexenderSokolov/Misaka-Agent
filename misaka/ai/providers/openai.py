@@ -21,12 +21,7 @@ def openaiProvider() -> Provider:
             baseUrl="https://api.openai.com/v1",
             auth=ProviderAuth(
                 apiKey=envApiKeyAuth("OpenAI API key", ["OPENAI_API_KEY"]),
-                oauth=lazyOAuth(
-                    name="OpenAI (ChatGPT subscription)",
-                    isSubscription=True,
-                    loginLabel="Sign in with ChatGPT",
-                    load=loadOpenAIChatGPTOAuth,
-                ),
+                oauth=lazyOAuth({"name": "OpenAI (ChatGPT subscription)", "isSubscription": True, "loginLabel": "Sign in with ChatGPT", "load": loadOpenAIChatGPTOAuth}),
             ),
             models=[
                 *OPENAI_MODELS.values(),
