@@ -226,3 +226,28 @@ def test_the_command_reads_no_project_settings_before_the_project_is_trusted(tmp
     assert mcp_extension.command(["list"]) == 0
     assert proxies == [None]
     assert sorted(os.listdir(project / ".misaka")) == ["settings.json"]
+
+
+def test_as_picks_a_sisters_own_mcp_json_and_last_order_s_is_the_default(monkeypatch, tmp_path, capsys):
+    """MISAKA fork: like `hermes -p <profile> mcp`, `--as <Sister>` (before `--`) uses her profile's `mcp.json`;
+    without it, Last Order's. The home keeps none."""
+    import misaka.core.http_dispatcher as dispatcher
+    import misaka.extensions.mcp as mcp_extension
+
+    monkeypatch.setattr(dispatcher, "applyHttpProxySettings", lambda _proxy: None)
+    monkeypatch.setattr(dispatcher, "configureHttpDispatcher", lambda: None)
+    monkeypatch.chdir(tmp_path)
+    sister = home.path("profiles_root") / "10032"
+    sister.mkdir(parents=True)
+
+    assert mcp_extension.command(["--as", "10032", "add", "docs", "--", "docs-mcp", "--as", "kept"]) == 0
+    assert readConfig(str(sister / "mcp.json"))["mcpServers"]["docs"]["args"] == ["--as", "kept"]
+    assert f"{APP_NAME} mcp --as 10032 list" in capsys.readouterr().out
+
+    assert mcp_extension.command(["add", "web", "--", "web-mcp"]) == 0
+    assert list(readConfig(str(home.path("roles_root") / "last_order" / "mcp.json"))["mcpServers"]) == ["web"]
+    assert list(readConfig(str(sister / "mcp.json"))["mcpServers"]) == ["docs"]
+    assert not home.path("mcp_config").exists()
+
+    assert mcp_extension.command(["--as", "20001", "list"]) == 1
+    assert "Unknown Sister '20001'" in capsys.readouterr().err

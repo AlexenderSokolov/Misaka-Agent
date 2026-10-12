@@ -56,6 +56,7 @@ from misaka.config import (
     get_auth_path,
     get_debug_log_path,
     home,
+    profiles,
 )
 from misaka.config.engine import detectInstallChange
 from misaka.core.agent_session import parseSkillBlock
@@ -6444,13 +6445,15 @@ class InteractiveMode:
         # does not load it.
         from misaka.extensions.mcp.config import addMcpServerConfig, loadMcpConfig
 
-        mcpPath = os.path.join(get_agent_dir(), "mcp.json")
+        # MISAKA fork: the global mcp.json is this window's role's own (`profiles.mcp_dir`).
+        mcpDir = profiles.mcp_dir(self.settingsManager.getModelProfile())
+        mcpPath = os.path.join(mcpDir, "mcp.json")
 
         def normalizeUrl(url: str) -> str:
             return re.sub(r"/+\Z", "", url)
 
         servers = loadMcpConfig({
-            "agentDir": get_agent_dir(),
+            "agentDir": mcpDir,
             "cwd": self.sessionManager.getCwd(),
             "projectTrusted": False,
         })["servers"]

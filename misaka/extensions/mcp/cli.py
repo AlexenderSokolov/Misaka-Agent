@@ -61,7 +61,8 @@ def _logPath(agentDir: str) -> str:
     return os.path.join(agentDir, "mcp.log")
 
 
-# MISAKA fork: the paths name the MISAKA home (`home.display`, `home.DIR_NAME`) where pi names ~/.pi.
+# MISAKA fork: the paths name the MISAKA home (`home.display`, `home.DIR_NAME`) where pi names ~/.pi, and the
+# global file is a role's (`--as`).
 HELP = f"""{chalk.bold("Usage:")}
   {APP_NAME} mcp add <server> [options] -- <command> [args...]
   {APP_NAME} mcp add <server> [options] --url <url>
@@ -71,7 +72,8 @@ HELP = f"""{chalk.bold("Usage:")}
   {APP_NAME} mcp logout <server>
 
 Configure and check MCP servers and sign in to OAuth servers without starting a session.
-Reads {home.display(home.path("mcp_config"))} and, in trusted projects, {home.DIR_NAME}/mcp.json.
+Reads Last Order's {home.display(home.path("roles_root") / "last_order" / "mcp.json")} (a Sister's own with --as)
+and, in trusted projects, {home.DIR_NAME}/mcp.json.
 
 Commands:
   add <server>            Add or replace a server in mcp.json
@@ -101,6 +103,7 @@ Options for add:
   --description <text>    What the server offers, shown in the system prompt
 
 Other options:
+  --as <Sister>           Use the Sister's mcp.json and sign-ins instead of Last Order's
   --json                  Print the list as JSON
   --timeout <seconds>     How long login waits for the browser (default: 300)"""
 
@@ -112,6 +115,10 @@ DEFAULT_LOGIN_TIMEOUT_SECONDS = 300
 class McpCommandOptions(TypedDict):
     cwd: str
     agentDir: str
+    # MISAKA fork: the directory of the global `mcp.json`, a role's profile. Defaults to `agentDir`.
+    mcpDir: NotRequired[str]
+    # MISAKA fork: the Sister `--as` named, repeated in the commands the output suggests.
+    asRole: NotRequired[str]
     # Defaults to `mcp-auth.json` under the home's credentials.
     credentials: NotRequired[McpOAuthCredentialStore]
     # Defaults to the platform browser.
@@ -151,6 +158,15 @@ def describeTransport(entry: McpServerEntry) -> str:
     if "url" in config:
         return config["url"]  # type: ignore[typeddict-item]
     return " ".join([config["command"], *(config.get("args") or [])])  # type: ignore[typeddict-item]
+
+
+def _mcpDir(options: McpCommandOptions) -> str:
+    return options.get("mcpDir") or options["agentDir"]
+
+
+def _command(options: McpCommandOptions) -> str:
+    asRole = options.get("asRole")
+    return f"{APP_NAME} mcp --as {asRole}" if asRole else f"{APP_NAME} mcp"
 
 
 def createConnection(
@@ -251,7 +267,7 @@ async def runMcpCommand(args: list[str], options: McpCommandOptions) -> int:
             else remove(rest, projectConfig, options, log, error)
         )
     projectTrusted = ProjectTrustStore(options["agentDir"]).get(options["cwd"]) is True
-    loaded = loadMcpConfig({"agentDir": options["agentDir"], "cwd": options["cwd"], "projectTrusted": projectTrusted})
+    loaded = loadMcpConfig({"agentDir": _mcpDir(options), "cwd": options["cwd"], "projectTrusted": projectTrusted})
     untrustedNote = (
         f"{projectConfig} is ignored because the project is not trusted. Start {APP_NAME} in the project to trust it."
         if not projectTrusted and projectConfig is not None and os.path.exists(projectConfig)
@@ -424,7 +440,7 @@ def add(
         # MISAKA fork: a project file needs a project directory, which the home root is not.
         error(f"There is no project at {options['cwd']} to hold a {home.DIR_NAME}/mcp.json.")
         return 1
-    path = projectConfig if project and projectConfig is not None else os.path.join(options["agentDir"], "mcp.json")
+    path = projectConfig if project and projectConfig is not None else os.path.join(_mcpDir(options), "mcp.json")
     scope = "project" if project else "global"
     try:
         replaced = addMcpServerConfig(path, name, validated)
@@ -439,8 +455,8 @@ def add(
         header.lower() == "authorization" for header in (validated.get("headers") or {})  # type: ignore[attr-defined]
     )
     log(
-        f"Check it with: {APP_NAME} mcp list"
-        f"{f'. If it requires sign-in: {APP_NAME} mcp login {name}' if mayNeedSignIn else ''}"
+        f"Check it with: {_command(options)} list"
+        f"{f'. If it requires sign-in: {_command(options)} login {name}' if mayNeedSignIn else ''}"
     )
     return 0
 
@@ -461,7 +477,7 @@ def remove(
         error(f"Usage: {APP_NAME} mcp remove <server> [-l]\n{HELP_HINT}")
         return 1
     project = "local" in parsed.values
-    globalConfig = os.path.join(options["agentDir"], "mcp.json")
+    globalConfig = os.path.join(_mcpDir(options), "mcp.json")
     if project and projectConfig is None:
         # MISAKA fork: see `add`.
         error(f"There is no project at {options['cwd']} to hold a {home.DIR_NAME}/mcp.json.")
@@ -480,7 +496,7 @@ def remove(
         (
             server
             for server in loadMcpConfig({
-                "agentDir": options["agentDir"],
+                "agentDir": _mcpDir(options),
                 "cwd": options["cwd"],
                 "projectTrusted": True,
             })["servers"]
@@ -559,7 +575,7 @@ async def _list(
         return 1 if failed else 0
     if len(reports) == 0 and len(loaded["errors"]) == 0:
         log(
-            f"No MCP servers configured. Add them to {os.path.join(options['agentDir'], 'mcp.json')} or {home.DIR_NAME}/mcp.json."
+            f"No MCP servers configured. Add them to {os.path.join(_mcpDir(options), 'mcp.json')} or {home.DIR_NAME}/mcp.json."
         )
     for entry in reports:
         state = (
@@ -572,7 +588,7 @@ async def _list(
         if entry.get("override"):
             log(f"  project override: {entry['override']}")
         if entry["state"] == "needs-auth":
-            log(f"  sign in with: {APP_NAME} mcp login {entry['name']}")
+            log(f"  sign in with: {_command(options)} login {entry['name']}")
         if len(entry["tools"]) > 0:
             overridden = entry.get("toolExposure") or {}
             tools = [f"{tool} [{overridden[tool]}]" if overridden.get(tool) else tool for tool in entry["tools"]]

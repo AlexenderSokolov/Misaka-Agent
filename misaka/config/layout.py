@@ -29,13 +29,15 @@ README = """# MISAKA profiles
 
 One directory per role: personality, skills, sub-agent types and MCP servers live here, never
 in the source tree. A role directory overlays the home above it -- what a role does not
-define, it shares with every other role.
+define, it shares with every other role. MCP servers are the exception: each role connects
+only her own, and the home has none.
 
     last_order/        Last Order, the coordinator
       SOUL.md          her voice -- OPTIONAL; shared duties and role charter are kept
       settings.json    what she holds of her own: "defaultProvider"/"defaultModel" (the model
                        she starts on; /model Ctrl+S writes it), "web"
-      mcp.json         MCP servers only she connects, on top of the home's mcp.json
+      mcp.json         her MCP servers (`misaka mcp`, `/mcp` in her window)
+      credentials/     her MCP sign-ins (mcp-auth.json)
       skills/          skills only she sees
       subagents/       sub-agent types only she sees
     sisters/<id>/      one per Sister, same layout (`misaka create <id>` builds it)

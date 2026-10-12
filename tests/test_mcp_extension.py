@@ -292,45 +292,6 @@ def test_validates_provider_auth_and_accepts_it_only_in_the_global_mcp_json(tmp_
         assert fragment in error
 
 
-def test_roles_are_isolated_last_order_owns_the_global_mcp_json(tmp_path):
-    """MISAKA fork: the global file is Last Order's, with her own `profiles/last_order/mcp.json` over it; a
-    Sister reads only `profiles/<role>/mcp.json`. The project file applies to every role."""
-    paths = setup(
-        tmp_path,
-        {"mcpServers": {"shared": {"command": "global-cmd"}, "docs": {"command": "x"}}},
-        {"mcpServers": {"project-tool": {"command": "project-cmd"}}},
-    )
-    profilesRoot = tmp_path / "profiles"
-    sister = profilesRoot / "sisters" / "10032"
-    sister.mkdir(parents=True)
-    (sister / "mcp.json").write_text(
-        json.dumps({"mcpServers": {"shared": {"command": "role-cmd"}, "camofox": {"command": "npx"}}}), encoding="utf-8"
-    )
-    loaded = loadMcpConfig({**paths, "projectTrusted": True, "roleDir": str(sister)})
-    assert [(server["name"], server.get("scope"), server["config"]["command"]) for server in loaded["servers"]] == [
-        ("shared", "role", "role-cmd"),
-        ("camofox", "role", "npx"),
-        ("project-tool", "project", "project-cmd"),
-    ]
-    # A Sister without a file of her own has none of Last Order's servers.
-    bare = profilesRoot / "sisters" / "20001"
-    bare.mkdir(parents=True)
-    assert loadMcpConfig({**paths, "projectTrusted": False, "roleDir": str(bare)})["servers"] == []
-
-    # Last Order reads the global file, and her own role file over it.
-    lastOrder = profilesRoot / "last_order"
-    lastOrder.mkdir(parents=True)
-    (lastOrder / "mcp.json").write_text(json.dumps({"mcpServers": {"docs": {"command": "lo-docs"}}}), encoding="utf-8")
-    hers = loadMcpConfig({**paths, "projectTrusted": False, "roleDir": str(lastOrder)})
-    assert [(server["name"], server.get("scope"), server["config"]["command"]) for server in hers["servers"]] == [
-        ("shared", "global", "global-cmd"),
-        ("docs", "role", "lo-docs"),
-    ]
-    # A session without a role directory reads the global file, once.
-    same = loadMcpConfig({**paths, "projectTrusted": False, "roleDir": paths["agentDir"]})
-    assert [server["name"] for server in same["servers"]] == ["shared", "docs"]
-
-
 # -- MCP tools ------------------------------------------------------------------------------------
 
 

@@ -58,7 +58,8 @@ LAYOUT: dict[str, Entry] = {
     "settings": Entry("settings.json", "edit"),
     "models": Entry("models.json", "edit"),
     "keybindings": Entry("keybindings.json", "edit"),
-    # The global MCP servers (`mcpServers`); a role directory may hold its own, and a trusted project too.
+    # A role's MCP servers (`mcpServers`), in her role directory only (`profiles.mcp_dir`): the home keeps
+    # none. A trusted project may add its own.
     "mcp_config": Entry("mcp.json", "edit"),
     # The shared layer: what every role sees. A role directory overlays it, first match winning.
     "shared_soul": Entry("MISAKA.md", "edit"),
@@ -77,6 +78,7 @@ LAYOUT: dict[str, Entry] = {
     "credentials": Entry("credentials", "secret", 0o700),
     "auth": Entry("credentials/auth.json", "secret", 0o600),
     "vault": Entry("credentials/vault", "secret", 0o700),
+    # A role's MCP sign-ins, beside her `mcp.json` in her role directory; the home keeps none.
     "mcp_auth": Entry("credentials/mcp-auth.json", "secret", 0o600),
     "db": Entry("state/board.db", "state"),
     "messages_db": Entry("state/messages.db", "state"),

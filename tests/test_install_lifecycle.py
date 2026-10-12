@@ -212,13 +212,16 @@ def _seed_home(root: Path) -> None:
 
 def test_an_update_snapshot_holds_settings_credentials_boards_and_roles(fresh_home, monkeypatch):
     _seed_home(fresh_home)
-    home.path("mcp_config").write_text('{"mcpServers": {}}', encoding="utf-8")
-    home.path("mcp_config", home.path("roles_root") / "last_order").write_text('{"mcpServers": {}}', encoding="utf-8")
+    lastOrder = home.path("roles_root") / "last_order"
+    home.path("mcp_config", lastOrder).write_text('{"mcpServers": {}}', encoding="utf-8")
+    home.path("mcp_auth", lastOrder).parent.mkdir(parents=True)
+    home.path("mcp_auth", lastOrder).write_text("{}", encoding="utf-8")
     shot = backup.snapshot("update")
     assert (shot / "settings.json").read_text(encoding="utf-8") == '{"a": 1}'
     assert (shot / "credentials" / "auth.json").exists()
     assert (shot / "profiles" / "last_order" / "settings.json").exists()
-    assert (shot / "mcp.json").exists() and (shot / "profiles" / "last_order" / "mcp.json").exists()
+    assert (shot / "profiles" / "last_order" / "mcp.json").exists()
+    assert (shot / "profiles" / "last_order" / "credentials" / "mcp-auth.json").exists()
     with closing(sqlite3.connect(shot / "state" / "board.db")) as con:
         assert con.execute("SELECT x FROM t").fetchone() == (1,)
     assert not (shot / "cache").exists()

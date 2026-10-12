@@ -934,28 +934,19 @@ def mcp_server_matches(pattern: Any, server: Any) -> bool:
 
 
 def configured_mcp_servers(profile_dir: Any) -> list[str]:
-    """The enabled servers a role's ``mcp.json`` files name, connected yet or not: the home's for Last Order
-    (or no role), the role's own otherwise. A definition that requires one is not refused while it is still
-    connecting or failed its first attempt."""
+    """The enabled servers the role's own ``mcp.json`` names (``profiles.mcp_dir``), connected yet or not. A
+    definition that requires one is not refused while it is still connecting or failed its first attempt."""
     from misaka.config import profiles
 
-    paths: list[Path] = []
-    if not profile_dir or profiles.is_last_order(profile_dir):
-        paths.append(Path(home.path("mcp_config")))
-    if profile_dir and os.path.realpath(profile_dir) != os.path.realpath(home.home()):
-        paths.append(Path(profile_dir) / "mcp.json")
-    names: list[str] = []
-    for path in paths:
-        try:
-            servers = json.loads(path.read_text(encoding="utf-8")).get("mcpServers")
-        except (OSError, ValueError, AttributeError):
-            continue
-        if isinstance(servers, dict):
-            names.extend(
-                name for name, config in servers.items()
-                if not (isinstance(config, dict) and config.get("enabled") is False) and name not in names
-            )
-    return names
+    try:
+        servers = json.loads(
+            Path(home.path("mcp_config", profiles.mcp_dir(profile_dir))).read_text(encoding="utf-8")
+        ).get("mcpServers")
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(servers, dict):
+        return []
+    return [name for name, config in servers.items() if not (isinstance(config, dict) and config.get("enabled") is False)]
 
 
 def available_mcp_servers(session: Any) -> list[str]:

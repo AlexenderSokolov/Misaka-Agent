@@ -44,26 +44,27 @@ each Sister.
 | `DESCRIBE.md` | Her specialty. Last Order reads it to decide who gets what. |
 | `SOUL.md` | Her personality and voice, optional. It shapes how she talks and thinks; her duties stay the same. |
 | `settings.json` | What is hers alone: her model (`defaultProvider` / `defaultModel`), `defaultThinkingLevel` and `web` overrides. |
-| `mcp.json` | Her MCP servers. The home's `~/.misaka/mcp.json` is Last Order's and does not reach her. |
-| `credentials/mcp-auth.json` | Her MCP sign-ins (`/mcp` in her window). Last Order's are in the home's `credentials/`. |
+| `mcp.json` | Her MCP servers. No other role connects them. |
+| `credentials/mcp-auth.json` | Her MCP sign-ins (`/mcp` in her window). |
 | `.env` | Keys that are hers, laid over the home's `.env`. |
 | `skills/` | Skills only she sees. |
 | `skill-bundles/` | Named sets of skills saved for her (`misaka bundles save`). |
 | `subagents/` | Sub-agent types only she can start. |
 
 MCP servers are set in `mcp.json` files, in the `mcpServers` shape other MCP clients use. Each role
-has her own: Last Order's are in the home's `~/.misaka/mcp.json` (and her
-`profiles/last_order/mcp.json`), a Sister's in `profiles/sisters/<number>/mcp.json`, and one role never
-connects another's servers. A sub-agent a Sister starts reaches her servers and no others; servers
-written inline in a sub-agent's definition are not started:
+has her own in her folder: Last Order's in `profiles/last_order/mcp.json`, a Sister's in
+`profiles/sisters/<number>/mcp.json`. One role never connects another's servers, and the home has no
+`mcp.json`. A sub-agent a Sister starts reaches her servers and no others; servers written inline in a
+sub-agent's definition are not started:
 
 ```json
 {"mcpServers": {"camofox": {"command": "npx", "args": ["-y", "camofox-mcp"]}}}
 ```
 
-`misaka mcp add camofox -- npx -y camofox-mcp` writes the home's file and `misaka mcp list` checks
-that the home's and the project's servers connect. `/mcp` in her window lists hers too, signs in to
-one, reconnects it, or turns it off. The [configuration reference](../reference/configuration.md#skills-and-mcp) lists every key.
+`misaka mcp add camofox -- npx -y camofox-mcp` writes Last Order's file, and `misaka mcp --as 10032 add
+camofox -- npx -y camofox-mcp` writes Sister 10032's. `misaka mcp list` (with the same `--as`) checks
+that her servers and the project's connect. `/mcp` in her window lists hers too, signs in to one,
+reconnects it, or turns it off. The [configuration reference](../reference/configuration.md#skills-and-mcp) lists every key.
 
 A server starts with a small part of MISAKA's environment: `PATH`, `HOME`, the locale, the proxy
 and certificate variables, the settings of npm, uv and pip (a registry mirror reaches `npx` and

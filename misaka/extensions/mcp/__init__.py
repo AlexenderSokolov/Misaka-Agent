@@ -25,8 +25,9 @@ their exposure; the last two are saved to the ``mcp.json`` that defines the serv
 current session for registered servers.
 
 Translated from pi's ``coding-agent/src/extensions/mcp/index.ts``. The module's tail is misaka's
-glue: the bundled-extension flags, the ``misaka mcp`` command, and the forks the user kept (a role's
-own ``mcp.json``, the role's identity in stdio servers' environment, the untrusted fence on results).
+glue: the bundled-extension flags, the ``misaka mcp`` command, and the forks the user kept (each role's
+own ``mcp.json`` and sign-ins in her profile, the role's identity in stdio servers' environment, the
+untrusted fence on results).
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import asyncio
 import functools
 import os
 import re
+import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
@@ -113,6 +115,9 @@ class McpExtensionOptions(TypedDict, total=False):
     createCredentials: Callable[[Any], McpOAuthCredentialStore]
     # File server log messages are appended to. Defaults to the home's `logs/mcp/mcp.log`.
     logPath: str
+    # MISAKA fork: the directory of the global `mcp.json`, named when no server is configured. Defaults to
+    # the agent directory; a misaka session's is its role's (`profiles.mcp_dir`).
+    mcpDir: str
     # Opens the OAuth authorization URL. Defaults to the platform browser.
     openUrl: Callable[[str], None]
     # Saves `/mcp` changes to the server's config file: its project `override` when set, else its
@@ -343,8 +348,8 @@ def _defaultLogPath() -> str:
     return str(home.path("mcp_log"))
 
 
-def _emptyMessage() -> str:
-    return f"No MCP servers configured. Add them to {os.path.join(get_agent_dir(), 'mcp.json')} or {home.DIR_NAME}/mcp.json."
+def _emptyMessage(mcpDir: str) -> str:
+    return f"No MCP servers configured. Add them to {os.path.join(mcpDir, 'mcp.json')} or {home.DIR_NAME}/mcp.json."
 
 
 def createMcpExtension(options: McpExtensionOptions | None = None) -> ExtensionFactory:
@@ -371,6 +376,7 @@ def createMcpExtension(options: McpExtensionOptions | None = None) -> ExtensionF
         # Working directory of the session, for stdio servers.
         sessionCwd = os.getcwd()
         credentials = options.get("credentials")
+        mcpDir = options.get("mcpDir") or get_agent_dir()
         # The session's model registry, which resolves `auth.provider` tokens.
         modelRegistry: Any = None
         serverLog: McpServerLog | None = None
@@ -901,7 +907,7 @@ def createMcpExtension(options: McpExtensionOptions | None = None) -> ExtensionF
                         servers, key=lambda server: (attentionRank(server), localeSortKey(server.entry["name"]))
                     )
                 ],
-                "empty": _emptyMessage(),
+                "empty": _emptyMessage(mcpDir),
                 "confirmLabel": "manage",
                 "cancelLabel": "close",
             }
@@ -1135,7 +1141,7 @@ def createMcpExtension(options: McpExtensionOptions | None = None) -> ExtensionF
 
         def formatStatus() -> str:
             if len(servers) == 0 and len(configErrors) == 0 and len(overridden) == 0:
-                return _emptyMessage()
+                return _emptyMessage(mcpDir)
             lines = []
             for server in servers:
                 name = server.entry["name"]
@@ -1636,8 +1642,9 @@ def _mcpServersCalled(pi: Any, details: Any) -> list[str]:
 
 
 def createMisakaMcpExtension(spec: Any) -> ExtensionFactory:
-    """The MCP extension as misaka's sessions load it: pi's ``createMcpExtension`` with roles isolated (a
-    Sister reads her own ``mcp.json`` in place of the global one, ``loadConfig``), the role's identity in stdio servers'
+    """The MCP extension as misaka's sessions load it: pi's ``createMcpExtension`` with roles isolated (each
+    role's profile is where pi's global ``mcp.json`` and sign-ins are, as a Hermes profile keeps its own:
+    ``loadConfig``, ``createCredentials``), the role's identity in stdio servers'
     environment (``createTransport``), and MCP output fenced as untrusted data, which the LCM's recall
     fence keys on: every MCP tool's description says its results are data, an MCP result's text is
     fenced (a ``tool_result`` handler), and so is the result of a codemode script that called an MCP tool,
@@ -1645,14 +1652,10 @@ def createMisakaMcpExtension(spec: Any) -> ExtensionFactory:
     tool's own result."""
     roleDir = getattr(spec, "profile_dir", None)
     roleEnv = _roleEnvironment(spec)
+    mcpDir = profiles.mcp_dir(roleDir)
 
     def loadConfig(ctx: Any) -> LoadedMcpConfig:
-        loaded = loadMcpConfig({
-            "agentDir": get_agent_dir(),
-            "cwd": ctx.cwd,
-            "projectTrusted": ctx.isProjectTrusted(),
-            "roleDir": str(roleDir) if roleDir else None,
-        })
+        loaded = loadMcpConfig({"agentDir": mcpDir, "cwd": ctx.cwd, "projectTrusted": ctx.isProjectTrusted()})
         # MISAKA fork: Last Order has neither codemode nor tool_search (they are the Sisters' tools), so her
         # servers declare their tools to her directly, as pi does with both off; `hidden` stays hidden. This
         # lives in the loaded copy only; `mcp.json` is edited from the file itself.
@@ -1672,20 +1675,13 @@ def createMisakaMcpExtension(spec: Any) -> ExtensionFactory:
         return createDefaultTransport(entry, cwd, authProvider)
 
     def createCredentials(runtime: Any) -> McpOAuthCredentialStore:
-        # MISAKA fork: roles are isolated, sign-ins too. The home's `mcp-auth.json` is Last Order's (and a
-        # session without a role's), as the home's `mcp.json` is; a Sister keeps hers in her profile.
-        if not roleDir or profiles.is_last_order(roleDir):
-            return runtime.McpOAuthCredentialStore()
-        from misaka.core.auth_storage import FileAuthStorageBackend
-
-        return runtime.McpOAuthCredentialStore(
-            FileAuthStorageBackend(str(home.path("mcp_auth", roleDir))), str(home.path("locks"))
-        )
+        return _roleCredentials(runtime.McpOAuthCredentialStore, mcpDir)
 
     register = createMcpExtension({
         "loadConfig": loadConfig,
         "createTransport": createTransport,
         "createCredentials": createCredentials,
+        "mcpDir": mcpDir,
     })
 
     def factory(pi: Any) -> None:
@@ -1711,6 +1707,36 @@ def createMisakaMcpExtension(spec: Any) -> ExtensionFactory:
     return factory
 
 
+def _roleCredentials(store: Any, mcpDir: str) -> McpOAuthCredentialStore:
+    """MISAKA fork: a role's MCP sign-ins, kept in her profile beside her ``mcp.json``."""
+    from misaka.core.auth_storage import FileAuthStorageBackend
+
+    return store(FileAuthStorageBackend(str(home.path("mcp_auth", mcpDir))), str(home.path("locks")))
+
+
+def _takeRole(argv: list[str]) -> tuple[list[str], str | None]:
+    """MISAKA fork: ``--as <Sister>`` (before ``--``) picks whose ``mcp.json`` and sign-ins the command uses, as
+    ``hermes -p <profile> mcp`` does; without it, Last Order's."""
+    rest: list[str] = []
+    who: str | None = None
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            rest.extend(argv[index:])
+            break
+        if arg == "--as" and index + 1 < len(argv):
+            who = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--as="):
+            who = arg.removeprefix("--as=")
+        else:
+            rest.append(arg)
+        index += 1
+    return rest, who
+
+
 def activate(spec: Any) -> ExtensionFactory:
     return createMisakaMcpExtension(spec)
 
@@ -1724,7 +1750,18 @@ def command(argv: list[str]) -> int:
     from misaka.core.settings_manager import SettingsManager
 
     from .cli_lazy import loadMcpCommand
+    from .oauth import McpOAuthCredentialStore
 
+    argv, who = _takeRole(argv)
+    roleDir = None
+    if who is not None:
+        roleDir = home.path("profiles_root") / who
+        if not who or not roleDir.is_dir():
+            from misaka.config import sisters
+
+            print(f"Unknown Sister {who!r}. Roster: {', '.join(sorted(sisters())) or 'none'}", file=sys.stderr)
+            return 1
+    mcpDir = profiles.mcp_dir(roleDir)
     cwd = os.getcwd()
     agentDir = get_agent_dir()
     # MISAKA fork: pi's entry applies the `httpProxy` setting before any command, from settings that never
@@ -1732,7 +1769,18 @@ def command(argv: list[str]) -> int:
     startupSettingsManager = SettingsManager.create(cwd, agentDir, {"projectTrusted": False})
     applyHttpProxySettings(startupSettingsManager.getGlobalSettings().get("httpProxy"))
     configureHttpDispatcher()
-    return asyncio.run(loadMcpCommand().runMcpCommand(argv, {"cwd": cwd, "agentDir": agentDir}))
+    return asyncio.run(
+        loadMcpCommand().runMcpCommand(
+            argv,
+            {
+                "cwd": cwd,
+                "agentDir": agentDir,
+                "mcpDir": mcpDir,
+                "credentials": _roleCredentials(McpOAuthCredentialStore, mcpDir),
+                **({"asRole": who} if who else {}),
+            },
+        )
+    )
 
 
 __all__ = [

@@ -27,11 +27,7 @@ cannot use it, so a repository cannot pick where the credential goes.
 The top-level ``autoEnableCodemode`` (default true) activates the codemode tool when a server
 with ``codemode`` exposure connects. A project value overrides the global one.
 
-Translated from pi's ``coding-agent/src/extensions/mcp/config.ts``. MISAKA fork: roles are isolated. The
-global file is Last Order's, with her ``profiles/last_order/mcp.json`` (scope ``role``) over it; a Sister's
-session reads only her own ``profiles/<role>/mcp.json``. The project file applies to every role. Only the
-project file may hold overrides, and the server it overrides is whichever entry the global or role file
-defined under that name.
+Translated from pi's ``coding-agent/src/extensions/mcp/config.ts``.
 """
 
 from __future__ import annotations
@@ -43,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict, TypeGuard
 
-from misaka.config import home, profiles
+from misaka.config import home
 from misaka.core.mcp_servers import (
     McpExposure,
     McpHttpServerConfig,
@@ -59,8 +55,7 @@ from misaka.utils.js import errorMessage, jsObjectOrder, jsonStringify
 from misaka.utils.js_regexp import RegExp
 from misaka.utils.node_errors import withSyscall
 
-# MISAKA fork: `role` is the role's own `mcp.json`; upstream knows only the other three.
-type McpServerScope = Literal["global", "role", "project", "extension"]
+type McpServerScope = Literal["global", "project", "extension"]
 
 
 class McpServerEntry(TypedDict):
@@ -68,7 +63,7 @@ class McpServerEntry(TypedDict):
     config: McpServerConfig
     # Config file that defined the entry, or the path of the extension that registered it.
     source: str
-    # The global, role or project `mcp.json`, or `extension` for servers registered with
+    # The global or the project `mcp.json`, or `extension` for servers registered with
     # `pi.registerMcpServer()`. Changes to extension servers are not saved.
     scope: NotRequired[McpServerScope]
     # Project `mcp.json` with an override of this global server's `enabled`, `exposure`, or `toolExposure`.
@@ -122,7 +117,7 @@ class McpConfigState:
     errors: list[str]
 
 
-def readConfigFile(path: str, scope: Literal["global", "role", "project"], state: McpConfigState) -> None:
+def readConfigFile(path: str, scope: Literal["global", "project"], state: McpConfigState) -> None:
     servers, errors = state.servers, state.errors
     if not os.path.exists(path):
         return
@@ -173,24 +168,13 @@ class LoadMcpConfigOptions(TypedDict):
     agentDir: str
     cwd: str
     projectTrusted: bool
-    # MISAKA fork: the role directory whose `mcp.json` overlays the global one (`profiles/<role>`, Last
-    # Order's too). A role directory that is the agent directory itself is read once, as the global file.
-    roleDir: NotRequired[str | None]
 
 
 def loadMcpConfig(options: LoadMcpConfigOptions) -> LoadedMcpConfig:
     """Load global and (when trusted) project MCP configuration. Disabled servers are included with
     ``enabled: false``, so they can be enabled again."""
     state = McpConfigState(servers={}, autoEnableCodemode=None, errors=[])
-    # MISAKA fork: roles are isolated. The global file is Last Order's: she reads it with her own
-    # `profiles/last_order/mcp.json` over it, while a Sister reads only her own `profiles/<role>/mcp.json`.
-    # The project file below applies to every role, as in pi.
-    roleDir = options.get("roleDir")
-    roleFile = bool(roleDir) and os.path.realpath(roleDir) != os.path.realpath(options["agentDir"])
-    if not roleFile or profiles.is_last_order(roleDir):
-        readConfigFile(os.path.join(options["agentDir"], "mcp.json"), "global", state)
-    if roleFile:
-        readConfigFile(os.path.join(roleDir, "mcp.json"), "role", state)
+    readConfigFile(os.path.join(options["agentDir"], "mcp.json"), "global", state)
     # MISAKA fork: `home.project_dir` names the project's config directory, and none at `$HOME`.
     projectDir = home.project_dir(options["cwd"]) if options["projectTrusted"] else None
     projectConfig = str(projectDir / "mcp.json") if projectDir is not None else None

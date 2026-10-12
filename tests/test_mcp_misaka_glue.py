@@ -40,7 +40,7 @@ async def _runOnce(tmp_path: Path, exposure: str, call: ToolCall) -> tuple[list[
         _writeConfig(profile / "mcp.json", _fixture(exposure))
         spec = types.SimpleNamespace(role="sisters/10032", profile_dir=str(profile), mcp_role="10032")
     else:
-        _writeConfig(home / "mcp.json", _fixture(exposure))
+        _writeConfig(home / "profiles" / "last_order" / "mcp.json", _fixture(exposure))
         spec = types.SimpleNamespace(role=None, profile_dir=None, mcp_role=None)
     async with session_with(tmp_path, [createCodemodeExtension(), createMisakaMcpExtension(spec)]) as session:
         await session.bindExtensions({})
@@ -109,9 +109,10 @@ def _ctx(cwd: Path):
     return types.SimpleNamespace(cwd=str(cwd), isProjectTrusted=lambda: False)
 
 
-def test_a_sister_does_not_see_the_servers_of_the_home_mcp_json(monkeypatch, tmp_path):
+def test_a_sister_sees_only_her_own_mcp_json(monkeypatch, tmp_path):
     home = Path(os.environ["MISAKA_HOME"])
     _writeConfig(home / "mcp.json", {"docs": {"command": "home-docs"}, "web": {"command": "home-web"}})
+    _writeConfig(home / "profiles" / "last_order" / "mcp.json", {"lo": {"command": "lo-tool"}})
     role = tmp_path / "profiles" / "sisters" / "10032"
     _writeConfig(role / "mcp.json", {"docs": {"command": "role-docs"}})
     captured = _captureOptions(monkeypatch, types.SimpleNamespace(role="10032", profile_dir=role))
@@ -122,27 +123,32 @@ def test_a_sister_does_not_see_the_servers_of_the_home_mcp_json(monkeypatch, tmp
     assert servers == {"docs": "role-docs"}
 
 
-def test_last_order_reads_the_home_mcp_json(monkeypatch, tmp_path):
+def test_last_order_reads_her_own_profile_and_the_home_mcp_json_reaches_no_one(monkeypatch, tmp_path):
+    """Each role's profile is a Hermes profile for MCP: Last Order's `mcp.json` is in `profiles/last_order`, a
+    session without a role reads hers, and the home keeps none."""
     home = Path(os.environ["MISAKA_HOME"])
-    _writeConfig(home / "mcp.json", {"docs": {"command": "home-docs"}})
-    captured = _captureOptions(
-        monkeypatch, types.SimpleNamespace(role="last_order", profile_dir=home / "profiles" / "last_order")
-    )
+    _writeConfig(home / "mcp.json", {"stray": {"command": "home-stray"}})
+    lastOrder = home / "profiles" / "last_order"
+    _writeConfig(lastOrder / "mcp.json", {"docs": {"command": "lo-docs"}})
 
-    loaded = captured["loadConfig"](_ctx(tmp_path))
+    for profile in (lastOrder, None):
+        captured = _captureOptions(monkeypatch, types.SimpleNamespace(role="last_order", profile_dir=profile))
+        loaded = captured["loadConfig"](_ctx(tmp_path))
+        assert {entry["name"]: (entry["config"]["command"], entry["scope"]) for entry in loaded["servers"]} == {
+            "docs": ("lo-docs", "global")
+        }
+        assert captured["mcpDir"] == str(lastOrder)
 
-    assert {entry["name"]: entry["config"]["command"] for entry in loaded["servers"]} == {"docs": "home-docs"}
 
-
-
-def test_a_sister_keeps_her_mcp_sign_ins_in_her_profile_and_last_order_in_the_home(monkeypatch, tmp_path):
+def test_every_role_keeps_her_mcp_sign_ins_in_her_profile(monkeypatch, tmp_path):
     from misaka.config import home
     from misaka.extensions.mcp import runtime
 
     root = Path(os.environ["MISAKA_HOME"])
     sister = root / "profiles" / "sisters" / "10032"
+    lastOrder = root / "profiles" / "last_order"
     stores = {}
-    for label, profile in (("sister", sister), ("last_order", root / "profiles" / "last_order"), ("none", None)):
+    for label, profile in (("sister", sister), ("last_order", lastOrder), ("none", None)):
         captured = _captureOptions(monkeypatch, types.SimpleNamespace(role=label, profile_dir=profile))
         store = captured["createCredentials"](runtime)
         store.forServer("docs", "https://docs.example/mcp").save({"tokens": {"access_token": label}})
@@ -151,7 +157,8 @@ def test_a_sister_keeps_her_mcp_sign_ins_in_her_profile_and_last_order_in_the_ho
     assert stores["sister"].tokens("docs", "https://docs.example/mcp")["access_token"] == "sister"
     assert stores["last_order"].tokens("docs", "https://docs.example/mcp")["access_token"] == "none"
     assert (sister / "credentials" / "mcp-auth.json").is_file()
-    assert home.path("mcp_auth").is_file()
+    assert (lastOrder / "credentials" / "mcp-auth.json").is_file()
+    assert not home.path("mcp_auth").exists()
 
 
 def test_last_order_reaches_every_server_directly_and_a_sisters_keep_pi_s_default(monkeypatch, tmp_path):
@@ -159,7 +166,8 @@ def test_last_order_reaches_every_server_directly_and_a_sisters_keep_pi_s_defaul
     directly, as pi does with both off; only `hidden` stands. A Sister's servers keep pi's `codemode` default.
     Nothing is written to `mcp.json`."""
     home = Path(os.environ["MISAKA_HOME"])
-    _writeConfig(home / "mcp.json", {
+    lastOrderConfig = home / "profiles" / "last_order" / "mcp.json"
+    _writeConfig(lastOrderConfig, {
         "plain": {"command": "a"},
         "scripted": {"command": "b", "exposure": "codemode", "toolExposure": {"x": "deferred", "y": "hidden"}},
         "hidden": {"command": "c", "exposure": "hidden"},
@@ -172,7 +180,7 @@ def test_last_order_reaches_every_server_directly_and_a_sisters_keep_pi_s_defaul
         "hidden": "hidden",
     }
     assert configs["scripted"]["toolExposure"] == {"x": "direct", "y": "hidden"}
-    assert "exposure" not in json.loads((home / "mcp.json").read_text(encoding="utf-8"))["mcpServers"]["plain"]
+    assert "exposure" not in json.loads(lastOrderConfig.read_text(encoding="utf-8"))["mcpServers"]["plain"]
 
     sister = home / "profiles" / "sisters" / "10032"
     _writeConfig(sister / "mcp.json", {"plain": {"command": "c"}})

@@ -50,11 +50,12 @@ lists them all.
 | `misaka task add TITLE --to SISTER --body-file FILE` | add a card by hand (`--body TEXT`, `--reviewer`, `--priority`, `--model`, `--needs ID`); the body needs `## acceptance criteria` |
 | `misaka task start ID` | run a ready card in this terminal |
 | `misaka task ID --delete` | delete a card and its history |
-| `misaka mcp add SERVER [-l] -- COMMAND [ARGS...]` | add a process MCP server to `~/.misaka/mcp.json` (`-l`: this project's `.misaka/mcp.json`) |
+| `misaka mcp add SERVER [-l] -- COMMAND [ARGS...]` | add a process MCP server to Last Order's `profiles/last_order/mcp.json` (`-l`: this project's `.misaka/mcp.json`) |
 | `misaka mcp add SERVER [-l] --url URL` | add a Streamable HTTP MCP server; `misaka mcp --help` lists the options |
 | `misaka mcp remove SERVER [-l]` | remove a server |
-| `misaka mcp list [--json]` | connect the servers of the home and project files and show their state, tools and errors; exits 1 while anything is wrong |
+| `misaka mcp list [--json]` | connect the servers of Last Order's file and the project's and show their state, tools and errors; exits 1 while anything is wrong |
 | `misaka mcp login SERVER [--timeout SECONDS]` / `logout SERVER` | sign in to an OAuth server through the browser, or delete the stored sign-in |
+| `misaka mcp --as SISTER ...` | any of the above for that Sister: her `mcp.json` and her sign-ins |
 
 ### Documents and the web
 

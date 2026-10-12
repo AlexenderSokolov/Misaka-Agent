@@ -139,18 +139,18 @@ turns one off, for example `"extensions": ["-builtin:llama.cpp"]`; a trusted pro
 
 MCP servers are configured in `mcp.json` files, in the `mcpServers` shape other MCP clients use:
 
-1. `~/.misaka/mcp.json`, Last Order's servers
-2. `~/.misaka/profiles/<role>/mcp.json`, one role's own servers
-3. the project's `.misaka/mcp.json`, once you have trusted the project
+1. `~/.misaka/profiles/last_order/mcp.json`, Last Order's servers
+2. `~/.misaka/profiles/sisters/<id>/mcp.json`, one Sister's servers
+3. the project's `.misaka/mcp.json`, once you have trusted the project, for every role
 
-Roles do not share servers. Last Order reads the home file, with her own `profiles/last_order/mcp.json`
-over it; a Sister reads only her own file and does not get Last Order's servers. The project file adds
-to either, and a later file replaces an entry of the same name. `misaka mcp add` writes entries to the home or the project file and `misaka mcp list` connects
-and checks the servers of those two; a Sister's servers are managed with `/mcp` in her window
-([commands](commands.md)).
+Each role connects the servers of her own file and the project's, and no other role's. The home has
+no `mcp.json`; a session that belongs to no role uses Last Order's file. An entry in the project file
+replaces the role's entry of the same name. `misaka mcp add` writes to Last Order's file, to a
+Sister's with `--as <id>`, or to the project's with `-l`; `misaka mcp list` connects and checks the
+servers that role gets. `/mcp` in a window manages that window's role ([commands](commands.md)).
 
 A project entry without `command`, `url` or `type` changes only `enabled`, `exposure` and
-`toolExposure` of the server of that name from the home or role file, and keeps the rest of it,
+`toolExposure` of the server of that name from the role's file, and keeps the rest of it,
 `env`, `headers` and `auth` included. This turns a server off in one project:
 
 ```json
@@ -158,7 +158,7 @@ A project entry without `command`, `url` or `type` changes only `enabled`, `expo
 ```
 
 In a trusted project, `/mcp` offers *Enable in this project* and *Disable in this project* for the
-servers of `~/.misaka/mcp.json`. They write such an entry, and later changes to that server go to it.
+servers of the role's own file. They write such an entry, and later changes to that server go to it.
 
 ```json
 {
@@ -172,7 +172,7 @@ servers of `~/.misaka/mcp.json`. They write such an entry, and later changes to 
 | Key | Meaning |
 |---|---|
 | `command`, `args`, `env`, `cwd` | a server started as a process, speaking on its standard streams; `~` expands, `cwd` is relative to the working directory |
-| `url`, `headers` | a Streamable HTTP server. Without an `Authorization` header it signs in with OAuth when the server asks (`/mcp login`, `misaka mcp login`); `oauth` holds a pre-registered client (`clientId`, `clientSecret`, `callbackUrl`, `callbackPort`, `scope`, `clientName`, `authServerMetadataUrl`); `auth: {"provider": "..."}` sends a `/login` provider's token instead (home and role files only) |
+| `url`, `headers` | a Streamable HTTP server. Without an `Authorization` header it signs in with OAuth when the server asks (`/mcp login`, `misaka mcp login`); `oauth` holds a pre-registered client (`clientId`, `clientSecret`, `callbackUrl`, `callbackPort`, `scope`, `clientName`, `authServerMetadataUrl`); `auth: {"provider": "..."}` sends a `/login` provider's token instead (a role's file only) |
 | `exposure` | how the model reaches the tools: `codemode` (from codemode scripts; the default for a Sister's servers), `deferred` (declared once `tool_search` loads them), `direct` (declared like built-in tools; Last Order's servers are always reached this way) or `hidden` |
 | `toolExposure` | the exposure of single tools, by name or `*` pattern |
 | `description` | one line about what the server offers; the model sees it |
@@ -183,7 +183,7 @@ Values may use `${VAR}` for an environment variable and `!command` for a command
 the server connects. Each server's tools are named `mcp__<server>__<tool>`. The top-level
 `autoEnableCodemode` (default `true`) activates the codemode tool when a `codemode` server connects.
 
-Sign-ins are kept in `~/.misaka/credentials/mcp-auth.json`. What servers log goes to
+Each role keeps her sign-ins in her own folder, in `credentials/mcp-auth.json`. What servers log goes to
 `~/.misaka/logs/mcp/mcp.log`.
 
 ### Codemode
