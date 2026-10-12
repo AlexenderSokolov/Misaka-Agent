@@ -127,10 +127,10 @@ def test_a_runner_claims_its_row_where_no_identity_can_be_read(tmp_path, monkeyp
         runs.init(con)
         run = runs.create(con, workspace=str(tmp_path), question="How was the salt monopoly run?")
         root = runs.root(con, run["id"])
-        key = runs.prepare_runner(con, "research_branches", root["id"])
+        key = runs.prepare_runner(con, "research_execution", root["id"])
         monkeypatch.setattr(processes, "identity", lambda pid: None)
-        assert runs.claim_runner(con, "research_branches", root["id"], key)
-        assert runs.claim_runner(con, "research_branches", root["id"], key), "the same process claims again"
+        assert runs.claim_runner(con, "research_execution", root["id"], key)
+        assert runs.claim_runner(con, "research_execution", root["id"], key), "the same process claims again"
         assert processes.identity(12345) is None, "everyone else still sees an unreadable process as unknown"
 
 

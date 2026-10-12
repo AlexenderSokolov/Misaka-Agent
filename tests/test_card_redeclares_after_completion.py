@@ -155,9 +155,9 @@ async def test_a_red_team_revising_its_critique_after_completion_redeclares_it(c
     (no claim left) it was not found, and the revised critique was never declared (0.18.10 sweep)."""
     from misaka.core.platform import tasks
     con, tid, out, part = card
-    con.execute("CREATE TABLE IF NOT EXISTS research_run_tasks (task_id TEXT PRIMARY KEY, run_id TEXT, branch_id TEXT, "
+    con.execute("CREATE TABLE IF NOT EXISTS research_cards (task_id TEXT PRIMARY KEY, run_id TEXT, branch_id TEXT, "
                 "kind TEXT, round INT, local_id TEXT, depends_json TEXT, created_at INT)")
-    con.execute("INSERT INTO research_run_tasks VALUES (?,?,?,?,?,?,?,?)", (tid, "r", "b", "red_team", 1, None, "[]", 0))
+    con.execute("INSERT INTO research_cards VALUES (?,?,?,?,?,?,?,?)", (tid, "r", "b", "red_team", 1, None, "[]", 0))
     con.commit()
     tasks.add_event(con, tid, "research_critique", {"issues": [], "claim_lock": "lock1"}, generation=1, claim_lock="lock1")
     await _complete(con, tid, out, part)

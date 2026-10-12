@@ -345,9 +345,9 @@ def test_a_run_whose_driver_died_does_not_hold_up_an_update(tmp_path, monkeypatc
         runs.init(con)
         live = runs.create(con, workspace=str(tmp_path), question="Live")
         dead = runs.create(con, workspace=str(tmp_path), question="Dead")
-        con.execute("UPDATE research_runs SET driver_lock='d1', driver_expires=? WHERE id=?",
+        con.execute("UPDATE graphs SET lease_token='d1', lease_expires=? WHERE id=?",
                     (int(time.time()) + 600, live["id"]))
-        con.execute("UPDATE research_runs SET driver_lock='d2', driver_expires=? WHERE id=?",
+        con.execute("UPDATE graphs SET lease_token='d2', lease_expires=? WHERE id=?",
                     (int(time.time()) - 600, dead["id"]))
     found = update.active_runs()
     assert [line.split()[0] for line in found] == [live["id"]]

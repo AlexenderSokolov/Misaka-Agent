@@ -219,9 +219,9 @@ position none of them argued. Say what the shared continuation rests on, and wha
 def errata_above(con, run, node):
     """Corrections recorded against the nodes this one descends from, as a prompt section; empty
     when there are none."""
-    from misaka.core.research import graph
+    from misaka.core.research import views
 
-    above = graph.ancestors(con, node["id"])
+    above = views.ancestors(con, node["id"])
     errata = [e for e in runs.errata(con, run["id"]) if e["node"] in above]
     return SYNTHESIS_ERRATA.format(errata="\n".join(
         f"- `{e['node']}` says \"{e['claim']}\" -> {e['correction']} ({e['grounds']})" for e in errata)) if errata else ""
@@ -231,7 +231,7 @@ def position(con, run, node):
     """Where a node stands on the graph, for its own Last Order: how it was reached, the rival
     options it was opened against (with their outcome and conclusion where they have one), and the
     stance it owes its parents -- a join confronts them, any other node answers them."""
-    from misaka.core.research import graph
+    from misaka.core.research import views
 
     lines = []
     for option in runs.origin_options(con, node["id"]):
@@ -245,7 +245,7 @@ def position(con, run, node):
             if rival["node_id"] == node["id"]:
                 outcome = "also pursued by this node"
             elif rival["node_id"]:
-                conclusions = graph.syntheses(con, run, runs.node(con, rival["node_id"]))
+                conclusions = views.syntheses(con, run, runs.node(con, rival["node_id"]))
                 who = ("the deciding node's own line" if rival["node_id"] == option["decided_at"]
                        else f"pursued by node {rival['node_id']}")
                 outcome = who + (f", conclusion `{runs.artifact_path(conclusions[-1])}`" if conclusions
@@ -260,7 +260,7 @@ def position(con, run, node):
         lines.append(f"- a join of nodes {', '.join(row['id'] for row in parents)}: their work is carried forward "
                      "together here (the context packet gives the reconciliation's reasons)")
     stance = JOIN_CONFRONTATION if len(parents) > 1 else ""
-    return "\n".join(lines) + "\n" + stance + INTERLOCUTORS.format(graph=graph.graph_path(run), paths=graph.paths_path(run))
+    return "\n".join(lines) + "\n" + stance + INTERLOCUTORS.format(graph=views.graph_path(run), paths=views.paths_path(run))
 
 
 SYNTHESIS_CONTRACT = """# Node conclusion — synthesize the submitted research output
@@ -1167,7 +1167,7 @@ def review_context(con, run, red, issues, *, round, kind="critique"):
 
 def dispose(con, run, cfg, worker, node, red, issues, *, round, revisions_left):
     """Last Order's dispositions for one review round: every material issue exactly once."""
-    from misaka.core.research import graph
+    from misaka.core.research import views
     key = runs.dispose_key(round)
     accepted = runs.action(con, run["id"], node["id"], key)
     if accepted:
@@ -1199,7 +1199,7 @@ def dispose(con, run, cfg, worker, node, red, issues, *, round, revisions_left):
               "No revision is left on this node: answer every issue another way.")
     prompt = (DISPOSE_CONTRACT.format(revise=revise, branch="" if forks else " Not available: this node is at max_depth.")
               + (DISPOSE_FINAL if revisions_left <= 0 else "")
-              + f"\n# Round {round} of review\nThe graph: `{graph.graph_path(run)}`\n"
+              + f"\n# Round {round} of review\nThe graph: `{views.graph_path(run)}`\n"
               + review_context(con, run, red, issues, round=round) + navigation(run["id"]))
     action, _raw = _command(
         con, run, cfg, worker, node, prompt, key=key, name="misaka_research_dispose",
@@ -1212,7 +1212,7 @@ def dispose(con, run, cfg, worker, node, red, issues, *, round, revisions_left):
 def fill_gaps(con, run, cfg, worker, node, card, gaps, *, version, round, revisions_left):
     """Last Order's answer to divergence round ``round``: every gap it found in version ``version``,
     exactly once -- filled by a revision while the node has gap revisions left, else answered."""
-    from misaka.core.research import graph
+    from misaka.core.research import views
     key = runs.gaps_key(version)
     accepted = runs.action(con, run["id"], node["id"], key)
     if accepted:
@@ -1240,7 +1240,7 @@ def fill_gaps(con, run, cfg, worker, node, card, gaps, *, version, round, revisi
     revise = (f"{revisions_left} gap revision(s) left on this node." if revisions_left > 0 else
               "No gap revision is left on this node: answer every gap another way.")
     prompt = (GAPS_CONTRACT.format(revise=revise)
-              + f"\n# Divergence review of version {version}\nThe graph: `{graph.graph_path(run)}`\n"
+              + f"\n# Divergence review of version {version}\nThe graph: `{views.graph_path(run)}`\n"
               + review_context(con, run, card, gaps, round=round, kind="divergence") + navigation(run["id"]))
     action, _raw = _command(
         con, run, cfg, worker, node, prompt, key=key, name="misaka_research_dispose",
@@ -1303,7 +1303,7 @@ def cards_failed(con, run, cfg, worker, node, *, kind, lost):
 def decide(con, run, cfg, worker, node, *, divergence, proposals, branches):
     """Last Order's decisions after the divergence review: every proposal and every branch-disposed
     red-team issue is taken up by an option or declined with its reason."""
-    from misaka.core.research import graph
+    from misaka.core.research import views
     accepted = runs.action(con, run["id"], node["id"], runs.DECIDE_KEY)
     if accepted:
         return accepted["payload"]
@@ -1337,7 +1337,7 @@ def decide(con, run, cfg, worker, node, *, divergence, proposals, branches):
                     {"option": row["id"], "label": row["label"], "premise": row["premise"],
                      "decision": row["decision_question"]}
                     for row in runs.pending_options(con, run["id"]) if row["decided_at"] == node["id"]]}
-    prompt = (DECIDE_CONTRACT + f"\n# Node\n{node['id']}: {node['question']}\nThe paths list: `{graph.paths_path(run)}`\nThe graph: `{graph.graph_path(run)}`\n"
+    prompt = (DECIDE_CONTRACT + f"\n# Node\n{node['id']}: {node['question']}\nThe paths list: `{views.paths_path(run)}`\nThe graph: `{views.graph_path(run)}`\n"
               + f"Depth {node['depth']} of {runs.current_limits(con, run)['max_depth']}.\n"
               + prompt_guard.untrusted("divergence", _catalog_text(material)) + navigation(run["id"]))
     action, _raw = _command(

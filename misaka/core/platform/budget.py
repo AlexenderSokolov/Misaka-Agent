@@ -136,12 +136,12 @@ def scope(con, task_id):
         return None
     run = con.execute("SELECT id FROM research_runs WHERE id=?", (str(task_id),)).fetchone()
     if run is None:
-        run = con.execute("SELECT run_id FROM research_run_tasks WHERE task_id=?", (str(task_id),)).fetchone()
+        run = con.execute("SELECT run_id FROM research_cards WHERE task_id=?", (str(task_id),)).fetchone()
     if run is None:
         return None
     run_id = run[0]
     return {run_id, *(row[0] for row in con.execute(
-        "SELECT task_id FROM research_run_tasks WHERE run_id=?", (run_id,)))}
+        "SELECT task_id FROM research_cards WHERE run_id=?", (run_id,)))}
 
 
 def _held(con, ids, now):

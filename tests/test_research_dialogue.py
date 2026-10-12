@@ -11,15 +11,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from misaka.core import graph as graph_core
 from misaka.core.network import worker
 from misaka.core.platform import cards, repo, tasks
 from misaka.core.research import (
     commands,
     context,
-    graph,
     planner,
     report,
     runs,
+    views,
     workflow,
 )
 from misaka.core.session_manager import SessionManager
@@ -79,7 +80,7 @@ def test_a_node_is_told_its_rival_options_and_what_became_of_them(lab):
 def test_a_join_is_told_to_confront_its_parents_not_to_average_them(lab):
     a, b = _frames(lab)
     for node in (a, b):
-        lab.con.execute("UPDATE research_branches SET status='closing' WHERE id=?", (node["id"],))
+        lab.con.execute("UPDATE research_execution SET status='closing' WHERE id=?", (node["id"],))
     join = runs.create_node(lab.con, lab.run["id"], question="How did money and alliances lock each other?",
                             parents=[a["id"], b["id"]])
     text = planner.position(lab.con, lab.run, join)
@@ -95,12 +96,12 @@ def test_a_dissolution_belongs_to_the_conclusion_it_was_written_with(lab):
     a, _b = _frames(lab)
     _conclude(lab.con, lab.run, a)
     _dissolve(lab, a, "research_question")
-    assert graph.dissolution(lab.con, lab.run, a)["question"] == "research_question"
-    assert [n["id"] for n in graph.dissolving_nodes(lab.con, lab.run)] == [a["id"]]
+    assert views.dissolution(lab.con, lab.run, a)["question"] == "research_question"
+    assert [n["id"] for n in views.dissolving_nodes(lab.con, lab.run)] == [a["id"]]
     runs.write_text(lab.con, lab.run["id"], "synthesis", "Revised", runs.generated_path("synthesis-2.md", node_id=a["id"]),
                     "Revised conclusion", branch_id=a["id"])
-    assert graph.dissolution(lab.con, lab.run, a) is None        # the revision answers the question after all
-    assert graph.dissolving_nodes(lab.con, lab.run) == []
+    assert views.dissolution(lab.con, lab.run, a) is None        # the revision answers the question after all
+    assert views.dissolving_nodes(lab.con, lab.run) == []
 
 
 async def test_the_root_s_dissolution_is_always_of_the_research_question(lab):
@@ -157,7 +158,7 @@ async def test_a_node_s_own_question_dissolving_needs_no_consent(lab):
 async def test_the_survey_records_connections_once(lab):
     a, b = _frames(lab)
     tool = commands.relate_tool(lab.con, lab.run, session_file=lab.run["root_session"],
-                                validate=lambda value: graph.resolve_relations(lab.con, lab.run, value))
+                                validate=lambda value: views.resolve_relations(lab.con, lab.run, value))
     ctx = SimpleNamespace(sessionManager=SimpleNamespace(sessionFile=lab.run["root_session"]))
     relation = {"kind": "resonates", "nodes": [a["id"], b["id"]], "note": "both read the same petitions"}
     await tool.execute("c1", {"relations": [relation]}, None, None, ctx)
@@ -169,7 +170,7 @@ async def test_the_survey_records_connections_once(lab):
 
 def _red_card(lab):
     con, run, root = lab.con, lab.run, lab.root
-    runs.prepare_runner(con, "research_branches", root["id"])
+    runs.prepare_runner(con, "research_execution", root["id"])
     root = runs.node(con, root["id"])
     tid = cards.create(con, run["workspace"], "Red team", "## deliverable\ncritique.md\n", "10033",
                        after_row=lambda tid: runs.link_task(con, run["id"], tid, kind="red_team", node=root, round=1))
@@ -253,7 +254,7 @@ def test_the_final_report_is_written_from_indexed_documents_one_command_per_part
     a, b = _frames(lab)
     for node, text in ((root, "Root conclusion.\n"), (a, "Money constrained it.\n"), (b, "Alliances blocked it.\n")):
         _conclude(con, run, node, text)
-        con.execute("UPDATE research_branches SET status='closed' WHERE id=?", (node["id"],))
+        con.execute("UPDATE research_execution SET status='closed' WHERE id=?", (node["id"],))
     seen, tool_calls = [], []
     ctx = SimpleNamespace(sessionManager=SimpleNamespace(sessionFile=run["root_session"]))
 
@@ -284,7 +285,7 @@ def test_the_final_report_is_written_from_indexed_documents_one_command_per_part
     survey = report._checkpoint(con, run, "survey")
     assert Path(survey["path"]).read_text(encoding="utf-8").count("## Part") == 3 and Path(draft["path"]).read_text(encoding="utf-8").startswith("## Part 5")
     assert f"document `{report.doc_id(run, survey['path'])}`" in seen[-1]  # the draft reads the survey by its id
-    keys = {row[0] for row in con.execute("SELECT action_key FROM research_actions WHERE run_id=?", (run["id"],))}
+    keys = {entry.key for entry in graph_core.entries(con, run["id"])}
     assert {f"survey:{n['id']}" for n in (root, a, b)} <= keys and "draft" in keys
     # The run's products are in the corpus: the three conclusions, then the survey and draft themselves.
     docs = report.index_run(con, run)

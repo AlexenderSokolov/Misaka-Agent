@@ -30,14 +30,14 @@ def state(tmp_path, monkeypatch):
 @pytest.mark.parametrize("finish_before_first_poll", [False, True])
 async def test_resident_node_completion_is_not_lost(state, finish_before_first_poll):
     con, run, root = state
-    key = runs.prepare_runner(con, "research_branches", root["id"])
-    assert runs.claim_runner(con, "research_branches", root["id"], key)
+    key = runs.prepare_runner(con, "research_execution", root["id"])
+    assert runs.claim_runner(con, "research_execution", root["id"], key)
     handles = {root["id"]: SimpleNamespace(pid=os.getpid())}
     spawner = SimpleNamespace(alive=lambda handle: True)
 
     def finish():
         runs.set_node(con, root["id"], status="closed")
-        runs.release_runner(con, "research_branches", root["id"], key)
+        runs.release_runner(con, "research_execution", root["id"], key)
 
     if finish_before_first_poll:
         finish()
@@ -55,13 +55,13 @@ async def test_resident_node_completion_is_not_lost(state, finish_before_first_p
 @pytest.mark.asyncio
 async def test_parent_spawn_reply_does_not_restore_released_runner(state):
     con, _run, root = state
-    key = runs.prepare_runner(con, "research_branches", root["id"])
-    assert runs.claim_runner(con, "research_branches", root["id"], key)
+    key = runs.prepare_runner(con, "research_execution", root["id"])
+    assert runs.claim_runner(con, "research_execution", root["id"], key)
     runs.set_node(con, root["id"], status="closed")
-    runs.release_runner(con, "research_branches", root["id"], key)
+    runs.release_runner(con, "research_execution", root["id"], key)
     # A late pane.create reply still names the living resident window.
     workflow._record_runner(
-        con, "research_branches", root["id"], SimpleNamespace(pid=os.getpid()), key=key
+        con, "research_execution", root["id"], SimpleNamespace(pid=os.getpid()), key=key
     )
     assert runs.node(con, root["id"])["runner_pid"] is None
 

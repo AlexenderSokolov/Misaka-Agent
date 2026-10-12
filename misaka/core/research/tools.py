@@ -15,7 +15,7 @@ from misaka.config import CFG
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.platform import tasks as task_store
 from misaka.core.platform.prompt_guard import untrusted
-from misaka.core.research import graph, ledger, runs
+from misaka.core.research import ledger, runs, views
 from misaka.core.tools.truncate import TruncationOptions, formatSize, truncateHead
 
 # One tool result is one prompt turn for the smallest window in play (272k); the whole index of a
@@ -85,13 +85,10 @@ def register(harn):
             value = runs.summary(con, run["id"])
             return _text("\n".join(f"{k}: {v}" for k, v in value.items()))
         if params.view == "graph":
-            return _text(untrusted("research-graph", graph.render_graph(graph.snapshot(con, run))))
+            return _text(untrusted("research-graph", views.render_graph(views.snapshot(con, run))))
         if params.view == "issues":
-            rows = con.execute(
-                "SELECT * FROM research_issues WHERE run_id=? AND (? IS NULL OR branch_id=?) "
-                "ORDER BY branch_id,round,origin,priority DESC",
-                (run["id"], params.node, params.node),
-            ).fetchall()
+            rows = sorted(runs.issues(con, run["id"], node_id=params.node),
+                          key=lambda r: (r["branch_id"] or "", r["round"], r["origin"], -r["priority"]))
             return _text(untrusted("research-issues", "\n".join(
                 f"{r['id']} node {r['branch_id']} round {r['round']} [{r['origin']}/{r['kind']}] "
                 f"→ {r['disposition'] or 'undisposed'}" + (f" ({runs.destination(r)})" if runs.destination(r) else "")

@@ -320,3 +320,17 @@ def test_the_lease_passes_on_when_it_expires_or_its_holder_is_gone(held):
     assert graph.get(con, graph_id).lease_token == "third"
     graph.release(con, graph_id, "third")
     assert graph.get(con, graph_id).lease_token is None
+
+
+def test_locate_finds_the_graph_that_holds_an_element(board):
+    first = graph.create(board, "demo", SCHEMA)
+    second = graph.create(board, "demo", SCHEMA)
+    for made in (first, second):
+        graph.acquire(board, made.id, "driver", ttl=60)
+        graph.commit(board, made.id, "changes", [{"op": "add_node", "kind": "note", "id": "shared"}], token="driver")
+    graph.commit(board, first.id, "changes", [{"op": "add_node", "kind": "note", "id": "mine"}], token="driver")
+    assert graph.locate(board, "mine") == first.id and graph.locate(board, "nowhere") is None
+    with pytest.raises(graph.GraphError):
+        graph.locate(board, "shared")
+    graph.commit(board, first.id, "changes", [{"op": "retire", "id": "mine"}], token="driver")
+    assert graph.locate(board, "mine") is None

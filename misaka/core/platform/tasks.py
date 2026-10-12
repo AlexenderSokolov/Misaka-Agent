@@ -746,8 +746,8 @@ def delete_task(con, task_id, *, allow_active=False):
     con.execute("DELETE FROM events WHERE task_id=?", (task_id,))
     con.execute("DELETE FROM todos WHERE task_id=?", (task_id,))
     con.execute("DELETE FROM task_runs WHERE task_id=?", (task_id,))
-    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_run_tasks'").fetchone():
-        con.execute("DELETE FROM research_run_tasks WHERE task_id=?", (task_id,))   # a link without its card is a trap for resume
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_cards'").fetchone():
+        con.execute("DELETE FROM research_cards WHERE task_id=?", (task_id,))   # a link without its card is a trap for resume
     from misaka.core.platform import cards
     skipped = []
     for child in _children_of(con, task_id):

@@ -354,7 +354,7 @@ async def test_real_approval_tools_fence_captured_owner(state, changed, action):
     con, run, root = state
     branch = runs.create_node(con, run["id"], question="fixture", parents=[root["id"]])
     assert runs.acquire_driver(con, run["id"], "old-driver")
-    key = runs.prepare_runner(con, "research_branches", branch["id"])
+    key = runs.prepare_runner(con, "research_execution", branch["id"])
     run = runs.get(con, run["id"])
     branch = runs.node(con, branch["id"])
     runs.set_node(con, branch["id"], status="awaiting_approval")
@@ -375,12 +375,12 @@ async def test_real_approval_tools_fence_captured_owner(state, changed, action):
     tool = next(t for t in definitions if t.name == "misaka_research_" + action)
     if changed in ["driver", "both"]:
         con.execute(
-            "UPDATE research_runs SET driver_lock=? WHERE id=?",
+            "UPDATE graphs SET lease_token=? WHERE id=?",
             ("new-driver", run["id"]),
         )
     if changed in ["node", "both"]:
         con.execute(
-            "UPDATE research_branches SET runner_key=? WHERE id=?",
+            "UPDATE research_execution SET runner_key=? WHERE id=?",
             ("new-node", branch["id"]),
         )
     args = (
@@ -412,7 +412,7 @@ async def test_real_approval_tools_fence_captured_owner(state, changed, action):
     if changed == "none" and action == "withdraw":
         assert runs.action(con, run["id"], branch["id"], runs.plan_key(round_)) is None
     if changed == "none":
-        runs.release_runner(con, "research_branches", branch["id"], key)
+        runs.release_runner(con, "research_execution", branch["id"], key)
 
 
 async def test_spawn_cancellation_waits_for_and_reaps_late_handle(state):
@@ -468,7 +468,7 @@ async def test_a_level_starts_its_nodes_one_at_a_time(state, tmp_path):
     async def start(node):
         started.append(node["id"])
         handles[node["id"]] = SimpleNamespace(pid=None)
-        return runs.prepare_runner(con, "research_branches", node["id"])
+        return runs.prepare_runner(con, "research_execution", node["id"])
 
     def answer(node, stop_reason):
         with open(runs.node(con, node["id"])["session_file"], "a", encoding="utf-8") as handle:
@@ -498,7 +498,7 @@ async def test_a_level_starts_its_nodes_one_at_a_time(state, tmp_path):
         assert await eventually(lambda: started == ids)
         for node in nodes:
             runs.set_node(con, node["id"], status="closed")
-            runs.release_runner(con, "research_branches", node["id"], runs.node(con, node["id"])["runner_key"])
+            runs.release_runner(con, "research_execution", node["id"], runs.node(con, node["id"])["runner_key"])
         assert await asyncio.wait_for(task, 1) == "done"
     finally:
         task.cancel()
@@ -526,7 +526,7 @@ async def test_a_node_that_has_planned_does_not_hold_the_next_start(state, tmp_p
     async def start(node):
         started.append(node["id"])
         handles[node["id"]] = SimpleNamespace(pid=None)
-        return runs.prepare_runner(con, "research_branches", node["id"])
+        return runs.prepare_runner(con, "research_execution", node["id"])
 
     async def eventually(check):
         for _ in range(400):
@@ -554,7 +554,7 @@ def _reply(stop_reason):
 
 async def test_unclaimed_runner_is_not_completed_and_late_release_is_fenced(state):
     con, run, root = state
-    key = runs.prepare_runner(con, "research_branches", root["id"])
+    key = runs.prepare_runner(con, "research_execution", root["id"])
     task = asyncio.create_task(
         workflow._wait_level(
             con,
@@ -570,10 +570,10 @@ async def test_unclaimed_runner_is_not_completed_and_late_release_is_fenced(stat
         await asyncio.sleep(0.02)
         assert not task.done()
         runs.set_node(con, root["id"], status="closed")
-        runs.release_runner(con, "research_branches", root["id"], key)
+        runs.release_runner(con, "research_execution", root["id"], key)
         assert await asyncio.wait_for(task, 0.5) == "done"
-        new = runs.prepare_runner(con, "research_branches", root["id"])
-        runs.release_runner(con, "research_branches", root["id"], key)
+        new = runs.prepare_runner(con, "research_execution", root["id"])
+        runs.release_runner(con, "research_execution", root["id"], key)
         assert runs.node(con, root["id"])["runner_key"] == new
     finally:
         task.cancel()
@@ -822,7 +822,7 @@ async def test_clarification_drains_running_sibling_without_starting_pending_nod
     async def start(node):
         started.append(node["id"])
         handles[node["id"]] = object()
-        keys[node["id"]] = runs.prepare_runner(con, "research_branches", node["id"])
+        keys[node["id"]] = runs.prepare_runner(con, "research_execution", node["id"])
         return keys[node["id"]]
 
     task = asyncio.create_task(
@@ -847,7 +847,7 @@ async def test_clarification_drains_running_sibling_without_starting_pending_nod
             await asyncio.sleep(0.002)
         assert started == [a["id"], b["id"]]
         runs.set_node(con, a["id"], status="waiting_input")
-        runs.release_runner(con, "research_branches", a["id"], keys[a["id"]])
+        runs.release_runner(con, "research_execution", a["id"], keys[a["id"]])
         await asyncio.sleep(0.02)
         assert not task.done()
         assert runs.get(con, run["id"])["status"] == "active"
@@ -862,7 +862,7 @@ async def test_clarification_drains_running_sibling_without_starting_pending_nod
             tool_call_id="sibling-plan",
         )
         runs.set_node(con, b["id"], status="closed")
-        runs.release_runner(con, "research_branches", b["id"], keys[b["id"]])
+        runs.release_runner(con, "research_execution", b["id"], keys[b["id"]])
         result = await asyncio.wait_for(task, 1)
         assert result["reason"] == "waiting_input"
         assert runs.get(con, run["id"])["status"] == "waiting_input"
@@ -972,14 +972,14 @@ async def test_stop_or_takeover_during_start_prevents_next_spawn(
     monkeypatch.setattr(workflow, "_settle_stopped_tasks", AsyncMock())
 
     async def start(node):
-        key = runs.prepare_runner(con, "research_branches", node["id"])
+        key = runs.prepare_runner(con, "research_execution", node["id"])
         started.append(node["id"])
         handles[node["id"]] = node["id"]
         if halt == "stop":
             runs.request_stop(con, run["id"])
         else:
             con.execute(
-                "UPDATE research_runs SET driver_lock='successor' WHERE id=?",
+                "UPDATE graphs SET lease_token='successor' WHERE id=?",
                 (run["id"],),
             )
         return key
@@ -1049,13 +1049,13 @@ def test_a_failed_node_is_retried_with_its_failed_cards_and_the_loop_is_capped(s
         runs.retry_node(con, run, node["id"], session_file=str(tmp_path / "s.jsonl"), tool_call_id="call-0")
     for attempt in range(1, 4):
         con.execute("UPDATE tasks SET status='failed' WHERE id=?", (tid,))
-        con.execute("UPDATE research_branches SET status='failed', last_error='provider refused' WHERE id=?", (node["id"],))
+        con.execute("UPDATE research_execution SET status='failed', last_error='provider refused' WHERE id=?", (node["id"],))
         assert runs.retry_node(con, run, node["id"], session_file=str(tmp_path / "s.jsonl"),
                                tool_call_id=f"call-{attempt}") == attempt
         current = runs.node(con, node["id"])
         assert (current["status"], current["last_error"]) == ("planning", None)
         assert tasks.get(con, tid)["status"] == "ready"           # its failed card went back to its Sister
-    con.execute("UPDATE research_branches SET status='failed' WHERE id=?", (node["id"],))
+    con.execute("UPDATE research_execution SET status='failed' WHERE id=?", (node["id"],))
     with pytest.raises(ValueError, match="already retried 3 times"):
         runs.retry_node(con, run, node["id"], session_file=str(tmp_path / "s.jsonl"), tool_call_id="call-4")
 
@@ -1076,7 +1076,7 @@ async def test_a_retried_node_re_enters_its_level_without_a_resume(state, tmp_pa
     async def start(node):
         started.append(node["id"])
         handles[node["id"]] = SimpleNamespace(pid=None)
-        return runs.prepare_runner(con, "research_branches", node["id"])
+        return runs.prepare_runner(con, "research_execution", node["id"])
 
     def answer(node):
         with open(runs.node(con, node["id"])["session_file"], "a", encoding="utf-8") as handle:
@@ -1098,7 +1098,7 @@ async def test_a_retried_node_re_enters_its_level_without_a_resume(state, tmp_pa
         assert await eventually(lambda: started == [a["id"], b["id"]])
         answer(b)
         # a's process ends mid-plan: the level marks it failed and goes on without it.
-        runs.release_runner(con, "research_branches", a["id"], runs.node(con, a["id"])["runner_key"])
+        runs.release_runner(con, "research_execution", a["id"], runs.node(con, a["id"])["runner_key"])
         assert await eventually(lambda: runs.node(con, a["id"])["status"] == "failed")
         assert "its process ended while queued" in runs.node(con, a["id"])["last_error"]
         # Last Order retries it: it is queued again and started, no resume needed.
@@ -1107,7 +1107,7 @@ async def test_a_retried_node_re_enters_its_level_without_a_resume(state, tmp_pa
         assert runs.node(con, a["id"])["status"] == "planning"
         for node in nodes:
             runs.set_node(con, node["id"], status="closed")
-            runs.release_runner(con, "research_branches", node["id"], runs.node(con, node["id"])["runner_key"])
+            runs.release_runner(con, "research_execution", node["id"], runs.node(con, node["id"])["runner_key"])
         assert await asyncio.wait_for(task, 1) == "done"
     finally:
         task.cancel()

@@ -98,7 +98,7 @@ def ingest_report(con, run, task, report):
         if source:
             artifacts[source] = row
     link = con.execute(
-        "SELECT branch_id FROM research_run_tasks WHERE run_id=? AND task_id=?",
+        "SELECT branch_id FROM research_cards WHERE run_id=? AND task_id=?",
         (run["id"], task["id"]),
     ).fetchone()
     made, made_claims = 0, 0

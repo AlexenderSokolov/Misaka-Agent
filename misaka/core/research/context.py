@@ -12,7 +12,7 @@ import json
 import os
 
 from misaka.core.platform import prompt_guard
-from misaka.core.research import graph, ledger, runs
+from misaka.core.research import ledger, runs, views
 from misaka.utils.paths import posix_relpath
 
 
@@ -25,7 +25,7 @@ def _parent(con, run, node, parent):
             files.setdefault(row["kind"], []).append(rel(row["path"]))
     return {
         "id": parent["id"], "question": parent["question"], "depth": parent["depth"], "status": parent["status"],
-        "kind": graph.kind(con, parent), "session_file": parent["session_file"],
+        "kind": views.kind(con, parent), "session_file": parent["session_file"],
         "conclusions": files.get("synthesis", []), "critiques": files.get("critique", []),
         "divergence_review": files.get("divergence", []), "plans": files.get("plan", []),
         "issues": [{"id": row["id"], "origin": row["origin"], "round": row["round"], "question": row["question"],
@@ -63,13 +63,13 @@ def build(con, run, *, node):
                          "task_id": finding["task_id"],
                          "claim_type": finding["claim_type"], "claims": evidence})
     parents = runs.parents(con, node["id"])
-    ancestors = graph.ancestors(con, node["id"])
+    ancestors = views.ancestors(con, node["id"])
     return {
         "run_id": run["id"], "workspace": run["workspace"], "root_question": run["question"],
-        "root_session": run["root_session"], "graph": os.path.join(run["workspace"], graph.graph_path(run)),
-        "paths": os.path.join(run["workspace"], graph.paths_path(run)),
-        "node": {"id": node["id"], "question": node["question"], "depth": node["depth"], "kind": graph.kind(con, node),
-                 "forked_from": graph.fork_source(con, node)["id"] if parents else None},
+        "root_session": run["root_session"], "graph": os.path.join(run["workspace"], views.graph_path(run)),
+        "paths": os.path.join(run["workspace"], views.paths_path(run)),
+        "node": {"id": node["id"], "question": node["question"], "depth": node["depth"], "kind": views.kind(con, node),
+                 "forked_from": views.fork_source(con, node)["id"] if parents else None},
         "reached_by": [{"option": o["id"], "label": o["label"], "premise": o["premise"],
                         "decision": o["decision_question"], "stakes": o["decision_stakes"], "decided_at": o["decided_at"],
                         "rivals": [{"label": r["label"], "premise": r["premise"], "node": r["node_id"], "reason": r["reason"]}

@@ -292,8 +292,8 @@ def card_extras(con, task, cfg=None, *, include_materials=True):
     """
     extras = {"_research": None, "_materials": "", "_session_overrides": {}}
     with contextlib.suppress(Exception):   # a board without the research schema is an ordinary board
-        if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_run_tasks'").fetchone():
-            row = con.execute("SELECT run_id, branch_id, kind FROM research_run_tasks WHERE task_id=?",
+        if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_cards'").fetchone():
+            row = con.execute("SELECT run_id, branch_id, kind FROM research_cards WHERE task_id=?",
                               (task["id"],)).fetchone()
             if row is not None:
                 extras["_research"] = dict(row)
@@ -523,8 +523,8 @@ def build_submission(con, task, summary):
     divergence = attempt_payload(con, task, "research_divergence")
     if divergence is not None:
         submission["alternatives"] = divergence["alternatives"]
-    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_run_tasks'").fetchone():
-        link = con.execute("SELECT kind FROM research_run_tasks WHERE task_id=?", (task["id"],)).fetchone()
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_cards'").fetchone():
+        link = con.execute("SELECT kind FROM research_cards WHERE task_id=?", (task["id"],)).fetchone()
         from misaka.core.research import runs
         if link and link["kind"] in runs.CRITIQUE_KINDS and "issues" not in submission:
             raise IncompleteSubmission(

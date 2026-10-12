@@ -82,8 +82,8 @@ class CardContextTests(unittest.TestCase):
     def test_card_extras_and_single_catalog_owner(self):
         with closing(sqlite3.connect(":memory:")) as con:
             con.row_factory = sqlite3.Row
-            con.execute("CREATE TABLE research_run_tasks(task_id TEXT, run_id TEXT, branch_id TEXT, kind TEXT)")
-            con.execute("INSERT INTO research_run_tasks VALUES ('card-1','run-1','node-1','investigation')")
+            con.execute("CREATE TABLE research_cards(task_id TEXT, run_id TEXT, branch_id TEXT, kind TEXT)")
+            con.execute("INSERT INTO research_cards VALUES ('card-1','run-1','node-1','investigation')")
             row = {"id": "card-1", "assignee": "10032", "workspace": "/fixture"}
             with patch.object(worker, "materials_on_hand", return_value="Existing material"):
                 extra = worker.card_extras(con, row)

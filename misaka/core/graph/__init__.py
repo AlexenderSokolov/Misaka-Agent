@@ -55,7 +55,7 @@ from .model import (
     thaw,
 )
 from .snapshot import Snapshot
-from .store import create, get, init, snapshot, version
+from .store import create, get, init, locate, snapshot, version
 
 __all__ = [
     "APPLIED",
@@ -89,6 +89,7 @@ __all__ = [
     "entry",
     "get",
     "init",
+    "locate",
     "propose",
     "release",
     "renew",

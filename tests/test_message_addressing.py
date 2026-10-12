@@ -633,7 +633,7 @@ def _run(world, *, origin_session=None):
 
 def _link(world, run_id, task_id, branch="b_root"):
     world.board.execute(
-        "INSERT INTO research_run_tasks (task_id, run_id, branch_id, kind, created_at) VALUES (?,?,?,?,?)",
+        "INSERT INTO research_cards (task_id, run_id, branch_id, kind, created_at) VALUES (?,?,?,?,?)",
         (task_id, run_id, branch, "research", int(time.time())))
     world.board.commit()
 
@@ -736,9 +736,9 @@ def test_a_parked_card_with_its_window_open_is_still_reached_in_that_session(wor
 def _node(world, run_id, node_id, *, depth, session_id):
     now = int(time.time())
     world.board.execute(
-        "INSERT INTO research_branches (id, run_id, question, depth, status, session_file, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (node_id, run_id, "q", depth, "executing",
+        "INSERT INTO research_execution (id, run_id, status, session_file, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (node_id, run_id, "executing",
          f"state/sessions/research/{run_id}--node-{node_id}/2026-10-01T15-28-47-603Z_{session_id}.jsonl", now, now))
     world.board.commit()
 

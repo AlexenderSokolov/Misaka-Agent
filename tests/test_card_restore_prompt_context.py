@@ -19,8 +19,8 @@ class CardRestorePromptContextTests(unittest.TestCase):
             (root / "downloads").mkdir()
             (root / "downloads" / "broken.md").write_bytes(b"\xff")
             con.row_factory = sqlite3.Row
-            con.execute("CREATE TABLE research_run_tasks(task_id TEXT, run_id TEXT, branch_id TEXT, kind TEXT)")
-            con.execute("INSERT INTO research_run_tasks VALUES ('card-1','run-1','node-1','investigation')")
+            con.execute("CREATE TABLE research_cards(task_id TEXT, run_id TEXT, branch_id TEXT, kind TEXT)")
+            con.execute("INSERT INTO research_cards VALUES ('card-1','run-1','node-1','investigation')")
             row = {"id": "card-1", "workspace": directory, "generation": 1, "agent_id": "agent-1",
                    "session_file": "", "assignee": "10032", "claim_lock": None}
             runtime = SimpleNamespace(con=con, cfg={}, _handles={}, session=object(),

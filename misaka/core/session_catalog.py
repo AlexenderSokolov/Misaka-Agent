@@ -392,9 +392,12 @@ def list_entries(con, *, extra_paths=()):
     product = os.path.realpath(sessions.sessions_root())
     roots = {product, get_sessions_dir()}
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")} if con else set()
-    run_rows = {r["id"]: dict(r) for r in con.execute("SELECT * FROM research_runs")} if "research_runs" in tables else {}
-    nodes = {r["id"]: dict(r) for r in con.execute("SELECT * FROM research_branches")} if "research_branches" in tables else {}
-    links = {r["task_id"]: dict(r) for r in con.execute("SELECT * FROM research_run_tasks")} if "research_run_tasks" in tables else {}
+    run_rows, nodes, links = {}, {}, {}
+    if "research_runs" in tables:
+        from misaka.core.research import runs
+        run_rows = {row["id"]: row for row in runs.listing(con)}
+        nodes = {row["id"]: row for run_id in run_rows for row in runs.nodes(con, run_id)}
+        links = {row["task_id"]: dict(row) for row in con.execute("SELECT * FROM research_cards")}
     cards = {}
     if "tasks" in tables:
         for row in con.execute("SELECT * FROM tasks"):

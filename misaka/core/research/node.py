@@ -346,16 +346,16 @@ def _run(label, routine, *, row_id, runner_key):
         text = f"{type(error).__name__}: {error}"
         print(f"{label} failed: {text}", flush=True)
         try:
-            con.execute('UPDATE research_branches SET last_error=COALESCE(last_error,?) WHERE id=? AND runner_key=?',
+            con.execute('UPDATE research_execution SET last_error=COALESCE(last_error,?) WHERE id=? AND runner_key=?',
                         (text, row_id, runner_key))
         except Exception:  # noqa: BLE001 - keep the original traceback even when recording it also fails
             traceback.print_exc()
 
     try:
         runs.init(con)
-        if not runs.claim_runner(con, "research_branches", row_id, runner_key):
+        if not runs.claim_runner(con, "research_execution", row_id, runner_key):
             print(f"{label}: superseded execution: "
-                  f"{runs.note_claim_failure(con, 'research_branches', row_id, runner_key)}", flush=True)
+                  f"{runs.note_claim_failure(con, 'research_execution', row_id, runner_key)}", flush=True)
             return 1
         cfg = current_config()
         runner = HeadlessRunner(con, cfg)
@@ -426,9 +426,9 @@ def run_interactive(run_id, node_id, *, runner_key):
     con = task_store.connect(os.path.expanduser(CFG["db"]))
     try:
         runs.init(con)
-        if not runs.claim_runner(con, "research_branches", node_id, runner_key):
+        if not runs.claim_runner(con, "research_execution", node_id, runner_key):
             print(f"node {node_id}: superseded execution: "
-                  f"{runs.note_claim_failure(con, 'research_branches', node_id, runner_key)}", flush=True)
+                  f"{runs.note_claim_failure(con, 'research_execution', node_id, runner_key)}", flush=True)
             return 1
         run, node = runs.get(con, run_id), runs.node(con, node_id)
     finally:
@@ -464,7 +464,7 @@ def run_interactive(run_id, node_id, *, runner_key):
         traceback.print_exc()
         con = task_store.connect(os.path.expanduser(CFG["db"]))
         try:
-            con.execute('UPDATE research_branches SET last_error=COALESCE(last_error,?) WHERE id=? AND runner_key=?',
+            con.execute('UPDATE research_execution SET last_error=COALESCE(last_error,?) WHERE id=? AND runner_key=?',
                         (f"{type(error).__name__}: {error}", node_id, runner_key))
         finally:
             con.close()

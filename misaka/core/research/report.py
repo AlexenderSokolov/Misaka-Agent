@@ -21,7 +21,7 @@ from pathlib import Path
 from misaka.core.documents import index as corpus
 from misaka.core.platform import prompt_guard
 from misaka.core.platform import tasks as task_store
-from misaka.core.research import bundle, commands, graph, planner, runs
+from misaka.core.research import bundle, commands, planner, runs, views
 from misaka.core.session_manager import findMostRecentSession
 from misaka.utils import atomic
 
@@ -178,7 +178,7 @@ def _catalog(con, run, docs, focus=None):
         by_kind = {}
         for row in rows:
             by_kind.setdefault(row["kind"], []).append(doc(row["path"]))
-        entry = {"node": node["id"], "kind": graph.kind(con, node), "depth": node["depth"], "status": node["status"],
+        entry = {"node": node["id"], "kind": views.kind(con, node), "depth": node["depth"], "status": node["status"],
                  "parents": [p["id"] for p in runs.parents(con, node["id"])],
                  "children": [c["id"] for c in runs.children(con, node["id"])],
                  "question": node["question"],
@@ -190,7 +190,7 @@ def _catalog(con, run, docs, focus=None):
                  # Counts only: every issue's text made the catalog 280 KB (2026-09-29, 293 issues); the
                  # issues view lists a node's.
                  "issues": _issue_counts(runs.issues(con, run["id"], node_id=node["id"])),
-                 "dissolves": graph.dissolution(con, run, node)}
+                 "dissolves": views.dissolution(con, run, node)}
         if node["id"] == focus:
             entry.update({"reached_by": [{"decided_at": o["decided_at"], "decision": o["decision_question"],
                                           "option": o["label"], "premise": o["premise"]}
@@ -244,12 +244,12 @@ def _record(con, run):
                           for n in runs.nodes(con, run["id"]) if n["status"] == "parked"],
         "decisions": decisions,
         "relations": runs.relations(con, run["id"]),
-        "dissolutions": [{"node": n["id"], **graph.dissolution(con, run, n)} for n in runs.nodes(con, run["id"])
-                         if graph.dissolution(con, run, n)],
+        "dissolutions": [{"node": n["id"], **views.dissolution(con, run, n)} for n in runs.nodes(con, run["id"])
+                         if views.dissolution(con, run, n)],
         "dissolution_consent": (runs.action(con, run["id"], runs.root(con, run["id"])["id"], runs.CONSENT_KEY)
                                 or {}).get("payload"),
-        "graph": os.path.join(run["workspace"], graph.graph_path(run)),
-        "paths": os.path.join(run["workspace"], graph.paths_path(run)),
+        "graph": os.path.join(run["workspace"], views.graph_path(run)),
+        "paths": os.path.join(run["workspace"], views.paths_path(run)),
     }
 
 
@@ -335,8 +335,8 @@ def _common(con, run, docs, focus=None):
             "(root first, then by depth)\n"
             + prompt_guard.untrusted("research-catalog", json.dumps(_catalog(con, run, docs, focus), ensure_ascii=False,
                                                                     indent=2))
-            + f"\nThe graph: `{os.path.join(run['workspace'], graph.graph_path(run))}`; every possibility raised and where "
-            f"it went: `{os.path.join(run['workspace'], graph.paths_path(run))}`; the complete list of materials the run "
+            + f"\nThe graph: `{os.path.join(run['workspace'], views.graph_path(run))}`; every possibility raised and where "
+            f"it went: `{os.path.join(run['workspace'], views.paths_path(run))}`; the complete list of materials the run "
             f"opened and downloaded, which misaka writes when the report is delivered (Appendix III): "
             f"`{os.path.join(run['workspace'], runs.run_path(run, bundle.MANIFEST))}`.\n")
 
@@ -348,7 +348,7 @@ def prepare(con, run, cfg, worker, *, check_active=None):
     root = runs.root(con, run["id"])
     if _checkpoint(con, run, "survey") is None:
         relate = commands.relate_tool(con, run, session_file=run["root_session"],
-                                      validate=lambda value: graph.resolve_relations(con, run, value))
+                                      validate=lambda value: views.resolve_relations(con, run, value))
         sections = []
         for node in runs.nodes(con, run["id"]):
             key = f"survey:{node['id']}"

@@ -31,7 +31,7 @@ from misaka import workspace as workspace_index
 from misaka.core.platform import budget, prompt_guard
 from misaka.core.platform import cards as card_files
 from misaka.core.platform import tasks as task_store
-from misaka.core.research import bundle, commands, graph, ledger, planner, report, runs
+from misaka.core.research import bundle, commands, ledger, planner, report, runs, views
 from misaka.core.research import context as context_packet
 from misaka.utils.async_lifecycle import settle, settle_thread_call
 from misaka.utils.markdown import atx_headings
@@ -140,7 +140,7 @@ def _write(con, run, node, kind, title, name, content, **metadata):
 
 async def _views(con, run, *, final=False):
     """Rewrite the graph's views in the project. Off the loop: it waits for the run's view lock."""
-    await asyncio.to_thread(graph.write_views, con, run, final=final)
+    await asyncio.to_thread(views.write_views, con, run, final=final)
 
 
 def _bundle(con, run, *, task=None, node=None):
@@ -212,8 +212,7 @@ def _withdraw_emptied_round(con, run, node, round):
     with runs.owned_txn(con, run, node):
         for key in (runs.start_key(round), runs.plan_key(round)):
             runs.delete_action(con, run["id"], node["id"], key)
-        con.execute("DELETE FROM research_actions WHERE run_id=? AND branch_id=? AND action_key LIKE ?",
-                    (run["id"], node["id"], runs.plan_change_key(round) + ":%"))
+        runs.withdraw_actions(con, run["id"], node["id"], runs.plan_change_key(round) + ":")
     _forget_plan(con, run, node, round)
 
 
@@ -333,14 +332,14 @@ async def _submit_tasks(con, run, node, specs, *, kind, progress=None, round=1, 
             break
         with runs.owned_txn(con, run, node):
             existing = con.execute(
-                "SELECT task_id FROM research_run_tasks WHERE run_id=? AND branch_id=? AND local_id=?",
+                "SELECT task_id FROM research_cards WHERE run_id=? AND branch_id=? AND local_id=?",
                 (run["id"], node["id"], spec["local_id"]),
             ).fetchone()
             if existing and task_store.get(con, existing["task_id"]) is not None:
                 local_to_task[spec["local_id"]] = existing["task_id"]   # a resume after a crash: the card already exists
                 continue
             if existing:                                   # the card was deleted: drop the stale link and rebuild it
-                con.execute("DELETE FROM research_run_tasks WHERE task_id=?", (existing["task_id"],))
+                con.execute("DELETE FROM research_cards WHERE task_id=?", (existing["task_id"],))
             tid = card_files.create(
                 con, root, spec["title"],
                 planner.task_body(spec, run_id=run["id"], node=node, siblings=specs, previous=previous,
@@ -751,7 +750,7 @@ def _register_task_artifacts(con, run, task, submitted):
     whole runs (2026-09-24: 18 changed paths across 6 cards, one of them settle's own bundle).
     A changed or missing file of the card's own raises ``ArtifactDrift`` after the whole list
     is checked, and nothing of that card is registered under the stale declaration."""
-    link = con.execute("SELECT * FROM research_run_tasks WHERE task_id=?", (task["id"],)).fetchone()
+    link = con.execute("SELECT * FROM research_cards WHERE task_id=?", (task["id"],)).fetchone()
     if not link or not task["workspace"]:
         return
     node = runs.node(con, link["branch_id"])
@@ -920,11 +919,10 @@ def _receive_issues(con, run, node, task, *, round, items):
     with runs.owned_txn(con, run, node):
         # Per round: one red-team card reviews every version, and an earlier round's answered
         # issues must neither be replaced nor keep this round's from being recorded.
-        recorded = con.execute("SELECT disposition FROM research_issues WHERE task_id=? AND round=?",
-                               (task["id"], round)).fetchall()
+        recorded = [row for row in runs.issues(con, run["id"], round=round) if row["task_id"] == task["id"]]
         if any(row["disposition"] for row in recorded):
             return
-        con.execute("DELETE FROM research_issues WHERE task_id=? AND round=?", (task["id"], round))
+        runs.drop_issues(con, run["id"], [row["id"] for row in recorded])
         for item in items:
             runs.add_issue(con, run["id"], node=node, task_id=task["id"], round=round, **item)
 
@@ -994,8 +992,8 @@ def _divergence_brief(con, run, node, version, *, round):
                  "dispositions": prompt_guard.untrusted("dispositions", planner.disposition_table(gaps))}
     return planner.divergence_body(
         node, synthesis_path=runs.artifact_path(_synthesis(con, run, node, version)),
-        plan_path=_artifact_paths(con, run, node, "plan"), graph_path=graph.graph_path(run),
-        paths_path=graph.paths_path(run), deliverable=runs.versioned("divergence.md", round), rereview=again)
+        plan_path=_artifact_paths(con, run, node, "plan"), graph_path=views.graph_path(run),
+        paths_path=views.paths_path(run), deliverable=runs.versioned("divergence.md", round), rereview=again)
 
 
 def _divergence_paths(con, run, node, card):
@@ -1079,7 +1077,7 @@ def _close(con, run, node, status):
             details.append(f"{card['id']} ({card['status']}): {payload or 'no failure detail recorded'}")
         reason = f"{node['status']}: " + ("; ".join(details) or "node did not complete this phase")
         with runs.owned_txn(con, run, node):
-            con.execute("UPDATE research_branches SET last_error=? WHERE id=?", (reason, node["id"]))
+            con.execute("UPDATE research_execution SET last_error=? WHERE id=?", (reason, node["id"]))
             runs.set_state(con, run["id"], error=f"node {node['id']}: {reason}")
     _bundle(con, run, node=node)                      # the node's folder is complete: gather what it rests on
     _index(con, run, node)
@@ -1119,17 +1117,16 @@ def _revisions(con, run, node, *, before=None, loop="dispose"):
     team's (``dispose``) or the divergence review's (``gaps``): its rounds whose dispositions include
     a revise -- counting only rounds before version ``before`` when given."""
     count = 0
-    for row in con.execute("SELECT action_key,payload_json FROM research_actions WHERE run_id=? AND branch_id=? "
-                           "AND action_key LIKE ?", (run["id"], node["id"], f"{loop}:%")):
+    for row in runs.actions(con, run["id"], node["id"], f"{loop}:"):
         if before is not None and int(row["action_key"].split(":", 1)[1]) >= before:
             continue
-        count += any(item["disposition"] == "revise" for item in json.loads(row["payload_json"])["dispositions"])
+        count += any(item["disposition"] == "revise" for item in row["payload"]["dispositions"])
     return count
 
 
 def _synthesis(con, run, node, version):
     """The node's conclusion of the given version, when written."""
-    rows = graph.syntheses(con, run, node)
+    rows = views.syntheses(con, run, node)
     return rows[version - 1] if len(rows) >= version else None
 
 
@@ -1154,7 +1151,7 @@ def _deliberation(con, run, node, version):
         if int(metadata.get("version") or 1) < version and metadata.get("through"):
             start, earlier = metadata["through"], runs.artifact_path(row)
     given = []
-    for row in [*graph.syntheses(con, run, node), *runs.artifacts(con, run["id"], kind="plan", branch_id=node["id"])]:
+    for row in [*views.syntheses(con, run, node), *runs.artifacts(con, run["id"], kind="plan", branch_id=node["id"])]:
         with contextlib.suppress(OSError):
             given.append(Path(runs.artifact_path(row)).read_text(encoding="utf-8"))
     through = planner.session_leaf(session_file)
@@ -1234,7 +1231,7 @@ def _red_team_brief(con, run, node, version, assignee):
                     "dispositions": prompt_guard.untrusted("dispositions", earlier["dispositions"])}
     return planner.red_team_body(
         node, synthesis_path=runs.artifact_path(_synthesis(con, run, node, version)),
-        plan_path=_artifact_paths(con, run, node, "plan"), graph_path=graph.graph_path(run),
+        plan_path=_artifact_paths(con, run, node, "plan"), graph_path=views.graph_path(run),
         deliberation_path=_artifact_path(con, run, node, "deliberation") if written else None,
         evidence=planner.evidence_block(con, run, node),
         own_cards=[row for row in _done(con, run, node, "research") if row["assignee"] == assignee],
@@ -1354,7 +1351,7 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
     def fail(card, reason):
         task_store.add_event(con, card["id"], "research_review_missing", {"reason": reason})
         with runs.owned_txn(con, owner_run, owner_node):
-            con.execute("UPDATE research_branches SET last_error=? WHERE id=?", (reason, nid))
+            con.execute("UPDATE research_execution SET last_error=? WHERE id=?", (reason, nid))
             runs.set_state(con, run["id"], error=f"node {nid}: {reason}")
         return _close(con, run, node, "failed")
 
@@ -1536,7 +1533,7 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
             set_node(status=reviewer)
 
         elif status == "critiquing":
-            version = len(graph.syntheses(con, run, node))
+            version = len(views.syntheses(con, run, node))
             red = _red_team_card(con, run, node)
             if red is None:
                 assignee = _red_team_assignee(con, run, node)
@@ -1612,7 +1609,7 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
                 return closed
 
         elif status == "disposing":
-            version = len(graph.syntheses(con, run, node))
+            version = len(views.syntheses(con, run, node))
             red = _red_team_card(con, run, node)
             if red is None or red["status"] != "done" or not _reviewed(con, red, version):
                 raise RuntimeError(f"Node {nid} has no completed red-team review to answer.")
@@ -1646,7 +1643,7 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
             # not take, and the gaps it left. The gaps are this node's to fill, and every version a
             # gap revision makes is reviewed again, until a review finds no gap or the node's gap
             # revisions are spent; only then do the possibilities become its decision (2026-10-01).
-            version = len(graph.syntheses(con, run, node))
+            version = len(views.syntheses(con, run, node))
             card = _divergence_card(con, run, node)
             if card is None:
                 assignee = _red_team_assignee(con, run, node)
@@ -1707,7 +1704,7 @@ async def _expand_owned(con, cfg, runner, worker, run, node, *, context, tool_ca
             set_node(status="deciding")
 
         elif status == "filling_gaps":
-            version = len(graph.syntheses(con, run, node))
+            version = len(views.syntheses(con, run, node))
             card = _divergence_card(con, run, node)
             if card is None or card["status"] != "done" or not _divergence_reviewed(con, card, version):
                 raise RuntimeError(f"Node {nid} has no completed divergence review to answer.")
@@ -1855,10 +1852,10 @@ async def _await_approval(con, cfg, runner, worker, run, node, *, poll_seconds, 
             session.unregisterCustomTools(tools)
         if control is not None and control.review_tools is tools:
             control.review_tools = ()
-        con.execute("UPDATE research_branches SET status='planning' WHERE id=? "
-                    "AND runner_key IS ? AND status='awaiting_approval' AND EXISTS "
-                    "(SELECT 1 FROM research_runs WHERE id=? AND driver_lock IS ?)",
-                    (nid, node["runner_key"], run["id"], run["driver_lock"]))
+        with task_store.write_txn(con):
+            if runs.holds_driver(con, run["id"], run["driver_lock"]):
+                con.execute("UPDATE research_execution SET status='planning' WHERE id=? "
+                            "AND runner_key IS ? AND status='awaiting_approval'", (nid, node["runner_key"]))
 
 
 async def _skip_node(con, run, node, progress):
@@ -1974,7 +1971,7 @@ def _conclusions(con, run):
     """
     out = []
     for node in runs.nodes(con, run["id"]):
-        rows = graph.syntheses(con, run, node)
+        rows = views.syntheses(con, run, node)
         if not rows:
             continue
         try:
@@ -1985,7 +1982,7 @@ def _conclusions(con, run):
             text = f"*(This conclusion could not be read back: {error})*"
         parents = ", ".join(p["id"] for p in runs.parents(con, node["id"])) or "none"
         version = f", version {len(rows)}" if len(rows) > 1 else ""
-        out.append(f"### [{node['id']}] {graph.kind(con, node)}, depth {node['depth']}{version} — "
+        out.append(f"### [{node['id']}] {views.kind(con, node)}, depth {node['depth']}{version} — "
                    f"{_cell(node['question'])}\n\nParents: {parents}\n\n{text}")
     return out
 
@@ -2039,7 +2036,7 @@ def _partial_result(con, run, reason, *, status="stopped", driver_lock=None):
                        error=reason[:500] if status == "failed" else None)
     _try_refresh_workspace_index(con, runs.get(con, run["id"]))
     _bundle(con, run)
-    graph.write_views(con, run, final=True)
+    views.write_views(con, run, final=True)
     return {"reason": status, "final": {"artifact": aid, "path": path,
             "content": Path(path).read_text(encoding="utf-8")},
             "run": runs.summary(con, run["id"])}
@@ -2164,13 +2161,13 @@ async def _expand_level(con, cfg, spawner, run, level, *, poll_seconds, progress
     handles = {}
 
     async def start(node):                          # registered one by one: a failed spawn stops the started ones
-        await asyncio.to_thread(_reap_orphan_runner, con, "research_branches", node)
+        await asyncio.to_thread(_reap_orphan_runner, con, "research_execution", node)
         with runs.owned_txn(con, run):
-            key = runs.prepare_runner(con, "research_branches", node["id"])
+            key = runs.prepare_runner(con, "research_execution", node["id"])
         handle, cancelled = await settle_thread_call(
             spawner.spawn, _node_argv(run, node, key), cwd=run["workspace"])
         handles[node["id"]] = handle
-        _record_runner(con, "research_branches", node["id"], handle, key=key)
+        _record_runner(con, "research_execution", node["id"], handle, key=key)
         if cancelled is not None:
             raise cancelled
         return key
@@ -2283,13 +2280,13 @@ async def _wait_level(con, cfg, spawner, run, handles, *, poll_seconds, progress
                 if not halted and node["status"] not in ("waiting_input", *runs.NODE_TERMINAL):
                     reason = _runner_failure(node, tail=_pane_tail(spawner, handle))
                     with runs.owned_txn(con, run):
-                        con.execute("UPDATE research_branches SET last_error=?,status='failed',updated_at=? WHERE id=?",
+                        con.execute("UPDATE research_execution SET last_error=?,status='failed',updated_at=? WHERE id=?",
                                     (reason, int(time.time()), nid))
                     await _progress(progress, "node_failed", f"{_label(node)} failed: {reason}. The level goes on. "
                                     f"If the cause was passing, misaka_research_retry(node=\"{nid}\") runs it again now; "
                                     "otherwise the resume after this level retries it.", run, node=nid)
                 handles.pop(nid)
-                _clear_runner(con, "research_branches", nid, key=keys[nid])
+                _clear_runner(con, "research_execution", nid, key=keys[nid])
                 hold = hold or node["status"] == "waiting_input"   # the run is about to pause for the user
         # A node Last Order retried (runs.retry_node) is back on the frontier with no process: queue it again.
         queued = {n["id"] for n in pending} | handles.keys()
@@ -2317,7 +2314,7 @@ async def _settle_stopped_tasks(con, cfg, run_id):
 
 def _prepare_sessions(con, run):
     """Give every node that has not run yet its conversation: a fork of the Last Order conversation
-    of its ``graph.fork_source`` -- its parent, or for a join the lowest node its parents share --
+    of its ``views.fork_source`` -- its parent, or for a join the lowest node its parents share --
     with ``fork_entry`` marking where its own turns begin. A fork written just before a crash is
     found in the node's own folder and adopted, since the node never ran in it."""
     from misaka.core.session_manager import findMostRecentSession
@@ -2325,7 +2322,7 @@ def _prepare_sessions(con, run):
     for node in runs.nodes(con, run["id"]):
         if node["status"] != "queued" or node["session_file"] or runs.is_root(node):
             continue
-        source = graph.fork_source(con, node)
+        source = views.fork_source(con, node)
         directory = planner._lo_session(run, node)
         session = findMostRecentSession(directory)
         entry = planner.session_leaf(session) if session else None
@@ -2352,18 +2349,18 @@ def _reconcile_material(con, run):
     for node in runs.nodes(con, run["id"]):
         if node["status"] != "closed":
             continue
-        conclusions = graph.syntheses(con, run, node)
+        conclusions = views.syntheses(con, run, node)
         conclusion = runs.artifact_path(conclusions[-1]) if conclusions else None
-        finished.append({"id": node["id"], "kind": graph.kind(con, node), "depth": node["depth"],
+        finished.append({"id": node["id"], "kind": views.kind(con, node), "depth": node["depth"],
                          "question": node["question"], "new_since_last_reconciliation": node["id"] not in covered,
                          "parents": [p["id"] for p in runs.parents(con, node["id"])],
                          "conclusion": rel(conclusion), "conclusion_doc": conclusion and report.doc_id(run, conclusion),
-                         "node_view": graph.node_view_path(node["id"])})
+                         "node_view": views.node_view_path(node["id"])})
     pending = [{"option": row["id"], "label": row["label"], "premise": row["premise"],
                 "decision": row["decision_question"], "stakes": row["decision_stakes"],
                 "decided_at": row["decided_at"], "decided_in": row["decision_origin"]}
-               for row in graph.reconcilable_options(con, run)]
-    return {"graph": graph.graph_path(run), "paths": graph.paths_path(run),
+               for row in views.reconcilable_options(con, run)]
+    return {"graph": views.graph_path(run), "paths": views.paths_path(run),
             "limits": {"max_depth": chosen["max_depth"], "max_nodes": chosen["max_nodes"],
                        "nodes_now": len(runs.nodes(con, run["id"]))},
             "pending_options": pending, "finished_nodes": finished,
@@ -2371,7 +2368,7 @@ def _reconcile_material(con, run):
 
 
 async def _reconcile(con, cfg, run, window, *, poll_seconds, progress, check_active):
-    """The level barrier: when the graph calls for it (``graph.reconcile_state``), the root Last Order
+    """The level barrier: when the graph calls for it (``views.reconcile_state``), the root Last Order
     reconciles in the run's own conversation and the result is applied in one transaction. A
     recorded reconciliation is never asked for twice; one that no longer fits the graph is dropped
     and asked for again. Returns None, or a halt ("stopped") while waiting for the user's go-ahead."""
@@ -2379,14 +2376,14 @@ async def _reconcile(con, cfg, run, window, *, poll_seconds, progress, check_act
     if rounds and rounds[-1]["applied_at"] is None:
         round = rounds[-1]["round"]
     else:
-        needed, _considered = graph.reconcile_state(con, run)
+        needed, _considered = views.reconcile_state(con, run)
         if not needed:
             return None
         round = rounds[-1]["round"] + 1 if rounds else 1
     await _views(con, run)
 
     def validate(payload):
-        return graph.resolve_reconcile(con, runs.get(con, run["id"]), payload)
+        return views.resolve_reconcile(con, runs.get(con, run["id"]), payload)
 
     await _progress(progress, "reconciling", f"The root Last Order is reconciling the graph (round {round}).", run)
     for attempt in (1, 2):
@@ -2405,9 +2402,8 @@ async def _reconcile(con, cfg, run, window, *, poll_seconds, progress, check_act
             if attempt == 2:
                 raise
             with runs.owned_txn(con, run):
-                con.execute("DELETE FROM research_reconciles WHERE run_id=? AND round=? AND applied_at IS NULL",
-                            (run["id"], round))
-    _needed, considered = graph.reconcile_state(con, run)
+                runs.withdraw_reconcile(con, run["id"], round)
+    _needed, considered = views.reconcile_state(con, run)
     receipt = runs.apply_reconcile(con, run, round, resolved, considered=considered)
     opened = len(receipt["nodes"]) + len(receipt["joins"])
     await _progress(progress, "reconciled",
@@ -2457,13 +2453,13 @@ async def _await_consent(con, cfg, run, window, *, poll_seconds, progress, check
     final answer may say so -- in any run, whatever its approval policy, as with a reframed question.
     The root Last Order puts it to them in the run's conversation, then the report waits until she
     records their decision. Returns None, or "stopped"."""
-    dissolving = graph.dissolving_nodes(con, run)
+    dissolving = views.dissolving_nodes(con, run)
     root = runs.root(con, run["id"])
     if not dissolving or runs.action(con, run["id"], root["id"], runs.CONSENT_KEY):
         return None
     material = [{"node": node["id"], "question": node["question"],
-                 "conclusion": runs.artifact_path(graph.syntheses(con, run, node)[-1]),
-                 "grounds": graph.dissolution(con, run, node)["grounds"]} for node in dissolving]
+                 "conclusion": runs.artifact_path(views.syntheses(con, run, node)[-1]),
+                 "grounds": views.dissolution(con, run, node)["grounds"]} for node in dissolving]
     where = ("in this window" if not getattr(window, "headless", False)
              else f"with `misaka chat --attach --session {run['root_session']}`")
     await _progress(progress, "dissolution", "The research concludes that the question itself dissolves "
@@ -2543,15 +2539,15 @@ async def run(con, cfg, spawner, *, run_id, poll_seconds=POLL_SECONDS, progress=
         while pending := [n for n in runs.nodes(con, run_id) if n["id"] not in reaped]:
             for row in pending:
                 check_active(allow_stop=True)
-                await asyncio.to_thread(_reap_orphan_runner, con, "research_branches", row)
+                await asyncio.to_thread(_reap_orphan_runner, con, "research_execution", row)
                 reaped.add(row["id"])
         if origin_session:
             from misaka.core.platform import notifications
             with task_store.write_txn(con):
                 current = runs.get(con, run_id)
                 if current["origin_session"] != origin_session:
-                    con.execute("UPDATE research_runs SET origin_session=? WHERE id=? AND driver_lock=?",
-                                (origin_session, run_id, driver_lock))
+                    if runs.holds_driver(con, run_id, driver_lock):
+                        con.execute("UPDATE research_runs SET origin_session=? WHERE id=?", (origin_session, run_id))
                     subscription = notifications.subscribe(con, run_id, "research-chat")
                     con.execute("UPDATE notification_subscriptions SET lease_token=NULL,leased_event_id=NULL,"
                                 "lease_expires=NULL WHERE id=?", (subscription,))
@@ -2574,7 +2570,7 @@ async def run(con, cfg, spawner, *, run_id, poll_seconds=POLL_SECONDS, progress=
         root = runs.root(con, run_id)
         # The driver owns the root in-process; never register it as a killable child.
         with runs.owned_txn(con, run):
-            runs.prepare_runner(con, "research_branches", root["id"])
+            runs.prepare_runner(con, "research_execution", root["id"])
         pane = os.environ.get("MISAKA_NET_PANE") if session is not None else None
         if session is None:
             context = node_session(con, cfg, runs.get(con, run_id), runs.node(con, root["id"]))

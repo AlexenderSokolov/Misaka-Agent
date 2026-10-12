@@ -220,6 +220,17 @@ def snapshot(con: sqlite3.Connection, graph_id: str, *, at: int | None = None) -
     return found
 
 
+def locate(con: sqlite3.Connection, element_id: str) -> str | None:
+    """The graph whose current version holds a node or an edge called ``element_id``; None when none
+    does. Ids are a graph's own, so a name two graphs share is refused rather than guessed."""
+    found = {row[0] for row in con.execute(
+        "SELECT graph FROM graph_nodes WHERE id=? AND until IS NULL "
+        "UNION SELECT graph FROM graph_edges WHERE id=? AND until IS NULL", (element_id, element_id))}
+    if len(found) > 1:
+        raise GraphError(f"{element_id} names an element of several graphs: {', '.join(sorted(found))}")
+    return next(iter(found), None)
+
+
 def taken(con: sqlite3.Connection, graph_id: str, element_id: str) -> bool:
     """Whether any version of the graph ever had a node or an edge called ``element_id``."""
     return bool(con.execute(

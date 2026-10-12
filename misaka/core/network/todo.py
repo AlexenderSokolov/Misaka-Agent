@@ -301,9 +301,9 @@ class TodoPart:
             }
             link = None
             if (p.findings or p.issues is not None or p.alternatives is not None) and c.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_run_tasks'"
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_cards'"
             ).fetchone():
-                link = c.execute("SELECT run_id,kind FROM research_run_tasks WHERE task_id=?", (task_id,)).fetchone()
+                link = c.execute("SELECT run_id,kind FROM research_cards WHERE task_id=?", (task_id,)).fetchone()
             if p.issues is not None:
                 if not link or link["kind"] not in runs.CRITIQUE_KINDS:
                     raise ValueError("Only this node's red-team card may record critique issues.")

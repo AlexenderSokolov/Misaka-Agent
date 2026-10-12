@@ -32,7 +32,7 @@ def state(tmp_path, monkeypatch):
 async def test_phase_projection_keeps_original_owner(state, monkeypatch, takeover):
     con, run, root = state
     assert runs.acquire_driver(con, run["id"], "old-driver")
-    runs.prepare_runner(con, "research_branches", root["id"])
+    runs.prepare_runner(con, "research_execution", root["id"])
     runs.set_node(con, root["id"], status="planning")
     run, root = runs.get(con, run["id"]), runs.node(con, root["id"])
     plan = {
@@ -55,12 +55,12 @@ async def test_phase_projection_keeps_original_owner(state, monkeypatch, takeove
     async def yield_owner(*a):
         if takeover == "driver":
             con.execute(
-                "UPDATE research_runs SET driver_lock='new-driver' WHERE id=?",
+                "UPDATE graphs SET lease_token='new-driver' WHERE id=?",
                 (run["id"],),
             )
         if takeover == "node":
             con.execute(
-                "UPDATE research_branches SET runner_key='new-node' WHERE id=?",
+                "UPDATE research_execution SET runner_key='new-node' WHERE id=?",
                 (root["id"],),
             )
 
@@ -329,7 +329,7 @@ async def test_takeover_between_assignments_stops_old_card_creation(state, takeo
     async def progress(event):
         if takeover and event["local_id"] == "first":
             con.execute(
-                "UPDATE research_runs SET driver_lock='new-driver' WHERE id=?",
+                "UPDATE graphs SET lease_token='new-driver' WHERE id=?",
                 (run["id"],),
             )
 
@@ -602,7 +602,7 @@ async def test_driver_takeover_during_planner_thread_does_not_publish(
 
     def plan(*a, **k):
         con.execute(
-            "UPDATE research_runs SET driver_lock='new' WHERE id=?", (run["id"],)
+            "UPDATE graphs SET lease_token='new' WHERE id=?", (run["id"],)
         )
         return (
             {"status": "clarify", "plan_markdown": "stale", "clarifying_questions": []},
@@ -690,7 +690,7 @@ async def test_repeated_cancellation_drains_only_owned_card_scope(
     await asyncio.wait_for(reached.wait(), 1)
     if takeover:
         con.execute(
-            "UPDATE research_runs SET driver_lock='new' WHERE id=?", (run["id"],)
+            "UPDATE graphs SET lease_token='new' WHERE id=?", (run["id"],)
         )
     task.cancel()
     if not takeover:
@@ -929,7 +929,7 @@ def test_panel_stop_checks_driver_at_receipt_not_just_sender(state):
     daemon._board = lambda: con
     daemon.close = Mock()
     con.execute(
-        "UPDATE research_runs SET driver_lock='successor' WHERE id=?", (run["id"],)
+        "UPDATE graphs SET lease_token='successor' WHERE id=?", (run["id"],)
     )
     result = daemon._api(
         "card.stop",
@@ -951,13 +951,13 @@ def test_panel_stop_checks_driver_at_receipt_not_just_sender(state):
 def test_driver_takeover_atomically_fences_delayed_node_spawn(state):
     con, run, root = state
     assert runs.acquire_driver(con, run["id"], "old")
-    key = runs.prepare_runner(con, "research_branches", root["id"])
+    key = runs.prepare_runner(con, "research_execution", root["id"])
     assert runs.acquire_driver(con, run["id"], "old")
     assert runs.node(con, root["id"])["runner_key"] == key
-    con.execute("UPDATE research_runs SET driver_expires=0 WHERE id=?", (run["id"],))
+    con.execute("UPDATE graphs SET lease_expires=0 WHERE id=?", (run["id"],))
     assert runs.acquire_driver(con, run["id"], "new")
     assert runs.node(con, root["id"])["runner_key"] is None
-    assert not runs.claim_runner(con, "research_branches", root["id"], key)
+    assert not runs.claim_runner(con, "research_execution", root["id"], key)
 
 
 @pytest.mark.parametrize("rollback", [False, True])

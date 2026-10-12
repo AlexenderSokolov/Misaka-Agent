@@ -152,15 +152,29 @@ def active_runs() -> list[str]:
     from contextlib import closing
 
     from misaka.config import home
+    from misaka.core import graph
     from misaka.core.research.runs import ACTIVE
     board = home.path("db")
     if not board.is_file():
         return []
     try:
         with closing(sqlite3.connect(board.resolve().as_uri() + "?mode=ro", uri=True)) as con:
-            rows = con.execute(f"SELECT id, workspace FROM research_runs WHERE status IN ({','.join('?' * len(ACTIVE))}) "
-                               "AND driver_lock IS NOT NULL AND (driver_expires IS NULL OR driver_expires>=?)",
-                               (*ACTIVE, int(time.time()))).fetchall()
+            con.row_factory = sqlite3.Row
+            active = con.execute(f"SELECT id, workspace FROM research_runs WHERE status IN ({','.join('?' * len(ACTIVE))})",
+                                 ACTIVE).fetchall()
+            now, rows = int(time.time()), []
+            # A run is driven while its graph's lease is held; a board research has not opened since
+            # an upgrade keeps the lease on the run row still (schema v18, migrated on that open).
+            before_migration = "driver_lock" in {row[1] for row in con.execute('PRAGMA table_info("research_runs")')}
+            for run_id, workspace in active:
+                if before_migration:
+                    token, expires = con.execute("SELECT driver_lock, driver_expires FROM research_runs WHERE id=?",
+                                                 (run_id,)).fetchone()
+                else:
+                    lease = graph.get(con, run_id)
+                    token, expires = (lease.lease_token, lease.lease_expires) if lease else (None, None)
+                if token is not None and (expires is None or expires >= now):
+                    rows.append((run_id, workspace))
     except sqlite3.Error:
         return []
     return [f"{run_id}  {home.display(workspace)}" for run_id, workspace in rows]

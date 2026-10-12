@@ -86,7 +86,7 @@ class NodePart:
             self.show(content, payload)
 
         def failed(text):
-            con.execute('UPDATE research_branches SET last_error=COALESCE(last_error,?) WHERE id=? AND runner_key=?',
+            con.execute('UPDATE research_execution SET last_error=COALESCE(last_error,?) WHERE id=? AND runner_key=?',
                         (text, self.node_id, self.runner_key))
 
         window = None
@@ -124,7 +124,7 @@ class NodePart:
                 if control is not None and control.check_active is check_active:
                     control.check_active = previous_check
                 try:
-                    runs.release_runner(con, "research_branches", self.node_id, self.runner_key)
+                    runs.release_runner(con, "research_execution", self.node_id, self.runner_key)
                 finally:
                     con.close()
 

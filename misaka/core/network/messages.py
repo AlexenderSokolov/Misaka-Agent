@@ -215,13 +215,13 @@ def _sender_node(board, *, sender_task, sender_session):
     whose Last Order conversation she is; a run's window outside its nodes has no node, and a
     sender outside any run has neither."""
     if sender_task:
-        row = board.execute("SELECT run_id, branch_id FROM research_run_tasks WHERE task_id=?",
+        row = board.execute("SELECT run_id, branch_id FROM research_cards WHERE task_id=?",
                             (sender_task,)).fetchone()
         if row:
             return row["run_id"], row["branch_id"]
     if sender_session:
         tail = f"%{sender_session}.jsonl"   # stored session files end in their session id
-        row = board.execute("SELECT run_id, id FROM research_branches WHERE session_file LIKE ?",
+        row = board.execute("SELECT run_id, id FROM research_execution WHERE session_file LIKE ?",
                             (tail,)).fetchone()
         if row:
             return row["run_id"], row["id"]
@@ -244,7 +244,7 @@ def _node_last_order(*, sender_task, sender_session):
     board = tasks.connect(_board_path())
     try:
         _run, node = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
-        row = (board.execute("SELECT session_file FROM research_branches WHERE id=?", (node,)).fetchone()
+        row = (board.execute("SELECT session_file FROM research_execution WHERE id=?", (node,)).fetchone()
                if node else None)
     except sqlite3.OperationalError:     # a board research has never touched has no such tables
         return None
@@ -272,7 +272,7 @@ def _run_cards(role, *, sender_task, sender_session):
         run, branch = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
         if run is None:
             return []
-        query = ("SELECT t.id, t.status, t.title FROM research_run_tasks l JOIN tasks t ON t.id=l.task_id "
+        query = ("SELECT t.id, t.status, t.title FROM research_cards l JOIN tasks t ON t.id=l.task_id "
                  "WHERE l.run_id=? AND t.assignee=? AND t.id IS NOT ?")
         rows = board.execute(query + " AND l.branch_id=? ORDER BY t.created_at",
                              (run, role, sender_task, branch)).fetchall() if branch else []
