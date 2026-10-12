@@ -13,12 +13,12 @@ from misaka.ai.types import TextContent
 from misaka.core.extensions.types import ToolDefinition
 from misaka.core.messages import CompactionSummaryMessage
 from misaka.core.tools.edit import createEditToolDefinition
-from misaka.ui.tui.interactive.components.bash_execution import BashExecutionComponent
-from misaka.ui.tui.interactive.components.compaction_summary_message import (
+from misaka.modes.interactive.components.bash_execution import BashExecutionComponent
+from misaka.modes.interactive.components.compaction_summary_message import (
     CompactionSummaryMessageComponent,
 )
-from misaka.ui.tui.interactive.components.tool_execution import ToolExecutionComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.components.tool_execution import ToolExecutionComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui.tui_main_screen import TuiMainScreen
 from misaka.utils.ansi import stripAnsi
 from tests.tui_virtual_terminal import VirtualTerminal

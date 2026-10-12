@@ -12,14 +12,14 @@ from typing import Any
 
 from misaka.core.extensions.types import ToolRenderers
 from misaka.core.tools.renderers import createAllToolRenderers
-from misaka.ui.tui import Container, Spacer, Text, TruncatedText
-from misaka.ui.tui.interactive.components.assistant_message import (
+from misaka.modes.interactive.components.assistant_message import (
     AssistantMessageComponent,
 )
-from misaka.ui.tui.interactive.components.status_indicator import WorkingStatusIndicator
-from misaka.ui.tui.interactive.components.tool_execution import ToolExecutionComponent
-from misaka.ui.tui.interactive.components.user_message import UserMessageComponent
-from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.modes.interactive.components.status_indicator import WorkingStatusIndicator
+from misaka.modes.interactive.components.tool_execution import ToolExecutionComponent
+from misaka.modes.interactive.components.user_message import UserMessageComponent
+from misaka.modes.interactive.theme.theme import theme
+from misaka.ui.tui import Container, Spacer, Text, TruncatedText
 
 
 def liveOf(view: dict[str, Any]) -> dict[str, Any]:

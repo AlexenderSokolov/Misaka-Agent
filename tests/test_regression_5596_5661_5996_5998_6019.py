@@ -26,7 +26,7 @@ from misaka.core.auth_storage import AuthStorage
 from misaka.core.messages import convertToLlm
 from misaka.core.session_manager import SessionManager
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.utils.values import read_field
 from tests.model_runtime_test_utils import (
     createInMemoryModelRegistry,

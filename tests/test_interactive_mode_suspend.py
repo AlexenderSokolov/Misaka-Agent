@@ -13,8 +13,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from misaka.ui.tui.interactive import interactive_mode
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive import interactive_mode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 
 posixOnly = pytest.mark.skipif(sys.platform == "win32", reason="SIGTSTP and SIGCONT exist on POSIX only")
 

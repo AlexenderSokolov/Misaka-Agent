@@ -143,7 +143,7 @@ async def test_overflow_preserves_primary_error_and_cleans_up_on_owner(tmp_path,
 
 @pytest.mark.asyncio
 async def test_background_crash_handler_returns_to_owner(monkeypatch):
-    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+    from misaka.modes.interactive.interactive_mode import InteractiveMode
 
     owner = threading.get_ident()
     loop = asyncio.get_running_loop()

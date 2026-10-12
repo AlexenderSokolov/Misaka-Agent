@@ -30,9 +30,9 @@ from misaka.core.tools.render_utils import (
     replaceTabs,
 )
 from misaka.core.tools.truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize
+from misaka.modes.interactive.components.keybinding_hints import keyHint, keyText
+from misaka.modes.interactive.theme.theme import getLanguageFromPath, highlightCode
 from misaka.ui.tui import Text
-from misaka.ui.tui.interactive.components.keybinding_hints import keyHint, keyText
-from misaka.ui.tui.interactive.theme.theme import getLanguageFromPath, highlightCode
 from misaka.utils.js import UNDEFINED, jsString
 from misaka.utils.paths import formatPathRelativeToCwdOrAbsolute
 from misaka.utils.values import read_field

@@ -12,20 +12,20 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from misaka.ui.tui import Container, Text
-from misaka.ui.tui.interactive import interactive_mode
-from misaka.ui.tui.interactive.components.status_indicator import (
+from misaka.modes.interactive import interactive_mode
+from misaka.modes.interactive.components.status_indicator import (
     BranchSummaryStatusIndicator,
     CompactionStatusIndicator,
     RetryStatusIndicator,
     WorkingStatusIndicator,
 )
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import initTheme
-from misaka.ui.tui.interactive.tui_renderer import (
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.modes.interactive.tui_renderer import (
     InteractiveTuiOptions,
     createInteractiveTui,
 )
+from misaka.ui.tui import Container, Text
 from tests.tui_virtual_terminal import VirtualTerminal
 
 

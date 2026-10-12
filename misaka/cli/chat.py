@@ -71,8 +71,8 @@ def launch(who, model=None, cont=False, pick=False, session=None, read_only=Fals
             path = resolve_session(session, None)
         from misaka.config.engine import get_agent_dir
         from misaka.core.settings_manager import SettingsManager
+        from misaka.modes.interactive.conversation import Conversation
         from misaka.ui.tui import ProcessTerminal, TuiMainScreen
-        from misaka.ui.tui.interactive.conversation import Conversation
 
         settings = SettingsManager.create(os.getcwd())
         ui = TuiMainScreen(ProcessTerminal(), settings.getShowHardwareCursor(), get_agent_dir())
@@ -169,9 +169,9 @@ async def follow_session(screen, path, *, catalog=False, attach=False):
     from misaka.core.keybindings import KeybindingsManager
     from misaka.core.platform import processes
     from misaka.core.settings_manager import SettingsManager
+    from misaka.modes.interactive.components.keybinding_hints import keyHint
+    from misaka.modes.interactive.theme.theme import initTheme, theme
     from misaka.ui.tui import Text, matchesKey, setCapabilityOverrides, setKeybindings
-    from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
-    from misaka.ui.tui.interactive.theme.theme import initTheme, theme
 
     closed = asyncio.Event()
     keybindings = KeybindingsManager.create()
@@ -191,8 +191,8 @@ async def follow_session(screen, path, *, catalog=False, attach=False):
     if attach:
         from misaka.core.session_catalog import _object, owner_record
         from misaka.core.session_control import request
-        from misaka.ui.tui.interactive.components.custom_editor import CustomEditor
-        from misaka.ui.tui.interactive.theme.theme import getEditorTheme
+        from misaka.modes.interactive.components.custom_editor import CustomEditor
+        from misaka.modes.interactive.theme.theme import getEditorTheme
 
         owner = _display_value(_object(path) if catalog else owner_record(path))
         if not owner.get("control") or owner.get("state") == "saved":

@@ -25,8 +25,8 @@ from misaka.core.extensions.types import (
 from misaka.core.tools import render_utils
 from misaka.core.tools.edit_diff import EditDiffError, EditDiffResult, computeEditsDiff
 from misaka.core.tools.render_utils import argOf, renderToolPath
+from misaka.modes.interactive.components.diff import RenderDiffOptions, renderDiff
 from misaka.ui.tui import Box, Container, Spacer, Text
-from misaka.ui.tui.interactive.components.diff import RenderDiffOptions, renderDiff
 from misaka.utils.js import UNDEFINED, jsonStringify
 from misaka.utils.values import read_field
 

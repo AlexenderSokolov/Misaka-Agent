@@ -20,10 +20,10 @@ import pytest
 
 from misaka.core.extensions import startup_sections
 from misaka.core.source_info import SourceInfo
+from misaka.modes.interactive.components.oauth_selector import AuthSelectorProvider
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import CombinedAutocompleteProvider, Container
-from misaka.ui.tui.interactive.components.oauth_selector import AuthSelectorProvider
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.ui.tui.tui_main_screen import TuiMainScreen
 from misaka.utils.js import AbortController
 from tests.tui_virtual_terminal import VirtualTerminal

@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
+from misaka.modes.interactive.components.custom_editor import CustomEditor
 from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.custom_editor import CustomEditor
 from misaka.ui.tui.tui_main_screen import TuiMainScreen
 from tests.tui_test_themes import defaultEditorTheme
 from tests.tui_virtual_terminal import VirtualTerminal

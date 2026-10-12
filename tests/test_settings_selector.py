@@ -13,13 +13,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.settings_selector import (
+from misaka.modes.interactive.components.settings_selector import (
     SettingsCallbacks,
     SettingsConfig,
     SettingsSelectorComponent,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.ui.tui import setKeybindings
 from misaka.utils.ansi import stripAnsi
 from tests.suite_harness import createHarness
 

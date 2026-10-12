@@ -16,11 +16,11 @@ from misaka.core.export_html.tool_renderer import (
     ToolHtmlRenderer,
 )
 from misaka.core.session_manager import SessionManager
-from misaka.modes.json_event import to_jsonable
-from misaka.ui.tui.interactive.theme.theme import (
+from misaka.modes.interactive.theme.theme import (
     getResolvedThemeColors,
     getThemeExportColors,
 )
+from misaka.modes.json_event import to_jsonable
 from misaka.utils.paths import normalizePath, resolvePath
 
 TEMPLATE_RENDERED_TOOLS = {"bash", "read", "write", "edit", "ls"}

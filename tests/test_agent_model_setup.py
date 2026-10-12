@@ -144,8 +144,8 @@ def test_model_alias_folding_does_not_cross_providers():
 @pytest.mark.parametrize("persist", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
 async def test_model_selector_has_one_save_path(persist, failure, monkeypatch):
-    from misaka.ui.tui.interactive import interactive_mode
-    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+    from misaka.modes.interactive import interactive_mode
+    from misaka.modes.interactive.interactive_mode import InteractiveMode
 
     calls, statuses, errors, tasks, selectors = [], [], [], [], []
 
@@ -182,7 +182,7 @@ async def test_model_selector_has_one_save_path(persist, failure, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [False, True])
 async def test_login_adoption_has_one_save_path(failure):
-    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+    from misaka.modes.interactive.interactive_mode import InteractiveMode
 
     model = NS(provider="custom", id="vendor/model")
     statuses, errors = [], []

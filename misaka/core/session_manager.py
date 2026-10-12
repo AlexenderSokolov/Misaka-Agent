@@ -558,7 +558,7 @@ def sessions_root_of(session_dir: str | None) -> str | None:
     ``None`` keeps the engine default.
 
     Both ends of "all sessions" go through here: the CLI picker (``cli/engine.py``) and the TUI
-    ``/resume`` selector (``ui/tui/interactive/interactive_mode.py``), which is why it lives with
+    ``/resume`` selector (``modes/interactive/interactive_mode.py``), which is why it lives with
     ``encode_cwd`` rather than in either caller.
     """
     if not session_dir:

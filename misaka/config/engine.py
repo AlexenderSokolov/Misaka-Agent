@@ -61,7 +61,7 @@ def get_themes_dir() -> str:
     # Use __file__-relative resolution so that theme files are found correctly
     # both when running from source (uv run misaka) and when installed as a
     # package (uv tool install misaka / pip install misaka).
-    return str(_get_package_module_dir() / "ui" / "tui" / "interactive" / "theme")
+    return str(_get_package_module_dir() / "modes" / "interactive" / "theme")
 
 
 def get_export_template_dir() -> str:

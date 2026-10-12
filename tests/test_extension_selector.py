@@ -5,15 +5,15 @@ from __future__ import annotations
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import keybindings as tui_keybindings
-from misaka.ui.tui.interactive.components.extension_selector import (
+from misaka.modes.interactive.components.extension_selector import (
     ExtensionSelectorComponent,
 )
-from misaka.ui.tui.interactive.components.radius_login_selector import (
+from misaka.modes.interactive.components.radius_login_selector import (
     RadiusOption,
     createLoginMenuSelector,
     radiusShimmer,
 )
+from misaka.ui.tui import keybindings as tui_keybindings
 from misaka.utils.ansi import stripAnsi
 
 

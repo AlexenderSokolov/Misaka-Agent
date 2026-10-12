@@ -20,8 +20,8 @@ from misaka.ai.models import ModelsRefreshOptions
 from misaka.core.agent_session import AgentSession
 from misaka.core.auth_storage import AuthStorage
 from misaka.core.model_resolver import defaultModelPerProvider
-from misaka.ui.tui.interactive import interactive_mode
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive import interactive_mode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 from misaka.utils.js import startTask
 from tests.experimental_support import FakeTimers
 from tests.suite_harness import createHarness

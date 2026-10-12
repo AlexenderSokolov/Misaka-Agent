@@ -31,8 +31,8 @@ from misaka.experimental.services.models import Models
 from misaka.experimental.services.plugins import PresentationPlugins, SessionPlugins
 from misaka.experimental.services.sessions import SessionDirectory, SessionManagement
 from misaka.experimental.services.transcript import Transcript
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import ProcessTerminal, TuiMainScreen
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from tests.chat_support import waitFor
 from tests.experimental_durable_support import openFauxConversation
 from tests.experimental_session_support import makeShortDirectory

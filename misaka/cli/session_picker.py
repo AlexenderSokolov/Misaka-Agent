@@ -12,10 +12,10 @@ from typing import Any
 from misaka.core.keybindings import KeybindingsManager
 from misaka.core.session_manager import SessionInfo, SessionListProgress
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.session_selector import (
+from misaka.modes.interactive.components.session_selector import (
     SessionSelectorComponent,
 )
+from misaka.ui.tui import setKeybindings
 
 from .startup_ui import createStartupTui, startStartupTui
 

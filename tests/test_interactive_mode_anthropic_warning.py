@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 
 
 def createSettingsManager(warnings: dict[str, bool] | None = None):

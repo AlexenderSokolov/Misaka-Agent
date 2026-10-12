@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 
+from misaka.modes.interactive.components.bash_execution import BashExecutionComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import visibleWidth
-from misaka.ui.tui.interactive.components.bash_execution import BashExecutionComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
 
 
 def createTuiStub(columns: int) -> Any:

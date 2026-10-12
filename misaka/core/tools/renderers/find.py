@@ -24,8 +24,8 @@ from misaka.core.tools.render_utils import (
     shortenPath,
 )
 from misaka.core.tools.truncate import DEFAULT_MAX_BYTES, formatSize
+from misaka.modes.interactive.components.keybinding_hints import keyHint
 from misaka.ui.tui import Text
-from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
 from misaka.utils.js import UNDEFINED, jsString, jsTrim
 from misaka.utils.values import read_field
 

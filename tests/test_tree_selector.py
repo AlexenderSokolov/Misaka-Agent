@@ -10,9 +10,9 @@ import pytest
 
 from misaka.core.keybindings import KeybindingsManager
 from misaka.core.session_manager import SessionTreeNode
+from misaka.modes.interactive.components.tree_selector import TreeSelectorComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import setKeybindings, visibleWidth
-from misaka.ui.tui.interactive.components.tree_selector import TreeSelectorComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.utils.ansi import stripAnsi
 
 

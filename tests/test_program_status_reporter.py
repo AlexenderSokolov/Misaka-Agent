@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from misaka.ai.types import AssistantMessage
-from misaka.ui.tui.interactive.program_status_reporter import ProgramStatusReporter
+from misaka.modes.interactive.program_status_reporter import ProgramStatusReporter
 from misaka.utils.js import jsonStringify
 
 

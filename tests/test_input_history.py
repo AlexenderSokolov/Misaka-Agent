@@ -8,10 +8,10 @@ windows sharing one role's file overwrote each other's entries with their own st
 import json
 from types import SimpleNamespace
 
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import getEditorTheme, getMarkdownTheme
 from misaka.ui.tui import Container
 from misaka.ui.tui.components.editor import Editor
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import getEditorTheme, getMarkdownTheme
 
 
 def _editor(monkeypatch, path):

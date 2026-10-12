@@ -707,7 +707,7 @@ async def test_reports_provider_errors_as_results_and_invalid_arguments_as_excep
 
 def _render(result, isError=False, expanded=True, width=200) -> str:
     from misaka.extensions.codemode.renderer import renderResult
-    from misaka.ui.tui.interactive.theme.theme import initTheme, theme
+    from misaka.modes.interactive.theme.theme import initTheme, theme
     from misaka.utils.ansi import stripAnsi
 
     initTheme("dark")

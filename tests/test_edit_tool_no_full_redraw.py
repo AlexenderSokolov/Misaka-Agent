@@ -16,9 +16,9 @@ import pytest
 
 from misaka.core.tools.edit import createEditToolDefinition
 from misaka.core.tools.edit_diff import Edit, EditDiffError, computeEditsDiff
+from misaka.modes.interactive.components.tool_execution import ToolExecutionComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import Container, Text
-from misaka.ui.tui.interactive.components.tool_execution import ToolExecutionComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.ui.tui.tui_main_screen import TuiMainScreen
 from misaka.utils.ansi import stripAnsi
 

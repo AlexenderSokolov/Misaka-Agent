@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from misaka.ui.tui.interactive.components.themed_text import ThemedText
-from misaka.ui.tui.interactive.theme import theme as theme_module
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.components.themed_text import ThemedText
+from misaka.modes.interactive.theme import theme as theme_module
+from misaka.modes.interactive.theme.theme import initTheme
 
 
 @pytest.fixture(autouse=True)

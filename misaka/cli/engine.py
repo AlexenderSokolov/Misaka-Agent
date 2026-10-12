@@ -73,15 +73,15 @@ from misaka.core.trust_manager import (
     hasTrustRequiringProjectResources,
 )
 from misaka.modes import InteractiveMode, runPrintMode
-from misaka.ui.tui import (
-    setCapabilityOverrides,
-)
-from misaka.ui.tui.interactive.theme.theme import (
+from misaka.modes.interactive.theme.theme import (
     initTheme,
     setThemeJsonValidator,
     stopThemeWatcher,
 )
-from misaka.ui.tui.interactive.theme.theme_json import validateThemeJson
+from misaka.modes.interactive.theme.theme_json import validateThemeJson
+from misaka.ui.tui import (
+    setCapabilityOverrides,
+)
 from misaka.utils._abort_signal import TimeoutAbortSignal
 from misaka.utils.chalk import chalk
 from misaka.utils.js import errorMessage, jsTrim

@@ -13,8 +13,8 @@ import pytest
 
 from misaka.ai.providers.faux import fauxAssistantMessage
 from misaka.config import APP_NAME
-from misaka.ui.tui.interactive import interactive_mode
-from misaka.ui.tui.interactive.interactive_mode import (
+from misaka.modes.interactive import interactive_mode
+from misaka.modes.interactive.interactive_mode import (
     InteractiveMode,
     formatCrashExtensionHint,
 )

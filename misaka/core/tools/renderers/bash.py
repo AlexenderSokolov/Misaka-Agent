@@ -24,13 +24,13 @@ from misaka.core.extensions.types import (
 from misaka.core.tools import render_utils
 from misaka.core.tools.render_utils import argOf, getTextOutput, invalidArgText
 from misaka.core.tools.truncate import DEFAULT_MAX_BYTES, formatSize
-from misaka.ui.tui import Container, Spacer, Text
-from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
-from misaka.ui.tui.interactive.components.visual_truncate import (
+from misaka.modes.interactive.components.keybinding_hints import keyHint
+from misaka.modes.interactive.components.visual_truncate import (
     VisualLinePreview,
     VisualLinePreviewOptions,
 )
-from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.modes.interactive.theme.theme import theme
+from misaka.ui.tui import Container, Spacer, Text
 from misaka.utils.js import (
     clearInterval,
     jsString,

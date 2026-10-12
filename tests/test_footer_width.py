@@ -11,12 +11,12 @@ from typing import Any
 
 import pytest
 
-from misaka.ui.tui import visibleWidth
-from misaka.ui.tui.interactive.components.footer import (
+from misaka.modes.interactive.components.footer import (
     FooterComponent,
     formatCwdForFooter,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.ui.tui import visibleWidth
 from misaka.utils.ansi import stripAnsi
 
 

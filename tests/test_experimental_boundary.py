@@ -120,7 +120,7 @@ def test_the_published_command_line_does_not_load_the_experimental_stack(tmp_pat
 def test_the_chat_panel_and_research_do_not_load_the_experimental_stack(tmp_path):
     program = (
         "import sys\n"
-        "import misaka.ui.tui.interactive.interactive_mode, misaka.ui.panel, misaka.core.research.workflow\n"
+        "import misaka.modes.interactive.interactive_mode, misaka.ui.panel, misaka.core.research.workflow\n"
         f"loaded = sorted(name for name in sys.modules if any(name == p or name.startswith(p + '.') for p in {STACK!r}))\n"
         "print('LOADED', loaded)\n"
     )

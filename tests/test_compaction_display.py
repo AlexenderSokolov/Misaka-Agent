@@ -10,9 +10,9 @@ from types import SimpleNamespace
 
 from misaka.core import session_manager
 from misaka.core.platform.prompt_guard import untrusted
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import getMarkdownTheme
 from misaka.ui.tui import Container
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import getMarkdownTheme
 
 SUMMARY = "[Session Arc Summary (d1, node 42)]\nT0 checked 130 titles.\n[Expand for details: node 42]"
 

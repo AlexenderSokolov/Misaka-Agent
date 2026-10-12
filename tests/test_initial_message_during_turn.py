@@ -5,7 +5,7 @@ raised "Agent is already processing. Specify streamingBehavior ..." and the note
 (2026-09-23). The startup messages now queue as follow-ups; an idle session is unchanged."""
 from types import SimpleNamespace
 
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 
 _REFUSAL = ("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') "
             "to queue the message.")

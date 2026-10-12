@@ -92,7 +92,7 @@ def theme_variant():
             live = None
         if live is None:
             try:
-                from misaka.ui.tui.interactive.theme.theme import getTerminalTheme
+                from misaka.modes.interactive.theme.theme import getTerminalTheme
                 live = getTerminalTheme()
             except Exception:  # noqa: BLE001 - if detection fails, assume dark (MISAKA's primary palette)
                 live = "dark"

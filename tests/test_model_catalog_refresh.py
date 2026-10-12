@@ -1,4 +1,4 @@
-"""pi's ``model-catalog-refresh.test.ts`` (``misaka/ui/tui/interactive/model_catalog_refresh.py``)."""
+"""pi's ``model-catalog-refresh.test.ts`` (``misaka/modes/interactive/model_catalog_refresh.py``)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from misaka.ai.models import ModelsRefreshResult
-from misaka.ui.tui.interactive.model_catalog_refresh import refreshModelCatalogs
+from misaka.modes.interactive.model_catalog_refresh import refreshModelCatalogs
 from misaka.utils.js import AbortController
 
 

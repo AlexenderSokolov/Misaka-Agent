@@ -10,11 +10,11 @@ import pytest
 
 from misaka.core.keybindings import KeybindingsManager
 from misaka.core.session_manager import SessionInfo
-from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.session_selector import (
+from misaka.modes.interactive.components.session_selector import (
     SessionSelectorComponent,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.ui.tui import setKeybindings
 from tests.experimental_support import flush
 
 

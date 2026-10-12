@@ -11,7 +11,7 @@ from misaka.core.moments import Moments
 from misaka.core.skills import index
 from misaka.core.skills.layers import extension_roots
 from misaka.core.skills.wiring.skills import SkillsPart, _slash_entries
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 
 NAME = '<inline:misaka_lcm>:misaka_lcm'
 

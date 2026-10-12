@@ -9,13 +9,13 @@ import pytest
 
 from misaka.ai.auth.types import AuthCheck
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import keybindings as tui_keybindings
-from misaka.ui.tui.interactive.components.oauth_selector import (
+from misaka.modes.interactive.components.oauth_selector import (
     AuthSelectorProvider,
     OAuthSelectorComponent,
     formatAuthSelectorProviderType,
 )
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.ui.tui import keybindings as tui_keybindings
 from misaka.utils.ansi import stripAnsi
 
 

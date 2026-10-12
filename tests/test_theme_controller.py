@@ -16,9 +16,9 @@ from unittest import mock
 import pytest
 
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui.interactive.theme import theme as theme_module
-from misaka.ui.tui.interactive.theme.theme import initTheme
-from misaka.ui.tui.interactive.theme.theme_controller import InteractiveThemeController
+from misaka.modes.interactive.theme import theme as theme_module
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme_controller import InteractiveThemeController
 
 
 def createUi() -> mock.Mock:

@@ -42,7 +42,7 @@ from misaka.core.system_prompt import (
     normalizeBuildSystemPromptOptions,
 )
 from misaka.core.virtual_models import VirtualModelDefinition
-from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.modes.interactive.theme.theme import theme
 from misaka.utils.values import maybe_await
 
 RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = (

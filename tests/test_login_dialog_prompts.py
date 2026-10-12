@@ -9,10 +9,10 @@ import pytest
 
 from misaka.ai.auth.types import AuthInfoLink
 from misaka.core.keybindings import KeybindingsManager
+from misaka.modes.interactive.components import login_dialog
+from misaka.modes.interactive.components.login_dialog import LoginDialogComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components import login_dialog
-from misaka.ui.tui.interactive.components.login_dialog import LoginDialogComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.utils.ansi import stripAnsi
 
 

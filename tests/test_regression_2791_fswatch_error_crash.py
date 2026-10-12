@@ -14,9 +14,9 @@ import json
 import os
 from pathlib import Path
 
-import misaka.ui.tui.interactive.theme as theme_package
+import misaka.modes.interactive.theme as theme_package
 from misaka.config import get_custom_themes_dir
-from misaka.ui.tui.interactive.theme import theme as theme_module
+from misaka.modes.interactive.theme import theme as theme_module
 
 
 def test_process_should_survive_an_error_event_on_the_theme_fswatcher():

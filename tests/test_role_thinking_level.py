@@ -14,7 +14,7 @@ from test_subagent_native_startup import isolated as isolated  # noqa: PLC0414
 from misaka.config import home
 from misaka.core.network import roster
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui.interactive import interactive_mode
+from misaka.modes.interactive import interactive_mode
 
 
 def _reasoning_models():

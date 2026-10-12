@@ -7,7 +7,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 from misaka.utils.js import startTask
 
 

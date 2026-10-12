@@ -51,7 +51,7 @@ from misaka.core.source_info import (
     isSyntheticPath,
 )
 from misaka.core.timings import resetTimings
-from misaka.ui.tui.interactive.theme.theme import Theme, loadThemeFromPath
+from misaka.modes.interactive.theme.theme import Theme, loadThemeFromPath
 from misaka.ui.tui.terminal_image import (
     TerminalColorMode,
     detectCapabilities,

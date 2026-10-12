@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from misaka.core.agent_session_runtime import SessionImportFileNotFoundError
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 
 
 def getPathCommandArgument(text: str, command: str) -> str | None:

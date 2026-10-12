@@ -13,21 +13,21 @@ from unittest.mock import MagicMock
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import visibleWidth
-from misaka.ui.tui.components import loader as loaderModule
-from misaka.ui.tui.interactive.components import countdown_timer as countdownModule
-from misaka.ui.tui.interactive.components.custom_editor import (
+from misaka.modes.interactive.components import countdown_timer as countdownModule
+from misaka.modes.interactive.components.custom_editor import (
     CustomEditor,
     CustomEditorOptions,
 )
-from misaka.ui.tui.interactive.components.status_indicator import (
+from misaka.modes.interactive.components.status_indicator import (
     BranchSummaryStatusIndicator,
     CompactionStatusIndicator,
     IdleStatus,
     RetryStatusIndicator,
     WorkingStatusIndicator,
 )
-from misaka.ui.tui.interactive.theme.theme import getEditorTheme, initTheme, theme
+from misaka.modes.interactive.theme.theme import getEditorTheme, initTheme, theme
+from misaka.ui.tui import visibleWidth
+from misaka.ui.tui.components import loader as loaderModule
 from misaka.utils.ansi import stripAnsi
 from tests.experimental_support import FakeTimers
 

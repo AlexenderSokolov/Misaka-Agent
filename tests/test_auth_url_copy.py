@@ -17,10 +17,10 @@ import pytest
 from misaka.ai.compat.extension_oauth_types import OAuthDeviceCodeInfo
 from misaka.core.keybindings import KeybindingsManager
 from misaka.extensions.mcp.ui import McpManagerView
+from misaka.modes.interactive.components import login_dialog
+from misaka.modes.interactive.components.login_dialog import LoginDialogComponent
+from misaka.modes.interactive.theme.theme import initTheme, theme
 from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components import login_dialog
-from misaka.ui.tui.interactive.components.login_dialog import LoginDialogComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme, theme
 from misaka.utils import clipboard
 from misaka.utils.ansi import stripAnsi
 from misaka.utils.js import AbortController

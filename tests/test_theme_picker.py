@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from misaka.config import get_custom_themes_dir, get_themes_dir
-from misaka.ui.tui.interactive.theme.theme import (
+from misaka.modes.interactive.theme.theme import (
     getAvailableThemes,
     getAvailableThemesWithPaths,
     setRegisteredThemes,

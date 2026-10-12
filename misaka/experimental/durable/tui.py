@@ -21,6 +21,27 @@ from misaka.core.extensions.types import ToolRenderers
 from misaka.core.keybindings import KeybindingsManager
 from misaka.core.tools.renderers import createAllToolRenderers
 from misaka.experimental.durable.runtime import agentOf
+from misaka.modes.interactive.components.assistant_message import (
+    AssistantMessageComponent,
+)
+from misaka.modes.interactive.components.custom_editor import (
+    CustomEditor,
+    CustomEditorOptions,
+)
+from misaka.modes.interactive.components.dynamic_border import DynamicBorder
+from misaka.modes.interactive.components.footer import formatTokens
+from misaka.modes.interactive.components.keybinding_hints import keyText
+from misaka.modes.interactive.components.status_indicator import WorkingStatusIndicator
+from misaka.modes.interactive.components.tool_execution import ToolExecutionComponent
+from misaka.modes.interactive.components.user_message import UserMessageComponent
+from misaka.modes.interactive.theme.theme import (
+    ThemeColor,
+    getEditorTheme,
+    getMarkdownTheme,
+    initTheme,
+    theme,
+)
+from misaka.modes.interactive.theme.theme_controller import InteractiveThemeController
 from misaka.ui.tui import (
     TUI,
     Box,
@@ -41,27 +62,6 @@ from misaka.ui.tui import (
     setCapabilityOverrides,
     setKeybindings,
 )
-from misaka.ui.tui.interactive.components.assistant_message import (
-    AssistantMessageComponent,
-)
-from misaka.ui.tui.interactive.components.custom_editor import (
-    CustomEditor,
-    CustomEditorOptions,
-)
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.components.footer import formatTokens
-from misaka.ui.tui.interactive.components.keybinding_hints import keyText
-from misaka.ui.tui.interactive.components.status_indicator import WorkingStatusIndicator
-from misaka.ui.tui.interactive.components.tool_execution import ToolExecutionComponent
-from misaka.ui.tui.interactive.components.user_message import UserMessageComponent
-from misaka.ui.tui.interactive.theme.theme import (
-    ThemeColor,
-    getEditorTheme,
-    getMarkdownTheme,
-    initTheme,
-    theme,
-)
-from misaka.ui.tui.interactive.theme.theme_controller import InteractiveThemeController
 from misaka.utils.js import jsTrim, toFixed
 
 SELECT_THEME = SelectListTheme(

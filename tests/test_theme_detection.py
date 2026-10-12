@@ -11,7 +11,7 @@ import re
 
 import pytest
 
-from misaka.ui.tui.interactive.theme.theme import (
+from misaka.modes.interactive.theme.theme import (
     detectColorFgBgTheme,
     detectTerminalTheme,
     getThemeByName,

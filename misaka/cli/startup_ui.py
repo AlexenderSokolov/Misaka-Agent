@@ -18,24 +18,24 @@ from misaka.config import get_agent_dir
 from misaka.core.keybindings import KeybindingsManager
 from misaka.core.package_manager import DefaultPackageManager, ResolvedResource
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui import (
-    TUI,
-    ProcessTerminal,
-    TuiMainScreen,
-    setCapabilityOverrides,
-    setKeybindings,
-)
-from misaka.ui.tui.interactive.components.extension_input import ExtensionInputComponent
-from misaka.ui.tui.interactive.components.extension_selector import (
+from misaka.modes.interactive.components.extension_input import ExtensionInputComponent
+from misaka.modes.interactive.components.extension_selector import (
     ExtensionSelectorComponent,
 )
-from misaka.ui.tui.interactive.theme.theme import (
+from misaka.modes.interactive.theme.theme import (
     Theme,
     getTerminalTheme,
     initTheme,
     loadThemeFromPath,
     resolveThemeSetting,
     setRegisteredThemes,
+)
+from misaka.ui.tui import (
+    TUI,
+    ProcessTerminal,
+    TuiMainScreen,
+    setCapabilityOverrides,
+    setKeybindings,
 )
 from misaka.utils.js import startTask
 

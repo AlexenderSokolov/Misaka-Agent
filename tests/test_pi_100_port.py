@@ -6,8 +6,8 @@ import json
 from types import SimpleNamespace
 
 from misaka.core.virtual_models import VIRTUAL_MODEL_API
-from misaka.ui.tui.interactive.components.user_message import UserMessageComponent
-from misaka.ui.tui.interactive.components.visual_truncate import (
+from misaka.modes.interactive.components.user_message import UserMessageComponent
+from misaka.modes.interactive.components.visual_truncate import (
     VisualLinePreview,
     VisualLinePreviewOptions,
     truncateToVisualLines,
@@ -67,7 +67,7 @@ def test_visual_truncation_keeps_the_start_or_the_end_and_the_preview_places_its
 def _startup_mode(quiet_startup, verbose: bool = False):
     from types import SimpleNamespace
 
-    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+    from misaka.modes.interactive.interactive_mode import InteractiveMode
 
     mode = SimpleNamespace(
         options=SimpleNamespace(verbose=verbose),
@@ -89,8 +89,8 @@ def test_header_only_quiet_startup_keeps_the_header_and_hides_the_details():
         def __getattr__(self, name):
             raise AssertionError(f"the resource listing must not be built (read {name})")
 
+    from misaka.modes.interactive.interactive_mode import InteractiveMode
     from misaka.ui.tui import Container
-    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
 
     header_only.session = NoListing()
     header_only.loadedResourcesContainer = Container()

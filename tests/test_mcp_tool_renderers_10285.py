@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 from misaka.core.session_manager import SessionManager
 from misaka.extensions.mcp import createMcpExtension
-from misaka.ui.tui.interactive.theme.theme import initTheme, theme
+from misaka.modes.interactive.theme.theme import initTheme, theme
 from misaka.utils.ansi import stripAnsi
 from misaka.utils.values import read_field
 from tests.suite_harness import createHarness

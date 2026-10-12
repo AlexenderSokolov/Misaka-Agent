@@ -10,14 +10,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.scoped_models_selector import (
+from misaka.modes.interactive.components.scoped_models_selector import (
     ModelsCallbacks,
     ModelsConfig,
     ScopedModelsSelectorComponent,
 )
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import initTheme, theme
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import initTheme, theme
+from misaka.ui.tui import setKeybindings
 from misaka.utils.ansi import stripAnsi
 from tests.suite_harness import createHarness
 

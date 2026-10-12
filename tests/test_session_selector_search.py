@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from misaka.core.session_manager import SessionInfo
-from misaka.ui.tui.interactive.components.session_selector_search import (
+from misaka.modes.interactive.components.session_selector_search import (
     filterAndSortSessions,
 )
 

@@ -12,8 +12,8 @@ import pytest
 from misaka.core.tools import createAllToolDefinitions
 from misaka.core.tools.download_file import create_download_file_tool_definition
 from misaka.core.tools.web_fetch import create_web_fetch_tool_definition
-from misaka.ui.tui.interactive.components.tool_execution import ToolRenderContext
-from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.modes.interactive.components.tool_execution import ToolRenderContext
+from misaka.modes.interactive.theme.theme import theme
 
 ARGS = {
     "read": {"path": "notes.md", "offset": 3, "limit": 10},

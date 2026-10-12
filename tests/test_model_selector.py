@@ -9,11 +9,11 @@ import pytest
 from misaka.ai.models import ModelsRefreshResult
 from misaka.ai.types import Model
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import keybindings as tui_keybindings
-from misaka.ui.tui.interactive.components.model_selector import (
+from misaka.modes.interactive.components.model_selector import (
     DefaultModelReference,
     ModelSelectorComponent,
 )
+from misaka.ui.tui import keybindings as tui_keybindings
 from misaka.utils.ansi import stripAnsi
 
 PROVIDER = "fixture"
@@ -162,7 +162,7 @@ async def test_closing_the_selector_aborts_its_refresh():
 
 def test_a_late_done_from_a_closed_selector_leaves_the_newer_one_open():
     # interactive-mode.ts showSelector: each selector's done() is a no-op once another replaced it.
-    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+    from misaka.modes.interactive.interactive_mode import InteractiveMode
 
     class _Container:
         def __init__(self):
@@ -209,7 +209,7 @@ def test_a_late_done_from_a_closed_selector_leaves_the_newer_one_open():
 def test_model_completions_match_fuzzily_on_id_and_name():
     from types import SimpleNamespace
 
-    from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+    from misaka.modes.interactive.interactive_mode import InteractiveMode
 
     opus = _model("claude-opus-4-7", "Claude Opus 4.7", provider="anthropic")
     session = SimpleNamespace(
@@ -231,8 +231,8 @@ def test_model_completions_match_fuzzily_on_id_and_name():
 
 
 def test_login_completions_merge_auth_types_and_sort_as_locale_compare_does():
-    from misaka.ui.tui.interactive.components.oauth_selector import AuthSelectorProvider
-    from misaka.ui.tui.interactive.interactive_mode import (
+    from misaka.modes.interactive.components.oauth_selector import AuthSelectorProvider
+    from misaka.modes.interactive.interactive_mode import (
         createFuzzyAutocompleteItems,
         formatLoginProviderCompletionDescription,
         getLoginProviderCompletionOptions,

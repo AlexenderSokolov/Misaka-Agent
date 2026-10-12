@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from misaka.config import APP_NAME
-from misaka.ui.tui.interactive.interactive_mode import formatResumeCommand
+from misaka.modes.interactive.interactive_mode import formatResumeCommand
 
 
 @pytest.fixture

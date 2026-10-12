@@ -156,7 +156,7 @@ from misaka.core.virtual_models import (
     getVirtualModelState,
     isVirtualModel,
 )
-from misaka.ui.tui.interactive.theme.theme import getThemeByName, theme
+from misaka.modes.interactive.theme.theme import getThemeByName, theme
 from misaka.utils._abort_signal import AnyAbortSignal
 from misaka.utils.image_process import ProcessImageOptions, processImage
 from misaka.utils.image_resize import ImageResizeOptions

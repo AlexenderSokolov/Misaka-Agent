@@ -72,6 +72,7 @@ from misaka.core.virtual_models import (
     ModelRouteRequest,
     VirtualModelDefinition,
 )
+from misaka.modes.interactive.theme.theme import Theme
 from misaka.ui.tui import (
     TUI,
     AutocompleteProvider,
@@ -82,7 +83,6 @@ from misaka.ui.tui import (
     OverlayHandle,
     OverlayOptions,
 )
-from misaka.ui.tui.interactive.theme.theme import Theme
 
 if TYPE_CHECKING:
     from misaka.core.bash_executor import BashResult

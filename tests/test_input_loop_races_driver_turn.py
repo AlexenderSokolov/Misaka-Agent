@@ -8,7 +8,7 @@ steer that Enter would have queued had it seen the turn."""
 import asyncio
 from types import SimpleNamespace
 
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 
 
 async def test_input_loop_queues_a_steer_when_a_turn_started_in_between():

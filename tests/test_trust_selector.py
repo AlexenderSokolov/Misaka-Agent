@@ -12,13 +12,13 @@ import pytest
 
 from misaka.core.keybindings import KeybindingsManager
 from misaka.core.trust_manager import ProjectTrustStoreEntry, ProjectTrustUpdate
-from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.trust_selector import (
+from misaka.modes.interactive.components.trust_selector import (
     TrustSelection,
     TrustSelectorComponent,
     TrustSelectorOptions,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.ui.tui import setKeybindings
 from misaka.utils.ansi import stripAnsi
 from misaka.utils.paths import canonicalizePath, resolvePath
 

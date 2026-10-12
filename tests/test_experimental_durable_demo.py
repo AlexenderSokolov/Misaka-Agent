@@ -21,7 +21,7 @@ from misaka.experimental.durable.tui import (
     describeTask,
     totalUsage,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
 from tests.chat_support import waitFor
 from tests.experimental_durable_support import openFauxConversation
 

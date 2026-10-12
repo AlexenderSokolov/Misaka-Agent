@@ -350,7 +350,7 @@ class TestWin32Clipboard:
 
 @pytest.fixture
 def paste(monkeypatch):
-    from misaka.ui.tui.interactive import interactive_mode
+    from misaka.modes.interactive import interactive_mode
 
     readers = SimpleNamespace(
         file_paths=AsyncMock(return_value=None), image=AsyncMock(return_value=None), text=AsyncMock(return_value=None)

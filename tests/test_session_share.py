@@ -19,13 +19,13 @@ import pytest
 from misaka.agent.types import AgentTool, AgentToolResult
 from misaka.ai.types import TextContent
 from misaka.core.session_manager import SessionManager
-from misaka.ui.tui.interactive import session_share
-from misaka.ui.tui.interactive.session_share import (
+from misaka.modes.interactive import session_share
+from misaka.modes.interactive.session_share import (
     SessionShareContext,
     exportSessionForShare,
     shareSession,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
 from tests.suite_harness import createHarness
 
 

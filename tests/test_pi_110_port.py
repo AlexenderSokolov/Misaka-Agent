@@ -333,7 +333,7 @@ async def test_read_returns_an_image_block_as_structured_content(tmp_path):
 
 
 def test_colors_each_line_of_python_docstrings_independently():
-    from misaka.ui.tui.interactive.theme.theme import (
+    from misaka.modes.interactive.theme.theme import (
         getMarkdownTheme,
         highlightCode,
         theme,
@@ -400,7 +400,7 @@ async def test_a_radius_login_offers_the_radius_mcp_server(tmp_path, monkeypatch
     import json
     import types
 
-    import misaka.ui.tui.interactive.interactive_mode as interactiveMode
+    import misaka.modes.interactive.interactive_mode as interactiveMode
     from misaka.core.radius import RADIUS_MCP_URL
 
     monkeypatch.setattr(interactiveMode, "get_agent_dir", lambda: str(tmp_path))

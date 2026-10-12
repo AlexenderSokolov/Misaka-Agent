@@ -313,7 +313,7 @@ class SkillsPart:
         from misaka.core.extensions import startup_sections
 
         def _dim(text):
-            from misaka.ui.tui.interactive.theme.theme import theme
+            from misaka.modes.interactive.theme.theme import theme
             return theme.fg("dim", text)
 
         startup_sections.register(

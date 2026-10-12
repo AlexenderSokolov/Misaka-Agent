@@ -9,7 +9,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 
 
 async def test_keeps_signal_handlers_registered_while_signal_triggered_cleanup_is_pending():

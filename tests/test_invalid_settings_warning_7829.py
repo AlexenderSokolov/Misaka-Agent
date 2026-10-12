@@ -7,9 +7,9 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from misaka.core.agent_session_services import AgentSessionRuntimeDiagnostic
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import Container
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from tests.suite_harness import createHarness
 
 

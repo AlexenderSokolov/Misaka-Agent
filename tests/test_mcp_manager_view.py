@@ -8,8 +8,8 @@ import pytest
 
 from misaka.core.keybindings import KeybindingsManager
 from misaka.extensions.mcp.ui import McpManagerView
+from misaka.modes.interactive.theme.theme import initTheme, theme
 from misaka.ui.tui import keybindings as tui_keybindings
-from misaka.ui.tui.interactive.theme.theme import initTheme, theme
 from misaka.utils.ansi import stripAnsi
 
 ESCAPE = "\x1b"

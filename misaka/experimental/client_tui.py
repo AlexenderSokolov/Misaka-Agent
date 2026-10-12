@@ -44,6 +44,18 @@ from misaka.experimental.services.slash_commands_provider import (
     createSlashCommandsRuntimeFacet,
 )
 from misaka.experimental.services.transcript import Transcript
+from misaka.modes.interactive.components.custom_editor import CustomEditor
+from misaka.modes.interactive.theme.theme import (
+    getEditorTheme,
+    setRegisteredThemes,
+    stopThemeWatcher,
+    theme,
+)
+from misaka.modes.interactive.theme.theme_controller import InteractiveThemeController
+from misaka.modes.interactive.tui_renderer import (
+    InteractiveTuiOptions,
+    createInteractiveTui,
+)
 from misaka.ui.tui import (
     CombinedAutocompleteProvider,
     Container,
@@ -56,18 +68,6 @@ from misaka.ui.tui import (
     setKeybindings,
 )
 from misaka.ui.tui.autocomplete import AutocompleteItem
-from misaka.ui.tui.interactive.components.custom_editor import CustomEditor
-from misaka.ui.tui.interactive.theme.theme import (
-    getEditorTheme,
-    setRegisteredThemes,
-    stopThemeWatcher,
-    theme,
-)
-from misaka.ui.tui.interactive.theme.theme_controller import InteractiveThemeController
-from misaka.ui.tui.interactive.tui_renderer import (
-    InteractiveTuiOptions,
-    createInteractiveTui,
-)
 from misaka.utils.collation import localeSortKey
 from misaka.utils.js import (
     UNDEFINED,

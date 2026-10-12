@@ -8,7 +8,7 @@ the same. Without a terminal (a pipe, a container) every menu falls back to a nu
 prompt, so the wizard is never stuck waiting for a key nobody can press.
 
 Colour comes from the theme files the chat and the panel draw from
-(``ui/tui/interactive/theme/{dark,light}.json``), the variant picked from the terminal's
+(``modes/interactive/theme/{dark,light}.json``), the variant picked from the terminal's
 background the way the panel picks it, so the wizard is the same rose as the rest of the
 program rather than a generic cyan-and-green shell script. Truecolor when the terminal
 reports it, the nearest xterm-256 index otherwise; plain text, with the emblem in block

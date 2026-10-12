@@ -8,11 +8,11 @@ import pytest
 from misaka.cli.chat import follow_session
 from misaka.core import session_catalog, session_control
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui import Container
-from misaka.ui.tui.interactive.components.assistant_message import (
+from misaka.modes.interactive.components.assistant_message import (
     AssistantMessageComponent,
 )
-from misaka.ui.tui.interactive.conversation import Conversation
+from misaka.modes.interactive.conversation import Conversation
+from misaka.ui.tui import Container
 from misaka.utils.ansi import stripAnsi
 
 

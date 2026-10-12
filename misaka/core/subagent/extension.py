@@ -161,7 +161,7 @@ def _render_result(result: Any, context: Any = None, *_args: Any) -> Any:
         # instead of recreating Intl or another UI framework.
         from misaka.core.tools.bash import _format_duration
         from misaka.core.tools.render_utils import get_text_output
-        from misaka.ui.tui.interactive.components.footer import format_tokens
+        from misaka.modes.interactive.components.footer import format_tokens
 
         expanded = bool(read_field(context, "expanded", False))
         lines = []

@@ -10,6 +10,10 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict
 
+from misaka.modes.interactive.components.auth_url import AuthUrlComponent
+from misaka.modes.interactive.components.dynamic_border import DynamicBorder
+from misaka.modes.interactive.components.keybinding_hints import keyHint
+from misaka.modes.interactive.theme.theme import getSelectListTheme
 from misaka.ui.tui import (
     Container,
     Input,
@@ -20,17 +24,13 @@ from misaka.ui.tui import (
     truncateToWidth,
     visibleWidth,
 )
-from misaka.ui.tui.interactive.components.auth_url import AuthUrlComponent
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
-from misaka.ui.tui.interactive.theme.theme import getSelectListTheme
 from misaka.utils.js import addAbortListener, errorMessage, jsTrim, spawn, startTask
 from misaka.utils.values import signal_aborted
 
 if TYPE_CHECKING:
     from misaka.core.extensions.types import ExtensionCommandContext
     from misaka.core.keybindings import KeybindingsManager
-    from misaka.ui.tui.interactive.theme.theme import Theme
+    from misaka.modes.interactive.theme.theme import Theme
     from misaka.ui.tui.tui import TUI, Component, Focusable
 
 

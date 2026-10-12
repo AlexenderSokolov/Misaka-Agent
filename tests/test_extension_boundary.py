@@ -16,8 +16,8 @@ WIZARD = PACKAGE / "cli" / "setup_wizard.py"
 NAMES = ("lcm", "LCM", "coverage_scan", "coverage maps", "coverage-maps")
 # The owner's second exception (2026-10-12): the interactive mode offers the Radius MCP server after a Radius
 # login and writes it with the MCP extension's config helpers, as upstream pi does.
-ALLOWED_IMPORTS = {("misaka/ui/tui/interactive/interactive_mode.py", "misaka.extensions.mcp.config.addMcpServerConfig"),
-                   ("misaka/ui/tui/interactive/interactive_mode.py", "misaka.extensions.mcp.config.loadMcpConfig")}
+ALLOWED_IMPORTS = {("misaka/modes/interactive/interactive_mode.py", "misaka.extensions.mcp.config.addMcpServerConfig"),
+                   ("misaka/modes/interactive/interactive_mode.py", "misaka.extensions.mcp.config.loadMcpConfig")}
 
 
 def _files():

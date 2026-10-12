@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from misaka.ui.tui.interactive.external_editor import editInExternalEditor
+from misaka.modes.interactive.external_editor import editInExternalEditor
 
 editorFixturePath = os.path.join(os.path.dirname(__file__), "fixtures", "fake_external_editor.py")
 

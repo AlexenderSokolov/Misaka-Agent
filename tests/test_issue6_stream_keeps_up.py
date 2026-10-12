@@ -20,7 +20,7 @@ import pytest
 from misaka.ai.api import _openai_sdk
 from misaka.ai.utils.retry import _RETRYABLE_PROVIDER_ERROR_PATTERN
 from misaka.core.session_manager import SessionManager
-from misaka.ui.tui.interactive.components.footer import FooterComponent
+from misaka.modes.interactive.components.footer import FooterComponent
 from misaka.ui.tui.terminal import ProcessTerminal
 from misaka.ui.tui.tui_main_screen import TuiMainScreen
 

@@ -20,9 +20,9 @@ from misaka.ai.providers.faux import fauxAssistantMessage
 from misaka.ai.types import Usage
 from misaka.core.auth_storage import AuthStorage
 from misaka.core.keybindings import KeybindingsManager
+from misaka.modes.interactive.components.model_selector import ModelSelectorComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.model_selector import ModelSelectorComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.utils.ansi import stripAnsi
 from misaka.utils.values import read_field
 from tests.model_runtime_test_utils import createModelRegistry, getModelRuntime

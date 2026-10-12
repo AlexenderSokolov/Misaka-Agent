@@ -24,11 +24,11 @@ from misaka.core.tools.read import createReadTool, createReadToolDefinition
 from misaka.core.tools.renderers import bash as bash_renderers
 from misaka.core.tools.renderers import withBuiltInRenderers
 from misaka.core.tools.write import createWriteToolDefinition
+from misaka.modes.interactive.components.tool_execution import ToolExecutionComponent
+from misaka.modes.interactive.theme import theme as theme_module
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import Text
 from misaka.ui.tui.components import image as image_module
-from misaka.ui.tui.interactive.components.tool_execution import ToolExecutionComponent
-from misaka.ui.tui.interactive.theme import theme as theme_module
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.ui.tui.terminal_image import (
     TerminalCapabilities,
     resetCapabilitiesCache,

@@ -13,6 +13,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypedDict
 
+from misaka.modes.interactive.components.dynamic_border import DynamicBorder
+from misaka.modes.interactive.components.keybinding_hints import keyHint
 from misaka.ui.tui import (
     Container,
     Input,
@@ -26,8 +28,6 @@ from misaka.ui.tui import (
     truncateToWidth,
     visibleWidth,
 )
-from misaka.ui.tui.interactive.components.dynamic_border import DynamicBorder
-from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
 from misaka.utils.collation import localeCompare
 from misaka.utils.js import (
     UNDEFINED,

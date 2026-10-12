@@ -46,12 +46,12 @@ from misaka.mcp import (
     Tool,
     toLlmContent,
 )
-from misaka.ui.tui import Container, Spacer, Text
-from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
-from misaka.ui.tui.interactive.components.visual_truncate import (
+from misaka.modes.interactive.components.keybinding_hints import keyHint
+from misaka.modes.interactive.components.visual_truncate import (
     VisualLinePreview,
     VisualLinePreviewOptions,
 )
+from misaka.ui.tui import Container, Spacer, Text
 from misaka.utils.js import (
     UNDEFINED,
     bufferFromBase64,

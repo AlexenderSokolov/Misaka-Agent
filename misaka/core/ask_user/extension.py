@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from misaka.ai.utils.typebox_helpers import typeboxSchema
 from misaka.core.extensions.types import ToolDefinition
-from misaka.ui.tui.interactive.components.ask_user_question import (
+from misaka.modes.interactive.components.ask_user_question import (
     AskUserQuestionComponent,
 )
 

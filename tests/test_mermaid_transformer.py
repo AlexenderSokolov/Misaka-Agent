@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from misaka.ui.tui.interactive.components.mermaid import (
+from misaka.modes.interactive.components.mermaid import (
     MermaidTransformerOptions,
     createMermaidMarkdownTransformer,
 )

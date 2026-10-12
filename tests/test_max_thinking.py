@@ -8,7 +8,7 @@ from pathlib import Path
 from misaka.cli.args import isValidThinkingLevel
 from misaka.config import get_themes_dir
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui.interactive.theme.theme import loadThemeFromPath
+from misaka.modes.interactive.theme.theme import loadThemeFromPath
 
 
 async def test_is_accepted_by_cli_and_settings():

@@ -16,7 +16,7 @@ from misaka.core.sdk import createAgentSession
 from misaka.core.session_manager import SessionManager
 from misaka.core.settings_manager import SettingsManager
 from misaka.core.skills.wiring.skills import SkillsPart
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.interactive_mode import InteractiveMode
 from misaka.utils.values import read_field
 from tests.offline import refuse_network
 
@@ -307,11 +307,11 @@ async def test_input_interception_and_expansion_opt_out_remain_effective(host, m
 async def test_render_and_history_rebuild_do_not_reactivate_or_mutate_skill(host, monkeypatch):
     from copy import deepcopy
 
-    from misaka.ui.tui import Container
-    from misaka.ui.tui.interactive.components.skill_invocation_message import (
+    from misaka.modes.interactive.components.skill_invocation_message import (
         SkillInvocationMessageComponent,
     )
-    from misaka.ui.tui.interactive.components.transcript import TranscriptRenderer
+    from misaka.modes.interactive.components.transcript import TranscriptRenderer
+    from misaka.ui.tui import Container
     activation = Mock(wraps=host.part._run_activation)
     monkeypatch.setattr(host.part, '_run_activation', activation)
     await host.session.prompt('/agent-reach inspect')

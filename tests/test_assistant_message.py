@@ -13,11 +13,11 @@ from typing import Any
 import pytest
 
 from misaka.ai.types import AssistantMessage
-from misaka.ui.tui.interactive.components.assistant_message import (
+from misaka.modes.interactive.components.assistant_message import (
     AssistantMessageComponent,
 )
-from misaka.ui.tui.interactive.components.user_message import UserMessageComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.components.user_message import UserMessageComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.utils.ansi import stripAnsi
 
 OSC133_ZONE_START = "\x1b]133;A\x07"

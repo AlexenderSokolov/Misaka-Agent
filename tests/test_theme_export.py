@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from misaka.config import get_custom_themes_dir, get_themes_dir
-from misaka.ui.tui.interactive.theme.theme import getThemeExportColors
+from misaka.modes.interactive.theme.theme import getThemeExportColors
 
 
 def _darkTheme() -> dict[str, Any]:

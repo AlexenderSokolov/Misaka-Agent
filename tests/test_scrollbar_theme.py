@@ -12,12 +12,12 @@ from typing import Any
 import pytest
 
 from misaka.config import get_themes_dir
-from misaka.ui.tui.interactive.theme import theme as theme_module
-from misaka.ui.tui.interactive.theme.theme import (
+from misaka.modes.interactive.theme import theme as theme_module
+from misaka.modes.interactive.theme.theme import (
     loadThemeFromPath,
     setThemeJsonValidator,
 )
-from misaka.ui.tui.interactive.theme.theme_json import validateThemeJson
+from misaka.modes.interactive.theme.theme_json import validateThemeJson
 
 
 @pytest.fixture(autouse=True)

@@ -11,12 +11,12 @@ from typing import Any
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.model_selector import (
+from misaka.modes.interactive.components.model_selector import (
     ModelSelectorComponent,
     ScopedModelItem,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.ui.tui import setKeybindings
 from misaka.utils.ansi import stripAnsi
 from tests.suite_harness import createHarness
 

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import misaka.ui.tui.interactive.theme as theme_package
+import misaka.modes.interactive.theme as theme_package
 from misaka.core.resource_loader import DefaultResourceLoader
 from misaka.core.settings_manager import SettingsManager
 from misaka.ui.tui.terminal_image import resetCapabilitiesCache, setCapabilityOverrides

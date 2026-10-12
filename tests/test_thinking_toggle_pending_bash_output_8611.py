@@ -7,10 +7,10 @@ import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from misaka.modes.interactive.components.tool_execution import ToolExecutionComponent
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import Container
-from misaka.ui.tui.interactive.components.tool_execution import ToolExecutionComponent
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.utils.ansi import stripAnsi
 
 

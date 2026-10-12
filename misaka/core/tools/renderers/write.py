@@ -24,9 +24,9 @@ from misaka.core.tools.render_utils import (
     renderToolPath,
     replaceTabs,
 )
+from misaka.modes.interactive.components.keybinding_hints import keyHint
+from misaka.modes.interactive.theme.theme import getLanguageFromPath, highlightCode
 from misaka.ui.tui import Container, Text
-from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
-from misaka.ui.tui.interactive.theme.theme import getLanguageFromPath, highlightCode
 from misaka.utils.js import UNDEFINED
 from misaka.utils.values import read_field
 

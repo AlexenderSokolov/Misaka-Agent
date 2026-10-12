@@ -29,7 +29,7 @@ from misaka.core.extensions.types import LoadExtensionsResult
 from misaka.core.messages import convertToLlm
 from misaka.core.session_manager import SessionManager
 from misaka.core.settings_manager import SettingsManager
-from misaka.ui.tui.interactive.theme.theme import theme
+from misaka.modes.interactive.theme.theme import theme
 from misaka.utils.js import jsonStringify
 from misaka.utils.values import read_field
 from tests.model_runtime_test_utils import (

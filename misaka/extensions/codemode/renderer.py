@@ -36,7 +36,7 @@ SCRIPT_HEADER = re.compile(r"^Script (completed|failed)\nWall time [0-9.]+ secon
 
 
 def expandHint(theme: Any, hidden: int, noun: str) -> str:
-    from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
+    from misaka.modes.interactive.components.keybinding_hints import keyHint
 
     return f"{theme.fg('muted', f'... ({hidden} more {noun},')} {keyHint('app.tools.expand', 'to expand')}{theme.fg('muted', ')')}"
 
@@ -89,11 +89,11 @@ def formatCall(call: Any, theme: Any, expanded: bool) -> str:
 
 
 def renderCall(args: Any, theme: Any, context: Any) -> Any:
-    from misaka.ui.tui.interactive.components.visual_truncate import (
+    from misaka.modes.interactive.components.visual_truncate import (
         VisualLinePreview,
         VisualLinePreviewOptions,
     )
-    from misaka.ui.tui.interactive.theme.theme import highlightCode
+    from misaka.modes.interactive.theme.theme import highlightCode
 
     # The code includes the `// @options:` line, so options show as part of the script.
     code = render_utils.str(read_field(args, "code")) if args is not None else render_utils.str(None)
@@ -123,8 +123,8 @@ def renderCall(args: Any, theme: Any, context: Any) -> Any:
 
 
 def renderResult(result: Any, options: Any, theme: Any, context: Any) -> Any:
-    from misaka.ui.tui.interactive.components.keybinding_hints import keyHint
-    from misaka.ui.tui.interactive.components.visual_truncate import (
+    from misaka.modes.interactive.components.keybinding_hints import keyHint
+    from misaka.modes.interactive.components.visual_truncate import (
         VisualLinePreview,
         VisualLinePreviewOptions,
     )

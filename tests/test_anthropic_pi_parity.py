@@ -140,10 +140,10 @@ async def test_custom_models_load_pi_thinking_metadata(tmp_path, monkeypatch):
 
 
 def test_thinking_selector_uses_pi_descriptions():
-    from misaka.ui.tui.interactive.components.settings_selector import (
+    from misaka.modes.interactive.components.settings_selector import (
         THINKING_DESCRIPTIONS,
     )
-    from misaka.ui.tui.interactive.components.thinking_selector import (
+    from misaka.modes.interactive.components.thinking_selector import (
         LEVEL_DESCRIPTIONS,
     )
 

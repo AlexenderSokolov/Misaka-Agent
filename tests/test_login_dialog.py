@@ -6,8 +6,8 @@ import pytest
 
 from misaka.ai.auth.types import AuthInfoLink
 from misaka.core.keybindings import KeybindingsManager
+from misaka.modes.interactive.components.login_dialog import LoginDialogComponent
 from misaka.ui.tui import keybindings as tui_keybindings
-from misaka.ui.tui.interactive.components.login_dialog import LoginDialogComponent
 from misaka.utils.ansi import stripAnsi
 
 

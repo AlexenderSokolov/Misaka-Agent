@@ -7,11 +7,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import setKeybindings
-from misaka.ui.tui.interactive.components.thinking_selector import (
+from misaka.modes.interactive.components.thinking_selector import (
     ThinkingSelectorComponent,
 )
-from misaka.ui.tui.interactive.theme.theme import initTheme
+from misaka.modes.interactive.theme.theme import initTheme
+from misaka.ui.tui import setKeybindings
 from misaka.utils.ansi import stripAnsi
 
 

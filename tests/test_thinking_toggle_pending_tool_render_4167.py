@@ -9,9 +9,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from misaka.modes.interactive.interactive_mode import InteractiveMode
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import Container, Text
-from misaka.ui.tui.interactive.interactive_mode import InteractiveMode
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.utils.ansi import stripAnsi
 
 TOOL_CALL_ID = "tool-4167"

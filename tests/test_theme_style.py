@@ -15,8 +15,8 @@ from typing import Any
 import pytest
 
 from misaka.config import get_themes_dir
+from misaka.modes.interactive.theme.theme import Theme, loadThemeFromPath
 from misaka.ui.tui.colors import colorToHex, styleText
-from misaka.ui.tui.interactive.theme.theme import Theme, loadThemeFromPath
 
 
 def loadTheme(tmp_path: Path, base: str, edit: Callable[[dict[str, Any]], None] = lambda _theme: None) -> Theme:

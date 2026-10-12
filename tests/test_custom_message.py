@@ -6,9 +6,9 @@ import time
 from typing import Any
 
 from misaka.core.messages import CustomMessage
+from misaka.modes.interactive.components.custom_message import CustomMessageComponent
+from misaka.modes.interactive.theme.theme import initTheme
 from misaka.ui.tui import Text
-from misaka.ui.tui.interactive.components.custom_message import CustomMessageComponent
-from misaka.ui.tui.interactive.theme.theme import initTheme
 from misaka.utils.ansi import stripAnsi
 
 

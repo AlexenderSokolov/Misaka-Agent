@@ -8,8 +8,7 @@ import pytest
 
 from misaka.ai.types import Model
 from misaka.core.keybindings import KeybindingsManager
-from misaka.ui.tui import keybindings as tui_keybindings
-from misaka.ui.tui.interactive.components.scoped_models_selector import (
+from misaka.modes.interactive.components.scoped_models_selector import (
     ModelsCallbacks,
     ModelsConfig,
     ScopedModelsSelectorComponent,
@@ -17,6 +16,7 @@ from misaka.ui.tui.interactive.components.scoped_models_selector import (
     enableAll,
     toggle,
 )
+from misaka.ui.tui import keybindings as tui_keybindings
 from misaka.utils.ansi import stripAnsi
 
 PROVIDER = "fixture"
