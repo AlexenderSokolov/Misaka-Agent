@@ -61,6 +61,115 @@ def fork_source(con, node):
     return runs.node(con, ids[0])
 
 
+def lineage(con, node):
+    """The nodes whose conversations this node's own continues, nearest first: itself, the node it
+    forked (``fork_source``), and so on up to the root. A single-parent line is its ancestors; a
+    join's parents are its ancestors but not its lineage -- their deliberation is in their own
+    sessions, not in the conversation the join inherited."""
+    chain, current = [node["id"]], node
+    while not runs.is_root(current):
+        current = fork_source(con, current)
+        chain.append(current["id"])
+    return chain
+
+
+# --- where each possibility went ---------------------------------------------------------
+# Every possibility raised in a run -- an option of a decision, a divergence proposal, a red-team
+# issue taken to a decision -- has at most one pointer to what answers it, set by the Last Order who
+# judged it: an issue ``becomes`` an option or is ``covered_by`` a node; an option ``opens`` a node
+# or, left unopened, is ``covered_by`` the node or the option that answers it. Following them ends at
+# a node, or at a record left unopened (declined, not pursued, or still waiting). Nothing here judges
+# whether two possibilities are the same; it reads what was recorded. The chain is never shortened:
+# each step is someone's judgement, and the record keeps them all.
+
+def possibility_issues(con, run, issues=None):
+    """The issues that are possibilities, the ones the paths list carries: every divergence proposal,
+    and every red-team issue taken to a node's decision -- disposed ``branch``, or named in a decision
+    that then covered or declined it. A gap is not one, nor a red-team issue answered in its node."""
+    decided = set()
+    for node in runs.nodes(con, run["id"]):
+        recorded = runs.action(con, run["id"], node["id"], runs.DECIDE_KEY)
+        if recorded:
+            payload = recorded["payload"]
+            decided.update(source for decision in payload.get("decisions", ()) for option in decision["options"]
+                           for source in option.get("sources", ()))
+            decided.update(item["issue_id"] for item in payload.get("declined", ()))
+    rows = runs.issues(con, run["id"]) if issues is None else issues
+    return [row for row in rows if row["origin"] == "divergence" or row["disposition"] == "branch" or row["id"] in decided]
+
+
+def _pointer(element):
+    """Where one possibility points, or None: an issue's option or node, an option's node or cover."""
+    if "decision_id" in element:                          # an option
+        return element["node_id"] or element["covered_by"]
+    return element["option_id"] or element["covered_by"]
+
+
+def where(elements, element_id):
+    """The chain from ``element_id`` along the recorded pointers, ending at a node id or at a record
+    with no pointer (``elements`` maps the run's options and issues by id). Never written back."""
+    chain, seen = [element_id], {element_id}
+    while chain[-1] in elements:
+        target = _pointer(elements[chain[-1]])
+        if target is None or target in seen:
+            break
+        chain.append(target)
+        seen.add(target)
+    return chain
+
+
+def reopenable(con, run):
+    """The records a new option may bring back by answering the reason recorded for them: possibilities
+    declined, covered or left unopened -- every one that is not a node's own and no longer waits."""
+    found = {row["id"] for row in possibility_issues(con, run) if row["disposition"] in ("decline", "covered")}
+    found.update(row["id"] for row in runs.options(con, run["id"]) if row["node_id"] is None and row["reason"])
+    return found
+
+
+def coverage_claims(con, run):
+    """Possibilities a node closed as ``covered`` by a node -- or a waiting option -- of another line,
+    whose coverage no reconciliation has reviewed yet. A node knows its own line from the inside: the
+    nodes it descends from decided in the conversation it continues, or, for a join, in the parents'
+    sessions its packet names. Another line it knows only by what that node wrote, so whether that node
+    really answers the possibility is judged where both lines are in view: the reconciliation. Each
+    claim carries what it needs: the proposal, the claimant's reason, and the covering node or option
+    as it stood when the claim was made and as it stands now."""
+    workspace = run["workspace"]
+    options = {row["id"]: row for row in runs.options(con, run["id"])}
+    decided_at = {row["id"]: row["node_id"] for row in runs.decisions(con, run["id"])}
+    claims = []
+    for issue in possibility_issues(con, run):
+        if issue["disposition"] != "covered" or issue.get("coverage_review"):
+            continue
+        target = issue["covered_by"] or issue["option_id"]
+        if target is None:
+            continue
+        claimant = issue["branch_id"]
+        owner = target if issue["covered_by"] else decided_at.get(options[target]["decision_id"])
+        if owner == claimant or owner in ancestors(con, claimant):
+            continue
+        decided = runs.action(con, run["id"], claimant, runs.DECIDE_KEY)
+        claimed_at = decided["created_at"] if decided else issue["created_at"]
+        claim = {"proposal": issue["id"], "raised_at": claimant, "question": issue["question"],
+                 "rationale": issue["rationale"], "claimant_reason": issue["reason"], "claimed_at": claimed_at}
+        if issue["covered_by"]:
+            node = runs.node(con, target)
+            versions = syntheses(con, run, node)
+            then = [row for row in versions if row["created_at"] <= claimed_at]
+            claim["covered_by"] = {
+                "node": target, "question": node["question"], "depth": node["depth"], "status": node["status"],
+                "conclusion": posix_relpath(versions[-1]["path"], workspace) if versions else None,
+                "conclusion_when_claimed": posix_relpath(then[-1]["path"], workspace) if then else None,
+                "revised_since_claim": bool(versions) and len(then) < len(versions)}
+        else:
+            option = options[target]
+            claim["covered_by"] = {"option": target, "label": option["label"], "premise": option["premise"],
+                                   "decided_at": owner,
+                                   "outcome": _outcome(con, option, owner)}
+        claims.append(claim)
+    return claims
+
+
 def syntheses(con, run, node):
     """The node's conclusions, first version first."""
     return list(runs.artifacts(con, run["id"], branch_id=node["id"], kind="synthesis"))
@@ -108,7 +217,8 @@ def reconcile_state(con, run):
     or failed and waiting for its retry -- not even on a resume, which restarts the driver's loop at
     this check with a level half done. Then it is needed while an option waits for an outcome, or
     when nodes finished since the last one and at least two nodes hold a conclusion (below that no
-    join or relation can exist). Structure only; nothing here reads what a node found."""
+    join or relation can exist), or while a coverage claim waits for its review. Structure only;
+    nothing here reads what a node found."""
     nodes = runs.nodes(con, run["id"])
     finished = [n for n in nodes if n["status"] == "closed"]
     covered = set()
@@ -118,7 +228,8 @@ def reconcile_state(con, run):
     fresh = [n["id"] for n in finished if n["id"] not in covered]
     concluded = sum(1 for n in finished if syntheses(con, run, n))
     settled = all(n["status"] in ("closed", "parked") for n in nodes)
-    needed = settled and (bool(reconcilable_options(con, run)) or (bool(fresh) and concluded >= 2))
+    needed = settled and (bool(reconcilable_options(con, run)) or bool(coverage_claims(con, run))
+                          or (bool(fresh) and concluded >= 2))
     return needed, [n["id"] for n in finished]
 
 
@@ -128,26 +239,45 @@ def resolve_reconcile(con, run, payload):
     it joins). Raises ValueError with what to change; judges nothing about content."""
     chosen = runs.current_limits(con, run)
     pending = {row["id"]: row for row in reconcilable_options(con, run)}
+    problems = []
+    claims = {claim["proposal"]: claim for claim in coverage_claims(con, run)}
+    verdicts = payload.get("coverage") or []
+    reviewed = Counter(item["proposal"] for item in verdicts)
+    stray = sorted(set(reviewed) - set(claims))
+    if stray:
+        problems.append(f"not coverage claims waiting for review: {', '.join(stray)}")
+    twice = sorted(pid for pid, count in reviewed.items() if count > 1)
+    if twice:
+        problems.append(f"coverage claims given more than one verdict: {', '.join(twice)}")
+    unreviewed = sorted(set(claims) - set(reviewed))
+    if unreviewed:
+        problems.append(f"every coverage claim needs a verdict (holds or reopen); missing: {', '.join(unreviewed)}")
+    # A reopened proposal is a possibility of its own: it is given an outcome like a pending option, and a
+    # node opened for it is a child of the node that raised it.
+    reopened = {item["proposal"]: claims[item["proposal"]] for item in verdicts
+                if item["verdict"] == "reopen" and item["proposal"] in claims}
+    origin = {**{oid: row["decided_at"] for oid, row in pending.items()},
+              **{pid: claim["raised_at"] for pid, claim in reopened.items()}}
     named = Counter([oid for item in payload["nodes"] for oid in item["options"]]
                     + [item["option"] for item in payload["not_pursued"]])
-    problems = []
-    unknown = sorted(set(named) - set(pending))
+    unknown = sorted(set(named) - set(origin))
     if unknown:
-        problems.append(f"not pending options of this run: {', '.join(unknown)}")
+        problems.append(f"not pending options of this run or proposals whose coverage this reconciliation "
+                        f"reopens: {', '.join(unknown)}")
     twice = sorted(oid for oid, count in named.items() if count > 1)
     if twice:
         problems.append(f"options given more than one outcome: {', '.join(twice)}")
-    missing = sorted(set(pending) - set(named))
+    missing = sorted(set(origin) - set(named))
     if missing:
-        problems.append("every pending option needs an outcome (a node, or not_pursued with its reason); "
-                        f"missing: {', '.join(missing)}")
-    resolved = {"nodes": [], "joins": [], "not_pursued": [], "relations": []}
+        problems.append("every pending option, and every proposal whose coverage is reopened, needs an outcome "
+                        f"(a node, or not_pursued with its reason); missing: {', '.join(missing)}")
+    resolved = {"nodes": [], "joins": [], "not_pursued": [], "relations": [], "coverage": []}
     total = len(runs.nodes(con, run["id"]))
     for position, item in enumerate(payload["nodes"], 1):
         if not item["options"]:
             problems.append(f"nodes[{position}] pursues no option; a node opened without one is a join")
             continue
-        parent_ids = list(dict.fromkeys(pending[oid]["decided_at"] for oid in item["options"] if oid in pending))
+        parent_ids = list(dict.fromkeys(origin[oid] for oid in item["options"] if oid in origin))
         depth = max((runs.node(con, pid)["depth"] for pid in parent_ids), default=-1) + 1
         if parent_ids and depth > chosen["max_depth"]:
             problems.append(f"nodes[{position}] would open at depth {depth}, beyond max_depth {chosen['max_depth']}: "
@@ -180,8 +310,23 @@ def resolve_reconcile(con, run, payload):
         problems.append(f"this would bring the graph to {total + opened} nodes, over max_nodes {chosen['max_nodes']}: "
                         "merge options that ask the same question into one node, or record options under "
                         "not_pursued with the node limit as the reason")
+    opening = {oid for item in payload["nodes"] for oid in item["options"]}
     for item in payload["not_pursued"]:
-        resolved["not_pursued"].append({"option": item["option"], "reason": item["reason"]})
+        cover = item.get("covered_by") or None
+        found = runs.node(con, cover) if cover else None
+        if cover and cover == item["option"]:
+            problems.append(f"not_pursued {item['option']} is covered by itself")
+        elif cover and not (found is not None and found["run_id"] == run["id"]) and cover not in opening:
+            problems.append(f"not_pursued {item['option']}: covered_by {cover} is neither a node of this run nor an "
+                            "option this reconciliation opens")
+        resolved["not_pursued"].append({"option": item["option"], "reason": item["reason"], "covered_by": cover})
+    for item in verdicts:
+        claim = claims.get(item["proposal"])
+        if claim is not None:
+            cover = claim["covered_by"]
+            resolved["coverage"].append({"proposal": item["proposal"], "verdict": item["verdict"], "note": item["note"],
+                                         "node": claim["raised_at"],
+                                         "covered_by": cover.get("node") or cover.get("option")})
     resolved["relations"] = _relations(con, run, payload["relations"], problems)
     if problems:
         raise ValueError("Reconciliation not accepted: " + "; ".join(problems) + ".")
@@ -229,7 +374,9 @@ def _outcome(con, option, deciding_node_id):
     if option["node_id"]:
         return f"node `{option['node_id']}`"
     if option["reason"]:
-        return f"not pursued: {option['reason']}"
+        cover = option.get("covered_by")
+        what = "node" if cover and runs.node(con, cover) is not None else "option"
+        return "not pursued" + (f", answered by {what} `{cover}`" if cover else "") + f": {option['reason']}"
     return "pending"
 
 
@@ -268,22 +415,25 @@ def snapshot(con, run):
             "id": decision["id"], "node": decision["node_id"], "origin": decision["origin"],
             "question": decision["question"], "stakes": decision["stakes"],
             "options": [{"id": o["id"], "label": o["label"], "premise": o["premise"], "node": o["node_id"],
-                         "reason": o["reason"], "outcome": _outcome(con, o, decision["node_id"])}
+                         "reason": o["reason"], "covered_by": o["covered_by"], "answers": o["answers"],
+                         "outcome": _outcome(con, o, decision["node_id"])}
                         for o in runs.options(con, run["id"], decision_id=decision["id"])]})
     for item in runs.reconcile_rounds(con, run["id"]):
         out["reconciles"].append({"round": item["round"], "applied": item["applied_at"] is not None,
                                   "summary": item["payload"].get("summary", ""), "receipt": item["receipt"]})
-    out["paths"] = _paths(con, run, out)
+    issues = possibility_issues(con, run)
+    claims = {claim["proposal"] for claim in coverage_claims(con, run)}
+    out["paths"] = _paths(con, run, out, issues, claims)
+    out["destinations"] = _destinations(con, run, out, issues, claims)
     out["errata"] = runs.errata(con, run["id"])
     return out
 
 
-def _paths(con, run, data):
+def _paths(con, run, data, issues, claims):
     """Every possibility raised in the run, under the node that raised it, with where it went: each
     option of every decision (with the proposals it takes up), and each divergence proposal or branch
     issue no option took up. Red-team corrections are not possibilities and stay out."""
     options = {option["id"] for decision in data["decisions"] for option in decision["options"]}
-    issues = runs.issues(con, run["id"])
     taken = {}
     for issue in issues:
         if issue["option_id"] in options:
@@ -291,24 +441,97 @@ def _paths(con, run, data):
     out = []
     for node in data["nodes"]:
         entries = [{"id": option["id"], "what": "option", "text": option["label"], "premise": option["premise"],
-                    "decision": decision["question"], "outcome": option["outcome"], "takes_up": taken.get(option["id"], [])}
+                    "decision": decision["question"], "outcome": option["outcome"], "takes_up": taken.get(option["id"], []),
+                    "answers": option["answers"]}
                    for decision in data["decisions"] if decision["node"] == node["id"] for option in decision["options"]]
-        entries += [{"id": issue["id"], "what": "proposal", "text": issue["question"], "outcome": _proposal_outcome(con, run, issue)}
+        entries += [{"id": issue["id"], "what": "proposal", "text": issue["question"],
+                     "outcome": _proposal_outcome(con, run, issue, claims)}
                     for issue in issues if issue["branch_id"] == node["id"]
-                    and (issue["origin"] == "divergence" or issue["disposition"] == "branch")
-                    and issue["option_id"] not in options]
+                    and not (issue["disposition"] != "covered" and issue["option_id"] in options)]
         if entries:
             out.append({"node": node["id"], "kind": node["kind"], "depth": node["depth"], "question": node["question"],
                         "entries": entries})
     return out
 
 
-def _proposal_outcome(con, run, issue):
+def _destinations(con, run, data, issues, claims):
+    """The same possibilities as ``_paths``, grouped the other way: under what answers each now -- the
+    node that pursues it, or the record that leaves it unopened -- through every option it went by.
+    A path brought back by a later option stays under its own record, which names that option."""
+    decided_at = {decision["id"]: decision["node"] for decision in data["decisions"]}
+    options = {row["id"]: row for row in runs.options(con, run["id"])}
+    elements = {**options, **{row["id"]: row for row in issues}}
+    order = {node["id"]: position for position, node in enumerate(data["nodes"])}
+    answered_by = {}
+    for option in options.values():
+        for record in option["answers"]:
+            answered_by.setdefault(record, []).append(option["id"])
+
+    def describe(element_id, chain):
+        element = elements[element_id]
+        if "decision_id" in element:
+            entry = {"id": element_id, "what": "option", "text": element["label"], "premise": element["premise"],
+                     "at": decided_at.get(element["decision_id"]), "reason": element["reason"]}
+        else:
+            entry = {"id": element_id, "what": "proposal", "text": element["question"], "at": element["branch_id"],
+                     "disposition": element["disposition"], "reason": element["reason"],
+                     "review": _review_note(element, claims) or None}
+        entry["via"] = chain[1:-1]
+        entry["brought_back_by"] = []
+        for oid in answered_by.get(element_id, []):
+            end = where(elements, oid)[-1]
+            goes = (f"node `{end}`" if end not in elements else "waiting for the reconciliation" if end == oid
+                    and not options[oid]["reason"] else f"`{end}`")
+            entry["brought_back_by"].append({"option": oid, "at": decided_at.get(options[oid]["decision_id"]),
+                                             "goes_to": goes})
+        return entry
+
+    groups = {}
+    for element_id in [*options, *(row["id"] for row in issues)]:
+        chain = where(elements, element_id)
+        end = chain[-1]
+        groups.setdefault(end, []).append(describe(element_id, chain))
+    nodes = {node["id"]: node for node in data["nodes"]}
+    out = {"nodes": [], "not_opened": [], "waiting": [], "undecided": []}
+    for end in sorted(groups, key=lambda key: (order.get(key, len(order)), key)):
+        members = groups[end]
+        if end in nodes:
+            node = nodes[end]
+            out["nodes"].append({"node": end, "kind": node["kind"], "depth": node["depth"], "status": node["status"],
+                                 "question": node["question"], "members": members})
+            continue
+        root = elements.get(end)
+        if root is None:
+            continue
+        if "decision_id" in root:
+            out["not_opened" if root["reason"] else "waiting"].append({"record": end, "members": members})
+        else:
+            out["undecided" if root["disposition"] is None else "not_opened"].append({"record": end, "members": members})
+    return out
+
+
+def _proposal_outcome(con, run, issue, claims=()):
     if issue["disposition"] == "covered":
-        return f"covered by node `{issue['covered_by']}`" + (f" -- {issue['reason']}" if issue["reason"] else "")
+        target = f"node `{issue['covered_by']}`" if issue["covered_by"] else f"option `{issue['option_id']}`"
+        return (f"covered by {target}" + (f" -- {issue['reason']}" if issue["reason"] else "")
+                + _review_text(issue, claims))
     if issue["disposition"] == "decline":
         return f"declined: {issue['reason']}"
     return "awaiting this node's decision"
+
+
+def _review_note(issue, claims):
+    """What became of a coverage claim: its review, or that it waits for one; empty for any other issue."""
+    review = issue.get("coverage_review")
+    if review:
+        word = "held" if review["verdict"] == "holds" else "was reopened"
+        return f"the coverage claim {word} at reconciliation {review['round']}: {review['note']}"
+    return "a claim across lines: the next reconciliation reviews it" if issue["id"] in claims else ""
+
+
+def _review_text(issue, claims):
+    note = _review_note(issue, claims)
+    return f" ({note})" if note else ""
 
 
 def render_graph(data):
@@ -390,7 +613,61 @@ def render_paths(data):
             else:
                 lines.append(f"- `{entry['id']}` proposal: {flat(entry['text'])} → {flat(entry['outcome'])}")
         lines.append("")
+    lines += _render_destinations(data.get("destinations"), flat)
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _render_destinations(found, flat):
+    """The paths list's second part: every possibility under what answers it now."""
+    if not found or not any(found.values()):
+        return []
+
+    def member(entry, root, indent=""):
+        where = f" at `{entry['at']}`" if entry["at"] else ""
+        if entry["what"] == "option":
+            text = f"{indent}- `{entry['id']}` option \"{flat(entry['text'])}\"{where} — premise: {flat(entry['premise'])}"
+        else:
+            text = f"{indent}- `{entry['id']}` proposal{where}: {flat(entry['text'])}"
+        if entry["via"]:
+            text += " — via " + " → ".join(f"`{step}`" for step in entry["via"])
+        if entry["id"] == root:
+            if entry["what"] == "option" and entry["reason"]:
+                text += f" — not pursued: {flat(entry['reason'])}"
+            elif entry["what"] == "proposal" and entry["disposition"] == "decline":
+                text += f" — declined: {flat(entry['reason'])}"
+        elif entry["what"] == "proposal" and entry["disposition"] == "covered":
+            text += f" — covered: {flat(entry['reason'])}"
+        elif entry["what"] == "option" and entry["reason"]:
+            text += f" — not pursued: {flat(entry['reason'])}"
+        if entry.get("review"):
+            text += f" ({flat(entry['review'])})"
+        lines = [text]
+        lines += [f"{indent}  - brought back by option `{b['option']}`" + (f" at `{b['at']}`" if b["at"] else "")
+                  + f", which answers the reason recorded here → {b['goes_to']}" for b in entry["brought_back_by"]]
+        return lines
+
+    lines = ["## Where each possibility went", "",
+             ("The same possibilities, grouped under what answers each now: the node that pursues it -- opened for it, "
+              "or named as covering it -- or the record that leaves it unopened, through every option it went by "
+              "(`via`). A possibility reached from another frame shows here beside the node that took it up. Grouped "
+              "by premise only as the run's Last Orders judged it: read the premises, not the labels."), ""]
+    for group in found["nodes"]:
+        lines += [(f"### Node `{group['node']}` ({group['kind']}, depth {group['depth']}, {group['status']}) — "
+                   f"{_clip(group['question'], 120)}"), ""]
+        for entry in group["members"]:
+            lines += member(entry, None)
+        lines.append("")
+    for title, key in (("Not opened", "not_opened"), ("Waiting for the reconciliation", "waiting"),
+                       ("Waiting for its node's decision", "undecided")):
+        if found[key]:
+            lines += [f"### {title}", ""]
+            for group in found[key]:
+                # The record first; what went to it under it.
+                ordered = sorted(group["members"], key=lambda entry: entry["id"] != group["record"])
+                for entry in ordered:
+                    lines += member(entry, group["record"], "" if entry["id"] == group["record"] else "  ")
+            lines.append("")
+    return lines
 
 
 def render_node(data, node_id):

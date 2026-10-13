@@ -33,7 +33,8 @@ def _parent(con, run, node, parent):
                    for row in runs.issues(con, run["id"], node_id=parent["id"])],
         "decisions": [{"question": d["question"], "stakes": d["stakes"],
                        "options": [{"label": o["label"], "premise": o["premise"], "node": o["node_id"],
-                                    "reason": o["reason"], "leads_here": o["node_id"] == node["id"]}
+                                    "reason": o["reason"], "covered_by": o["covered_by"],
+                                    "leads_here": o["node_id"] == node["id"]}
                                    for o in runs.options(con, run["id"], decision_id=d["id"])]}
                       for d in runs.decisions(con, run["id"], node_id=parent["id"])],
     }
@@ -146,7 +147,8 @@ def render(packet):
             lines.append(f"- decision: {decision['question']} (stakes: {decision['stakes']})")
             for option in decision["options"]:
                 outcome = ("this node" if option["leads_here"] else f"node {option['node']}" if option["node"]
-                           else f"not pursued: {option['reason']}" if option["reason"] else "pending")
+                       else "not pursued" + (f", answered by {option['covered_by']}" if option.get("covered_by") else "")
+                       + f": {option['reason']}" if option["reason"] else "pending")
                 lines.append(f"  - {option['label']} -- {option['premise']} → {outcome}")
     # Findings are Sisters' words and their sources' quotations: data, fenced as planner's
     # evidence block fences the same ledger (issue #10 audit, M3).

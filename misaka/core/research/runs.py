@@ -137,7 +137,9 @@ MAX_NODES_CEILING = 500
 # A run's own compaction threshold, as a share of the context window: below a tenth a session would
 # compact on nearly every turn, above 0.95 there is no room left to compact into.
 MIN_CONTEXT_THRESHOLD, MAX_CONTEXT_THRESHOLD = 0.1, 0.95
-RESEARCH_SCHEMA_VERSION = 19   # the structure moved into the run's graph; v18 is migrated (_migrate_from_18)
+# v19: the structure moved into the run's graph (v18 is migrated, _migrate_from_18). v20: an option left unopened
+# points at what answers it, and an option can answer a path declined before (_migrate_from_19).
+RESEARCH_SCHEMA_VERSION = 20
 DRIVER_TTL_SECONDS = 300
 RESEARCH_TABLES = (
     "research_claims", "research_findings", "research_artifacts", "research_cards", "research_execution",
@@ -241,8 +243,12 @@ def init(con):
             _validate_current_schema(con)
             return
         recorded = con.execute("SELECT MAX(version) FROM schema_migrations WHERE component='research'").fetchone()[0]
-        if recorded == 18:
-            _migrate_from_18(con)
+        if recorded in (18, 19):
+            # A v18 board's graphs are made with the current schema; a v19 board's are given it.
+            if recorded == 18:
+                _migrate_from_18(con)
+            else:
+                _migrate_from_19(con)
             con.execute("INSERT INTO schema_migrations(component,version,applied_at) VALUES('research',?,?)",
                         (RESEARCH_SCHEMA_VERSION, int(time.time())))
             return
@@ -268,7 +274,14 @@ def graph_schema(chosen):
             "opens": {"from": ["option"], "to": ["inquiry"], "max_out": 1},
             "raised_on": {"from": ["issue"], "to": ["inquiry"], "max_out": 1},
             "becomes": {"from": ["issue"], "to": ["option"], "max_out": 1},
-            "covered_by": {"from": ["issue"], "to": ["inquiry"], "max_out": 1},
+            # What answers a possibility that was not opened as a node of its own: an issue's covering node,
+            # or, for an option left unopened, the node that pursues it or the option opened for it. Each
+            # possibility has one such pointer, set by whoever judged it; following them -- with
+            # ``becomes`` and ``opens`` -- ends at a node or at a record left unopened (views.where).
+            "covered_by": {"from": ["issue", "option"], "to": ["inquiry", "option"], "max_out": 1, "acyclic": True},
+            # A cross-reference, not a pointer: an option that brings back a path declined or left unopened,
+            # and answers the reason recorded for it. The path stays where it was.
+            "answers": {"from": ["option"], "to": ["issue", "option"], "unique": True},
             "member": {"from": ["relation"], "to": ["inquiry"], "unique": True},
         },
     }
@@ -385,6 +398,16 @@ def _migrate_from_18(con):
                   "research_branches"):
         con.execute(f"DROP TABLE {table}")
     _execute_script(con, INDEXES)
+
+
+def _migrate_from_19(con):
+    """Give every run's graph the v20 schema: the same kinds, with ``covered_by`` widened to options and
+    ``answers`` added. Nothing in a graph changes; the schema op is journaled like any other."""
+    for run in con.execute("SELECT * FROM research_runs ORDER BY created_at,rowid").fetchall():
+        if graph.get(con, run["id"]) is None:
+            continue
+        with _holding(con, run["id"]) as token:
+            graph.commit(con, run["id"], "schema", graph_schema(limits(run)), token=token)
 
 
 def _lease_holder_is_dead(lock):
@@ -1338,6 +1361,8 @@ def add_decision(con, run_id, *, node, round, origin, index, question, stakes, o
             change.add_edge("offers", decision_id, option_id)
             if choice.get("own"):
                 change.add_edge("opens", option_id, node["id"])
+            for record in dict.fromkeys(choice.get("answers") or ()):
+                change.add_edge("answers", option_id, record)
         return decision_id
 
     return _commit(con, run_id, "add_decision", {"node": node["id"], "origin": origin, "round": int(round),
@@ -1360,7 +1385,9 @@ def decisions(con, run_id, *, node_id=None):
 def _option_row(snap, run_id, found):
     offered = snap.in_edges(found.id, "offers")
     return {"id": found.id, "run_id": run_id, "decision_id": offered[0].source if offered else None,
-            **graph.thaw(found.attrs), "node_id": _end(snap, found.id, "opens")}
+            **graph.thaw(found.attrs), "node_id": _end(snap, found.id, "opens"),
+            "covered_by": _end(snap, found.id, "covered_by"),
+            "answers": [edge.target for edge in snap.out_edges(found.id, "answers")]}
 
 
 def options(con, run_id, *, decision_id=None):
@@ -1416,20 +1443,25 @@ def origin_options(con, node_id):
     return _options_with_decisions(con, row["run_id"], led_here)
 
 
-def set_option(con, option_id, *, node_id=None, reason=None):
+def set_option(con, option_id, *, node_id=None, reason=None, covered_by=None):
     run_id = graph.locate(con, option_id)
     if run_id is not None:
-        _commit(con, run_id, "set_option", {"option": option_id, "node": node_id, "reason": reason},
-                lambda change: _set_option(change, option_id, node_id, reason))
+        _commit(con, run_id, "set_option", {"option": option_id, "node": node_id, "reason": reason,
+                                            "covered_by": covered_by},
+                lambda change: _set_option(change, option_id, node_id, reason, covered_by))
 
 
-def _set_option(change, option_id, node_id, reason):
-    """The outcome of an option: the node that pursues it, or the reason it was not opened."""
+def _set_option(change, option_id, node_id, reason, covered_by=None):
+    """The outcome of an option: the node that pursues it, or the reason it was not opened -- with,
+    when something answers it, that node or the option opened for it (``covered_by``)."""
     change.update(option_id, {"reason": reason})
-    for edge in change.view.out_edges(option_id, "opens"):
-        change.retire(edge.id)
+    for kind in ("opens", "covered_by"):
+        for edge in change.view.out_edges(option_id, kind):
+            change.retire(edge.id)
     if node_id:
         change.add_edge("opens", option_id, node_id)
+    elif covered_by:
+        change.add_edge("covered_by", option_id, covered_by)
 
 
 # --- relations: what links nodes without scheduling anything ------------------------------
@@ -1557,25 +1589,68 @@ def apply_reconcile(con, run, round, resolved, *, considered):
             return graph.thaw(entry.receipt)
 
         def open_level(change, _entry):
+            now = int(time.time())
             opened = {"nodes": [], "joins": []}
+            # Coverage claims first: a reopened proposal becomes an option here, which the outcomes below name.
+            as_option = _review_coverage(change, round, resolved.get("coverage") or (), now)
             for item in resolved["nodes"]:
                 child = _open_node(con, change, run, item["question"], item["parents"])
                 for option_id in item["options"]:
-                    _set_option(change, option_id, child, None)
+                    _set_option(change, as_option.get(option_id, option_id), child, None)
                 opened["nodes"].append(child)
             for item in resolved["joins"]:
                 opened["joins"].append(_open_node(con, change, run, item["question"], item["parents"]))
             for item in resolved["not_pursued"]:
-                _set_option(change, item["option"], None, item["reason"])
-            now = int(time.time())
+                cover = item.get("covered_by")
+                _set_option(change, as_option.get(item["option"], item["option"]), None, item["reason"],
+                            as_option.get(cover, cover))
             for position, item in enumerate(resolved["relations"]):
                 _add_relation(change, _derived_id("rel_", run["id"], round, position), item["kind"], item["note"],
                               item["nodes"], now)
-            return {"considered": list(considered), **opened}
+            return {"considered": list(considered), **opened, **({"reopened": as_option} if as_option else {})}
 
         with _holding(con, run["id"]) as token:
             receipt = graph.apply(con, entry.id, token=token, handlers={"reconcile": open_level})
     return graph.thaw(receipt)
+
+
+REOPENED_QUESTION = ("Reconciliation {round}: possibilities raised here that the node named as covering them "
+                     "does not pursue")
+REOPENED_STAKES = ("Each was closed as covered by a node or an option of another line; reading both lines, the "
+                   "reconciliation found that line does not answer it, so it is a possibility of its own.")
+
+
+def _review_coverage(change, round, verdicts, now):
+    """The reconciliation's verdict on each coverage claim (``views.coverage_claims``), on the claim's
+    issue. A claim that holds keeps its pointer. A reopened one becomes an option of a decision the
+    reconciliation records at the node that raised it -- its premise the verdict's note -- which the
+    reconciliation then opens or leaves unopened like any pending option. Returns issue id -> option id."""
+    as_option, by_node = {}, {}
+    for verdict in verdicts:
+        review = {"round": int(round), "verdict": verdict["verdict"], "note": verdict["note"],
+                  "claimed": verdict["covered_by"]}
+        change.update(verdict["proposal"], {"coverage_review": review})
+        if verdict["verdict"] == "reopen":
+            by_node.setdefault(verdict["node"], []).append(verdict)
+    for node_id, items in by_node.items():
+        decision_id = _derived_id("d_", node_id, "reconcile", round, 0)
+        change.add_node("decision", {"round": int(round), "origin": "reconcile", "question": REOPENED_QUESTION.format(
+            round=int(round)), "stakes": REOPENED_STAKES, "created_at": now}, id=decision_id)
+        change.add_edge("decides", node_id, decision_id)
+        for position, verdict in enumerate(items):
+            issue_id = verdict["proposal"]
+            question = change.view.node(issue_id).attrs["question"]
+            option_id = change.add_node("option", {"label": question, "premise": verdict["note"], "reason": None,
+                                                   "created_at": now}, id=_derived_id("o_", decision_id, position))
+            change.add_edge("offers", decision_id, option_id)
+            for kind in ("covered_by", "becomes"):
+                for edge in change.view.out_edges(issue_id, kind):
+                    change.retire(edge.id)
+            change.add_edge("becomes", issue_id, option_id)
+            change.update(issue_id, {"disposition": "branch", "reason": (
+                f"reconciliation {int(round)}: not covered by {verdict['covered_by']} -- {verdict['note']}")})
+            as_option[issue_id] = option_id
+    return as_option
 
 
 _LIVE = (graph.PROPOSED, graph.APPROVED, graph.APPLIED)

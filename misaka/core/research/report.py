@@ -228,7 +228,8 @@ def _record(con, run):
         decisions.append({"node": decision["node_id"], "origin": decision["origin"], "question": decision["question"],
                           "stakes": decision["stakes"],
                           "options": [{"label": o["label"], "premise": o["premise"], "node": o["node_id"],
-                                       "not_pursued": o["reason"]}
+                                       "not_pursued": o["reason"], "answered_by": o["covered_by"],
+                                       "brings_back": o["answers"]}
                                       for o in runs.options(con, run["id"], decision_id=decision["id"])]})
     issues = runs.issues(con, run["id"])
     return {
@@ -238,7 +239,8 @@ def _record(con, run):
                         for i in issues if i["disposition"] == "correct"],
         "errata": runs.errata(con, run["id"]),
         "not_taken": [{"issue": i["id"], "node": i["branch_id"], "origin": i["origin"], "question": i["question"],
-                       "disposition": i["disposition"], "to": runs.destination(i), "reason": i["reason"]}
+                       "disposition": i["disposition"], "to": runs.destination(i), "reason": i["reason"],
+                       **({"coverage_review": i["coverage_review"]} if i.get("coverage_review") else {})}
                       for i in issues if i["disposition"] in {"decline", "covered"}],
         "skipped_nodes": [{"node": n["id"], "question": n["question"]}
                           for n in runs.nodes(con, run["id"]) if n["status"] == "parked"],

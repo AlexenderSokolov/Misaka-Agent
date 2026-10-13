@@ -2336,8 +2336,9 @@ def _prepare_sessions(con, run):
 
 
 def _reconcile_material(con, run):
-    """What the root Last Order reconciles: every pending option with the decision it belongs to,
-    every node that finished its own work, and the limits."""
+    """What the root Last Order reconciles: every pending option with the decision it belongs to (and
+    the paths it says it brings back), every node that finished its own work, every coverage claim
+    across lines waiting for its review, and the limits."""
     chosen = runs.current_limits(con, run)
     workspace = run["workspace"]
     rel = lambda path: posix_relpath(path, workspace) if path else None
@@ -2356,15 +2357,23 @@ def _reconcile_material(con, run):
                          "parents": [p["id"] for p in runs.parents(con, node["id"])],
                          "conclusion": rel(conclusion), "conclusion_doc": conclusion and report.doc_id(run, conclusion),
                          "node_view": views.node_view_path(node["id"])})
+    snapshot = views.snapshot(con, run)
+    recorded = {entry["id"]: entry for group in snapshot["paths"] for entry in group["entries"]}
+
+    def brought_back(record):
+        entry = recorded.get(record, {})
+        return {"path": record, "text": entry.get("text"), "went": entry.get("outcome")}
+
     pending = [{"option": row["id"], "label": row["label"], "premise": row["premise"],
                 "decision": row["decision_question"], "stakes": row["decision_stakes"],
-                "decided_at": row["decided_at"], "decided_in": row["decision_origin"]}
+                "decided_at": row["decided_at"], "decided_in": row["decision_origin"],
+                **({"answers": [brought_back(record) for record in row["answers"]]} if row["answers"] else {})}
                for row in views.reconcilable_options(con, run)]
     return {"graph": views.graph_path(run), "paths": views.paths_path(run),
             "limits": {"max_depth": chosen["max_depth"], "max_nodes": chosen["max_nodes"],
                        "nodes_now": len(runs.nodes(con, run["id"]))},
-            "pending_options": pending, "finished_nodes": finished,
-            "relations_so_far": runs.relations(con, run["id"])}
+            "pending_options": pending, "coverage_claims": views.coverage_claims(con, run),
+            "finished_nodes": finished, "relations_so_far": runs.relations(con, run["id"])}
 
 
 async def _reconcile(con, cfg, run, window, *, poll_seconds, progress, check_active):
@@ -2406,10 +2415,13 @@ async def _reconcile(con, cfg, run, window, *, poll_seconds, progress, check_act
     _needed, considered = views.reconcile_state(con, run)
     receipt = runs.apply_reconcile(con, run, round, resolved, considered=considered)
     opened = len(receipt["nodes"]) + len(receipt["joins"])
+    reopened = sum(1 for item in resolved.get("coverage", ()) if item["verdict"] == "reopen")
+    reviewed = (f", {len(resolved['coverage'])} coverage claim(s) reviewed ({reopened} reopened)"
+                if resolved.get("coverage") else "")
     await _progress(progress, "reconciled",
                     f"Reconciliation {round}: {opened} node(s) opened"
                     + (f" ({len(receipt['joins'])} join(s))" if receipt["joins"] else "")
-                    + f", {len(resolved['not_pursued'])} option(s) not pursued, "
+                    + f", {len(resolved['not_pursued'])} option(s) not pursued{reviewed}, "
                     f"{len(resolved['relations'])} relation(s) recorded.", run,
                     nodes=[*receipt["nodes"], *receipt["joins"]])
     await _views(con, run)

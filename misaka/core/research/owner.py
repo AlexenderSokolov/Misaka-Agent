@@ -30,7 +30,8 @@ TOOL_DESCRIPTIONS = {
                                 "park or branch; corrections stay in the node."),
     "misaka_research_decide": "Record the forks this node opens and why the alternatives not taken are not opened.",
     "misaka_research_reconcile": ("Reconcile the research graph at a level: open options as nodes, join finished "
-                                  "nodes, record options not pursued and relations between nodes."),
+                                  "nodes, review coverage claims across lines, record options not pursued and "
+                                  "relations between nodes."),
     "misaka_research_dissolve": ("Record that a conclusion dissolves a question rather than answering it; dissolving "
                                  "the research question waits for the user's consent."),
     "misaka_research_consent": ("Record the user's decision on dissolving the research question, once they have "

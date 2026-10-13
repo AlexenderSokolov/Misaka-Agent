@@ -427,6 +427,8 @@ Ways in, among others; use one where it bites, never as a label:
   where it went. Read it before anything else. What is on it is not proposed again: when a node pursues it -- from
   whatever frame it was reached -- or an option waiting to be opened takes it up, name that node or option in
   `covered_by`; a path declined or left unopened comes back only with what answers the reason recorded for it.
+  Its last part groups every possibility under what answers it now, so one reached from another frame shows beside
+  the node that took it up: compare premises there, not labels.
 - The research graph: `{graph_path}` -- every node and what it pursues.
 
 ## what makes a proposal
@@ -490,8 +492,18 @@ rests on another presupposition or takes the answer where your line cannot go.
   its challenge is.
 - A possibility is opened once. One on the paths list that a node already pursues -- at any depth, reached from any
   frame -- or that an option waiting to be opened takes up is `covered` by that node or option, not a new option; what
-  your line adds to it is for the reconciliation to join or relate. A path the list shows declined or left unopened becomes an option again only with what answers the
-  reason recorded then.
+  your line adds to it is for the reconciliation to join or relate. The same label is not the same possibility:
+  compare premises.
+- Your own line you know from the inside. `on_your_line` below lists what the nodes this one descends from already
+  decided, each with where it was decided: in the conversation this one continues, or -- for the parents of a join --
+  in the session file named. Before you take a proposal for one of them, read why it went where it went: above in
+  this conversation, or, where that part was compacted or lies in another session, with the conversation tools you
+  have or in the session file itself. A node of another line you know only by what it wrote: a proposal you mark
+  `covered` by it, or by another node's waiting option, is a claim the reconciliation reviews with both lines in
+  view -- say in `reason` which premise you compared and how that node's research answers it.
+- A path the list shows declined or left unopened becomes an option again only with what answers the reason recorded
+  then: name it in the option's `answers`, and let the option's premise say what answers that reason. Being covered
+  is not being answered: a covered path whose covering node does not answer it comes back the same way.
 Record every possibility not taken and invent none to fill a count; you may add forks you see yourself. Options open as
 nodes when the root reconciles this level. Every proposal and every branch issue appears exactly once: in one option's
 `sources` or in `declined` -- `covered` when a node of the graph already pursues it or an option waiting to be opened
@@ -512,13 +524,24 @@ conclusions say something. What relates two nodes is what their conclusions say,
 - An option stays unopened only for a structural reason: it complements a node that exists or opens now (name it), a
   node already pursues it, it is a correction rather than a possibility, the depth or node limit stops it, or a limit
   the user set for this run does -- how many forks may open, say: then open the options whose reasons weigh most within
-  it. Record that reason in `not_pursued`. "Not worth it" is not a reason: a genuine possibility is opened.
+  it. Record that reason in `not_pursued`, and when a node answers the option -- it pursues it, or the option
+  complements it -- that node's id in `covered_by` (the pending option you open for it, when it opens now). "Not
+  worth it" is not a reason: a genuine possibility is opened.
 - A possibility is opened once. An option whose premise a node already pursues -- at any depth, reached from any
   frame, as the paths list shows -- stays unopened: that node is its answer (name it). If
   what the option adds is that possibility meeting the proposing node's line, and the meeting is itself worth
   researching, join the two nodes (below): the join carries forward the research both already did instead of
   starting it again; otherwise record the link as a relation. A path the list shows declined or left unopened
-  opens only when the option answers the reason recorded then.
+  opens only when the option answers the reason recorded then; a pending option names in `answers` the paths it
+  brings back.
+- Coverage claims: a node of this level closed a proposal as covered by a node -- or a waiting option -- of another
+  line, so nothing was opened for it. That node knew the other line only by what it wrote, at the time it decided;
+  here both are in view. Give every claim below a verdict in `coverage`: read the covering node's conclusion (as it
+  stands now, and whether it was revised since the claim) against the proposal's premise. `holds` when that research
+  answers the proposal -- say how; `reopen` when it does not -- `note` is the premise the proposal rests on that the
+  covering line does not, and the proposal then gets an outcome like a pending option: its id in a node's `options`
+  (with pending options that ask the same question, if any) or in `not_pursued`. A claim that holds may still call for
+  a join or a relation, as an option does.
 - Finished nodes whose paths arrive at the same place -- the same state, the same sub-question, the same finding by
   different routes -- may be carried forward together: a join is a new node with each of them as a parent. It shares
   their future work; their histories, evidence and premises stay their own, and it may fork again. Conclusions that
@@ -543,7 +566,8 @@ gives the dissolution as one reading.
 RECONCILE_WAITS = """
 # The reconciliation waits for the user
 It is applied only once the user agrees. After the tool accepts, present it in plain language -- the nodes it opens and
-why, the options it leaves unopened and why, the joins -- and talk it over. Revise it with `misaka_research_reconcile`
+why, the options it leaves unopened and why, the joins, and each coverage claim it upholds or reopens -- and talk it
+over. Revise it with `misaka_research_reconcile`
 (a call replaces the recorded one). Once the user has said it should go ahead, call `misaka_research_start`; it is
 available from the next turn on, so this turn ends with your summary.
 """
@@ -1309,6 +1333,7 @@ def decide(con, run, cfg, worker, node, *, divergence, proposals, branches):
         return accepted["payload"]
     expected = {item["id"] for item in (*proposals, *branches)}
     known = {row["id"] for row in (*runs.nodes(con, run["id"]), *runs.pending_options(con, run["id"]))}
+    reopenable = views.reopenable(con, run)
 
     def validate(value):
         cited = [source for decision in value["decisions"] for option in decision["options"] for source in option["sources"]]
@@ -1322,6 +1347,15 @@ def decide(con, run, cfg, worker, node, *, divergence, proposals, branches):
             if any(option["own"] and option["sources"] for option in decision["options"]):
                 raise ValueError(f"Decision {index}: this node's own line is its concluded conclusion, made of no "
                                  "proposal.")
+            for option in decision["options"]:
+                if option["own"] and option["answers"]:
+                    raise ValueError(f"Decision {index}: this node's own line is its concluded conclusion; it brings "
+                                     "back no path.")
+                stray = [record for record in option["answers"] if record not in reopenable]
+                if stray:
+                    raise ValueError(f"Decision {index}, option \"{option['label']}\": answers names "
+                                     f"{', '.join(stray)}, which the paths list does not show declined, covered or "
+                                     "left unopened.")
         for item in value["declined"]:
             if item["disposition"] == "covered" and (item["covered_by"] not in known or item["covered_by"] == node["id"]):
                 raise ValueError(f"covered needs the id of another node of this run, or of an option waiting to be "
@@ -1336,7 +1370,8 @@ def decide(con, run, cfg, worker, node, *, divergence, proposals, branches):
                 "pending_options_of_earlier_decisions": [
                     {"option": row["id"], "label": row["label"], "premise": row["premise"],
                      "decision": row["decision_question"]}
-                    for row in runs.pending_options(con, run["id"]) if row["decided_at"] == node["id"]]}
+                    for row in runs.pending_options(con, run["id"]) if row["decided_at"] == node["id"]],
+                "on_your_line": on_your_line(con, run, node)}
     prompt = (DECIDE_CONTRACT + f"\n# Node\n{node['id']}: {node['question']}\nThe paths list: `{views.paths_path(run)}`\nThe graph: `{views.graph_path(run)}`\n"
               + f"Depth {node['depth']} of {runs.current_limits(con, run)['max_depth']}.\n"
               + prompt_guard.untrusted("divergence", _catalog_text(material)) + navigation(run["id"]))
@@ -1346,6 +1381,57 @@ def decide(con, run, cfg, worker, node, *, divergence, proposals, branches):
         model=commands.Decide, validate=validate, session_dir=_lo_session(run, node),
     )
     return action["payload"]
+
+
+def _decided_where(con, run, decision, lineage):
+    """Where the turn that made ``decision`` is, for a node whose conversation continues ``lineage``."""
+    if decision["origin"] == "reconcile":
+        entry = runs.reconcile(con, run["id"], decision["round"])
+        return {"in": f"the root Last Order's conversation (reconciliation {decision['round']})",
+                "session_file": entry["session_file"] if entry else run["root_session"],
+                "tool_call_id": entry["tool_call_id"] if entry else None}
+    key = runs.DECIDE_KEY if decision["origin"] == "decide" else runs.plan_key(decision["round"])
+    recorded = runs.action(con, run["id"], decision["node_id"], key)
+    inside = decision["node_id"] in lineage
+    return {"in": "this conversation, above" if inside else f"node {decision['node_id']}'s conversation",
+            "session_file": recorded["session_file"] if recorded else None,
+            "tool_call_id": recorded["tool_call_id"] if recorded else None}
+
+
+def on_your_line(con, run, node):
+    """What the nodes ``node`` descends from already decided -- every option of their decisions and every
+    possibility their decisions disposed -- each with where it went and where the turn that decided it is:
+    in the conversation the node continues (its lineage), or in another session (a join's parents' lines)."""
+    from misaka.core.research import views
+
+    above = views.ancestors(con, node["id"])
+    if not above:
+        return []
+    lineage = set(views.lineage(con, node))
+    found, decided = [], {}
+    for decision in runs.decisions(con, run["id"]):
+        if decision["node_id"] not in above:
+            continue
+        where = _decided_where(con, run, decision, lineage)
+        for option in runs.options(con, run["id"], decision_id=decision["id"]):
+            found.append({"id": option["id"], "what": "option", "label": option["label"], "premise": option["premise"],
+                          "decided_at": decision["node_id"], "decision": decision["question"],
+                          "went": ("this node" if option["node_id"] == node["id"]
+                                   else "its deciding node's own line" if option["node_id"] == decision["node_id"]
+                                   else views._outcome(con, option, decision["node_id"])),
+                          "answers": option["answers"],
+                          "deliberation": where})
+        if decision["origin"] == "decide":
+            decided[decision["node_id"]] = where
+    for issue in views.possibility_issues(con, run):
+        if issue["branch_id"] not in above or issue["disposition"] not in ("covered", "decline"):
+            continue
+        where = decided.get(issue["branch_id"]) or _decided_where(
+            con, run, {"origin": "decide", "node_id": issue["branch_id"], "round": 1}, lineage)
+        found.append({"id": issue["id"], "what": "proposal", "question": issue["question"],
+                      "decided_at": issue["branch_id"], "went": views._proposal_outcome(con, run, issue),
+                      "deliberation": where})
+    return found
 
 
 def present_dissolution(con, run, cfg, worker, *, material):
