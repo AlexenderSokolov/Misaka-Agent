@@ -439,7 +439,7 @@ def run_interactive(run_id, node_id, *, runner_key):
 
     # Her Sisters write to her (their card names her session): she reads the mail pinned to her,
     # and leaves the card notifications to the root's window, which reads them for the run (B123).
-    flags, assembly, env = role_session_setup(profile, run["workspace"], research_context=True,
+    flags, assembly, env = role_session_setup(profile, run["workspace"], workflow_context=True,
                                               receive_messages=True, receive_notifications=False,
                                               overrides=runs.session_overrides(run))
     flags += ["--session-dir", planner._lo_session(run, node)]

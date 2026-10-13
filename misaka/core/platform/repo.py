@@ -1,6 +1,6 @@
 """The project's Git history, written only when the user asks.
 
-Research and cards write directly into the project and never commit: the history is the
+Workflows and cards write directly into the project and never commit: the history is the
 user's. ``misaka init`` creates the repository; ``project_commit`` and ``/commit`` commit what the
 user confirms, under the user's own git identity. Commits record selected files, never deliver
 them through branches or merges.

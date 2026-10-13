@@ -6,9 +6,10 @@ from inside core -- a card under the daemon, a sub-agent child -- where the bund
 package cannot be imported without core referring to it. So the entry assigns the
 composition function into ``misaka.core.wiring.bundled`` instead, and core calls it
 with each session's spec. Every process entry calls ``install`` first: the CLI
-(``misaka.cli.app``), the sub-agent child (``misaka.cli.subagent_child``) and the
-research node (``misaka.cli.research_node``). A process that never runs an entry -- a
-bare kernel run in a test -- builds sessions without bundled extensions.
+(``misaka.cli.app``), the sub-agent child (``misaka.cli.subagent_child``), the
+research node (``misaka.cli.research_node``) and the panel daemon (``misaka.ui.panel.daemon``).
+A process that never runs an entry -- a bare kernel run in a test -- builds sessions without
+bundled extensions.
 
 ``install`` also registers the workflows that own cards (``misaka.core.platform.owners``), so the
 board treats a research card as research's in every process without importing research itself.

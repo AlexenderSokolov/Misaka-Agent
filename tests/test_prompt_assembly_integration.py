@@ -71,11 +71,11 @@ async def assembled(home, role, kind, *, research=False, custom=False, prompt_fl
     spec = SessionSpec(profile_dir=str(profile), role=role, workspace=str(workspace), kind=kind,
                        sender=role.rsplit("/", 1)[-1], mcp_role=role,
                        task_id="fixture-card" if kind == "card" else None,
-                       research_context=research)
+                       workflow_context=research)
     assembly = assemble(spec)
     if kind in {"foreground", "headless"}:
         role_flags, assembly, _env = role_session_setup(
-            str(profile), str(workspace), research_context=research,
+            str(profile), str(workspace), workflow_context=research,
             receive_messages=kind == "foreground")
         sections = parseArgs(role_flags).appendSystemPrompt or []
     else:
@@ -212,7 +212,7 @@ async def test_role_entry_keeps_shared_base_and_explicit_tool_ceiling(prompt_hom
     shared.write_text(content, encoding="utf-8", newline="\n")
     profile = prompt_home / "profiles" / "last_order"
     flags, assembly, _env = role_session_setup(
-        str(profile), str(prompt_home / "workspace"), research_context=research)
+        str(profile), str(prompt_home / "workspace"), workflow_context=research)
     assert assembly.spec.kind == "foreground"
     assert (parseArgs(flags).appendSystemPrompt or []).count(str(shared)) == 1
     assert parseArgs(flags).tools is None and not parseArgs(flags).noTools
@@ -245,7 +245,7 @@ async def test_durable_sister_real_child_flags_retain_persona_and_current_tool_g
     manager = object.__new__(_SisterManager)
     manager.role_context = RoleContext(role, str(prompt_home / "profiles" / role),
                                        str(prompt_home / "workspace"), role)
-    manager.research = {"run_id": "fixture-run"}
+    manager.owner_context = {"run_id": "fixture-run"}
     persona = "Saved historical Sister personality; preserve this exact text.\n"
     definition = AgentDefinition("sister-10032", "Fixture Sister", persona, source="misaka-sister")
     task = AgentTask(manager=manager, id="fixture-agent", definition=definition, description="Fixture",
@@ -318,7 +318,7 @@ async def test_role_questions_are_available_without_enabling_child_dialogs(promp
         assert "AskUserQuestion" not in session.getActiveToolNames()
     monkeypatch.setenv("MISAKA_NET_PANE", "fixture")
     spec = SessionSpec(str(prompt_home / "profiles/sisters/10032"), "sisters/10032",
-                       str(prompt_home / "workspace"), "card", research_context=True)
+                       str(prompt_home / "workspace"), "card", workflow_context=True)
     collector = ToolCollector()
     ask_user.activate(spec)(collector)
     assert [tool.name for tool in collector.tools] == ["AskUserQuestion"]

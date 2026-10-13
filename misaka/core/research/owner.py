@@ -42,8 +42,23 @@ TOOL_DESCRIPTIONS = {
 }
 
 
+# What research derives in a project and git should not record: the source bundles, rebuilt at
+# every settle as hard links of files kept elsewhere.
+GITIGNORE = """# research source bundles: rebuilt at every settle, hard links of files kept elsewhere
+nodes/**/SOURCES.md
+nodes/**/sources/
+nodes/**/.SOURCES-*.part
+final/*-SOURCES.md
+final/*-sources/
+final/.SOURCES-*.part
+"""
+
+
 class ResearchOwner(owners.CardOwner):
     name = "research"
+    scope_label = "research run"
+    token_cap_setting = "research.token_cap"
+    resume_command = "/research resume"
 
     # --- its cards ------------------------------------------------------------------------------
 
@@ -223,6 +238,53 @@ class ResearchOwner(owners.CardOwner):
         units = {row["id"]: row for run_id in scopes for row in runs.nodes(con, run_id)}
         cards = {row["task_id"]: dict(row) for row in con.execute("SELECT * FROM research_cards")}
         return scopes, units, cards
+
+    def session_dirs(self):
+        return frozenset({"research"})
+
+    def session_place(self, parts, units):
+        """A run's Last Order conversations live under ``research/<run>--root-lo`` and
+        ``research/<run>--node-<node>`` (``runs.session_dir``)."""
+        if len(parts) < 3 or parts[0] != "research":
+            return None
+        run_parts = parts[1].split("--", 3)
+        if len(run_parts) < 2:
+            return None
+        run, scope = run_parts[0], run_parts[1]
+        if scope == "root-lo":
+            root = next((unit for unit in units.values() if unit["run_id"] == run and unit["depth"] == 0), None)
+            return run, root["id"] if root else None, True
+        if scope.startswith("node-"):
+            return run, scope[5:], True
+        return run, None, False
+
+    # --- the board's settings and files -------------------------------------------------------------
+
+    def token_cap(self):
+        """settings.json ``research.token_cap``: what one run may spend (0 = none)."""
+        from misaka.config.product import setting
+
+        return max(0, setting("research", "token_cap", 0, int))      # a negative cap is none, as 0 is
+
+    def beast_at(self):
+        """settings.json ``research.beast_at``: the share of the cap where cards switch to beast mode."""
+        from misaka.config.product import setting
+
+        return setting("research", "beast_at", 0.85, float)
+
+    def read_only_tools(self):
+        return frozenset({"misaka_research_view"})
+
+    def owns_card_process(self, argv):
+        # The research worker wrapper and its durable Sister child may both own the attempt.
+        module = next((argv[i + 1] for i in range(len(argv) - 1) if argv[i] == "-m"), None)
+        return module == "misaka.cli.research_node" and "--run-card" in argv
+
+    def gitignore(self):
+        return GITIGNORE
+
+    def frozen_refusal(self, target):
+        return runs.frozen_refusal(target)
 
 
 def install():

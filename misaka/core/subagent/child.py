@@ -460,7 +460,7 @@ async def amain() -> int:
             mcp_role=mcp_role,
             receive_messages=bool(card),
             task_id=card,
-            research_context=bool(card) and os.environ.get("MISAKA_RESEARCH_CONTEXT") == "1",
+            workflow_context=bool(card) and os.environ.get("MISAKA_WORKFLOW_CONTEXT") == "1",
             skill_roots=(("sandbox", sandbox),) if sandbox else None,
             overrides=spec_overrides(session_overrides.from_env()) if card else (),
         )),

@@ -324,12 +324,12 @@ class TodoPart:
                 if generation is None or not bdb.add_event(
                     c,
                     task_id,
-                    "research_evidence",
+                    "card_evidence",
                     evidence,
                     generation=generation,
                     claim_lock=None if finished else claim_lock,
                 ):
-                    raise ValueError("Card ownership changed before its research evidence was recorded.")
+                    raise ValueError("Card ownership changed before its evidence was recorded.")
             cards.append_log(row["workspace"], task_id, sender, p.text)
             recorded = [f"{len(evidence['findings'])} finding(s)" if evidence["findings"] else "",
                         f"{len(evidence['uncertain'])} uncertainty(ies)" if evidence["uncertain"] else "",
@@ -415,8 +415,8 @@ class TodoPart:
             ToolDefinition(
                 name="misaka_card_note", label="Log a note on the card",
                 description="Append one line to this card's log (its `## log` section in the card file): a decision, a change "
-                            "of course, or a dead end. Research cards attach findings and uncertainty; red-team cards attach issues; "
-                            "divergence-review cards attach alternatives.",
+                            "of course, or a dead end. Findings and uncertainty attach here too, and a workflow's card "
+                            "attaches the fields its workflow adds.",
                 parameters=NoteParams, execute=note_exec,
                 promptSnippet="Log a decision or change of course on this card",
                 promptGuidelines=["Append findings and uncertainty as work progresses; explain corrections in new notes. Earlier declarations remain visible for review."]),
@@ -622,7 +622,7 @@ class TodoPart:
         (pi's retries and recovery are behind ``agent_settled``). A pane used to sit on it with
         the card running, its claim heartbeated and nobody to type -- a headless card fails the
         same attempt. A cut reply gets one more turn in this session first, told what happened,
-        as the research driver gives Last Order; the second cut fails like an error. The board's
+        as a workflow's driver gives Last Order; the second cut fails like an error. The board's
         failure model decides the rest: a backoff and a retry, or a card that stays failed."""
         row = self._owned_row()
         if row is None:
@@ -630,7 +630,7 @@ class TodoPart:
         generation = int(row["generation"])
         from misaka.core.network import worker
         if worker.stopped_at_cap(reason):
-            # The research run's token cap, not this card: it waits, ready, for a resume.
+            # The run's token cap, not this card: it waits, ready, for a resume.
             if self._bdb.back_to_ready(self.con(), self.task_id, generation=generation,
                                        claim_lock=row["claim_lock"]):
                 self._bdb.add_event(self.con(), self.task_id, "budget_stop", {"reason": reason},

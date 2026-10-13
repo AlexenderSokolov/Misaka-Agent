@@ -42,7 +42,7 @@ _NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = _buildProviderErrorPattern(
         # Sign in with ChatGPT: the subscription's shared usage limit, which resets
         # after hours rather than seconds.
         "subscription_sharing_usage_limit_exceeded",
-        # MISAKA fork: a research run's own token cap. Its message carries numbers ("has 429,000
+        # MISAKA fork: a workflow run's own token cap. Its message carries numbers ("has 429,000
         # of its 5,000,000 left") that the status codes below would otherwise read as a 429.
         "token_cap reached",
     ]

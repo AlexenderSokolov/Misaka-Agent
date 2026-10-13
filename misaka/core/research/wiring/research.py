@@ -819,6 +819,6 @@ ROLES = {"last_order"}
 
 def part(spec):
     from misaka.core.research.wiring.node import node_identity
-    if spec.research_context or node_identity():  # an existing workflow already owns this session
+    if spec.workflow_context or node_identity():  # an existing workflow already owns this session
         return None
     return ResearchPart()

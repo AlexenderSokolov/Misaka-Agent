@@ -259,9 +259,9 @@ class SkillsPart:
                             "project reads as its instructions; a Sister or sub-agent does not change them. "
                             "Tell Last Order what should change.")
                 # The one place a file tool's target is resolved, so the home's rule is asked here too,
-                # and research's: what a run's workflow saved and froze is not the tools' to change (B126).
-                from misaka.core.research.runs import frozen_refusal
-                return home_guard.refusal(target, workspace, kind) or frozen_refusal(target)
+                # and the card owners': what a workflow's run saved and froze is not the tools' to change (B126).
+                from misaka.core.platform import owners
+                return home_guard.refusal(target, workspace, kind) or owners.frozen_refusal(target)
             if tool in {"bash", "powershell"}:
                 return _command_touches(str(args.get("command") or ""), workspace, shell_roots,
                                         shell=tool, unattended=unattended)

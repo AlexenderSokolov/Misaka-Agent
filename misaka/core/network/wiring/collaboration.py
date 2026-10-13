@@ -47,7 +47,7 @@ def collaboration_sections(active):
     """Keep capability catalogs and parameter documentation in the tool definitions."""
     active = set(active)
     sections = []
-    # The board's own coordination tools, then those of the workflows that own cards (research's).
+    # The board's own coordination tools, then those of the workflows that own cards.
     described = dict(SISTER_TOOLS)
     for owner in owners.registered():
         described.update(owner.tool_descriptions())

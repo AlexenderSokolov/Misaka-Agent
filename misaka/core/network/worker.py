@@ -22,7 +22,7 @@ MAX_ARTIFACT_PATH_CHARS = 1_024
 
 
 def over_cap(usage_db, task_id, cap):
-    """Whether the research run ``task_id`` belongs to has spent ``cap``: a card is not started then."""
+    """Whether the scope ``task_id`` belongs to has spent ``cap``: a card is not started then."""
     from misaka.core.platform import budget
     cap = budget.default_cap() if cap is None else int(cap or 0)
     if not usage_db or not task_id or not cap:
@@ -36,7 +36,7 @@ def budget_cap_reason():
 
 
 def stopped_at_cap(error):
-    """Whether a run ended because a request did not fit under ``research.token_cap``."""
+    """Whether a run ended because a request did not fit under the token cap."""
     from misaka.core.platform import budget
     return budget.EXHAUSTED_MESSAGE in str(error or "")
 
@@ -51,7 +51,8 @@ COMPLETION_INSTRUCTIONS = """
   report progress. A card whose contract names a deliverable cannot be completed until that file exists there.
 - Put deliverables in the requested location: files written into the card's output directory are collected
   automatically.
-- On a research card, record final evidence-backed findings and concrete uncertainties with `misaka_card_note`.
+- When the card asks for findings, record final evidence-backed findings and concrete uncertainties with
+  `misaka_card_note`.
 """
 
 
@@ -286,17 +287,17 @@ def materials_on_hand(workspace):
 
 
 def card_extras(con, task, cfg=None, *, include_materials=True):
-    """Research/material context shared by every card entry point.
+    """A workflow's context and the materials on hand, shared by every card entry point.
 
     Who else is on the board reaches a session through its system prompt's routing catalog,
     never through the task body. Restore paths can skip materials they will not publish,
     avoiding unrelated filesystem reads.
     """
-    extras = {"_research": None, "_owner": None, "_materials": "", "_session_overrides": {}}
+    extras = {"_owner_context": None, "_owner": None, "_materials": "", "_session_overrides": {}}
     with contextlib.suppress(Exception):   # a board a workflow has never touched is an ordinary board
         owner, context = owners.card(con, task["id"])
         if owner is not None:
-            extras["_research"], extras["_owner"] = context, owner.name
+            extras["_owner_context"], extras["_owner"] = context, owner.name
             extras["_session_overrides"] = owner.session_overrides(con, context)
     if include_materials:
         extras["_materials"] = materials_on_hand(task["workspace"])
@@ -384,7 +385,7 @@ def _output_files(root, workspace):
     board's own folders are not deliverables."""
     out = []
     for base, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("cards", "research", "node_modules"))
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in ("cards", "node_modules"))
         out.extend(posix_relpath(os.path.join(base, name), workspace)
                    for name in sorted(files) if not name.startswith("."))
     return out
@@ -493,7 +494,7 @@ def build_submission(con, task, summary):
     # Never let an uncertainty-only note erase the findings recorded earlier.
     findings, uncertain = [], []
     for event in con.execute(
-        "SELECT payload FROM events WHERE task_id=? AND kind='research_evidence' "
+        "SELECT payload FROM events WHERE task_id=? AND kind='card_evidence' "
         "AND generation=? ORDER BY id", (task["id"], task["generation"]),
     ):
         evidence = json.loads(event["payload"])
@@ -568,7 +569,7 @@ def card_session_setup(task, workspace, profile_dir, provider, default_model):
         task_id=task.get("id"),
         tool_ceiling=MANAGEMENT_TOOLS if beast and delegates else None,
         skill_roots=skill_roots,
-        research_context=bool(task.get("_research")),
+        workflow_context=bool(task.get("_owner_context")),
         overrides=spec_overrides(task.get("_session_overrides")),
     ))
     from misaka.config import identity

@@ -62,7 +62,7 @@ class SisterCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("skills", entries[0])
 
     async def test_empty_sister_snapshot_never_reloads_or_adds_lo_research_contract(self):
-        part = capabilities.SisterCapabilitiesPart("/fixture", [], sister_id="10032", research_context=True)
+        part = capabilities.SisterCapabilitiesPart("/fixture", [], sister_id="10032", workflow_context=True)
         part.session = SimpleNamespace(getActiveToolNames=list)
         with patch.object(capabilities, "routing_catalog", side_effect=AssertionError("unexpected reload")):
             text = (await part.before_agent_start({"systemPrompt": "BASE"}, None))["systemPrompt"]
@@ -95,7 +95,7 @@ class CardContextTests(unittest.TestCase):
             with patch.object(owners, "_OWNERS", [_StubOwner()]), \
                     patch.object(worker, "materials_on_hand", return_value="Existing material"):
                 extra = worker.card_extras(con, row)
-            self.assertEqual(extra["_research"], {"run_id": "run-1", "branch_id": "node-1", "kind": "investigation",
+            self.assertEqual(extra["_owner_context"], {"run_id": "run-1", "branch_id": "node-1", "kind": "investigation",
                                                   "scope": "run-1"})
             self.assertEqual(extra["_owner"], "stub")
             self.assertEqual(extra["_materials"], "Existing material")
@@ -109,16 +109,16 @@ class CardContextTests(unittest.TestCase):
     def test_durable_prepare_uses_shared_card_context(self):
         runtime = SimpleNamespace(con=object(), cfg={"token_cap": 100})
         row = {"id": "card-1", "workspace": "/fixture", "generation": 1, "claim_lock": "fixture"}
-        extra = {"_research": {"run_id": "run-1"}, "_materials": "Materials"}
+        extra = {"_owner_context": {"run_id": "run-1"}, "_materials": "Materials"}
         with patch.object(cards, "attachment_list", return_value=[]), \
                 patch.object(worker, "card_handoffs", return_value=[]), \
                 patch.object(worker, "card_extras", return_value=extra) as context, \
                 patch.object(sister_runtime.budget, "status", return_value={"mode": "normal"}):
             prepared = sister_runtime.SisterRuntime._prepare_card(runtime, row)
         context.assert_called_once_with(runtime.con, row, runtime.cfg)
-        self.assertEqual(prepared["_research"], extra["_research"])
+        self.assertEqual(prepared["_owner_context"], extra["_owner_context"])
         self.assertEqual(prepared["_materials"], "Materials")
-        self.assertNotIn("_research", row)
+        self.assertNotIn("_owner_context", row)
 
     def test_pane_prepare_uses_shared_card_context_before_session_setup(self):
         class SetupReached(Exception):
@@ -128,7 +128,7 @@ class CardContextTests(unittest.TestCase):
             profile = Path(directory) / "10032"
             profile.mkdir()
             row = {"id": "card-1", "workspace": directory, "assignee": "10032"}
-            extra = {"_research": {"run_id": "run-1"}, "_materials": "Materials"}
+            extra = {"_owner_context": {"run_id": "run-1"}, "_materials": "Materials"}
             con = sqlite3.connect(":memory:")
             with patch.object(card_shell.db, "connect", return_value=con), \
                     patch.object(card_shell.db, "get", return_value=row), \
@@ -143,7 +143,7 @@ class CardContextTests(unittest.TestCase):
                     self.assertRaises(SetupReached):
                 card_shell.launch("card-1")
             context.assert_called_once_with(con, row)
-            self.assertEqual(setup.call_args.args[0]["_research"], extra["_research"])
+            self.assertEqual(setup.call_args.args[0]["_owner_context"], extra["_owner_context"])
             self.assertEqual(setup.call_args.args[0]["_materials"], "Materials")
 
     def test_dispatch_and_restore_keep_shared_context_path(self):
@@ -161,7 +161,7 @@ class CardContextTests(unittest.TestCase):
         for persona in ("Persisted old persona", f"Current persona\n\n{COMMON_CHARTER}\n\n{SISTER_ROLE}"):
             task = SimpleNamespace(definition=SimpleNamespace(prompt=persona))
             for research in (None, {"run_id": "run-1"}):
-                manager.research = research
+                manager.owner_context = research
                 with patch.object(SubagentManager, "_child_flags", new=AsyncMock(
                         return_value=["--system-prompt", "/fixture/persona.md", "--approve"])):
                     flags = asyncio.run(manager._child_flags(task))
@@ -180,7 +180,7 @@ class CardContextTests(unittest.TestCase):
                     self.assertIn(rule, prompt)
                 self.assertNotIn("[Research card]", prompt)  # only the mode overlay adds it
                 manager.skill_root = "/fixture/skills-ro"
-                self.assertEqual(manager.child_env_extra(task)["MISAKA_RESEARCH_CONTEXT"],
+                self.assertEqual(manager.child_env_extra(task)["MISAKA_WORKFLOW_CONTEXT"],
                                  "1" if research else "0")
 
 

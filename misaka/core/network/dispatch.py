@@ -76,8 +76,8 @@ def _worker_identity():
     ``reconcile`` below would find a live unrelated process behind the recorded number, skip the
     card forever, and the drive loop would offer it again on every poll.
 
-    When the claiming process leads its own process group -- the shape ``research.node`` starts a
-    card child in -- publish the group form the Sister path uses, so the reconciler can also
+    When the claiming process leads its own process group -- the shape a workflow's node process
+    starts a card child in -- publish the group form the Sister path uses, so the reconciler can also
     fence the model session the child left behind before the card is given to a new owner. The
     prefix is a promise about the process group, so it is only made when it is true: claimed from
     inside someone else's group, it would aim ``terminate_orphaned_group`` at that group.

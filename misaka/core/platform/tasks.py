@@ -1,4 +1,4 @@
-"""Durable SQLite storage for task cards, runs, and research workflows."""
+"""Durable SQLite storage for task cards and their runs."""
 
 import hashlib
 import json
@@ -151,7 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, kind, id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
 """
-TASK_SCHEMA_VERSION = 9
+TASK_SCHEMA_VERSION = 10
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 # One failure model for every way an attempt can end badly -- a crash, a timeout, a provider
 # error, a turn that ended without settling the card. Each counts against the same limit and the
@@ -346,6 +346,21 @@ def require_schema(con, component, version, *, populated):
     )
 
 
+def _migrate(con):
+    """Carry a v9 board (0.18.0) forward: the findings a card declares are the board's
+    ``card_evidence`` events (v9 named them for the one workflow that read them)."""
+    def recorded():
+        return con.execute("SELECT MAX(version) FROM schema_migrations WHERE component='tasks'").fetchone()[0]
+
+    if recorded() != 9:
+        return
+    with _write_txn(con):
+        if recorded() == 9:              # another process may have carried it while this one waited
+            con.execute("UPDATE events SET kind='card_evidence' WHERE kind='research_evidence'")
+            con.execute("INSERT INTO schema_migrations(component,version,applied_at) VALUES('tasks',?,?)",
+                        (TASK_SCHEMA_VERSION, int(time.time())))
+
+
 def connect(path: str) -> sqlite3.Connection:
     path = os.path.expanduser(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -391,6 +406,7 @@ def connect(path: str) -> sqlite3.Connection:
                 )
         con.executescript(SCHEMA)
         from misaka.core.platform import notifications
+        _migrate(con)
         require_schema(con, "tasks", TASK_SCHEMA_VERSION,
                        populated=con.execute("SELECT EXISTS(SELECT 1 FROM tasks)").fetchone()[0])
         notifications.init(con)

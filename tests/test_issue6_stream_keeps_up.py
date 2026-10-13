@@ -254,7 +254,7 @@ def test_the_token_cap_stop_is_never_retried_whatever_its_numbers():
     from misaka.ai.types import AssistantMessage
     from misaka.ai.utils.retry import isRetryableAssistantError
     from misaka.core.platform import budget
-    said = (f"{budget.EXHAUSTED_MESSAGE}: the next request needs up to 500,000 tokens and this research run "
+    said = (f"{budget.EXHAUSTED_MESSAGE}: the next request needs up to 500,000 tokens and this run "
             f"has 429,000 of its 5,000,000 left.")
     message = AssistantMessage(content=[], api="a", provider="p", model="m", usage=_empty_usage(),
                                stopReason="error", errorMessage=said, timestamp=0)

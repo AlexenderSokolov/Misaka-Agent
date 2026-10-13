@@ -18,7 +18,7 @@ from pathlib import Path
 
 from misaka.ai.session_resources import registerSessionResourceCleanup
 from misaka.config import get_sessions_dir, home, sessions
-from misaka.core.platform import processes
+from misaka.core.platform import owners, processes
 from misaka.core.session_manager import iter_session_files, readSessionHeader
 from misaka.core.wiring import KINDS, sender_address
 from misaka.utils import atomic, local_socket
@@ -220,7 +220,7 @@ def live_session(session_id):
     """The catalog record of a live session with this id, or None.
 
     A session is the most precise address there is -- a specific Last Order window in a
-    research tree, one attempt at one card -- and its id is what the panel shows and what a
+    workflow's tree, one attempt at one card -- and its id is what the panel shows and what a
     message carries as its sender, so a reply can go back to exactly that conversation."""
     if not session_id:
         return None
@@ -392,11 +392,11 @@ def list_entries(con, *, extra_paths=()):
     product = os.path.realpath(sessions.sessions_root())
     roots = {product, get_sessions_dir()}
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")} if con else set()
-    # The runs, nodes and card links of the workflows that own cards (research's), as their owners
-    # list them (``platform.owners``).
+    # The runs, nodes and card links of the workflows that own cards, as their owners list them
+    # (``platform.owners``).
     run_rows, nodes, links = {}, {}, {}
+    own_dirs = {"cards", "subagents"}.union(*(owner.session_dirs() for owner in owners.registered()))
     if con is not None:
-        from misaka.core.platform import owners
         for owner in owners.registered():
             scopes, units, cards = owner.catalog(con)
             run_rows.update(scopes)
@@ -451,7 +451,7 @@ def list_entries(con, *, extra_paths=()):
         if record.get("state") != "saved" and record.get("control"):
             row.update(control=record["control"], paused=record.get("paused", False))
         parts = _relative(path, product)
-        if len(parts) > 1 and parts[0] not in {"cards", "research", "subagents"}:
+        if len(parts) > 1 and parts[0] not in own_dirs:
             row["role"] = record.get("role", _role(parts[0]))
             row["kind"] = "dm" if parts[1] == "dm" else record.get("kind", "foreground")
         card = next((r for directory, r in cards.items() if _relative(path, directory)), None)
@@ -463,15 +463,15 @@ def list_entries(con, *, extra_paths=()):
                        kind="card", workspace=card["workspace"], cwd=card["workspace"], task_status=card["status"])
             link = links.get(card["id"], {})
             run, node = run_rows.get(link.get("run_id")), nodes.get(link.get("branch_id"))
-        run_parts = parts[1].split("--", 3) if len(parts) >= 3 and parts[0] == "research" else []
-        if len(run_parts) >= 2:
-            run = run_rows.get(run_parts[0])
-            scope = run_parts[1]
-            if scope == "root-lo":
-                node = next((n for n in nodes.values() if n["run_id"] == run_parts[0] and n["depth"] == 0), None)
-                row.update(kind="node", role="last-order")
-            elif scope.startswith("node-"):
-                node = nodes.get(scope[5:])
+        # A workflow's own conversation, placed by its owner: the run, and the node whose Last
+        # Order it is.
+        place = next((found for owner in owners.registered()
+                      if (found := owner.session_place(parts, nodes)) is not None), None)
+        if place is not None:
+            scope, unit, coordinator = place
+            run = run_rows.get(scope)
+            if coordinator:
+                node = nodes.get(unit) if unit else None
                 row.update(kind="node", role="last-order")
         if path in node_files:
             node = node_files[path]
@@ -505,10 +505,10 @@ def list_entries(con, *, extra_paths=()):
     entries.extend({**e, "workspace": os.path.realpath(e["cwd"]), "modified": 0}
                    for e in ephemeral if os.path.isdir(e.get("cwd") or ""))
     entries.sort(key=lambda e: e["modified"], reverse=True)
-    owners = set()
+    keyed = set()
     for entry in entries:
-        owner = ("card", entry["task_id"]) if entry["kind"] == "card" and entry.get("task_id") else None
-        if owner and owner not in owners:
-            entry["live_key"] = owner
-            owners.add(owner)
+        key = ("card", entry["task_id"]) if entry["kind"] == "card" and entry.get("task_id") else None
+        if key and key not in keyed:
+            entry["live_key"] = key
+            keyed.add(key)
     return entries

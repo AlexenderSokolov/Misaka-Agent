@@ -19,7 +19,7 @@ from misaka.config.identity import (
 )
 from misaka.core.network import validate
 from misaka.core.network.sister_runtime import SisterRuntime
-from misaka.core.platform import budget, toolkit
+from misaka.core.platform import budget, owners, toolkit
 from misaka.core.platform import tasks as db
 from misaka.core.platform.prompt_guard import untrusted
 from misaka.core.platform.vocabulary import DRIVER_OWNED_TOOLS
@@ -155,12 +155,10 @@ def _require_project_tasks(ctx, args):
 
 
 def _require_ordinary_tasks(task_ids):
-    """A normal Board entry point must not take over cards a workflow (research) drives: their
+    """A normal Board entry point must not take over cards a workflow drives: their
     owner refuses (``platform.owners``)."""
     if not task_ids:
         return
-    from misaka.core.platform import owners
-
     con = _con()
     for task_id in task_ids:
         owner, context = owners.card(con, task_id)
@@ -236,9 +234,11 @@ def _install(harn, runtime):
             lines.insert(0, f"(showing the last {len(rows)} of {total} cards)")
         if mine and any(line.startswith("*") for line in lines):
             lines.append("* = created in this conversation")
-        # The cap is each research run's (``/research status`` reads a run against it); the board's
-        # total is everything recorded, contact turns and plain cards included, and has no mode.
+        # The cap is each workflow run's, as its owner sets it; the board's total is everything
+        # recorded, contact turns and plain cards included, and has no mode.
         spent = budget.spent(con)
+        caps = "; ".join(f"{owner.token_cap_setting} applies to each {owner.scope_label}"
+                         for owner in owners.registered() if owner.token_cap_setting)
         from misaka.core.network import roster as roster_mod
         named = ", ".join(
             f"{s} ({roster_mod.describe_line(s, root=_cfg()['profiles_root']) or 'no description'})"
@@ -248,7 +248,7 @@ def _install(harn, runtime):
             f"Sister roster: {named or '(empty)'}"
             f"{' (use misaka_sister_view for introduction excerpts)' if named else ''}\n"
             + (f"Allies (external agents, assigned cards like a Sister): {allies}\n" if allies else "") +
-            f"Tokens recorded on this board: {spent:,} (research.token_cap applies to each research run)\n\n"
+            f"Tokens recorded on this board: {spent:,}" + (f" ({caps})" if caps else "") + "\n\n"
         )
         return _text(header + ("\n".join(lines) if lines else "(no task cards)"))
 
@@ -987,8 +987,9 @@ def _install(harn, runtime):
         harn,
         name="misaka_card_requeue", label="Requeue task card",
         description="Put a stopped or failed card back in the queue as a fresh attempt, the way the board "
-                    "reopens one itself. Research cards are not requeued here: their run is resumed by the "
-                    "user with /research resume.",
+                    "reopens one itself. Cards a workflow drives are not requeued here: the user resumes "
+                    "their run" + "".join(f" ({owner.name}: {owner.resume_command})" for owner in owners.registered()
+                                          if owner.resume_command) + ".",
         snippet="Requeue a stopped or failed card",
         guidelines=[COORDINATOR_BOARD_STATUS + " Requeue a stopped or failed card with misaka_card_requeue, and "
                     "ask the user first. Requeueing only puts the card back in the queue; misaka_dispatch is what "

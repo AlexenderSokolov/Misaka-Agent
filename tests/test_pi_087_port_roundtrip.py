@@ -53,9 +53,9 @@ async def _opened(home, session_manager):
     agent_dir = home / "agent" / "last_order-foreground"
     agent_dir.mkdir(parents=True, exist_ok=True)
     spec = SessionSpec(profile_dir=str(profile), role=role, workspace=str(workspace), kind="foreground",
-                       sender=role, mcp_role=role, task_id=None, research_context=False)
+                       sender=role, mcp_role=role, task_id=None, workflow_context=False)
     assembly = assemble(spec)
-    role_flags, assembly, _env = role_session_setup(str(profile), str(workspace), research_context=False,
+    role_flags, assembly, _env = role_session_setup(str(profile), str(workspace), workflow_context=False,
                                                     receive_messages=True)
     sections = parseArgs(role_flags).appendSystemPrompt or []
     options = {"cwd": str(workspace), "agentDir": str(agent_dir)}

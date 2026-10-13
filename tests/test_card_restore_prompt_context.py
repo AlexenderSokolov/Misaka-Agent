@@ -43,12 +43,12 @@ class CardRestorePromptContextTests(unittest.TestCase):
             materials.assert_not_called()
             self.assertEqual(handle.board_id, "card-1")
             prepared = factory.call_args.args[2]
-            self.assertEqual(prepared["_research"], {
+            self.assertEqual(prepared["_owner_context"], {
                 "run_id": "run-1", "branch_id": "node-1", "kind": "investigation", "scope": "run-1",
             })
             self.assertEqual(prepared["_materials"], "")
             assert "_colleagues" not in prepared
-            self.assertNotIn("_research", row)
+            self.assertNotIn("_owner_context", row)
 
     def test_prepare_keeps_material_snapshot_despite_corrupt_markdown(self):
         with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(":memory:")) as con:
@@ -69,7 +69,7 @@ class CardRestorePromptContextTests(unittest.TestCase):
             self.assertIn("- `downloads/broken.md`", prepared["_materials"].splitlines())
             self.assertIn("snapshot", prepared["_materials"])
             self.assertNotIn("Before any new fetch", prepared["_materials"])
-            self.assertIsNone(prepared["_research"])
+            self.assertIsNone(prepared["_owner_context"])
 
     def test_material_snapshot_retains_path_if_file_disappears_during_metadata_read(self):
         from misaka.core.web import evidence

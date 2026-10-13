@@ -2,9 +2,11 @@
 
 import psutil
 
+from misaka.core.platform import owners
+
 # A card is one model CLI process: a few hundred MiB resident while it streams. The host
-# cap follows the memory that is actually free, but never below this floor -- a research
-# node fans out eight cards at once, and a cap of two turned that into four serial rounds.
+# cap follows the memory that is actually free, but never below this floor -- a workflow's
+# step may fan out eight cards at once, and a cap of two turned that into four serial rounds.
 HOST_FLOOR = 4
 HOST_CEILING = 12
 PER_CARD_BYTES = 256 * 1024**2
@@ -59,11 +61,9 @@ def occupied(con):
             argv = psutil.Process(row["pid"]).cmdline()
         except psutil.Error:
             continue
-        # Both the research worker wrapper and its durable Sister child may
-        # own the attempt. A card-shell TUI deliberately lives beyond its turn.
+        # A workflow's card process (its owner knows its command line) and a durable Sister
+        # child may own the attempt. A card-shell TUI deliberately lives beyond its turn.
         module = next((argv[i + 1] for i in range(len(argv) - 1) if argv[i] == "-m"), None)
-        if module == "misaka.cli.subagent_child" or (
-            module == "misaka.cli.research_node" and "--run-card" in argv
-        ):
+        if module == "misaka.cli.subagent_child" or owners.owns_card_process(argv):
             taken[row["id"]] = row["assignee"]
     return taken

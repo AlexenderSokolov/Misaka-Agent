@@ -58,7 +58,7 @@ class SessionSpec:
     mcp_role: str | None = None
     receive_messages: bool = False
     # Whether this session also collects the workspace's card notifications; None = as
-    # ``receive_messages``. A research node's window reads its own mail but leaves the card
+    # ``receive_messages``. A workflow node's window reads its own mail but leaves the card
     # notifications to the root's window (B123).
     receive_notifications: bool | None = None
     task_id: str | None = None
@@ -67,11 +67,13 @@ class SessionSpec:
     # three layers (project, role, shared); a card passes its read-only sandbox instead.
     skill_roots: tuple[tuple[str, str], ...] | None = None
     startup_skills: tuple[str, ...] = ()
-    # Optional one-call catalog snapshot shared with Research's assignment validator.
+    # Optional one-call catalog snapshot shared with a workflow's assignment validator.
     sister_catalog: tuple[dict[str, Any], ...] | None = None
-    research_context: bool = False
+    # Whether this session works inside a workflow that owns cards (``platform.owners``): its
+    # driver holds the board tools, and the owner's context joins the system prompt.
+    workflow_context: bool = False
     # Settings this session runs with instead of the global ones, as ``(key, value)`` pairs
-    # (``misaka.core.session_overrides``): a research run's compaction threshold and output limit.
+    # (``misaka.core.session_overrides``): a workflow run's compaction threshold and output limit.
     overrides: tuple[tuple[str, Any], ...] = ()
 
 
@@ -248,10 +250,10 @@ def spec_overrides(overrides) -> tuple[tuple[str, Any], ...]:
 
 
 def role_session_setup(profile_dir, workspace, *, model=None, receive_messages=False,
-                       receive_notifications=None, research_context=False, startup_skills=(), overrides=None):
+                       receive_notifications=None, workflow_context=False, startup_skills=(), overrides=None):
     """One role session entry, independent of terminal, root/fork and lifetime.
 
-    Callers add only their transport/session-selection flags. Research changes the
+    Callers add only their transport/session-selection flags. A workflow changes the
     mode overlay and per-phase tool scope, never the base capability registry.
     """
     from misaka.config import identity
@@ -267,7 +269,7 @@ def role_session_setup(profile_dir, workspace, *, model=None, receive_messages=F
     assembly = assemble(SessionSpec(
         profile_dir=profile_dir, role=role, workspace=workspace, kind="foreground",
         sender=sender, mcp_role=sender, receive_messages=receive_messages,
-        receive_notifications=receive_notifications, research_context=research_context, startup_skills=tuple(startup_skills),
+        receive_notifications=receive_notifications, workflow_context=workflow_context, startup_skills=tuple(startup_skills),
         overrides=spec_overrides(overrides)))
     from misaka.config import env as env_file
 

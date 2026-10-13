@@ -564,7 +564,7 @@ def _call(worker, cfg, prompt, *, cwd, session_dir, continue_session=False,
           model=None, extra_tools=(), con=None, session_file=None, sister_catalog=None):
     kwargs = {
         "cwd": cwd,
-        "timeout": None, "research_context": True,
+        "timeout": None,
         "raw": raw, "usage_db": cfg.get("db"), "usage_task_id": task_id,
         "usage_generation": 1, "usage_token_cap": cfg.get("token_cap"),
         "session_dir": session_dir, "continue_session": continue_session,

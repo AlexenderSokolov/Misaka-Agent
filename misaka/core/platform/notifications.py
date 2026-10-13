@@ -86,7 +86,7 @@ def prune(con, *, now=None):
     The trigger appends one row per terminal transition, so the table grows for the life of
     the board. A row is dropped only once every subscription's cursor is past it, so a
     subscriber that has been away still gets what it missed. That rule needs the other half:
-    a research run's chat subscription outlives the run, and one abandoned cursor would
+    a workflow run's chat subscription outlives the run, and one abandoned cursor would
     otherwise pin the whole table forever. A subscription that has neither leased nor
     acknowledged anything in ``SUBSCRIPTION_IDLE_SECONDS`` is gone; a session that comes back
     later resubscribes and reads from ``SUBSCRIBE_LOOKBACK_SECONDS`` ago.

@@ -2513,8 +2513,13 @@ class Daemon:
 
 
 def main():
+    from misaka.cli import bootstrap
     from misaka.config import env as env_file
     from misaka.config.engine import configure_logging
+    # The daemon claims, deletes and lists cards: the workflows that own some of them must be
+    # registered here as in every other process (platform.owners). A settings.json knob it cannot
+    # use is the panes' to refuse; the daemon's exit would take every pane with it.
+    bootstrap.install(check_settings=False)
     home.ensure()
     configure_logging()      # the daemon's warnings belong in the log file, not net.sock.log (B6)
     env_file.load()          # panes inherit it; a panel started outside a shell still has its keys

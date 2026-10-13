@@ -48,7 +48,7 @@ def extract_json(text):
 def _escape_prose_quotes(text):
     """Escape the double quotes a model leaves bare inside JSON string values.
 
-    A research plan came back as one ``{"plan_markdown": "..."}`` whose Markdown quoted a
+    A workflow's plan came back as one ``{"plan_markdown": "..."}`` whose Markdown quoted a
     phrase -- ``默认接受"埃及成功、印度失败"的通行叙事`` -- with the quotes unescaped. The
     object failed to decode, the scan above moved on *into* it and returned the first
     fragment that did decode, ``"clarifying_questions": []`` -- an empty list -- and the

@@ -211,16 +211,16 @@ def _idle_card_target(card):
 
 
 def _sender_node(board, *, sender_task, sender_session):
-    """``(owner, scope, unit)`` the sender works in -- for research, the run and the node: her card's
-    node, or the node whose Last Order conversation she is; a run's window outside its nodes has no
-    node, and a sender outside any workflow has neither (``platform.owners``)."""
+    """``(owner, scope, unit)`` the sender works in -- a workflow's run and the node inside it: her
+    card's node, or the node whose Last Order conversation she is; a run's window outside its nodes
+    has no node, and a sender outside any workflow has neither (``platform.owners``)."""
     from misaka.core.platform import owners
 
     return owners.sender_scope(board, sender_task, sender_session)
 
 
 def _node_last_order(*, sender_task, sender_session):
-    """The Last Order of the sender's own research node, live and reading mail, else None. Every
+    """The Last Order of the sender's own workflow node, live and reading mail, else None. Every
     node's Last Order is a `last-order` window in the one panel space, so inside a run the name
     means hers: the root's window for a root card, a node's own window for that node's (B123)."""
     from misaka.core import session_catalog
@@ -232,7 +232,7 @@ def _node_last_order(*, sender_task, sender_session):
     try:
         owner, _run, node = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
         session_file = owner.unit_session_file(board, node) if node else None
-    except sqlite3.OperationalError:     # a board research has never touched has no such tables
+    except sqlite3.OperationalError:     # a board its workflows have never touched has no such tables
         return None
     finally:
         board.close()
@@ -245,29 +245,30 @@ def _node_last_order(*, sender_task, sender_session):
 
 
 def _run_cards(role, *, sender_task, sender_session):
-    """The cards ``role`` holds where the sender works, the sender's own aside: her node's when it
-    has any, else the whole run's -- a research graph puts the same Sister on several nodes, joins
-    included. A name sent from inside a run means one of them: that role's contact session is
-    outside the run, cannot see it, and once did a card's whole job beside the card (2026-10-01)."""
+    """``(owner, cards)``: the cards ``role`` holds where the sender works, the sender's own aside --
+    her node's when it has any, else the whole run's (a workflow's graph may put the same Sister on
+    several nodes, joins included). A name sent from inside a run means one of them: that role's
+    contact session is outside the run, cannot see it, and once did a card's whole job beside the
+    card (2026-10-01)."""
     from misaka.core.platform import tasks
 
     if not (sender_task or sender_session):
-        return []
+        return None, []
     board = tasks.connect(_board_path())
     try:
         owner, run, branch = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
         if run is None:
-            return []
+            return None, []
         units = dict(owner.scope_cards(board, run))
         ids = [task_id for task_id in units if task_id != sender_task]
         if not ids:
-            return []
+            return owner, []
         rows = board.execute(f"SELECT id, status, title FROM tasks WHERE assignee=? AND id IN ({','.join('?' * len(ids))}) "
                              "ORDER BY created_at", (role, *ids)).fetchall()
         mine = [row for row in rows if branch and units[row["id"]] == branch]
-        return mine or rows
-    except sqlite3.OperationalError:     # a board research has never touched has no such tables
-        return []
+        return owner, mine or rows
+    except sqlite3.OperationalError:     # a board its workflows have never touched has no such tables
+        return None, []
     finally:
         board.close()
 
@@ -389,13 +390,13 @@ def resolve_address(addr, *, sender, space=None, sender_task=None, sender_sessio
             + "; ".join(target["label"] for target in targets)
             + ". Send to one of them by its card id or session id."
         )
-    run_cards = _run_cards(addr, sender_task=sender_task, sender_session=sender_session)
+    run_owner, run_cards = _run_cards(addr, sender_task=sender_task, sender_session=sender_session)
     if len(run_cards) == 1:
         return resolve_address(run_cards[0]["id"], sender=sender, space=space, sender_task=sender_task,
                                sender_session=sender_session, contact=contact)
     if run_cards:
         raise ValueError(
-            f"'{addr}' has {len(run_cards)} cards in this research run: "
+            f"'{addr}' has {len(run_cards)} cards in this {run_owner.scope_label}: "
             + "; ".join(f"{card['id']} ({card['status']}: {card['title']})" for card in run_cards)
             + ". Send to one of them by its card id."
         )
@@ -753,7 +754,7 @@ class SendMessageParams(BaseModel):
     to: str = Field(description=(
         "A card id (t_xxxxxx) reaches the session running that card; a session id reaches that one "
         "conversation. A finished card, or its closed session, is woken in her own session with this "
-        "message as her next turn; a card that has not started gets it when it does. Inside a research "
+        "message as her next turn; a card that has not started gets it when it does. Inside a workflow's "
         "run a name means that role's card in the run; otherwise a name (last-order, or a Sister id such "
         "as 10032) reaches "
         "the one session of that role in your space, or her contact session when none is there; "

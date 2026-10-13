@@ -1,4 +1,4 @@
-"""Every model request a metered session makes, leased against ``research.token_cap`` and recorded.
+"""Every model request a metered session makes, leased against the token cap and recorded.
 
 All of them pass one point, ``misaka.ai.api._meter``: the built-in APIs (``lazyApi``) and the api registry ask it --
 the agent's own turns, compaction summaries, the vision bridge, MoA's member calls, LCM's summaries, the cache
@@ -11,7 +11,7 @@ thinking an adapter asks for beyond that (``thinking_allowance``) -- waits while
 flight fill the cap, stops with ``budget.EXHAUSTED_MESSAGE`` when spending already has, sends with
 ``maxTokens`` cut to the lease, and records what it used when it ends. Reasoning is left as the
 caller asked: the lease pays for it. 2026-10-07 (issue #10 plan, token_cap): a run used to get one
-fixed 32,768-token slice for its whole life, smaller than one research request, and only the
+fixed 32,768-token slice for its whole life, smaller than one of its requests, and only the
 session's own turns were bounded at all.
 """
 from __future__ import annotations
@@ -112,7 +112,7 @@ def _ended(out: AssistantMessageEventStream, model: Any, reason: str, text: str 
 
 def _exhausted_text(reading: dict, need: int) -> str:
     left = max(0, int(reading.get("cap", 0)) - int(reading.get("used", 0)))
-    return (f"{budget.EXHAUSTED_MESSAGE}: the next request needs up to {need:,} tokens and this research run "
+    return (f"{budget.EXHAUSTED_MESSAGE}: the next request needs up to {need:,} tokens and this run "
             f"has {left:,} of its {int(reading.get('cap', 0)):,} left. It stops here; raise the cap and resume it "
             f"to go on.")
 
@@ -159,7 +159,7 @@ def meter(model: Any, context: Any, options: Any, send) -> AssistantMessageEvent
         output = min(configured or model_max or FALLBACK_OUTPUT_TOKENS, model_max or FALLBACK_OUTPUT_TOKENS)
         if model.api == "openai-codex-responses" and model.api not in _warned_uncapped:
             _warned_uncapped.add(model.api)
-            logger.warning("%s takes no output limit: research.token_cap leases its whole output, "
+            logger.warning("%s takes no output limit: the token cap leases its whole output, "
                            "but cannot cut a reply short", model.api)
         extra = thinking_allowance(model, options)
         need = bound + min(MIN_OUTPUT_TOKENS, output) + extra

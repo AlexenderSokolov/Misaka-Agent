@@ -283,6 +283,27 @@ def test_ensure_narrows_a_credential_file_that_was_left_readable(tmp_path, monke
     assert home.path("auth").stat().st_mode & 0o777 == 0o600
 
 
+def test_a_v9_board_is_carried_forward(tmp_path, monkeypatch):
+    import sqlite3
+
+    from misaka.core.platform import tasks
+
+    monkeypatch.setenv(home.ENV_HOME, str(tmp_path / "home"))
+    tasks.connect(CFG["db"]).close()
+    raw = sqlite3.connect(CFG["db"])
+    raw.execute("UPDATE schema_migrations SET version=9 WHERE component='tasks'")
+    raw.execute("INSERT INTO events(task_id,kind,payload,created_at) VALUES('t_1','research_evidence','{}',0)")
+    raw.commit()
+    raw.close()
+    con = tasks.connect(CFG["db"])
+    try:
+        assert [row[0] for row in con.execute("SELECT kind FROM events")] == ["card_evidence"]
+        assert con.execute("SELECT MAX(version) FROM schema_migrations WHERE component='tasks'").fetchone()[0] == 10
+    finally:
+        con.close()
+    tasks.connect(CFG["db"]).close()                                                # current: a no-op
+
+
 def test_a_board_written_by_another_build_is_refused_by_version_and_left_alone(tmp_path, monkeypatch):
     import sqlite3
 
@@ -299,13 +320,14 @@ def test_a_board_written_by_another_build_is_refused_by_version_and_left_alone(t
     finally:
         con.close()
     raw = sqlite3.connect(CFG["db"])
-    raw.execute("UPDATE schema_migrations SET version=version-1 WHERE component='tasks'")
+    # Older than the first release (v9 is carried forward; anything before it is pre-release).
+    raw.execute("UPDATE schema_migrations SET version=8 WHERE component='tasks'")
     raw.commit()
     raw.close()
-    with pytest.raises(RuntimeError, match=f"pre-release MISAKA .v{tasks.TASK_SCHEMA_VERSION - 1}"):
+    with pytest.raises(RuntimeError, match="pre-release MISAKA .v8"):
         tasks.connect(CFG["db"])
     raw = sqlite3.connect(CFG["db"])                                                # nothing was reshaped
-    assert raw.execute("SELECT version FROM schema_migrations WHERE component='tasks'").fetchone()[0] == tasks.TASK_SCHEMA_VERSION - 1
+    assert raw.execute("SELECT version FROM schema_migrations WHERE component='tasks'").fetchone()[0] == 8
     # A newer build's board: the way out is an update, not a new home.
     raw.execute("UPDATE schema_migrations SET version=? WHERE component='tasks'", (tasks.TASK_SCHEMA_VERSION + 1,))
     raw.commit()

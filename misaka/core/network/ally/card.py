@@ -18,8 +18,8 @@ waits for the turn to end and goes in as the next one; a turn is never cancelled
 message (raven's rule). Ctrl-C in the pane cancels the turn and the card stays running.
 
 Two hosts: ``misaka ally-card`` in a daemon pane (the daemon claimed the card and hands the claim
-over in the environment, as for ``card-shell``), and ``dispatch.run_task`` in process for headless
-research. In process nobody types, so an attempt that goes idle without completing is over and
+over in the environment, as for ``card-shell``), and ``dispatch.run_task`` in process for a headless
+workflow. In process nobody types, so an attempt that goes idle without completing is over and
 its dispatcher settles it.
 """
 from __future__ import annotations
@@ -460,12 +460,12 @@ def _first_prompt(task, *, loaded, say, earlier):
     if loaded and say is not None:
         return say
     contract = worker.card_prompt(task)
-    if task.get("_research"):
+    if task.get("_owner_context"):
         # A Sister has this in her system prompt; ACP has none, so it opens the conversation.
         from misaka.core.platform import owners
         owner = owners.named(task.get("_owner"))
         if owner is not None:
-            contract = owner.card_discipline(task["_research"]) + "\n" + contract
+            contract = owner.card_discipline(task["_owner_context"]) + "\n" + contract
     if earlier:
         contract = EARLIER.format(path=earlier) + "\n\n" + contract
     return contract + (f"\n\n## Message\n{say}" if say is not None else "")

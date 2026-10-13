@@ -18,7 +18,7 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 from misaka.config import home
-from misaka.core.platform import repo, tasks
+from misaka.core.platform import owners, repo, tasks
 from misaka.utils import atomic
 from misaka.utils.frontmatter import parseFrontmatter
 
@@ -58,7 +58,7 @@ def _dump(fields, body):
 
 
 # The mtime gate for :func:`reconcile_one`, which is run over every card in the project on
-# every dispatch and every research tick. Nothing durable lives here: losing the dict to
+# every dispatch and every workflow tick. Nothing durable lives here: losing the dict to
 # process death costs one re-read per card, never a lost fact, so it stays on the allowed
 # side of "process-local caches may not hold anything a crash must not lose".
 #
@@ -181,7 +181,7 @@ def iter_cards(workspace):
 def create(con, workspace, title, body, assignee, *, reviewer=None, model=None,
            priority=0, origin_session=None, after_row=None, needs=()):
     """The one front door for new cards: index row first (it mints the id), then ``after_row(tid)``
-    for whatever else the row must be tied to (a research link), then the file. Any failure before
+    for whatever else the row must be tied to (a workflow's link), then the file. Any failure before
     the file exists rolls the row back -- no card exists without its truth, and no file without its row."""
     workspace = tasks.canonical_workspace(workspace)
     needs = list(dict.fromkeys(needs))
@@ -624,13 +624,6 @@ downloads/
 .DS_Store
 __pycache__/
 *.pyc
-# research source bundles: rebuilt at every settle, hard links of files kept elsewhere
-nodes/**/SOURCES.md
-nodes/**/sources/
-nodes/**/.SOURCES-*.part
-final/*-SOURCES.md
-final/*-sources/
-final/.SOURCES-*.part
 """
 
 PROJECT_TEMPLATE = """# {name}
@@ -679,7 +672,7 @@ def init_project(folder, *, draft_brief=True, git=True):
     """Make a folder a MISAKA project: the skeleton (PROJECT.md, cards/, .gitignore) with its
     cards indexed, and -- with ``git``, as ``misaka init`` asks -- a git repository. Only a
     repository this call itself created gets the initial commit; an existing repository is never
-    committed to. Starting research passes ``git=False``: git is the user's, never a side effect."""
+    committed to. A workflow starting in a folder passes ``git=False``: git is the user's, never a side effect."""
     folder = tasks.canonical_workspace(folder)
     _refuse_whole_home(folder)
     actions = []
@@ -695,9 +688,10 @@ def init_project(folder, *, draft_brief=True, git=True):
     ignore = os.path.join(folder, ".gitignore")
     config_dir = home.project_dir(folder)
     if not os.path.exists(ignore) and config_dir is not None:
-        # Derived and cache material only. The research bundle patterns are anchored to the
-        # research layout, so a person's own ``sources/`` elsewhere stays theirs to commit.
-        atomic.write_text(ignore, GITIGNORE_TEMPLATE.format(config_dir=config_dir.name))
+        # Derived and cache material only, the board's and what each card owner derives (anchored
+        # to its own layout, so a person's own ``sources/`` elsewhere stays theirs to commit).
+        atomic.write_text(ignore, GITIGNORE_TEMPLATE.format(config_dir=config_dir.name)
+                          + "".join(owner.gitignore() for owner in owners.registered()))
         actions.append(".gitignore written")
     con = tasks.connect(os.path.expanduser(_cfg_db()))
     try:
@@ -738,7 +732,7 @@ def _refuse_whole_home(folder):
         raise RuntimeError(
             f"{folder} is your home directory; a project has to be a folder of its own. "
             "Make one and initialize that instead, for example:\n"
-            "  mkdir ~/research && cd ~/research && misaka init")
+            "  mkdir ~/project && cd ~/project && misaka init")
 
 
 def _cfg_db():

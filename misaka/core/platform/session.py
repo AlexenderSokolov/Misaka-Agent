@@ -6,6 +6,7 @@ import threading
 from contextlib import asynccontextmanager
 
 from misaka.agent.guards import install_guards
+from misaka.core.platform import owners
 from misaka.core.platform.vocabulary import BOOKKEEPING_MANAGEMENT_TOOLS
 from misaka.utils import loop_watchdog
 from misaka.utils.async_lifecycle import settle
@@ -29,8 +30,6 @@ BOOKKEEPING_TOOLS = frozenset({
     # Corpus and skill inspection (misaka.core.documents.wiring.documents, .skills).
     "doc_list", "doc_outline", "doc_read", "doc_find", "doc_verify",
     "skills_list", "skill_view",
-    # The read-only view of a research run (misaka.core.research.tools).
-    "misaka_research_view",
     # Inbox and sub-agent management (misaka.core.network.messages, misaka.core.subagent),
     # spelled as the management vocabulary minus ``Agent`` so the exclusion noted above is
     # something this set performs rather than something a comment promises.
@@ -268,7 +267,7 @@ async def _run_session(flags, prompt, cwd, on_event=None, timeout=600, env=None,
         # that reader. Every model request is metered where it is sent (metering).
         from misaka.core.platform import metering
         install_guards(session, metering.allowance, wall_seconds=timeout,
-                       bookkeeping_tools=BOOKKEEPING_TOOLS)
+                       bookkeeping_tools=BOOKKEEPING_TOOLS | owners.read_only_tools())
         if on_event:
             session.subscribe(lambda ev: on_event(event_line(ev)))
 
@@ -292,7 +291,7 @@ async def _run_session(flags, prompt, cwd, on_event=None, timeout=600, env=None,
             stop = last.get("stopReason") if isinstance(last, dict) else getattr(last, "stopReason", None)
             if stop in ("error", "aborted", "length") and not timed_out:
                 # A reply cut at the output cap never reached its tool call; callers that
-                # extract JSON would fail on the truncated text anyway, and the research
+                # extract JSON would fail on the truncated text anyway, and a workflow's
                 # driver needs the cause by name to nudge one more turn.
                 from misaka.ai.utils._output_limit import output_limit_error
                 err = (last.get("errorMessage") if isinstance(last, dict)
