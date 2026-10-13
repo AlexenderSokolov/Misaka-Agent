@@ -1,8 +1,7 @@
 """Translated from pi's ``packages/codemode/src/runtime/host.ts``.
 
-MISAKA fork: the worker is an in-process task around a V8 isolate (``worker.py``), so there is no
-wasm module to load and no worker file to resolve; ``terminate()`` cancels the call that runs the
-script. Results are plain dicts, as the TypeScript objects are.
+MISAKA fork: the worker is a thread (``worker.py``), so there is no worker file to resolve and no ``workerUrl``
+option. Results are plain dicts, as the TypeScript objects are.
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ import asyncio
 import inspect
 import math
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -42,6 +42,7 @@ from ..types import (
     CodemodeStoreWrites,
     CodemodeTool,
 )
+from ..wasm import CodemodeWasmModule, loadQuickJSWasm
 from .protocol import (
     HostToWorkerMessage,
     WorkerData,
@@ -167,17 +168,20 @@ class _ExecutionOptions:
     signal: Any
     memoryLimitBytes: int | None
     store: dict[str, str]
+    wasm: Any
 
 
 class Execution:
-    """One script run in its own VM. A fresh VM per run keeps termination simple: a runaway script,
-    including one that only spins the microtask queue, is killed with ``terminate()`` and cannot
-    poison a later run."""
+    """One script run in its own worker and QuickJS VM. A fresh worker per run keeps termination simple: a runaway
+    script, including one that only spins the microtask queue, is killed with ``terminate()`` and cannot poison a
+    later run."""
 
     def __init__(self, options: _ExecutionOptions) -> None:
         loop = asyncio.get_running_loop()
         self.promise: asyncio.Future[CodemodeResult] = loop.create_future()
         self._worker: Worker | None = None
+        # pi: a `SharedArrayBuffer` of one Int32.
+        self._interrupt = threading.Event()
         self._tools = options.tools
         self._globals = options.globals
         self._signal = options.signal
@@ -189,7 +193,7 @@ class Execution:
         self._finished = False
         self._tasks: set[asyncio.Task[Any]] = set()
         # MISAKA fork: cancelling the task that awaits the result cancels this future, which has no
-        # counterpart for a promise. The run is then abandoned: stop it, and release the isolate.
+        # counterpart for a promise. The run is then abandoned: stop it, and end its worker.
         self.promise.add_done_callback(self._onSettled)
 
         if math.isfinite(options.timeoutMs):
@@ -207,7 +211,7 @@ class Execution:
             else:
                 self._removeAbortListener = addAbortListener(options.signal, self._onAbort)
 
-        self._start(options)
+        spawn(self._load(options), self._tasks)
 
     def abort(self, message: str) -> asyncio.Future[CodemodeResult]:
         self._finish({"kind": "aborted", "message": message})
@@ -217,7 +221,16 @@ class Execution:
         if future.cancelled():
             self._finish({"kind": "aborted", "message": "Execution cancelled"})
 
-    def _start(self, options: _ExecutionOptions) -> None:
+    async def _load(self, options: _ExecutionOptions) -> None:
+        """``options.wasm.then(start, fail)``."""
+        try:
+            wasm = await options.wasm if inspect.isawaitable(options.wasm) else options.wasm
+        except Exception as error:  # noqa: BLE001 - upstream's rejection handler
+            self._finish({"kind": "sandbox", "message": f"Failed to load QuickJS: {errorMessage(error)}"})
+            return
+        self._start(options, wasm)
+
+    def _start(self, options: _ExecutionOptions, wasm: CodemodeWasmModule) -> None:
         if self._finished:
             return
         workerData: WorkerData = {
@@ -231,16 +244,27 @@ class Execution:
                 for tool in options.tools.values()
             ],
             "globals": [{"name": global_.name, "spread": global_.spread is True} for global_ in options.globals.values()],
+            "wasm": wasm,
             "memoryLimitBytes": options.memoryLimitBytes,
             "store": options.store,
+            "interrupt": self._interrupt,
         }
         try:
-            worker = Worker(workerData, self._onMessage)
-            worker.start()
+            worker = Worker(workerData)
         except Exception as error:  # noqa: BLE001 - upstream `catch (error)` around `new Worker`
             self._finish({"kind": "sandbox", "message": f"Failed to start worker: {errorMessage(error)}"})
             return
         self._worker = worker
+        worker.on("message", self._onMessage)
+        worker.on("error", lambda error: self._finish({
+            "kind": "sandbox",
+            "name": type(error).__name__,
+            "message": errorMessage(error),
+        }))
+        worker.on("exit", lambda code: self._finish({
+            "kind": "sandbox",
+            "message": f"Worker exited with code {code} before the script settled",
+        }))
 
     def _onAbort(self) -> None:
         reason = read_field(self._signal, "reason") if self._signal is not None else None
@@ -251,10 +275,10 @@ class Execution:
 
     def _post(self, message: HostToWorkerMessage) -> None:
         if self._worker is not None:
-            self._worker.post(message)
+            self._worker.postMessage(message)
 
     def _onMessage(self, message: Any) -> None:
-        # An exception here would be lost in the worker's task and leave the execution unsettled.
+        # An exception here would be lost in the event loop's handler and leave the execution unsettled.
         try:
             self._handleMessage(message)
         except Exception as error:  # noqa: BLE001 - upstream `catch (error)`: the run's failure
@@ -374,15 +398,11 @@ class Execution:
         if worker is None:
             self._resolveResult(result)
             return
+        self._interrupt.set()
 
         async def terminate() -> None:
             try:
-                leftover = await worker.terminate()
-                # MISAKA fork: what the script printed during the evaluation a timeout or an abort cut
-                # off; upstream's bridge had posted it already. A script that finished or failed by
-                # itself has had its output relayed in order.
-                if error is not None and error["kind"] in ("timeout", "aborted"):
-                    self._output.extend(leftover)
+                await worker.terminate()
             except Exception:  # noqa: BLE001, S110 - upstream `.catch(() => undefined)`
                 pass
             self._resolveResult(result)
@@ -395,12 +415,12 @@ class Execution:
 
 
 class CodemodeSandbox:
-    """Runs JavaScript in a V8 isolate of its own. The script sees ``tools.<name>(args)`` for every
-    registered tool, ``ALL_TOOLS``, the output helpers ``text``, ``image``, ``exit``, and
-    ``console.*``, ``store``/``load``, and the configured globals; nothing else (no timers, ``fetch``,
+    """Runs JavaScript in a QuickJS VM (a separate wasm instance) inside a worker thread. The script sees
+    ``tools.<name>(args)`` for every registered tool, ``ALL_TOOLS``, the output helpers ``text``, ``image``, ``exit``,
+    and ``console.*``, ``store``/``load``, and the configured globals; nothing else (no timers, ``fetch``,
     ``process``, ``require``, modules). The built-ins are frozen before the script runs.
 
-    Each ``execute()`` gets its own VM; the sandbox only holds the tool table and defaults.
+    Each ``execute()`` gets its own worker and VM; the sandbox only holds the tool table and defaults.
     ``close()`` aborts in-flight executions.
     """
 
@@ -410,6 +430,7 @@ class CodemodeSandbox:
         self._globalsByName: dict[str, CodemodeTool] = {}
         self._timeoutMs: float = nullishCoalesce(options.get("timeoutMs"), DEFAULT_TIMEOUT_MS)
         self._memoryLimitBytes = options.get("memoryLimitBytes")
+        self._wasm = options.get("wasm")
         self._running: set[Execution] = set()
         self._closed = False
         for tool in options.get("tools") or []:
@@ -465,6 +486,7 @@ class CodemodeSandbox:
             signal=options.get("signal"),
             memoryLimitBytes=self._memoryLimitBytes,
             store=serializeStore(options.get("store")),
+            wasm=loadQuickJSWasm() if self._wasm is None else self._wasm,
         ))
         self._running.add(execution)
         execution.promise.add_done_callback(lambda _future: self._running.discard(execution))

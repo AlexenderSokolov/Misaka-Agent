@@ -1,7 +1,6 @@
 """Translated from pi's ``packages/codemode/src/types.ts``.
 
-MISAKA fork: scripts run on V8 through ``mini-racer`` rather than QuickJS in a wasm worker, so
-the ``wasm`` and ``workerUrl`` sandbox options have no counterpart.
+MISAKA fork: the worker is a thread, not a file, so the ``workerUrl`` sandbox option has no counterpart.
 """
 
 from __future__ import annotations
@@ -74,9 +73,9 @@ class CodemodeCall(TypedDict):
 
 
 # "script": the script threw or failed to parse; `name` and `stack` come from the script's error.
-# "timeout": the overall deadline expired; the VM was terminated.
-# "aborted": the caller's signal fired or the sandbox was closed; the VM was terminated.
-# "sandbox": the VM failed outside the script's control (for example out of memory).
+# "timeout": the overall deadline expired; the worker was terminated.
+# "aborted": the caller's signal fired or the sandbox was closed; the worker was terminated.
+# "sandbox": the worker or VM failed outside the script's control (for example a wasm trap).
 type CodemodeErrorKind = Literal["script", "timeout", "aborted", "sandbox"]
 
 
@@ -126,8 +125,12 @@ class CodemodeSandboxOptions(TypedDict, total=False):
     # deadline; the execution then only ends when the script settles or is aborted.
     # Default: 300000.
     timeoutMs: float
-    # Maximum memory the VM may allocate. Default: no limit beyond the engine's own.
+    # Maximum memory the QuickJS VM may allocate. Allocations beyond it fail inside the script as
+    # `InternalError: out of memory`. Default: no limit beyond wasm32's 4 GiB address space.
     memoryLimitBytes: int
+    # Compiled `quickjs.wasm`, usually from `loadQuickJSWasm()`, or a future of it. Default: `loadQuickJSWasm()`,
+    # the file shipped with misaka.
+    wasm: Any
 
 
 class CodemodeExecuteOptions(TypedDict, total=False):

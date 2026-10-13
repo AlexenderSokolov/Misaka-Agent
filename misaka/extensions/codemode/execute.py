@@ -66,8 +66,9 @@ ERROR_PREVIEW_CHARS = 500
 # `models.classify()` and `models.generateImages()` calls one script may have in flight; `Promise.all`
 # over many items queues the rest.
 MAX_CONCURRENT_MODEL_CALLS = 4
-# Heap limit for the VM. The isolate shares misaka's process, so without a limit a runaway script
-# can grow until the process dies. Overruns end the script (see runtime/engine.py).
+# Heap limit for the QuickJS VM. The worker shares misaka's process, so without a limit a runaway
+# script can grow to wasm32's 4 GiB and take the session down. Overruns throw
+# `InternalError: out of memory` inside the script.
 CODEMODE_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
 MODEL_TYPES: frozenset[str] = frozenset({"chat", "image", "classifier"})
 

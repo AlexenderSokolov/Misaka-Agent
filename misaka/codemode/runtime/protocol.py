@@ -1,19 +1,17 @@
-"""Messages between the host and the worker that drives one VM. Tool arguments, results, and values
-cross as JSON strings: the worker passes them into and out of the VM as strings and never builds
-structured values itself.
+"""Messages between the host (the event loop) and the worker. Tool arguments, results, and values cross as JSON
+strings: the worker passes them into and out of the QuickJS VM as strings and never builds structured values itself.
 
-Translated from pi's ``packages/codemode/src/runtime/protocol.ts``.
-
-MISAKA fork: no compiled wasm module and no shared interrupt flag travel with the worker data. The
-VM is a V8 isolate the worker owns in this process, and a runaway script is stopped by cancelling the
-call that runs it (see ``engine.py``).
+Translated from pi's ``packages/codemode/src/runtime/protocol.ts``. MISAKA fork: the interrupt flag is a
+``threading.Event`` where upstream shares an ``Int32Array`` over a ``SharedArrayBuffer``.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Literal, TypedDict
 
 from ..types import CodemodeOutputItem
+from ..wasm import CodemodeWasmModule
 
 
 class WorkerTool(TypedDict):
@@ -33,9 +31,14 @@ class WorkerData(TypedDict):
     code: str
     tools: list[WorkerTool]
     globals: list[WorkerGlobal]
+    # Compiled `quickjs.wasm`. The worker instantiates it; the compiled code is shared.
+    wasm: CodemodeWasmModule
     memoryLimitBytes: int | None
     # Snapshot for `load()`: key to JSON text.
     store: dict[str, str]
+    # Set by the host before terminating the worker. The VM's interrupt handler polls it, because a thread spinning
+    # in wasm cannot be stopped from outside.
+    interrupt: threading.Event
 
 
 # JSON-encoded `{ name?, message, stack? }` of an error thrown by the script.
@@ -70,7 +73,7 @@ class DoneErrorMessage(TypedDict):
 
 
 class CrashMessage(TypedDict):
-    """The VM failed outside the script's control, for example running out of memory."""
+    """The VM failed outside the script's control, for example a wasm trap."""
 
     type: Literal["crash"]
     message: str

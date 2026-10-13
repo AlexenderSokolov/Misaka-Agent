@@ -193,7 +193,7 @@ run calls in parallel and filter large results before it reads them. MCP tools r
 way by default. Codemode is a Sister's tool: Last Order coordinates and does not have it, so every tool
 of her MCP servers is declared to her directly, whatever `exposure` says (`hidden` still hides it). For a Sister the tool is off
 until something names it: `defaultTools` (`["+codemode"]`) or an MCP server with `codemode` exposure.
-Scripts run in a V8 sandbox with no
+Scripts run in a QuickJS sandbox with no
 file system, network or timers; they call tools through `tools.<name>(args)`. The reference the
 model reads is shipped with MISAKA as `codemode.md`.
 

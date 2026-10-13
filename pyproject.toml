@@ -59,8 +59,9 @@ dependencies = [
     "openpyxl>=3.1",
     "python-pptx>=1.0",
     "tiktoken>=0.14.0",
-    # The codemode engine uses a private mini-racer API (engine.py), so the minor version is pinned.
-    "mini-racer>=0.14.1,<0.15",
+    # codemode runs quickjs-wasi's QuickJS wasm on wasmtime (misaka/codemode/quickjs_wasi). wasmtime-py changes its
+    # API between major versions, so the major is pinned.
+    "wasmtime>=49,<50",
 ]
 
 [project.optional-dependencies]

@@ -58,7 +58,7 @@ def test_sdist_and_wheel_keep_package_with_ignored_source_symlink(tmp_path):
 
 def test_the_wheel_ships_the_licence_texts_catalog_data_and_bundled_assets(tmp_path):
     """The wheel a user install builds carries every licence text, the model catalog data with its manifest, and the
-    non-Python files the ported modules read at runtime, and no QuickJS wasm (codemode runs on mini-racer)."""
+    non-Python files the ported modules read at runtime, codemode's QuickJS wasm among them."""
     import json
 
     root = Path(__file__).resolve().parents[1]
@@ -98,5 +98,6 @@ def test_the_wheel_ships_the_licence_texts_catalog_data_and_bundled_assets(tmp_p
         "misaka/core/export_html/vendor/marked.min.js",
         "misaka/core/export_html/vendor/highlight.min.js",
     } <= names
-    assert not [name for name in names if name.endswith(".wasm")]
+    assert [name for name in names if name.endswith(".wasm")] == ["misaka/codemode/quickjs_wasi/quickjs.wasm"]
+    assert any(requirement.startswith("wasmtime") for requirement in requires)
     assert any(requirement.startswith("referencing") for requirement in requires)

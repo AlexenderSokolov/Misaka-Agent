@@ -18,7 +18,7 @@ MISAKA 的部分文件移植自其它项目。移植代码所附带的许可证�
 - 模型目录数据：`misaka/ai/providers/data/` 是 `@earendil-works/pi-ai` 1.1.0 发布包中 `dist/providers/data` 的原样拷贝，
   用 `scripts/refresh_model_catalog.py` 按清单校验后更新
 - 本仓库位置：`misaka/ai/**`、`misaka/agent/**`、`misaka/ui/tui/**`、`misaka/mcp/**`（Pi 的
-  `packages/mcp`）、`misaka/codemode/**`（Pi 的 `packages/codemode`，运行时换成 V8/mini-racer）、
+  `packages/mcp`）、`misaka/codemode/**`（Pi 的 `packages/codemode`；其中 `quickjs_wasi/` 见下面的 quickjs-wasi 条）、
   `misaka/extensions/{mcp,codemode,tool_search}/**`，`misaka/{chord,protocol,client,server,durable}/**`
   （Pi 的同名 packages；`chord/node` 是 Python 分叉）、`misaka/experimental/**` 与 `misaka/cli/experimental/**`
   （Pi 的 `coding-agent/src/experimental` 与 `src/cli/experimental`，开发专用），以及 `misaka/core/` 的内核
@@ -29,6 +29,19 @@ MISAKA 的部分文件移植自其它项目。移植代码所附带的许可证�
   以 `# MISAKA fork:` 注释标出并说明理由。Pi 树内自带第三方许可证头的文件另见下面各条：
   `utils/ansi.ts`（ansi-regex）、`tui/src/stdin-buffer.ts`（OpenTUI）、`mcp/src/oauth/{types,discovery,flow}.ts`
   （MCP TypeScript SDK）、`tui/src/oklab.ts`（Oklab）、`core/export-html/vendor/*.min.js`（marked、highlight.js）。
+
+## quickjs-wasi 与其中的 QuickJS-NG、wasi-libc（经 Pi 的 packages/codemode）
+
+- 上游：https://github.com/vercel-labs/quickjs-wasi ，npm 包 `quickjs-wasi` 3.6.2（Pi 1.1.0 的 codemode 依赖它）
+- 许可证：quickjs-wasi 为 MIT（Copyright (c) 2026 Vercel, Inc.）；其中的 QuickJS-NG 0.17.0 为 MIT
+  （Copyright (c) 2017-2026 Fabrice Bellard 等）；wasi-libc 按其多许可证中的 MIT 使用，所含 musl 为 MIT、
+  cloudlibc 为 BSD-2-Clause、dlmalloc 为 CC0
+- 许可证全文：`LICENSES/quickjs-wasi.txt`（四份上游声明的原文汇编）
+- 本仓库位置：`misaka/codemode/quickjs_wasi/quickjs.wasm`（npm 包里的 `quickjs.wasm` 原样拷贝，
+  sha256 `d4c9375f2b1ca4dc95f72c8aa2982a7a9951ac8011490d79c6582df732b4bbd9`）与
+  `misaka/codemode/quickjs_wasi/__init__.py`（完整 MIT 文本在该文件头部）
+- 说明：`__init__.py` 把 quickjs-wasi 的 `src/index.ts` 与 `src/wasi-shim.ts` 中 Pi 的 codemode worker
+  用到的部分移植成 Python，宿主的 WebAssembly 换成 wasmtime；分叉处在文件头部列出。
 
 ## ansi-regex / strip-ansi
 

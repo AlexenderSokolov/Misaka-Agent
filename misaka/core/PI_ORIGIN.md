@@ -145,7 +145,7 @@ pi 的 `pi install npm:/git:` 与 `~/.pi/agent/extensions/` 安装通道 misaka 
 | misaka | pi |
 |---|---|
 | `misaka/mcp/` | `packages/mcp` |
-| `misaka/codemode/` | `packages/codemode`（运行时换成 V8/mini-racer） |
+| `misaka/codemode/` | `packages/codemode`（worker 是线程；QuickJS wasm 经 `quickjs_wasi/`（quickjs-wasi 3.6.2 的 Python 移植）跑在 wasmtime 上） |
 | `misaka/chord/` | `packages/chord`（`chord/node` 是 Python 分叉） |
 | `misaka/{protocol,client,server,durable}/` | 同名 packages |
 | `misaka/env/` | `packages/env`（纯 Python，只经实验入口可达） |

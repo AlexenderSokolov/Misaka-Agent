@@ -1,9 +1,7 @@
 """pi codemode's ``sandbox.test.ts``.
 
-Left out: "accepts a worker path string", "reports a missing worker file as a sandbox error" and
-"reports a failing wasm module as a sandbox error" (there is no worker file and no wasm module), and
-the memory-limit case changes shape: V8 terminates a script that runs out of memory instead of
-throwing inside it, so the sandbox reports it (see the misaka regressions at the end).
+Left out: "accepts a worker path string" and "reports a missing worker file as a sandbox error" (the worker is a
+thread, not a file).
 """
 
 from __future__ import annotations
@@ -21,6 +19,8 @@ from misaka.codemode import (
     MAX_OUTPUT_ITEMS,
     CodemodeSandbox,
     CodemodeTool,
+    loadQuickJSWasm,
+    quickjs_wasi,
 )
 from misaka.codemode.runtime import host as codemode_host
 from misaka.codemode.runtime.prelude_source import PRELUDE_SOURCE
@@ -66,13 +66,9 @@ WEBP = "UklGRgAAAABXRUJQ"
 
 
 async def test_prelude_parses_as_javascript():
-    from misaka.codemode.runtime.engine import PRELUDE_FILE_NAME, Vm
-
-    vm = Vm(None)
-    try:
-        assert vm.evaluate(PRELUDE_SOURCE, PRELUDE_FILE_NAME) is not None
-    finally:
-        vm.close()
+    # MISAKA fork: parsed by QuickJS itself (upstream uses Node's `vm.Script`); the prelude evaluates to a function.
+    vm = quickjs_wasi.QuickJS.create(wasm=await loadQuickJSWasm())
+    vm.evalCode(PRELUDE_SOURCE, "prelude.js").dispose()
 
 
 # -- script execution --------------------------------------------------------------------------
@@ -633,18 +629,33 @@ class RawWorker:
     message passed as the script source, so tests can send the host payloads the real prelude never
     produces."""
 
-    def __init__(self, data, post) -> None:
-        self._data = data
-        self._post = post
+    def __init__(self, workerData) -> None:
+        self._listeners = {}
+        asyncio.get_running_loop().call_soon(lambda: self._emit("message", json.loads(workerData["code"])))
 
-    def start(self) -> None:
-        asyncio.get_running_loop().call_soon(lambda: self._post(json.loads(self._data["code"])))
+    def _emit(self, event, payload) -> None:
+        for listener in self._listeners.get(event, []):
+            listener(payload)
 
-    def post(self, _message) -> None:
+    def on(self, event, listener) -> None:
+        self._listeners.setdefault(event, []).append(listener)
+
+    def postMessage(self, _message) -> None:
         pass
 
-    async def terminate(self) -> list:
-        return []
+    async def terminate(self) -> int:
+        return 1
+
+
+async def test_reports_a_failing_wasm_module_as_a_sandbox_error(sandboxes):
+    failed = asyncio.get_running_loop().create_future()
+    failed.set_exception(RuntimeError("no wasm"))
+    sandbox = CodemodeSandbox({"wasm": failed})
+    sandboxes.append(sandbox)
+    assertMatches(await sandbox.execute("return 1"), {
+        "ok": False,
+        "error": {"kind": "sandbox", "message": "Failed to load QuickJS: no wasm"},
+    })
 
 
 # #10444: a malformed payload from the worker must fail the run as a sandbox error instead of
@@ -792,8 +803,7 @@ async def test_keeps_tools_and_console_frozen(sandboxes):
 # -- misaka regressions ------------------------------------------------------------------------
 
 
-async def test_running_out_of_memory_ends_the_script_as_a_sandbox_failure():
-    # V8 terminates the script instead of throwing `InternalError: out of memory` inside it.
+async def test_running_out_of_memory_throws_inside_the_script():
     sandbox = CodemodeSandbox({"memoryLimitBytes": 64 * 1024 * 1024})
     try:
         result = await sandbox.execute(
@@ -801,22 +811,11 @@ async def test_running_out_of_memory_ends_the_script_as_a_sandbox_failure():
         )
     finally:
         await sandbox.close()
-    assertMatches(result, {"ok": False, "error": {"kind": "sandbox", "message": "out of memory"}})
-
-
-async def test_a_script_cannot_see_the_hosts_name_in_its_stacks_or_globals(sandboxes):
-    sandbox = createSandbox(sandboxes)
-    result = await sandbox.execute("return [Object.keys(globalThis).includes('__misaka_codemode__'), new Error('x').stack];")
-    assert result["ok"] is True
-    listed, stack = result["value"]
-    assert listed is False
-    assert "__misaka_codemode__" not in stack
-    # Only named sources appear: the script's frames and the prelude's, which the prelude drops.
-    assert "<anonymous>:" not in stack and "<anonymous>)" not in stack.replace("<anonymous> (", "")
+    assertMatches(result, {"ok": True, "value": "InternalError: out of memory"})
 
 
 async def test_ends_a_run_when_the_script_reports_done_and_keeps_spinning(sandboxes):
-    # Upstream's host terminates the worker on "done"; here the prelude's done() wakes the worker.
+    # The host terminates the worker on "done"; the interrupt flag stops the spinning VM.
     sandbox = createSandbox(sandboxes)
     started = time.perf_counter()
     result = await asyncio.wait_for(
@@ -824,16 +823,6 @@ async def test_ends_a_run_when_the_script_reports_done_and_keeps_spinning(sandbo
     )
     assertMatches(result, {"ok": True, "output": [{"type": "text", "text": "before"}]})
     assert time.perf_counter() - started < 2
-
-
-async def test_a_script_cannot_reach_the_hosts_bridge(sandboxes):
-    sandbox = createSandbox(sandboxes)
-    result = await sandbox.execute("""
-        const host = globalThis.__misaka_codemode__;
-        host.install((bridge) => { bridge("output", "text", "smuggled"); return {}; }, "[]", "[]", "{}");
-        return [typeof host.bridge, Object.isFrozen(host)];
-    """)
-    assertMatches(result, {"ok": True, "value": ["undefined", True], "output": []})
 
 
 async def test_a_tool_may_return_an_awaitable_or_a_plain_value(sandboxes):
@@ -883,7 +872,7 @@ async def test_cancelling_the_task_that_awaits_a_run_stops_the_run(sandboxes):
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.sleep(0.3)
-    assert worker is not None and worker._vm is None
+    assert worker is not None and not worker._thread.is_alive()
 
 
 async def test_keeps_null_and_undefined_apart_for_return_values_arguments_and_results(sandboxes):
@@ -940,7 +929,7 @@ async def test_keeps_the_output_a_script_printed_before_a_timeout_or_an_abort(sa
     })
 
 
-async def test_running_out_of_memory_after_an_await_is_still_a_sandbox_failure():
+async def test_running_out_of_memory_after_an_await_throws_inside_the_script():
     sandbox = CodemodeSandbox({"memoryLimitBytes": 64 * 1024 * 1024, "tools": [echo]})
     try:
         result = await sandbox.execute(
@@ -949,7 +938,7 @@ async def test_running_out_of_memory_after_an_await_is_still_a_sandbox_failure()
         )
     finally:
         await sandbox.close()
-    assertMatches(result, {"ok": False, "error": {"kind": "sandbox", "message": "out of memory"}})
+    assertMatches(result, {"ok": True, "value": "InternalError: out of memory"})
 
 
 @pytest.mark.parametrize(("code", "expected"), [
@@ -971,7 +960,8 @@ async def test_running_out_of_memory_after_an_await_is_still_a_sandbox_failure()
      "number true number"),
 ])
 async def test_the_globals_quickjs_adds_behave_as_they_do_upstream(code, expected):
-    # Expectations are pi 1.1.0's sandbox output (quickjs-wasi) for the same scripts.
+    # Expectations are pi 1.1.0's sandbox output (quickjs-wasi) for the same scripts; they held for the V8 shims
+    # misaka had before it ran quickjs-wasi itself.
     sandbox = CodemodeSandbox({})
     try:
         result = await sandbox.execute(code)
@@ -997,7 +987,11 @@ async def test_output_made_before_running_out_of_memory_is_kept(sandboxes):
     sandbox = CodemodeSandbox({"timeoutMs": 20_000, "memoryLimitBytes": 64 * 1024 * 1024})
     sandboxes.append(sandbox)
     result = await sandbox.execute("text('before'); const a = []; while (true) a.push(new Array(100000).fill(1));")
-    assertMatches(result, {"ok": False, "error": {"kind": "sandbox", "message": "out of memory"}, "output": [{"type": "text", "text": "before"}]})
+    assertMatches(result, {
+        "ok": False,
+        "error": {"kind": "script", "name": "InternalError", "message": "out of memory"},
+        "output": [{"type": "text", "text": "before"}],
+    })
 
 
 async def test_a_tool_that_aborts_the_execution_records_its_call_as_cancelled(sandboxes):
@@ -1024,5 +1018,59 @@ async def test_a_script_spinning_after_it_reported_done_past_an_await_is_stopped
     result = await createSandbox(sandboxes, [echo], timeoutMs=30_000).execute(
         "await tools.echo(1); try { exit(); } catch {} for (;;) {}"
     )
-    assertMatches(result, {"ok": False, "error": {"kind": "sandbox", "message": "the script kept running after it finished"}})
+    assertMatches(result, {"ok": True, "calls": [{"name": "echo", "status": "ok"}]})
     assert time.monotonic() - started < 5
+
+
+# -- the QuickJS wasm on wasmtime (MISAKA) -------------------------------------------------------
+
+
+@pytest.mark.parametrize("recursion", [
+    "function dive() { dive(); } dive();",
+    "function dive() { [1].map(dive); } dive();",
+    "const o = { get x() { return this.x; } }; o.x;",
+    "const p = new Proxy({}, { get(target, key, receiver) { return receiver[key]; } }); p.a;",
+    "const o = { toString() { return String(o); } }; String(o);",
+    "class A { constructor() { new B(); } } class B extends A { constructor() { super(); } } new B();",
+])
+async def test_recursion_through_native_functions_is_a_catchable_range_error(sandboxes, recursion):
+    # The wasm stack (quickjs_wasi.MAX_WASM_STACK) outlasts QuickJS's own guard in each of these; with wasmtime's
+    # default 512 KiB all but the first trapped.
+    result = await createSandbox(sandboxes).execute(f"try {{ {recursion} }} catch (error) {{ return error.name; }}")
+    assertMatches(result, {"ok": True, "value": "RangeError"})
+
+
+async def test_exhausting_the_wasm_stack_fails_the_run_and_leaves_the_sandbox_working(sandboxes):
+    # Parsing nests deeper than any guard: the wasm traps, which ends the run as a sandbox failure.
+    sandbox = createSandbox(sandboxes)
+    result = await sandbox.execute("return JSON.parse('['.repeat(200000) + ']'.repeat(200000)).length")
+    assertMatches(result, {"ok": False, "error": {"kind": "sandbox"}})
+    assert "call stack exhausted" in result["error"]["message"]
+    assertMatches(await sandbox.execute("return 1"), {"ok": True, "value": 1})
+
+
+async def test_calls_into_wasm_take_the_unchecked_path():
+    # `Func.__call__` is about nine times slower; a wasmtime-py that moved its C API bindings would fall back to it
+    # silently, so this pins that the fast path is in use.
+    vm = quickjs_wasi.QuickJS.create(wasm=await loadQuickJSWasm())
+    assert isinstance(vm._e.qjs_eval, quickjs_wasi._UncheckedCall)
+    assert vm.evalCode("[1, 2, 3].map((x) => x * 2).join()").toString() == "2,4,6"
+
+
+async def test_a_finished_run_releases_its_vm(sandboxes, monkeypatch):
+    # A VM's wasm memory is invisible to the garbage collector, which would leave a large one to wait for a cycle
+    # collection; the worker disposes it when it ends.
+    disposed = []
+    dispose = quickjs_wasi.QuickJS.dispose
+    monkeypatch.setattr(quickjs_wasi.QuickJS, "dispose", lambda vm: (disposed.append(vm), dispose(vm))[1])
+    assertMatches(await createSandbox(sandboxes).execute("return 1"), {"ok": True, "value": 1})
+    assert len(disposed) == 1 and disposed[0].disposed
+
+
+async def test_strings_cross_into_and_out_of_the_vm_intact():
+    vm = quickjs_wasi.QuickJS.create(wasm=await loadQuickJSWasm())
+    seen = []
+    echo_ = vm.newFunction("echo", lambda value: (seen.append(value.toString()), vm.undefined)[1])
+    text = "h\u00e9llo \ud800 \U0001f600 \x00 end"
+    vm.callFunction(vm.evalCode("(echo, text) => echo(text)"), vm.undefined, echo_, vm.newString(text))
+    assert seen == [text]

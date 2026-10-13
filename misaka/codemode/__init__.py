@@ -1,8 +1,7 @@
 """pi's ``packages/codemode``: a sandbox that runs model-written JavaScript against the session's
 tools, and the TypeScript declarations scripts are shown.
 
-Translated from pi's ``packages/codemode/src/index.ts``. MISAKA fork: no ``loadQuickJSWasm`` and no
-``CodemodeWasmModule``; the engine is V8 through ``mini-racer`` (``runtime/engine.py``).
+Translated from pi's ``packages/codemode/src/index.ts``.
 """
 
 from misaka.codemode.declarations import (
@@ -46,6 +45,7 @@ from misaka.codemode.types import (
     CodemodeTool,
     CodemodeToolContext,
 )
+from misaka.codemode.wasm import CodemodeWasmModule, loadQuickJSWasm
 
 __all__ = [
     "CODEMODE_OPTIONS_PREFIX",
@@ -71,8 +71,10 @@ __all__ = [
     "CodemodeStoreWrites",
     "CodemodeTool",
     "CodemodeToolContext",
+    "CodemodeWasmModule",
     "ParsedCodemodeSource",
     "RenderDeclarationsOptions",
+    "loadQuickJSWasm",
     "mcpStructuredContentSchema",
     "parseCodemodeSource",
     "renderDeclarations",

@@ -4,7 +4,7 @@ The `codemode` tool lets the model write a JavaScript script that calls MISAKA's
 
 ## Scripts
 
-The tool input is raw JavaScript source, not JSON and not a markdown code fence. It runs as the body of an async function in a V8 sandbox, so top-level `await` and `return` work. The sandbox has no Node APIs, file system, network, or timers; scripts reach the outside world only through tools and `models`.
+The tool input is raw JavaScript source, not JSON and not a markdown code fence. It runs as the body of an async function in a QuickJS sandbox, so top-level `await` and `return` work. The sandbox has no Node APIs, file system, network, or timers; scripts reach the outside world only through tools and `models`.
 
 A script may start with an options line:
 
@@ -223,6 +223,6 @@ for (const block of result.output) {
 
 ## Limits
 
-- A script's VM has 256 MB of memory. Running out ends the script with `Script sandbox failed: out of memory`; filter or aggregate large data instead of accumulating it.
+- A script's VM has 256 MB of memory. Running out throws `InternalError: out of memory`; filter or aggregate large data instead of accumulating it.
 - A script that waits on a promise that can never settle (no tool call pending) fails immediately, since there are no timers.
 - Scripts cannot start other `codemode` scripts.

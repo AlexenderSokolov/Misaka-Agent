@@ -163,10 +163,9 @@ codemodeToolSystemPromptContribution: _SystemPromptContribution = {
 # MISAKA fork: the file ships inside the package (pi reads it from its docs directory).
 CODEMODE_DOCS_PATH = str(Path(__file__).with_name("codemode.md"))
 
-# MISAKA fork: the sandbox is V8 (mini-racer, decision D12), where pi's is QuickJS.
 DESCRIPTION_INTRO = (
     "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async "
-    "function body in a V8 sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n"
+    "function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n"
     "- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and "
     "rejects with an Error on failure. Calls still running when the script ends are cancelled.\n"
     '- Optional first line: `// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}`'

@@ -1,266 +1,268 @@
-"""Drives one script inside a fresh VM, relays tool calls and output to the host, and reports the
-result. The host terminates the worker when the script settles, times out, or is aborted.
+"""Worker thread entry. One worker runs one script inside a fresh QuickJS VM (a separate wasm instance), relays tool
+calls and output to the host, and reports the result. The host terminates the worker when the script settles, times
+out, or is aborted; the worker exists so that a spinning script never blocks the host thread.
 
 Translated from pi's ``packages/codemode/src/runtime/worker.ts``.
 
-MISAKA fork: upstream's worker is a thread with its own message port and a QuickJS instance whose
-``bridge`` host function posts to the main thread as the script runs. Here the worker is a task on
-the host's event loop that owns a V8 isolate (``engine.py``). The prelude's ``bridge`` queues
-``[kind, a, b, c]`` tuples inside the VM, and the worker takes the queue after every call into the
-VM, so no callback ever runs while the script is spinning and every call stays cancellable. Messages
-keep the order the script produced them, as with the port. A "done" also notifies the worker, which
-then ends the run at once, as upstream's host terminates the worker when the script reports done,
-even if the script keeps spinning (for example in a loop that catches the output limit's error). Code
-after an ``await`` runs outside any evaluation and cannot be stopped that way; a script that spins
-there after reporting done ends as a sandbox failure (see ``_onDone``).
-
-The bridge and the prelude's API live in the closure of a host object under a non-enumerable
-global, which the worker's own evaluations call. The object is reachable from scripts, as every
-global is, and the prelude freezes it with the other built-ins; what it offers a script is only
-what the script could do anyway: answer its own calls, or end itself.
+MISAKA fork: Python has no ``worker_threads``. ``Worker`` stands in for Node's: it runs ``main`` on a thread of its
+own, delivers what the thread posts to the host's event loop as "message", "error" and "exit" events, and queues the
+host's messages for the thread, which handles them once ``main`` has returned, as a worker's event loop does. wasm runs
+without the GIL, so a spinning script leaves the event loop free. ``terminate()`` cannot stop a thread: the host sets
+the interrupt flag first (upstream does too, for Bun), and the thread then ends.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import queue
+import threading
 from collections.abc import Callable
 from typing import Any
 
-from misaka.utils.js import jsonParse, jsonStringify, toWellFormed
+from misaka.utils.js import jsonStringify, jsTrimEnd
 
+from ..quickjs_wasi import MAX_STACK_SIZE, JSException, JSValueHandle, Memory, QuickJS
 from ..types import CodemodeOutputItem
-from . import engine
 from .prelude_source import PRELUDE_SOURCE
-from .protocol import (
-    HostToWorkerMessage,
-    WorkerData,
-    WorkerToHostMessage,
-    isHostToWorkerMessage,
-)
+from .protocol import WorkerData, WorkerToHostMessage, isHostToWorkerMessage
 
-HOST = "__misaka_codemode__"
+# Stack of a worker thread: the wasm stack limit (`quickjs_wasi.MAX_WASM_STACK`) and the host frames below and above
+# it (host callbacks run on top of wasm frames). Node's workers default to 4 MB as well.
+WORKER_STACK_BYTES = 4 * 1024 * 1024
 
-_HOST_SOURCE = f"""((notify) => {{
-  const queue = [];
-  let api;
-  let fn;
-  let installed = false;
-  let ran = false;
-  const bridge = (kind, a, b, c) => {{
-    queue.push([kind, a, b, c]);
-    if (kind === "done") notify();
-  }};
-  const host = {{
-    take() {{
-      return JSON.stringify(queue.splice(0));
-    }},
-    install(prelude, toolsJson, globalsJson, storeJson) {{
-      if (installed) return;
-      installed = true;
-      api = prelude(bridge, toolsJson, globalsJson, storeJson);
-    }},
-    compile(script) {{
-      fn = script;
-    }},
-    run() {{
-      if (ran) return;
-      ran = true;
-      return api.run(fn);
-    }},
-    settle(id, ok, payload) {{
-      return api.settle(id, ok, payload);
-    }},
-    stalled() {{
-      return api.stalled();
-    }},
-  }};
-  Object.defineProperty(globalThis, "{HOST}", {{ value: host, enumerable: false, writable: false, configurable: false }});
-}})"""
+_stackLock = threading.Lock()
+_TERMINATE = object()
 
 
-# How long `terminate()` waits for the output a stopped script left in its queue. Short: upstream's host has the
-# output already and resolves at once; an isolate still running code after an `await` never answers.
-_QUEUED_OUTPUT_TIMEOUT_SECONDS = 0.25
-# How long a script that reported done may keep the isolate busy before the run is stopped (see `_onDone`).
-_DONE_GRACE_SECONDS = 0.25
+class _ParentPort:
+    """``parentPort`` inside the worker thread."""
+
+    def __init__(self, worker: Worker) -> None:
+        self._worker = worker
+        self.listener: Callable[[Any], None] | None = None
+        # The worker's VM, which the thread disposes when it ends; upstream's ends with its worker.
+        self.vm: QuickJS | None = None
+
+    def postMessage(self, message: WorkerToHostMessage) -> None:
+        self._worker._emit("message", message)
+
+    def on(self, _event: str, listener: Callable[[Any], None]) -> None:
+        self.listener = listener
 
 
-def _hostCode(expression: str) -> str:
-    # Named like the prelude, so its frames leave the script's stacks with the prelude's.
-    return f"{expression}\n//# sourceURL={engine.PRELUDE_FILE_NAME}"
+def _errorText(error: BaseException) -> str:
+    """``${error.name}: ${error.message}``. A wasm trap's text is its cause; the backtrace above it is wasmtime's."""
+    name = error.name if isinstance(error, JSException) else type(error).__name__
+    lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+    return f"{name}: {lines[-1] if lines else ''}"
 
 
-def _outputItem(kind: Any, data: Any, mimeType: Any) -> CodemodeOutputItem:
-    if kind == "image":
-        return {"type": "image", "data": str(data), "mimeType": str(mimeType)}
-    if kind == "console":
-        return {"type": "text", "text": str(data), "console": True}
-    return {"type": "text", "text": str(data)}
+def crash(parentPort: _ParentPort, error: BaseException) -> None:
+    parentPort.postMessage({"type": "crash", "message": _errorText(error)})
+
+
+def discardOutput(memory: Memory) -> dict[str, Callable[..., int]]:
+    """QuickJS writes engine diagnostics to fd 1 and 2, which the default shim forwards to the host's stdout and
+    stderr. That output belongs to the host application (for example a TUI), so it is discarded. Reporting every byte
+    as written keeps libc from retrying."""
+
+    def fd_write(_fd: int, iovsPtr: int, iovsLen: int, nwrittenPtr: int) -> int:
+        written = 0
+        for i in range(iovsLen):
+            written += memory.getUint32(iovsPtr + i * 8 + 4)
+        memory.setUint32(nwrittenPtr, written)
+        return 0
+
+    return {"fd_write": fd_write}
+
+
+def describeException(error: JSException) -> str:
+    head = f"{error.name}: {error.message}" if error.message else error.name
+    stack = jsTrimEnd(error.stack) if error.stack is not None else None
+    return jsonStringify({"name": error.name, "message": error.message, "stack": f"{head}\n{stack}" if stack else head})
+
+
+def main(data: WorkerData, parentPort: _ParentPort) -> None:
+    def post(message: WorkerToHostMessage) -> None:
+        parentPort.postMessage(message)
+
+    interrupt = data["interrupt"]
+    vm = QuickJS.create(
+        wasm=data["wasm"],
+        memoryLimit=data["memoryLimitBytes"],
+        # Without a guard, deep recursion overflows the wasm stack and traps instead of throwing a
+        # catchable RangeError.
+        maxStackSize=MAX_STACK_SIZE,
+        interruptHandler=interrupt.is_set,
+        wasi=discardOutput,
+    )
+    parentPort.vm = vm
+
+    # Called from the prelude with primitives only. A missing argument is `None` (`undefined` upstream).
+    # MISAKA fork: each argument is read out of the VM once; a read costs a few calls into wasm.
+    def bridgeCallback(kind: JSValueHandle, a: Any = None, b: Any = None, c: Any = None) -> JSValueHandle:
+        match kindText := kind.toString():
+            case "call" | "global":
+                post({
+                    "type": "call",
+                    "id": int(a.toNumber()),
+                    "target": "tool" if kindText == "call" else "global",
+                    "name": b.toString(),
+                    "args": None if c is None or c.isUndefined else c.toString(),
+                })
+            case "output":
+                match a.toString():
+                    case "image":
+                        item: CodemodeOutputItem = {"type": "image", "data": b.toString(), "mimeType": c.toString()}
+                    case "console":
+                        item = {"type": "text", "text": b.toString(), "console": True}
+                    case _:
+                        item = {"type": "text", "text": b.toString()}
+                post({"type": "output", "item": item})
+            case "done":
+                if a.toBoolean():
+                    post({
+                        "type": "done",
+                        "ok": True,
+                        "value": None if b is None or b.isUndefined else b.toString(),
+                        "writes": c.toString(),
+                    })
+                else:
+                    post({"type": "done", "ok": False, "error": b.toString()})
+        return vm.undefined
+
+    bridge = vm.newFunction("bridge", bridgeCallback)
+
+    # The VM lives until the host terminates the worker, so these handles are never disposed.
+    api = vm.withScope(
+        lambda scope: scope.escape(
+            vm.callFunction(
+                vm.evalCode(PRELUDE_SOURCE, "codemode-prelude.js"),
+                vm.undefined,
+                bridge,
+                vm.newString(jsonStringify(data["tools"])),
+                vm.newString(jsonStringify(data["globals"])),
+                vm.newString(jsonStringify(data["store"])),
+            )
+        )
+    )
+    settle = api.getProp("settle")
+    run = api.getProp("run")
+    stalled = api.getProp("stalled")
+
+    def drain() -> None:
+        """Run queued jobs, then fail a script that waits on nothing that can ever resume it."""
+        vm.executePendingJobs()
+        vm.callFunction(stalled, api).dispose()
+
+    def onMessage(message: Any) -> None:
+        if not isHostToWorkerMessage(message):
+            return
+        try:
+            vm.withScope(
+                lambda _scope: vm.callFunction(
+                    settle,
+                    api,
+                    vm.newNumber(message["id"]),
+                    vm.true if message["ok"] else vm.false,
+                    vm.undefined if message["payload"] is None else vm.newString(message["payload"]),
+                )
+            )
+            drain()
+        except Exception as error:  # noqa: BLE001 - upstream `catch (error) { crash(error) }`
+            crash(parentPort, error)
+
+    parentPort.on("message", onMessage)
+
+    # The prefix shares the first line with the script so reported line numbers
+    # match the script as written.
+    try:
+        fn = vm.evalCode(f"(async (tools, console) => {{{data['code']}\n}})", "codemode.js")
+    except JSException as error:
+        post({"type": "done", "ok": False, "error": describeException(error)})
+        return
+    vm.callFunction(run, api, fn).dispose()
+    fn.dispose()
+    drain()
 
 
 class Worker:
-    def __init__(self, data: WorkerData, post: Callable[[WorkerToHostMessage], None]) -> None:
-        self._data = data
-        self._post = post
-        self._inbox: asyncio.Queue[HostToWorkerMessage] = asyncio.Queue()
-        self._vm: engine.Vm | None = None
-        self._task: asyncio.Task[None] | None = None
-        # The evaluation that may run script code, which a "done" ends.
-        self._running: asyncio.Future[Any] | None = None
-        self._doneRelayed = False
+    """Node's ``worker_threads.Worker`` running ``main`` with ``workerData``. Construct it on the event loop; listeners
+    added with ``on()`` right after construction see every event."""
 
-    def start(self) -> None:
-        self._task = asyncio.get_running_loop().create_task(self._main())
+    def __init__(self, workerData: WorkerData) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._listeners: dict[str, list[Callable[[Any], None]]] = {}
+        self._inbox: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._outbox: list[tuple[str, Any]] = []
+        self._outboxLock = threading.Lock()
+        self._flushScheduled = False
+        self._exited: asyncio.Future[int] = self._loop.create_future()
+        self._thread = threading.Thread(target=self._run, args=(workerData,), name="codemode-worker", daemon=True)
+        # `threading.stack_size()` applies to every thread started after it, so it is set only around this start.
+        with _stackLock:
+            previous = threading.stack_size()
+            try:
+                threading.stack_size(max(previous, WORKER_STACK_BYTES))
+            except (ValueError, RuntimeError):  # a platform that cannot size thread stacks keeps its default
+                previous = None
+            try:
+                self._thread.start()
+            finally:
+                if previous is not None:
+                    threading.stack_size(previous)
 
-    def post(self, message: HostToWorkerMessage) -> None:
-        self._inbox.put_nowait(message)
+    def on(self, event: str, listener: Callable[[Any], None]) -> None:
+        self._listeners.setdefault(event, []).append(listener)
 
-    async def terminate(self) -> list[CodemodeOutputItem]:
-        """Stop the script wherever it is and release the isolate. Answers the output the script produced
-        since the queue was last relayed, which the host keeps when it ends a run (a timeout or an
-        abort); upstream's bridge posts each item as the script makes it."""
-        task = self._task
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        output: list[CodemodeOutputItem] = []
-        vm = self._vm
-        if vm is not None:
-            # Bounded, as a script that keeps the microtask queue busy would otherwise hold this call.
-            with contextlib.suppress(Exception):
-                output = await asyncio.wait_for(self._queuedOutput(vm), _QUEUED_OUTPUT_TIMEOUT_SECONDS)
-            vm.close()
-            self._vm = None
-        return output
+    def postMessage(self, message: Any) -> None:
+        self._inbox.put(message)
 
-    async def _queuedOutput(self, vm: engine.Vm) -> list[CodemodeOutputItem]:
-        queued = jsonParse(await vm.run(_hostCode(f"{HOST}.take()")))
-        return [_outputItem(a, b, c) for kind, a, b, c in queued if kind == "output"]
+    async def terminate(self) -> int:
+        """Ends the worker once it is idle; resolves with its exit code. The host sets the interrupt flag first."""
+        self._inbox.put(_TERMINATE)
+        return await asyncio.shield(self._exited)
 
-    def _crash(self, error: BaseException) -> None:
-        self._post({"type": "crash", "message": f"{type(error).__name__}: {error}"})
+    def _emit(self, event: str, payload: Any) -> None:
+        """From the worker thread: deliver ``event`` on the host's event loop. Events queue in order and the loop
+        takes them in batches, woken once per batch rather than once per event."""
+        with self._outboxLock:
+            self._outbox.append((event, payload))
+            if self._flushScheduled:
+                return
+            self._flushScheduled = True
+        with contextlib.suppress(RuntimeError):  # the loop is closed: nobody is listening any more
+            self._loop.call_soon_threadsafe(self._flush)
 
-    async def _main(self) -> None:
+    def _flush(self) -> None:
+        with self._outboxLock:
+            events, self._outbox = self._outbox, []
+            self._flushScheduled = False
+        for event, payload in events:
+            if event == "exit" and not self._exited.done():
+                self._exited.set_result(payload)
+            for listener in list(self._listeners.get(event, ())):
+                listener(payload)
+
+    def _run(self, workerData: WorkerData) -> None:
+        parentPort = _ParentPort(self)
         try:
-            await self._run()
-        except asyncio.CancelledError:
-            raise
-        except engine.OutOfMemoryError:
-            vm = self._vm
-            if vm is not None:
-                with contextlib.suppress(Exception):
-                    for item in await asyncio.wait_for(self._queuedOutput(vm), _QUEUED_OUTPUT_TIMEOUT_SECONDS):
-                        self._post({"type": "output", "item": item})
-            self._post({"type": "crash", "message": "out of memory"})
-        except Exception as error:  # noqa: BLE001 - upstream `main(workerData).catch(crash)`
-            self._crash(error)
-
-    def _onDone(self) -> None:
-        """The prelude reported the script done; a script still spinning is stopped here."""
-        if self._running is not None:
-            self._running.cancel()
-            return
-        # MISAKA fork: code after an `await` runs once the evaluation that resumed it has returned, outside any
-        # evaluation, and V8 stops it only with the isolate. A done that is not relayed shortly means the script
-        # keeps spinning past it (upstream's host terminates the worker then); the run ends as a sandbox failure,
-        # since what it reported is still in the busy isolate.
-        asyncio.get_running_loop().call_later(_DONE_GRACE_SECONDS, self._stopSpinning)
-
-    def _stopSpinning(self) -> None:
-        if not self._doneRelayed:
-            self._post({"type": "crash", "message": "the script kept running after it finished"})
-
-    async def _runScript(self, vm: engine.Vm, code: str, fileName: str | None = None) -> None:
-        """Run an evaluation that may run script code. A "done" cancels it, which terminates the script
-        wherever it is; the worker then relays the queue as after any call."""
-        running = self._running = asyncio.ensure_future(vm.run(code, fileName))
-        try:
-            await running
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if not running.cancelled() or (current is not None and current.cancelling() > 0):
-                raise
+            try:
+                main(workerData, parentPort)
+            except Exception as error:  # noqa: BLE001 - upstream `main(workerData).catch(crash)`
+                crash(parentPort, error)
+            while (message := self._inbox.get()) is not _TERMINATE:
+                if parentPort.listener is not None:
+                    parentPort.listener(message)
+        except Exception as error:  # noqa: BLE001 - the worker's "error" event
+            self._emit("error", error)
         finally:
-            self._running = None
-
-    async def _run(self) -> None:
-        data = self._data
-        vm = self._vm = engine.Vm(data["memoryLimitBytes"])
-        with vm.notifier(self._onDone) as notify:
-            vm.evaluate(_HOST_SOURCE, engine.PRELUDE_FILE_NAME)(notify)
-            await self._runVm(vm)
-
-    async def _runVm(self, vm: engine.Vm) -> None:
-        data = self._data
-        # The prelude receives the bridge and builds the script's globals; it runs no script code.
-        await vm.run(
-            f"{HOST}.install(({PRELUDE_SOURCE}), {jsonStringify(jsonStringify(data['tools']))}, "
-            f"{jsonStringify(jsonStringify(data['globals']))}, {jsonStringify(jsonStringify(data['store']))})"
-            f"\n//# sourceURL={engine.PRELUDE_FILE_NAME}"
-        )
-
-        async def pump() -> None:
-            for kind, a, b, c in jsonParse(await vm.run(_hostCode(f"{HOST}.take()"))):
-                self._bridge(kind, a, b, c)
-
-        async def drain() -> None:
-            """Relay what the script produced, then fail a script that waits on nothing that can ever
-            resume it."""
-            await pump()
-            # A script V8 terminated for memory waits on nothing either; report what ended it.
-            vm.assertWithinMemory()
-            await vm.run(_hostCode(f"{HOST}.stalled()"))
-            await pump()
-
-        # The prefix shares the first line with the script so reported line numbers match the script
-        # as written. Passed as an argument, so V8 does not name the function after a property.
-        # MISAKA fork: compiled through `vm.run`, as a script can close the wrapper and run code at the
-        # top level of this evaluation, which must stay cancellable; a lone surrogate in the code
-        # becomes U+FFFD, as upstream's UTF-8 encoding of the code does.
-        try:
-            await self._runScript(
-                vm,
-                f"{HOST}.compile(async (tools, console) => {{{toWellFormed(data['code'])}\n}})",
-                engine.SCRIPT_FILE_NAME,
-            )
-        except engine.ScriptSyntaxError as error:
-            self._post({"type": "done", "ok": False, "error": jsonStringify(error.describe())})
-            return
-        await self._runScript(vm, _hostCode(f"{HOST}.run()"))
-        await drain()
-
-        while True:
-            message = await self._inbox.get()
-            if not isHostToWorkerMessage(message):
-                continue
-            payload = message["payload"]
-            await self._runScript(vm, _hostCode(
-                f"{HOST}.settle({jsonStringify(message['id'])}, {'true' if message['ok'] else 'false'}, "
-                f"{'undefined' if payload is None else jsonStringify(payload)})"
-            ))
-            await drain()
-
-    def _bridge(self, kind: str, a: Any, b: Any, c: Any) -> None:
-        """One queued ``bridge(kind, a, b, c)`` call; `null` stands for `undefined`."""
-        match kind:
-            case "call" | "global":
-                self._post({
-                    "type": "call",
-                    "id": int(a),
-                    "target": "tool" if kind == "call" else "global",
-                    "name": str(b),
-                    "args": None if c is None else str(c),
-                })
-            case "output":
-                self._post({"type": "output", "item": _outputItem(a, b, c)})
-            case "done":
-                self._doneRelayed = True
-                if a:
-                    self._post({"type": "done", "ok": True, "value": None if b is None else str(b), "writes": str(c)})
-                else:
-                    self._post({"type": "done", "ok": False, "error": str(b)})
+            parentPort.listener = None
+            if parentPort.vm is not None:
+                parentPort.vm.dispose()
+            # A terminated worker exits with code 1, as Node's does.
+            self._emit("exit", 1)
 
 
-__all__ = ["HOST", "Worker"]
+__all__ = ["WORKER_STACK_BYTES", "Worker", "describeException", "discardOutput", "main"]

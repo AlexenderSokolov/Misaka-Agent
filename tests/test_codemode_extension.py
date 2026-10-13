@@ -338,12 +338,18 @@ async def test_applies_the_timeout_ms_option_and_rejects_invalid_options(tmp_pat
         assert invalid.content == [TextContent(text="@options only supports `max_output_tokens` and `timeout_ms`; got `yield`")]
 
 
-async def test_limits_script_memory_so_runaway_allocations_end_the_script(tmp_path):
-    # MISAKA fork: V8 terminates the script instead of throwing `out of memory` inside it.
+async def test_limits_script_memory_so_runaway_allocations_fail_inside_the_script(tmp_path):
     async with session_with(tmp_path, [createCodemodeExtension()], settings={"defaultTools": ["codemode"]}) as session:
-        result = await run(session, '// @options: {"timeout_ms": 30000}\nlet a = [];\nwhile (true) a.push("x".repeat(1 << 20) + a.length);')
-        assert result.isError is True
-        assert "Script sandbox failed: out of memory" in resultText(result)
+        result = await run(
+            session,
+            '// @options: {"timeout_ms": 30000}\nlet a = [];\ntry { while (true) a.push("x".repeat(1 << 20) + a.length); }'
+            " catch (error) { const n = a.length; a = null; return { n, error: String(error) }; }",
+        )
+        assert result.isError is False
+        outcome = json.loads(resultText(result))
+        assert "out of memory" in outcome["error"]
+        # Each entry holds at least 1 MiB, so the limit stops the script well before wasm32's 4 GiB.
+        assert outcome["n"] < 512
 
 
 async def test_truncates_output_to_the_token_budget_and_spills_the_full_text(tmp_path):
