@@ -7,6 +7,8 @@ import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from misaka.config import profiles
+from misaka.core.network.card_contract import Finding
+from misaka.core.platform import owners
 from misaka.core.platform import tasks as task_store
 from misaka.core.platform.prompt_guard import untrusted
 from misaka.core.platform.session import run_coro, run_session
@@ -290,17 +292,12 @@ def card_extras(con, task, cfg=None, *, include_materials=True):
     never through the task body. Restore paths can skip materials they will not publish,
     avoiding unrelated filesystem reads.
     """
-    extras = {"_research": None, "_materials": "", "_session_overrides": {}}
-    with contextlib.suppress(Exception):   # a board without the research schema is an ordinary board
-        if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_cards'").fetchone():
-            row = con.execute("SELECT run_id, branch_id, kind FROM research_cards WHERE task_id=?",
-                              (task["id"],)).fetchone()
-            if row is not None:
-                extras["_research"] = dict(row)
-                from misaka.core.research import runs
-
-                # The run's own compaction threshold and output limit, when it chose them.
-                extras["_session_overrides"] = runs.session_overrides(runs.get(con, row["run_id"]))
+    extras = {"_research": None, "_owner": None, "_materials": "", "_session_overrides": {}}
+    with contextlib.suppress(Exception):   # a board a workflow has never touched is an ordinary board
+        owner, context = owners.card(con, task["id"])
+        if owner is not None:
+            extras["_research"], extras["_owner"] = context, owner.name
+            extras["_session_overrides"] = owner.session_overrides(con, context)
     if include_materials:
         extras["_materials"] = materials_on_hand(task["workspace"])
     return extras
@@ -494,7 +491,6 @@ def build_submission(con, task, summary):
 
     # Notes append material. Only critique issues are a complete snapshot (below).
     # Never let an uncertainty-only note erase the findings recorded earlier.
-    from misaka.core.research.ledger import Finding
     findings, uncertain = [], []
     for event in con.execute(
         "SELECT payload FROM events WHERE task_id=? AND kind='research_evidence' "
@@ -516,26 +512,9 @@ def build_submission(con, task, summary):
         "uncertain": uncertain,
         "findings": findings,
     }
-    # Typed tool data, frozen with the card's completion. Never reopen a model-written JSON file.
-    critique = attempt_payload(con, task, "research_critique")
-    if critique is not None:
-        submission["issues"] = critique["issues"]
-    divergence = attempt_payload(con, task, "research_divergence")
-    if divergence is not None:
-        submission["alternatives"] = divergence["alternatives"]
-    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_cards'").fetchone():
-        link = con.execute("SELECT kind FROM research_cards WHERE task_id=?", (task["id"],)).fetchone()
-        from misaka.core.research import runs
-        if link and link["kind"] in runs.CRITIQUE_KINDS and "issues" not in submission:
-            raise IncompleteSubmission(
-                "Record the red-team issues with misaka_card_note before completing the card "
-                "(issues=[] if none)."
-            )
-        if link and link["kind"] == "divergence" and "alternatives" not in submission:
-            raise IncompleteSubmission(
-                "Record the alternatives with misaka_card_note before completing the card "
-                "(alternatives=[] if none)."
-            )
+    owner, context = owners.card(con, task["id"])
+    if owner is not None:
+        owner.submission(con, task, context, submission, lambda kind: attempt_payload(con, task, kind))
     return submission
 
 

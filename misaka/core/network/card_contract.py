@@ -1,5 +1,22 @@
-"""The filename part of a card contract, separate from its prose requirements."""
+"""What a card contract holds besides its prose: its deliverable's filename, and the findings a card
+declares as it works."""
 import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class Finding(BaseModel):
+    """One finding a card declares (``misaka_card_note``): what it found, what kind of claim that is,
+    and where it comes from."""
+
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1)
+    claim_type: Literal["fact", "inference", "interpretation", "normative"] = "fact"
+    quote: str = ""
+    source_file: str | None = Field(None, description="Source path or locator, if applicable.")
+    doc_id: str | None = None
+    page: int | None = Field(None, ge=1, strict=True)
 
 
 def split_deliverable(value):

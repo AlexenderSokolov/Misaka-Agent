@@ -22,7 +22,7 @@ from misaka.core.network.sister_runtime import SisterRuntime
 from misaka.core.platform import budget, toolkit
 from misaka.core.platform import tasks as db
 from misaka.core.platform.prompt_guard import untrusted
-from misaka.core.research.tool_policy import DRIVER_OWNED_TOOLS
+from misaka.core.platform.vocabulary import DRIVER_OWNED_TOOLS
 from misaka.core.wiring import ToolCollector
 
 _CON = None
@@ -155,20 +155,17 @@ def _require_project_tasks(ctx, args):
 
 
 def _require_ordinary_tasks(task_ids):
-    """A normal Board entry point must not take over cards owned by a research run."""
+    """A normal Board entry point must not take over cards a workflow (research) drives: their
+    owner refuses (``platform.owners``)."""
     if not task_ids:
         return
-    from misaka.core.research import runs
+    from misaka.core.platform import owners
 
-    contexts = runs.task_contexts(_con())
+    con = _con()
     for task_id in task_ids:
-        context = contexts.get(task_id)
-        if context:
-            raise ValueError(
-                f"Card {task_id} belongs to research run {context['run_id']}; its driver owns "
-                "assignment, dependencies and review. Use the current research phase tools, "
-                f"or ask the user to run /research resume {context['run_id']} for a paused run."
-            )
+        owner, context = owners.card(con, task_id)
+        if owner is not None:
+            owner.guard(con, task_id, context)
 
 
 def _register(harn, name, label, description, parameters, snippet=None, guidelines=None):

@@ -632,6 +632,20 @@ def task_contexts(con):
     return contexts
 
 
+def task_context(con, task_id):
+    """One card's entry of ``task_contexts``, or None for a card outside every run."""
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_runs'").fetchone():
+        return None
+    init(con)
+    row = con.execute(
+        "SELECT c.task_id,c.run_id,c.branch_id AS node_id,c.kind,c.round,r.workspace,r.origin_session "
+        "FROM research_cards c JOIN research_runs r ON r.id=c.run_id WHERE c.task_id=?", (task_id,)).fetchone()
+    found = graph.snapshot(con, row["run_id"]).node(row["node_id"]) if row else None
+    if found is None:
+        return None
+    return {**dict(row), "depth": found.attrs["depth"], "node_question": found.attrs["question"]}
+
+
 def project_name(run):
     """Display name of the run's project: the workspace folder's basename."""
     return os.path.basename(run["workspace"].rstrip(os.sep)) or run["workspace"]

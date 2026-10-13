@@ -462,8 +462,10 @@ def _first_prompt(task, *, loaded, say, earlier):
     contract = worker.card_prompt(task)
     if task.get("_research"):
         # A Sister has this in her system prompt; ACP has none, so it opens the conversation.
-        from misaka.core.research.planner import RESEARCH_SISTER_DISCIPLINE
-        contract = RESEARCH_SISTER_DISCIPLINE + "\n" + contract
+        from misaka.core.platform import owners
+        owner = owners.named(task.get("_owner"))
+        if owner is not None:
+            contract = owner.card_discipline(task["_research"]) + "\n" + contract
     if earlier:
         contract = EARLIER.format(path=earlier) + "\n\n" + contract
     return contract + (f"\n\n## Message\n{say}" if say is not None else "")

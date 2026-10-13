@@ -181,7 +181,7 @@ class TodoPart:
     def __init__(self, task_id, sender):
         from typing import Literal
 
-        from pydantic import BaseModel, Field
+        from pydantic import BaseModel, Field, create_model
 
         from misaka.config import CFG
         from misaka.core.extensions.types import ToolDefinition
@@ -270,11 +270,10 @@ class TodoPart:
                 lines += ["log:", *(f"  {line}" for line in log[-20:])]
             return _text("\n".join(lines))
 
-        from misaka.core.research import runs
-        from misaka.core.research.commands import Alternative, Issue
-        from misaka.core.research.ledger import Finding
+        from misaka.core.network.card_contract import Finding
+        from misaka.core.platform import owners
 
-        class NoteParams(BaseModel):
+        class BaseNoteParams(BaseModel):
             # A field the tool does not know is refused, never dropped: findings sent flat beside
             # `text` were ignored and every declaration of a run was lost (2026-09-27).
             model_config = {"extra": "forbid"}
@@ -283,12 +282,13 @@ class TodoPart:
                 "Findings, each with its own text, claim_type and source. Append declarations; corrections do "
                 "not erase earlier notes."))
             uncertain: list[str] = Field(default_factory=list, description="Concrete uncertainties, one per item.")
-            issues: list[Issue] | None = Field(
-                None, description="Red-team cards: complete issue list for your node Last Order; [] means no issues."
-            )
-            alternatives: list[Alternative] | None = Field(
-                None, description="Divergence-review cards: the complete list of alternatives; [] means none."
-            )
+
+        # The fields of the workflows that own cards (a red team's issues, a divergence review's
+        # alternatives), each answered by the owner that declared it.
+        owned_fields = {name: (owner, spec) for owner in owners.registered()
+                        for name, spec in owner.note_fields().items()}
+        NoteParams = create_model("NoteParams", __base__=BaseNoteParams,
+                                  **{name: spec for name, (_owner, spec) in owned_fields.items()})
 
         async def note_exec(tool_call_id, raw, signal, on_update, ctx):
             from misaka.core.platform import cards
@@ -299,31 +299,20 @@ class TodoPart:
                 "findings": [item.model_dump(exclude_none=True) for item in p.findings],
                 "uncertain": [item.strip() for item in p.uncertain if item.strip()],
             }
-            link = None
-            if (p.findings or p.issues is not None or p.alternatives is not None) and c.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_cards'"
-            ).fetchone():
-                link = c.execute("SELECT run_id,kind FROM research_cards WHERE task_id=?", (task_id,)).fetchone()
-            if p.issues is not None:
-                if not link or link["kind"] not in runs.CRITIQUE_KINDS:
-                    raise ValueError("Only this node's red-team card may record critique issues.")
+
+            def record(kind, payload):
                 generation, claim_lock = self._ownership()
-                if generation is None or not bdb.add_event(
-                    c, task_id, "research_critique",
-                    {"issues": [item.model_dump() for item in p.issues], "claim_lock": claim_lock},
-                    generation=generation, claim_lock=claim_lock,
-                ):
-                    raise ValueError("Card ownership changed before its review was recorded.")
-            if p.alternatives is not None:
-                if not link or link["kind"] != "divergence":
-                    raise ValueError("Only this node's divergence-review card may record alternatives.")
-                generation, claim_lock = self._ownership()
-                if generation is None or not bdb.add_event(
-                    c, task_id, "research_divergence",
-                    {"alternatives": [item.model_dump() for item in p.alternatives], "claim_lock": claim_lock},
-                    generation=generation, claim_lock=claim_lock,
-                ):
-                    raise ValueError("Card ownership changed before its alternatives were recorded.")
+                return generation is not None and bdb.add_event(
+                    c, task_id, kind, {**payload, "claim_lock": claim_lock},
+                    generation=generation, claim_lock=claim_lock)
+
+            given = {name: getattr(p, name) for name in owned_fields if getattr(p, name) is not None}
+            owner_records = []
+            if given:
+                card_owner, context = owners.card(c, task_id)
+                for owner in dict.fromkeys(owner for name, (owner, _spec) in owned_fields.items() if name in given):
+                    mine = {name: value for name, value in given.items() if owned_fields[name][0] is owner}
+                    owner_records += owner.note(c, task_id, context if card_owner is owner else None, mine, record)
             if {"findings", "uncertain"} & p.model_fields_set:
                 generation, claim_lock = self._ownership()
                 # A finished card whose session works on -- a Sister's question, a note from Last
@@ -344,8 +333,7 @@ class TodoPart:
             cards.append_log(row["workspace"], task_id, sender, p.text)
             recorded = [f"{len(evidence['findings'])} finding(s)" if evidence["findings"] else "",
                         f"{len(evidence['uncertain'])} uncertainty(ies)" if evidence["uncertain"] else "",
-                        f"{len(p.issues)} issue(s)" if p.issues is not None else "",
-                        f"{len(p.alternatives)} alternative(s)" if p.alternatives is not None else ""]
+                        *owner_records]
             recorded = ", ".join(item for item in recorded if item)
             return _text("Logged on the card" + (f"; recorded {recorded}." if recorded else "; nothing declared."))
 

@@ -367,7 +367,7 @@ HALTED_CARD = '''
 import asyncio
 from misaka.ai.compat import ApiProvider, completeSimple, getModel, registerApiProvider
 from misaka.ai.utils.event_stream import AssistantMessageEventStream
-from misaka.core.platform import metering
+from misaka.cli import bootstrap
 from misaka.utils import loop_watchdog
 
 def slow(model, context, options=None):
@@ -378,7 +378,7 @@ def slow(model, context, options=None):
     return out
 
 registerApiProvider(ApiProvider(api="slow-test", stream=slow, streamSimple=slow), sourceId="slow")
-metering.install()
+bootstrap.install(check_settings=False)   # metering, and research owning its cards, as in a real card
 loop_watchdog.configure("card-t_halted", exit_on_stall=True)
 model = getModel("anthropic", "claude-sonnet-4-5").model_copy(update={"api": "slow-test", "maxTokens": 32_000})
 asyncio.run(loop_watchdog.watched(completeSimple(model, {"messages": [{"role": "user", "content": "x" * 40_000, "timestamp": 0}]})))

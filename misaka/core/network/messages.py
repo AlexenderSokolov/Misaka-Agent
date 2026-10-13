@@ -211,25 +211,12 @@ def _idle_card_target(card):
 
 
 def _sender_node(board, *, sender_task, sender_session):
-    """``(run_id, node_id)`` of the research node the sender works on: her card's node, or the node
-    whose Last Order conversation she is; a run's window outside its nodes has no node, and a
-    sender outside any run has neither."""
-    if sender_task:
-        row = board.execute("SELECT run_id, branch_id FROM research_cards WHERE task_id=?",
-                            (sender_task,)).fetchone()
-        if row:
-            return row["run_id"], row["branch_id"]
-    if sender_session:
-        tail = f"%{sender_session}.jsonl"   # stored session files end in their session id
-        row = board.execute("SELECT run_id, id FROM research_execution WHERE session_file LIKE ?",
-                            (tail,)).fetchone()
-        if row:
-            return row["run_id"], row["id"]
-        row = board.execute("SELECT id FROM research_runs WHERE origin_session=? OR root_session LIKE ?",
-                            (sender_session, tail)).fetchone()
-        if row:
-            return row["id"], None
-    return None, None
+    """``(owner, scope, unit)`` the sender works in -- for research, the run and the node: her card's
+    node, or the node whose Last Order conversation she is; a run's window outside its nodes has no
+    node, and a sender outside any workflow has neither (``platform.owners``)."""
+    from misaka.core.platform import owners
+
+    return owners.sender_scope(board, sender_task, sender_session)
 
 
 def _node_last_order(*, sender_task, sender_session):
@@ -243,14 +230,13 @@ def _node_last_order(*, sender_task, sender_session):
         return None
     board = tasks.connect(_board_path())
     try:
-        _run, node = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
-        row = (board.execute("SELECT session_file FROM research_execution WHERE id=?", (node,)).fetchone()
-               if node else None)
+        owner, _run, node = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
+        session_file = owner.unit_session_file(board, node) if node else None
     except sqlite3.OperationalError:     # a board research has never touched has no such tables
         return None
     finally:
         board.close()
-    name = os.path.basename((row["session_file"] if row else None) or "")
+    name = os.path.basename(session_file or "")
     session_id = name[-len("00000000-0000-0000-0000-000000000000.jsonl"):-len(".jsonl")]
     if not SESSION_ID.match(session_id) or session_id == sender_session:
         return None
@@ -269,14 +255,17 @@ def _run_cards(role, *, sender_task, sender_session):
         return []
     board = tasks.connect(_board_path())
     try:
-        run, branch = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
+        owner, run, branch = _sender_node(board, sender_task=sender_task, sender_session=sender_session)
         if run is None:
             return []
-        query = ("SELECT t.id, t.status, t.title FROM research_cards l JOIN tasks t ON t.id=l.task_id "
-                 "WHERE l.run_id=? AND t.assignee=? AND t.id IS NOT ?")
-        rows = board.execute(query + " AND l.branch_id=? ORDER BY t.created_at",
-                             (run, role, sender_task, branch)).fetchall() if branch else []
-        return rows or board.execute(query + " ORDER BY t.created_at", (run, role, sender_task)).fetchall()
+        units = dict(owner.scope_cards(board, run))
+        ids = [task_id for task_id in units if task_id != sender_task]
+        if not ids:
+            return []
+        rows = board.execute(f"SELECT id, status, title FROM tasks WHERE assignee=? AND id IN ({','.join('?' * len(ids))}) "
+                             "ORDER BY created_at", (role, *ids)).fetchall()
+        mine = [row for row in rows if branch and units[row["id"]] == branch]
+        return mine or rows
     except sqlite3.OperationalError:     # a board research has never touched has no such tables
         return []
     finally:

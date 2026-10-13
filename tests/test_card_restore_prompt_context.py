@@ -9,8 +9,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from misaka.core.network import sister_runtime, worker
-from misaka.core.platform import cards
+from misaka.core.platform import cards, owners
 
+
+class _StubOwner(owners.CardOwner):
+    """A workflow that owns ``card-1``: the board passes its context through without knowing it."""
+
+    name = "stub"
+
+    def card(self, con, task_id):
+        return {"run_id": "run-1", "branch_id": "node-1", "kind": "investigation", "scope": "run-1"} if task_id == "card-1" else None
 
 class CardRestorePromptContextTests(unittest.TestCase):
     def test_restore_ignores_corrupt_markdown_and_keeps_research_relation(self):
@@ -19,8 +27,6 @@ class CardRestorePromptContextTests(unittest.TestCase):
             (root / "downloads").mkdir()
             (root / "downloads" / "broken.md").write_bytes(b"\xff")
             con.row_factory = sqlite3.Row
-            con.execute("CREATE TABLE research_cards(task_id TEXT, run_id TEXT, branch_id TEXT, kind TEXT)")
-            con.execute("INSERT INTO research_cards VALUES ('card-1','run-1','node-1','investigation')")
             row = {"id": "card-1", "workspace": directory, "generation": 1, "agent_id": "agent-1",
                    "session_file": "", "assignee": "10032", "claim_lock": None}
             runtime = SimpleNamespace(con=con, cfg={}, _handles={}, session=object(),
@@ -29,7 +35,8 @@ class CardRestorePromptContextTests(unittest.TestCase):
                 _session_dir=lambda _: None,
                 _find_task_async=AsyncMock(return_value=SimpleNamespace(transcript=root / "session.jsonl")),
             )
-            with patch.object(sister_runtime.db, "get", return_value=row), \
+            with patch.object(owners, "_OWNERS", [_StubOwner()]), \
+                    patch.object(sister_runtime.db, "get", return_value=row), \
                     patch.object(sister_runtime, "_SisterManager", return_value=manager) as factory, \
                     patch.object(worker, "materials_on_hand", wraps=worker.materials_on_hand) as materials:
                 handle = asyncio.run(sister_runtime.SisterRuntime._restore(runtime, "card-1", None))
@@ -37,7 +44,7 @@ class CardRestorePromptContextTests(unittest.TestCase):
             self.assertEqual(handle.board_id, "card-1")
             prepared = factory.call_args.args[2]
             self.assertEqual(prepared["_research"], {
-                "run_id": "run-1", "branch_id": "node-1", "kind": "investigation",
+                "run_id": "run-1", "branch_id": "node-1", "kind": "investigation", "scope": "run-1",
             })
             self.assertEqual(prepared["_materials"], "")
             assert "_colleagues" not in prepared

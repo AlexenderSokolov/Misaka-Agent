@@ -38,7 +38,7 @@ def _send_message(definition, sender, task_id):
 def definitions():
     """The tools, for the card this process was started for."""
     from misaka.core.documents.wiring import documents
-    from misaka.core.research import tools as research_tools
+    from misaka.core.platform import owners
     from misaka.core.wiring import ToolCollector
 
     task_id = os.environ["MISAKA_USAGE_TASK_ID"]
@@ -48,7 +48,8 @@ def definitions():
         raise SystemExit(f"Card not found: {task_id}")
     sender = row["assignee"]
     borrowed = ToolCollector()
-    research_tools.register(borrowed)
+    for owner in owners.registered():       # a workflow's read-only views (research's misaka_research_view)
+        owner.borrowed_tools(borrowed)
     documents.register(borrowed)
     send = messages.MessagesPart(sender=sender, card_task=task_id).tools[0]
     return [*todo.card_tools(task_id, sender), _send_message(send, sender, task_id),

@@ -58,7 +58,9 @@ class CollaborationPromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(text.count(f"- `{name}`:"), 1)
 
     async def test_research_routes_do_not_expose_ordinary_board_or_message_tools(self):
-        names = [name for name in collaboration.SISTER_TOOLS if name.startswith("misaka_research_")]
+        from misaka.core.research.owner import TOOL_DESCRIPTIONS
+
+        names = list(TOOL_DESCRIPTIONS)
         part = self.make_part(names)
         text = (await part.before_agent_start({"systemPrompt": "BASE"}, None))["systemPrompt"]
         self.assertIn("driver creates and launches", text)

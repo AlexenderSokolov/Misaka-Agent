@@ -3,8 +3,8 @@ import json
 from contextlib import contextmanager
 
 from misaka.core.network.roster import coordinator_profile, routing_catalog
-from misaka.core.platform import prompt_guard
-from misaka.core.research.tool_policy import DRIVER_OWNED_TOOLS
+from misaka.core.platform import owners, prompt_guard
+from misaka.core.platform.vocabulary import DRIVER_OWNED_TOOLS
 
 
 class SisterCapabilitiesPart:
@@ -49,11 +49,11 @@ class SisterCapabilitiesPart:
     async def before_agent_start(self, event, ctx):
         system_prompt = event["systemPrompt"].rstrip()
         if self.research_context:
-            from misaka.core.research.prompting import system_context
-            common = system_context(self.session, self.session.getActiveToolNames(), system_prompt,
-                                    sister_id=self.sister_id)
-            if common:
-                system_prompt += "\n\n" + common
+            for owner in owners.registered():
+                common = owner.system_context(self.session, self.session.getActiveToolNames(), system_prompt,
+                                              self.sister_id)
+                if common:
+                    system_prompt += "\n\n" + common
         compact = ([coordinator_profile(entry) for entry in self.catalog]
                    if self.catalog is not None else routing_catalog())
         if self.sister_id is not None:

@@ -14,7 +14,7 @@ from misaka.cli import card_shell
 from misaka.core import wiring
 from misaka.core.network import dispatch, roster, sister_runtime, worker
 from misaka.core.network.wiring import capabilities
-from misaka.core.platform import cards
+from misaka.core.platform import cards, owners
 from misaka.core.subagent.runtime import SubagentManager
 
 
@@ -22,6 +22,15 @@ def catalog_payload(text):
     return json.loads(text.split('<<<UNTRUSTED-DATA name="sister-capabilities">>>\n', 1)[1]
                       .split('\n<<<END-UNTRUSTED-DATA>>>', 1)[0])
 
+
+
+class _StubOwner(owners.CardOwner):
+    """A workflow that owns ``card-1``: the board passes its context through without knowing it."""
+
+    name = "stub"
+
+    def card(self, con, task_id):
+        return {"run_id": "run-1", "branch_id": "node-1", "kind": "investigation", "scope": "run-1"} if task_id == "card-1" else None
 
 class SisterCatalogTests(unittest.IsolatedAsyncioTestCase):
     async def test_role_matrix_and_self_exclusion(self):
@@ -82,12 +91,13 @@ class CardContextTests(unittest.TestCase):
     def test_card_extras_and_single_catalog_owner(self):
         with closing(sqlite3.connect(":memory:")) as con:
             con.row_factory = sqlite3.Row
-            con.execute("CREATE TABLE research_cards(task_id TEXT, run_id TEXT, branch_id TEXT, kind TEXT)")
-            con.execute("INSERT INTO research_cards VALUES ('card-1','run-1','node-1','investigation')")
             row = {"id": "card-1", "assignee": "10032", "workspace": "/fixture"}
-            with patch.object(worker, "materials_on_hand", return_value="Existing material"):
+            with patch.object(owners, "_OWNERS", [_StubOwner()]), \
+                    patch.object(worker, "materials_on_hand", return_value="Existing material"):
                 extra = worker.card_extras(con, row)
-            self.assertEqual(extra["_research"], {"run_id": "run-1", "branch_id": "node-1", "kind": "investigation"})
+            self.assertEqual(extra["_research"], {"run_id": "run-1", "branch_id": "node-1", "kind": "investigation",
+                                                  "scope": "run-1"})
+            self.assertEqual(extra["_owner"], "stub")
             self.assertEqual(extra["_materials"], "Existing material")
             assert "_colleagues" not in extra                     # the routing catalog is the system prompt's
             text = worker.card_prompt({**row, **extra, "body": "Task"})

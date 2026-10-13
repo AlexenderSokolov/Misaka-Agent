@@ -17,21 +17,9 @@ import hashlib
 import json
 import os
 import re
-from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
-
+from misaka.core.network.card_contract import Finding
 from misaka.core.research import runs
-
-
-class Finding(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    text: str = Field(min_length=1)
-    claim_type: Literal["fact", "inference", "interpretation", "normative"] = "fact"
-    quote: str = ""
-    source_file: str | None = Field(None, description="Source path or locator, if applicable.")
-    doc_id: str | None = None
-    page: int | None = Field(None, ge=1, strict=True)
 
 
 def findings(con, run_id, *, branch_id=None, task_id=None, limit=None, offset=0):

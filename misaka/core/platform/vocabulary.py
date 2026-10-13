@@ -28,8 +28,17 @@ BOOKKEEPING_MANAGEMENT_TOOLS = tuple(
     name for name in MANAGEMENT_TOOLS if name != "Agent"
 )
 
+# The ordinary board tools a workflow's driver owns while it drives the session's cards (research
+# creates, starts, links, reviews and deletes them itself): withheld from that session.
+DRIVER_OWNED_TOOLS = frozenset({
+    "misaka_card", "misaka_dispatch", "misaka_sister", "misaka_card_link",
+    "misaka_card_request_review", "misaka_card_review", "misaka_card_unblock",
+    "misaka_card_requeue", "misaka_card_delete",
+})
+
 __all__ = [
     "BOOKKEEPING_MANAGEMENT_TOOLS",
+    "DRIVER_OWNED_TOOLS",
     "MANAGEMENT_TOOLS",
     "MANAGEMENT_TOOL_NAMES",
 ]

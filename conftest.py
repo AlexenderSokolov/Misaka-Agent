@@ -105,3 +105,12 @@ def pytest_runtest_makereport(item, call):
         report.longrepr = (str(item.path), item.location[1] or 0,
                            "Skipped: creating a symlink needs Developer Mode on Windows")
     return report
+
+
+@pytest.fixture(autouse=True, scope="session")
+def card_owners():
+    """Research owns its cards in every test process, as ``misaka.cli.bootstrap`` makes it in every
+    real one."""
+    from misaka.core.research import owner
+
+    owner.install()

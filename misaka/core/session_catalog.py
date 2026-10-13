@@ -392,12 +392,16 @@ def list_entries(con, *, extra_paths=()):
     product = os.path.realpath(sessions.sessions_root())
     roots = {product, get_sessions_dir()}
     tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")} if con else set()
+    # The runs, nodes and card links of the workflows that own cards (research's), as their owners
+    # list them (``platform.owners``).
     run_rows, nodes, links = {}, {}, {}
-    if "research_runs" in tables:
-        from misaka.core.research import runs
-        run_rows = {row["id"]: row for row in runs.listing(con)}
-        nodes = {row["id"]: row for run_id in run_rows for row in runs.nodes(con, run_id)}
-        links = {row["task_id"]: dict(row) for row in con.execute("SELECT * FROM research_cards")}
+    if con is not None:
+        from misaka.core.platform import owners
+        for owner in owners.registered():
+            scopes, units, cards = owner.catalog(con)
+            run_rows.update(scopes)
+            nodes.update(units)
+            links.update(cards)
     cards = {}
     if "tasks" in tables:
         for row in con.execute("SELECT * FROM tasks"):

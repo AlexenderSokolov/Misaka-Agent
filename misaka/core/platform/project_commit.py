@@ -88,7 +88,7 @@ SESSION_KINDS = {"foreground"}
 
 
 def part(spec):
-    from misaka.core.research.wiring.node import node_identity
-    if spec.research_context or node_identity():   # a research node's window: the run's, not the user's desk
+    from misaka.core.platform import owners
+    if spec.research_context or owners.owns_window():   # a workflow's window (a research node's), not the user's desk
         return None
     return ProjectCommitPart()

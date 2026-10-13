@@ -129,19 +129,11 @@ def _charge_expired_reservations(con, now):
 
 
 def scope(con, task_id):
-    """The ledger rows ``task_id`` is capped with: its research run and every card of that run, or
-    None when it belongs to no run (an ordinary card, a contact session) and is never capped."""
-    if not task_id or not con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_runs'").fetchone():
-        return None
-    run = con.execute("SELECT id FROM research_runs WHERE id=?", (str(task_id),)).fetchone()
-    if run is None:
-        run = con.execute("SELECT run_id FROM research_cards WHERE task_id=?", (str(task_id),)).fetchone()
-    if run is None:
-        return None
-    run_id = run[0]
-    return {run_id, *(row[0] for row in con.execute(
-        "SELECT task_id FROM research_cards WHERE run_id=?", (run_id,)))}
+    """The ledger rows ``task_id`` is capped with -- for a research card, its run and every card of
+    that run, as its owner says (``platform.owners``) -- or None when it is never capped (an ordinary
+    card, a contact session)."""
+    from misaka.core.platform import owners
+    return owners.budget_scope(con, task_id)
 
 
 def _held(con, ids, now):

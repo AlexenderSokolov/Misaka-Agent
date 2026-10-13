@@ -24,7 +24,7 @@ import psutil
 from misaka.config import profiles
 from misaka.config import sessions as session_roots
 from misaka.core.network import worker
-from misaka.core.platform import admission, budget, notifications
+from misaka.core.platform import admission, budget, notifications, owners
 from misaka.core.platform import processes as process_tree
 from misaka.core.platform import tasks as db
 from misaka.core.session_manager import findMostRecentSession
@@ -190,15 +190,6 @@ def _adoptable_transcript(task) -> str | None:
     except ValueError:
         return None
     return found
-
-
-def _research_run_active(con, research: Mapping[str, Any] | None) -> bool:
-    """Whether the research run a card belongs to still has a driver reading its results."""
-    from misaka.core.research import runs
-    try:
-        return runs.is_active(con, (research or {}).get("run_id"))
-    except Exception:  # noqa: BLE001 - a broken board must not silence the notification; wake LO
-        return False
 
 
 def _sister_notification(data: Mapping[str, Any]) -> str:
@@ -1188,12 +1179,12 @@ class SisterRuntime:
         frozen = dict(row)
         frozen.update(generation=generation, status=status)
         data = self._snapshot_row(frozen)
-        # Research phases already consume successful results. Keep their receipt visible
-        # and durable without starting another LO turn; failures/help still need attention.
+        # A workflow's phases (research's) already consume successful results. Keep their receipt
+        # visible and durable without starting another LO turn; failures/help still need attention.
         # That holds only while a driver is advancing the run: once it is paused or failed
         # (2026-09-18, B26) nobody reads the result unless Last Order is woken for it.
-        trigger_turn = (status != "done" or data.get("research") is None
-                        or not _research_run_active(self.con, data["research"]))
+        owner, context = owners.card(self.con, task_id)
+        trigger_turn = status != "done" or owner is None or not owner.reads_results(self.con, context)
         def persisted():
             delivery["_onPersist"]()
             db.add_event(self.con, task_id, "notified", {"status": data["status"], "collected": True},
@@ -1209,25 +1200,27 @@ class SisterRuntime:
         return True
 
     def deliver_pending(self, workspace: str, *, limit=100) -> int:
-        """Board chats share their workspace cursor; research has one cursor and explicit chat owner per run."""
-        from misaka.core.research import runs
+        """Board chats share their workspace cursor; a workflow (research) has one cursor and an
+        explicit chat owner per scope (run), as its owner says (``platform.owners``)."""
         workspace = db.canonical_workspace(workspace)
-        contexts = runs.task_contexts(self.con)
         channels = [(notifications.subscribe(
-            self.con, "last-order", f"board-harness:{workspace}", "task", "*", "terminal"), None)]
+            self.con, "last-order", f"board-harness:{workspace}", "task", "*", "terminal"), None, None)]
         session_id = getattr(getattr(self.session, "sessionManager", None), "sessionId", None)
-        if session_id and self.con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_runs'").fetchone():
-            channels += [(notifications.subscribe(self.con, r["id"], "research-chat"), r["id"])
-                         for r in self.con.execute("SELECT id FROM research_runs WHERE origin_session=?", (session_id,))]
+        if session_id:
+            channels += [(notifications.subscribe(self.con, scope, f"{owner.name}-chat"), scope, owner)
+                         for owner in owners.registered() for scope in owner.chat_scopes(self.con, session_id)]
+
+        def scope_of(task_id):
+            _owner, context = owners.card(self.con, task_id)
+            return None if context is None else context["scope"]
+
         delivered = 0
-        for subscription, run_id in channels:
+        for subscription, run_id, chat_owner in channels:
             for _ in range(max(0, int(limit))):
                 # Resume can hand ownership to another chat between polls. Check and
                 # lease in one short transaction; enqueue/persistence stay outside it.
                 with db.write_txn(self.con):
-                    if run_id and not self.con.execute(
-                            "SELECT 1 FROM research_runs WHERE id=? AND origin_session=?", (run_id, session_id)).fetchone():
+                    if run_id and not chat_owner.owns_chat(self.con, run_id, session_id):
                         break
                     event = notifications.claim_next(self.con, subscription)
                 if event is None:
@@ -1239,21 +1232,20 @@ class SisterRuntime:
                 row, progress = None, False
                 if event["resource_type"] == "task" and event["kind"] == "terminal":
                     row = db.get(self.con, event["resource_id"])
-                    context = contexts.get(event["resource_id"])
-                    routed = (context is not None and context["run_id"] == run_id) if run_id else (
-                        row is not None and context is None and db.workspace_for(row) == workspace)
+                    scope = scope_of(event["resource_id"])
+                    routed = scope == run_id if run_id else (
+                        row is not None and scope is None and db.workspace_for(row) == workspace)
                     if row is not None and routed:
                         generation, status = int(payload.get("generation") or 0), str(payload.get("status") or "")
                         routed = (generation == int(row["generation"]) and status == row["status"]
                                   and status in TERMINAL_BOARD_STATUSES)
                 else:
-                    progress = (event["resource_type"] == "research" and event["kind"] == "progress"
-                                and event["resource_id"] == run_id)
+                    progress = (chat_owner is not None and event["resource_type"] == chat_owner.name
+                                and event["kind"] == "progress" and event["resource_id"] == run_id)
                     routed = progress
                     if progress and "generation" in payload:
                         row = db.get(self.con, payload.get("task_id"))
-                        context = contexts.get(payload.get("task_id"))
-                        routed = (row is not None and context is not None and context["run_id"] == run_id
+                        routed = (row is not None and scope_of(payload.get("task_id")) == run_id
                                   and payload.get("generation") == row["generation"])
                 if not routed or (not progress and row is None):
                     notifications.ack(self.con, subscription, event["id"], event["lease_token"])
@@ -1266,19 +1258,10 @@ class SisterRuntime:
                     notifications.nack(self.con, subscription, event["id"], event["lease_token"], error)
                 delivery = {"_deliveryId": f"{subscription}:{event['id']}", "_onPersist": ack, "_onError": nack}
                 if progress:
-                    content = (f"Research `{run_id}` | depth {payload['depth']} | node {payload['node_id']}"
-                               f" | {payload['message']}")
-                    if payload.get("plan"):
-                        content += "\n```json\n" + json.dumps(payload["plan"], ensure_ascii=False, indent=2) + "\n```"
-                    for item in ([] if payload.get("plan") else payload.get("tasks") or []):
-                        content += f"\n- {item['title']} → Sister {item['assignee']}"
-                        if item.get("dependencies"):
-                            content += f" (depends on {', '.join(item['dependencies'])})"
-                    if payload.get("red_team") and not payload.get("plan"):
-                        content += "\nRed team: " + json.dumps(payload["red_team"], ensure_ascii=False)
+                    custom_type, content = chat_owner.progress(run_id, payload)
                     try:
                         self.session.moments.send_message(
-                            {"customType": "research-progress", "content": content, "display": True, "details": payload},
+                            {"customType": custom_type, "content": content, "display": True, "details": payload},
                             {"deliverAs": "followUp", "triggerTurn": False, **delivery})
                     except Exception as error:  # noqa: BLE001 - no ACK on enqueue failure
                         nack(error)
@@ -1337,10 +1320,9 @@ class SisterRuntime:
             "agent_id": row["agent_id"],
             "session_file": row["session_file"],
         }
-        from misaka.core.research import runs
-        context = runs.task_contexts(self.con).get(task_id)
-        if context:
-            data["research"] = context
+        owner, context = owners.card(self.con, task_id)
+        if owner is not None:
+            data[owner.name] = {key: value for key, value in context.items() if key != "scope"}
         if launched is not None:
             data["launched"] = launched
         if note:

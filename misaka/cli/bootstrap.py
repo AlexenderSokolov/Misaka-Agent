@@ -10,6 +10,9 @@ with each session's spec. Every process entry calls ``install`` first: the CLI
 research node (``misaka.cli.research_node``). A process that never runs an entry -- a
 bare kernel run in a test -- builds sessions without bundled extensions.
 
+``install`` also registers the workflows that own cards (``misaka.core.platform.owners``), so the
+board treats a research card as research's in every process without importing research itself.
+
 ``install`` is also where a process refuses to start on a settings.json knob it cannot
 use, listing every one at once, so a bad value is found before any work begins rather
 than by whichever long-running process reads it first.
@@ -29,6 +32,8 @@ def install(*, check_settings: bool = True) -> None:
     wiring.bundled = extensions.discover
     from misaka.core.platform import metering
     metering.install()          # every model request of a metered session is leased and recorded
+    from misaka.core.research import owner
+    owner.install()             # research answers for its cards wherever the board asks (platform.owners)
 
 
 __all__ = ["install"]
