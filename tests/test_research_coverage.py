@@ -8,14 +8,25 @@ which upholds it or reopens the proposal as a possibility of its own. An option 
 the node that answers it, and an option that brings back a declined path names it. Structure only:
 nothing here judges whether two possibilities are the same.
 """
+import json
 from contextlib import closing
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from misaka.core import graph
-from misaka.core.platform import tasks
-from misaka.core.research import commands, context, planner, runs, views, workflow
+from misaka.core.platform import repo, tasks
+from misaka.core.research import (
+    commands,
+    context,
+    planner,
+    report,
+    runs,
+    views,
+    workflow,
+)
+from misaka.core.session_manager import SessionManager
 
 
 @pytest.fixture
@@ -96,11 +107,29 @@ def test_coverage_by_another_line_is_a_claim_and_by_the_own_line_is_not(level):
     [claim] = views.coverage_claims(con, run)
     assert (claim["proposal"], claim["raised_at"], claim["covered_by"]["node"]) == (across, a["id"], b["id"])
     assert claim["covered_by"]["conclusion"].endswith("synthesis.md") and not claim["covered_by"]["revised_since_claim"]
-    # Nothing else calls for the root: no option waits and the level's conclusions were reconciled... but the claim does.
+    # It goes to the reconciliation the level's new conclusions call for.
     assert views.reconcile_state(con, run)[0] is True
     material = workflow._reconcile_material(con, run)
     assert [item["proposal"] for item in material["coverage_claims"]] == [across]
     assert "a claim across lines: the next reconciliation reviews it" in _paths(con, run)
+
+
+def test_a_claim_no_reconciliation_reviewed_calls_for_one_by_itself(level):
+    """A run carried over from v19 may hold a proposal closed as covered by another line on a level already
+    reconciled: nothing waits and no node is new, and the claim still calls for the root -- once."""
+    con, run, a, b = level.con, level.run, level.a, level.b
+    _decide(con, run, a, {"decisions": []}, level.tmp)
+    _decide(con, run, b, {"decisions": []}, level.tmp)
+    _reconcile(con, run, 2, {}, level.tmp)
+    assert views.reconcile_state(con, run)[0] is False
+    earlier = _proposal(con, run, a, "Patronage networks")
+    runs.dispose(con, earlier, "covered", covered_by=b["id"], reason="B studies coalitions")
+    assert views.reconcile_state(con, run)[0] is True
+    _reconcile(con, run, 3, {"coverage": [{"proposal": earlier, "verdict": "holds", "note": "B's second chapter"}]},
+               level.tmp)
+    assert runs.issue(con, earlier)["coverage_review"] == {"round": 3, "verdict": "holds", "note": "B's second chapter",
+                                                           "claimed": b["id"]}
+    assert views.reconcile_state(con, run)[0] is False
 
 
 def test_a_claim_records_the_covering_conclusion_written_after_it(level):
@@ -353,3 +382,135 @@ def test_a_v19_board_gets_the_v20_graph_schema(tmp_path):
         x, _y = (row["id"] for row in runs.options(con, run["id"], decision_id=did))
         runs.set_option(con, x, reason="covered", covered_by=root["id"])
         assert runs.option(con, x)["covered_by"] == root["id"]
+
+
+# --- through the driver: decide, the reconciliation, the node it reopens ------------------
+
+@pytest.fixture
+def driven(tmp_path, monkeypatch):
+    """A run with the root's conversation, as the driver runs it; model turns are scripted."""
+    monkeypatch.setattr(repo, "enabled", lambda *a: False)
+    monkeypatch.setattr(tasks, "task_state_dir", lambda tid: str(tmp_path / "state" / tid))
+    monkeypatch.setattr(workflow, "_bundle", lambda *a, **k: None)
+    with closing(tasks.connect(str(tmp_path / "board.db"))) as con:
+        run = runs.create(con, workspace=str(tmp_path), question="Why did the reform fail?",
+                          limits={"max_depth": 3, "plan_approval": False})
+        assert runs.acquire_driver(con, run["id"], "driver:test")
+        manager = SessionManager.create(str(tmp_path), str(tmp_path / "sessions"))
+        manager.appendMessage({"role": "user", "content": "go", "timestamp": 1})
+        manager.appendMessage({"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 2})
+        con.execute("UPDATE research_runs SET root_session=? WHERE id=?", (manager.getSessionFile(), run["id"]))
+        runs.prepare_runner(con, "research_execution", runs.root(con, run["id"])["id"])
+        yield SimpleNamespace(con=con, run=runs.get(con, run["id"]), tmp=tmp_path, monkeypatch=monkeypatch)
+
+
+def _decided(lab, node, answer, *, proposals=(), refused=None):
+    """``planner.decide`` with its real validation, then ``_apply_decisions``; the node closes."""
+    con, seen = lab.con, {}
+
+    def command(con_, run, cfg, worker, node_, prompt, *, key, model, validate, **_kwargs):
+        seen["prompt"] = prompt
+        if refused:
+            with pytest.raises(ValueError, match=refused[0]):
+                validate(model.model_validate(refused[1]).model_dump())
+        payload = validate(model.model_validate(answer).model_dump())
+        runs.record_action(con, run, node_, key, payload, session_file=node_["session_file"] or run["root_session"],
+                           tool_call_id=key)
+        return runs.action(con, run["id"], node_["id"], key), ""
+
+    lab.monkeypatch.setattr(planner, "_command", command)
+    run = runs.get(con, lab.run["id"])
+    payload = planner.decide(con, run, {}, None, node, divergence=[], proposals=list(proposals), branches=[])
+    workflow._apply_decisions(con, run, node, node, payload)
+    workflow._close(con, run, runs.node(con, node["id"]), "closed")
+    return seen["prompt"]
+
+
+async def _reconciled(lab, answer, *, refused=None):
+    """``workflow._reconcile`` with a scripted root Last Order; returns its material and progress."""
+    con, asked, said = lab.con, [], []
+
+    def reconcile(con_, run, cfg, window, *, round, material, validate):
+        asked.append(material)
+        if refused:
+            with pytest.raises(ValueError, match=refused[0]):
+                validate(commands.Reconcile.model_validate({"summary": "s", **refused[1](material)}).model_dump())
+        payload = commands.Reconcile.model_validate({"summary": "s", **answer(material)}).model_dump()
+        validate(payload)
+        return runs.record_reconcile(con, run, round, payload, session_file=run["root_session"],
+                                     tool_call_id=f"reconcile-{round}")
+
+    async def progress(_progress, _kind, text, *_args, **_kwargs):
+        said.append(text)
+
+    lab.monkeypatch.setattr(planner, "reconcile", reconcile)
+    lab.monkeypatch.setattr(workflow, "_progress", progress)
+    run = runs.get(con, lab.run["id"])
+    assert views.reconcile_state(con, run)[0]
+    assert await workflow._reconcile(con, {}, run, object(), poll_seconds=0, progress=None,
+                                     check_active=lambda: None) is None
+    workflow._prepare_sessions(con, runs.get(con, run["id"]))
+    return asked[0], said
+
+
+async def test_a_claim_across_lines_is_reopened_through_the_driver(driven):
+    """The whole way round: a node closes a proposal as covered by another line's node, the next
+    reconciliation is asked for that claim alone, reopens it as a node under the node that raised it,
+    and that node's decision finds the reconciliation's judgement on its own line -- and brings back
+    a path its parent declined only by naming it."""
+    con, run, lab = driven.con, driven.run, driven
+    root = runs.root(con, run["id"])
+    _conclude(con, run, root)
+    _decided(lab, root, {"decisions": [_fork("Which cause?", "fiscal", "coalition")]})
+    material, _said = await _reconciled(lab, lambda m: {"nodes": [
+        {"question": f"{o['label']}?", "options": [o["option"]], "rationale": "r"} for o in m["pending_options"]]})
+    assert material["coverage_claims"] == []
+    a, b = (runs.node(con, child["id"]) for child in runs.children(con, root["id"]))
+    _conclude(con, run, a)
+    _conclude(con, run, b)
+    norms = runs.issue(con, _proposal(con, run, a, "Villagers' norms?"))
+    climate = runs.issue(con, _proposal(con, run, a, "Climate shock?"))
+    _decided(lab, a, {"declined": [
+        {"issue_id": norms["id"], "disposition": "covered", "covered_by": b["id"], "reason": "B studies the elites"},
+        {"issue_id": climate["id"], "disposition": "decline", "reason": "no harvest data survives"}]},
+        proposals=[norms, climate])
+    _decided(lab, b, {"decisions": []})
+    assert views.reconcilable_options(con, runs.get(con, run["id"])) == []
+    material, said = await _reconciled(
+        lab, lambda m: {"coverage": [{"proposal": norms["id"], "verdict": "reopen", "note": "norms, not elites"}],
+                        "nodes": [{"question": "Villagers' norms?", "options": [norms["id"]], "rationale": "r"}]},
+        refused=("needs a verdict", lambda m: {}))
+    [claim] = material["coverage_claims"]
+    assert (claim["proposal"], claim["covered_by"]["node"], claim["covered_by"]["revised_since_claim"]) == (
+        norms["id"], b["id"], False)
+    assert any("1 coverage claim(s) reviewed (1 reopened)" in text for text in said)
+    [c] = (runs.node(con, child["id"]) for child in runs.children(con, a["id"]))
+    assert c["session_file"] and views.lineage(con, c) == [c["id"], a["id"], root["id"]]
+    assert views.coverage_claims(con, runs.get(con, run["id"])) == []
+    _conclude(con, run, c)
+    climate_back = {"label": "climate", "premise": "tree rings answer the missing harvest data",
+                    "answers": [climate["id"]]}
+    prompt = _decided(lab, c, {"decisions": [_fork("Next?") | {"options": [_fork("Next?")["options"][0], climate_back]}]},
+                      refused=("answers names nowhere", {"decisions": [_fork("Next?") | {"options": [
+                          _fork("Next?")["options"][0], {**climate_back, "answers": ["nowhere"]}]}]}))
+    assert "the root Last Order's conversation (reconciliation 2)" in prompt
+    [reopened] = [entry for entry in planner.on_your_line(con, run, c) if entry["went"] == "this node"]
+    assert reopened["deliberation"]["session_file"] == run["root_session"]
+    # Everything that reads the run renders it.
+    run = runs.get(con, run["id"])
+    assert "Villagers' norms?" in context.render(context.build(con, run, node=c))
+    data = views.snapshot(con, run)
+    views.render_graph(data)
+    for node in data["nodes"]:
+        views.render_node(data, node["id"])
+    json.dumps(report._record(con, run))
+    await workflow._views(con, run)
+    paths = Path(run["workspace"], views.paths_path(run)).read_text(encoding="utf-8")
+    assert "(the coverage claim was reopened at reconciliation 2: norms, not elites)" in paths
+    assert f"brought back by option `{runs.pending_options(con, run['id'])[0]['id']}`" in paths
+    # The option that brings the declined path back reaches the reconciliation with that path's record.
+    material, _said = await _reconciled(lab, lambda m: {"nodes": [
+        {"question": "Climate?", "options": [o["option"] for o in m["pending_options"]], "rationale": "r"}]})
+    [waiting] = material["pending_options"]
+    assert waiting["answers"] == [{"path": climate["id"], "text": "Climate shock?",
+                                   "went": "declined: no harvest data survives"}]
