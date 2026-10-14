@@ -154,13 +154,101 @@ def test_adding_an_extra_keeps_the_ones_installed(monkeypatch):
     assert command == ["uv", "tool", "install", "--force", f"misaka[pageindex,providers] @ git+{update.REPO_URL}"]
 
 
+# -- update: an install made from another branch follows that branch -------------------------
+
+def _from_branch(installer="uv tool", revision="heretic-0.19.17"):
+    return update.Install("git", False, installer, None, "c0ffee", "0.19.17", revision)
+
+
+def test_the_revision_an_install_was_made_from_is_read_from_its_record(monkeypatch):
+    import importlib.metadata
+    import json
+
+    record = {"url": update.REPO_URL, "vcs_info": {"vcs": "git", "commit_id": "c0ffee",
+                                                   "requested_revision": "heretic-0.19.17"}}
+    dist = SimpleNamespace(version="0.19.17", read_text=lambda name: (
+        json.dumps(record) if name == "direct_url.json" else "uv"))
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: dist)
+    found = update.describe()
+    assert (found.kind, found.commit, found.revision, found.follows) == ("git", "c0ffee", "heretic-0.19.17",
+                                                                        "heretic-0.19.17")
+    del record["vcs_info"]["requested_revision"]
+    assert update.describe().follows == update.BRANCH
+
+
+def test_an_install_from_another_branch_is_compared_with_that_branch(monkeypatch, capsys):
+    """2026-10-13: an install of heretic-0.19.17 -- ahead of main by 16 commits -- was compared with
+    main, told "this install's commit is not an ancestor of main" and to resolve it in a checkout it
+    does not have, and the check exited 1."""
+    asked = []
+    monkeypatch.setattr(update, "describe", lambda: _from_branch())
+    monkeypatch.setattr(update, "github_token", lambda: ("t", "GITHUB_TOKEN"))
+    monkeypatch.setattr(update, "_api", lambda path: asked.append(path) or ({"status": "identical", "ahead_by": 0}, None))
+    assert update.run() == 0
+    out = capsys.readouterr().out
+    assert asked == ["/compare/c0ffee...heretic-0.19.17"]
+    assert "Up to date with heretic-0.19.17." in out and "main" not in out
+    monkeypatch.setattr(update, "_api", lambda path: ({"status": "ahead", "ahead_by": 2}, None))
+    monkeypatch.setattr(update, "installed_extras", list)
+    assert update.run() == 0
+    out = capsys.readouterr().out
+    assert "2 commit(s) behind heretic-0.19.17." in out and "uv tool upgrade misaka" in out
+
+
+def test_a_comparison_that_fails_does_not_send_a_git_install_to_a_checkout(monkeypatch, capsys):
+    monkeypatch.setattr(update, "describe", lambda: _from_branch())
+    monkeypatch.setattr(update, "github_token", lambda: (None, ""))
+    monkeypatch.setattr(update, "_api", lambda path: ({"status": "diverged"}, None))
+    assert update.run() == 1
+    out = capsys.readouterr().out
+    assert "not an ancestor of heretic-0.19.17" in out and "checkout" not in out
+
+
+def test_reinstalling_or_adding_an_extra_keeps_the_branch(monkeypatch):
+    """A requirement without the revision installs main: adding an extra from setup would have put a
+    heretic install back on main, whose code cannot open the board the branch's code migrated."""
+    monkeypatch.setattr(update, "installed_extras", lambda: ["providers"])
+    source = f"git+{update.REPO_URL}@heretic-0.19.17"
+    assert update.adding_extras(_from_branch(), ["pageindex"]) == [
+        "uv", "tool", "install", "--force", f"misaka[pageindex,providers] @ {source}"]
+    first, second = update._install_commands(_from_branch("pip"))
+    assert first[-1] == f"misaka @ {source}" and second[-1] == f"misaka[providers] @ {source}"
+    assert update._install_commands(_from_branch("uv"))[0][-1] == f"misaka[providers] @ {source}"
+    assert update._install_commands(_from_branch()) == [["uv", "tool", "upgrade", "misaka"]]   # uv's receipt has it
+
+
+def test_a_checkout_follows_the_branch_of_origin_it_tracks(tmp_path):
+    import subprocess
+
+    def git(cwd, *args):
+        subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+
+    origin, checkout = tmp_path / "origin.git", tmp_path / "checkout"
+    git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    git(tmp_path, "clone", str(origin), str(checkout))
+    for args in (("config", "user.email", "t@example.com"), ("config", "user.name", "t"),
+                 ("commit", "--allow-empty", "-m", "one"), ("push", "origin", "HEAD:main"),
+                 ("checkout", "-b", "feature/x"), ("commit", "--allow-empty", "-m", "two"),
+                 ("push", "-u", "origin", "feature/x")):
+        git(checkout, *args)
+    install = update.Install("checkout", True, "uv", checkout, None, "0.19.17")
+    state = update._checkout_state(install)
+    assert (state["follows"], state["behind"], state["reason"]) == ("feature/x", 0, None)
+    git(checkout, "reset", "--hard", "HEAD~1")              # one commit behind its branch, ahead of nothing
+    state = update._checkout_state(install)
+    assert (state["follows"], state["behind"], state["reason"]) == ("feature/x", 1, None)
+    git(checkout, "branch", "--unset-upstream")             # no upstream: main, as before
+    state = update._checkout_state(install)
+    assert state["follows"] == "main"
+
+
 # -- update: running work, the snapshot, the rollback -----------------------------------------
 
 def _apply_setup(monkeypatch, install, *, blocking=(), panes=(), starts=None):
     calls = []
     monkeypatch.setattr(update, "describe", lambda: install)
     monkeypatch.setattr(update, "_checkout_state", lambda _install: {"head": "old", "behind": 1, "dirty": False, "reason": None})
-    monkeypatch.setattr(update, "_behind", lambda _commit: (1, None))
+    monkeypatch.setattr(update, "_behind", lambda _commit, _head=update.BRANCH: (1, None))
     monkeypatch.setattr(update, "installed_extras", list)
     monkeypatch.setattr(update, "running_work", lambda: (list(blocking), list(panes)))
     monkeypatch.setattr(update, "prompt_choice", lambda *_a, **_k: 1)
