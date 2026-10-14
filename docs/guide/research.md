@@ -246,7 +246,8 @@ Last Order goes through the possibilities not taken, and any objection she answe
 
 - an **option** of a decision, with its premise, to open as a new node;
 - **covered**, when a node or a waiting option already pursues it;
-- **declined**, with her reason. The final report lists declined paths and why.
+- **declined**, with her reason -- also a proposal her own line already takes, saying where. The
+  final report lists declined paths and why.
 
 A fork is a possibility that excludes the node's own line. A presupposition the answer depends
 on becomes one too: the node opened for it researches whether it holds, and what the answer
@@ -295,7 +296,7 @@ the run in, and rearranges it. With approval on, she presents this to you like a
 ### The paths list
 
 The run keeps a list of every possibility raised so far, grouped under the node that raised it,
-with what became of it (`final/<run>-paths.md`). Each possibility is opened once: one that a node
+with its premise and what became of it (`final/<run>-paths.md`). Each possibility is opened once: one that a node
 already pursues goes to that node, and a declined path comes back only with an answer to why it
 was declined.
 

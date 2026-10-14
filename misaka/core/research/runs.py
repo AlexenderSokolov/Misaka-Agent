@@ -1623,8 +1623,9 @@ REOPENED_STAKES = ("Each was closed as covered by a node or an option of another
 def _review_coverage(change, round, verdicts, now):
     """The reconciliation's verdict on each coverage claim (``views.coverage_claims``), on the claim's
     issue. A claim that holds keeps its pointer. A reopened one becomes an option of a decision the
-    reconciliation records at the node that raised it -- its premise the verdict's note -- which the
-    reconciliation then opens or leaves unopened like any pending option. Returns issue id -> option id."""
+    reconciliation records at the node that raised it -- the proposal's question and premise, the verdict's
+    note recorded as why it was reopened -- which the reconciliation then opens or leaves unopened like any
+    pending option. Returns issue id -> option id."""
     as_option, by_node = {}, {}
     for verdict in verdicts:
         review = {"round": int(round), "verdict": verdict["verdict"], "note": verdict["note"],
@@ -1640,8 +1641,9 @@ def _review_coverage(change, round, verdicts, now):
         for position, verdict in enumerate(items):
             issue_id = verdict["proposal"]
             question = change.view.node(issue_id).attrs["question"]
-            option_id = change.add_node("option", {"label": question, "premise": verdict["note"], "reason": None,
-                                                   "created_at": now}, id=_derived_id("o_", decision_id, position))
+            option_id = change.add_node("option", {"label": question, "premise": verdict["premise"] or question,
+                                                   "reason": None, "created_at": now},
+                                        id=_derived_id("o_", decision_id, position))
             change.add_edge("offers", decision_id, option_id)
             for kind in ("covered_by", "becomes"):
                 for edge in change.view.out_edges(issue_id, kind):

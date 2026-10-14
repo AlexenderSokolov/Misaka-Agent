@@ -98,6 +98,16 @@ def possibility_issues(con, run, issues=None):
     return [row for row in rows if row["origin"] == "divergence" or row["disposition"] == "branch" or row["id"] in decided]
 
 
+def proposal_premise(issue):
+    """What a proposal rests on: the divergence reviewer's stated premise, else its rationale's first line
+    (a red-team issue's). Premises, not questions, tell two possibilities apart."""
+    text = (issue.get("rationale") or "").strip()
+    for line in text.splitlines():
+        if line.startswith("Premise: "):
+            return line[len("Premise: "):].strip()
+    return text.splitlines()[0].strip() if text else ""
+
+
 def _pointer(element):
     """Where one possibility points, or None: an issue's option or node, an option's node or cover."""
     if "decision_id" in element:                          # an option
@@ -151,7 +161,8 @@ def coverage_claims(con, run):
         decided = runs.action(con, run["id"], claimant, runs.DECIDE_KEY)
         claimed_at = decided["created_at"] if decided else issue["created_at"]
         claim = {"proposal": issue["id"], "raised_at": claimant, "question": issue["question"],
-                 "rationale": issue["rationale"], "claimant_reason": issue["reason"], "claimed_at": claimed_at}
+                 "premise": proposal_premise(issue), "rationale": issue["rationale"], "claimant_reason": issue["reason"],
+                 "claimed_at": claimed_at}
         if issue["covered_by"]:
             node = runs.node(con, target)
             versions = syntheses(con, run, node)
@@ -325,7 +336,7 @@ def resolve_reconcile(con, run, payload):
         if claim is not None:
             cover = claim["covered_by"]
             resolved["coverage"].append({"proposal": item["proposal"], "verdict": item["verdict"], "note": item["note"],
-                                         "node": claim["raised_at"],
+                                         "node": claim["raised_at"], "premise": claim["premise"],
                                          "covered_by": cover.get("node") or cover.get("option")})
     resolved["relations"] = _relations(con, run, payload["relations"], problems)
     if problems:
@@ -444,7 +455,7 @@ def _paths(con, run, data, issues, claims):
                     "decision": decision["question"], "outcome": option["outcome"], "takes_up": taken.get(option["id"], []),
                     "answers": option["answers"]}
                    for decision in data["decisions"] if decision["node"] == node["id"] for option in decision["options"]]
-        entries += [{"id": issue["id"], "what": "proposal", "text": issue["question"],
+        entries += [{"id": issue["id"], "what": "proposal", "text": issue["question"], "premise": proposal_premise(issue),
                      "outcome": _proposal_outcome(con, run, issue, claims)}
                     for issue in issues if issue["branch_id"] == node["id"]
                     and not (issue["disposition"] != "covered" and issue["option_id"] in options)]
@@ -474,7 +485,7 @@ def _destinations(con, run, data, issues, claims):
                      "at": decided_at.get(element["decision_id"]), "reason": element["reason"]}
         else:
             entry = {"id": element_id, "what": "proposal", "text": element["question"], "at": element["branch_id"],
-                     "disposition": element["disposition"], "reason": element["reason"],
+                     "premise": proposal_premise(element), "disposition": element["disposition"], "reason": element["reason"],
                      "review": _review_note(element, claims) or None}
         entry["via"] = chain[1:-1]
         entry["brought_back_by"] = []
@@ -611,10 +622,15 @@ def render_paths(data):
                              f"premise: {flat(entry['premise'])} → {flat(entry['outcome'])}")
                 lines += [f"  - takes up `{t['issue']}`: {flat(t['question'])}" for t in entry["takes_up"]]
             else:
-                lines.append(f"- `{entry['id']}` proposal: {flat(entry['text'])} → {flat(entry['outcome'])}")
+                lines.append(f"- `{entry['id']}` proposal: {flat(entry['text'])}{_premise_text(entry, flat)} → "
+                             f"{flat(entry['outcome'])}")
         lines.append("")
     lines += _render_destinations(data.get("destinations"), flat)
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _premise_text(entry, flat):
+    return f" — premise: {flat(entry['premise'])}" if entry.get("premise") else ""
 
 
 def _render_destinations(found, flat):
@@ -627,7 +643,7 @@ def _render_destinations(found, flat):
         if entry["what"] == "option":
             text = f"{indent}- `{entry['id']}` option \"{flat(entry['text'])}\"{where} — premise: {flat(entry['premise'])}"
         else:
-            text = f"{indent}- `{entry['id']}` proposal{where}: {flat(entry['text'])}"
+            text = f"{indent}- `{entry['id']}` proposal{where}: {flat(entry['text'])}" + _premise_text(entry, flat)
         if entry["via"]:
             text += " — via " + " → ".join(f"`{step}`" for step in entry["via"])
         if entry["id"] == root:

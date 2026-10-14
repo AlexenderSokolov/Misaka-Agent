@@ -482,9 +482,10 @@ disposed as `branch` (its gaps were filled or answered in the divergence rounds,
 against the choices your conclusion made -- what each gained, gave up and traded -- before you record anything: a
 possibility your line did not take -- one it gave up or one it never chose -- cannot stand together with it because it
 rests on another presupposition or takes the answer where your line cannot go.
-- Only a possibility not taken is a fork. A decision is a question with its stakes and at least two options that
-  exclude one another, each with its premise; this node's own line may be one option (`own: true`) beside a single
-  possibility it did not take -- that is a real fork. Proposals that together make one other path are one option. A
+- Only a possibility not taken is a fork; a proposal your line already takes is none -- `decline` it, saying where
+  your conclusion takes it. A decision is a question with its stakes and at least two options that exclude one
+  another, each with its premise; this node's own line may be one option (`own: true`) beside a single possibility it
+  did not take -- that is a real fork. Proposals that together make one other path are one option. A
   proposal that brings to light a presupposition your line rests on is a fork when the answer depends on it: the node
   opened for it researches whether the presupposition holds and what the answer becomes if it does not. A proposal
   aimed at the question itself (genealogy, symptomatic reading, ideology critique) is a possibility like any other,
@@ -493,14 +494,15 @@ rests on another presupposition or takes the answer where your line cannot go.
 - A possibility is opened once. One on the paths list that a node already pursues -- at any depth, reached from any
   frame -- or that an option waiting to be opened takes up is `covered` by that node or option, not a new option; what
   your line adds to it is for the reconciliation to join or relate. The same label is not the same possibility:
-  compare premises.
+  compare premises -- the list and `on_your_line` give each one's.
 - Your own line you know from the inside. `on_your_line` below lists what the nodes this one descends from already
   decided, each with where it was decided: in the conversation this one continues, or -- for the parents of a join --
   in the session file named. Before you take a proposal for one of them, read why it went where it went: above in
   this conversation, or, where that part was compacted or lies in another session, with the conversation tools you
-  have or in the session file itself. A node of another line you know only by what it wrote: a proposal you mark
-  `covered` by it, or by another node's waiting option, is a claim the reconciliation reviews with both lines in
-  view -- say in `reason` which premise you compared and how that node's research answers it.
+  have or in the session file itself. A node of another line -- a sibling opened by the same decision as yours is
+  one -- you know only by what it wrote: a proposal you mark `covered` by it, or by another node's waiting option, is
+  a claim the reconciliation reviews with both lines in view -- say in `reason` which premise you compared and how
+  that node's research answers it.
 - A path the list shows declined or left unopened becomes an option again only with what answers the reason recorded
   then: name it in the option's `answers`, and let the option's premise say what answers that reason. Being covered
   is not being answered: a covered path whose covering node does not answer it comes back the same way.
@@ -532,16 +534,17 @@ conclusions say something. What relates two nodes is what their conclusions say,
   what the option adds is that possibility meeting the proposing node's line, and the meeting is itself worth
   researching, join the two nodes (below): the join carries forward the research both already did instead of
   starting it again; otherwise record the link as a relation. A path the list shows declined or left unopened
-  opens only when the option answers the reason recorded then; a pending option names in `answers` the paths it
-  brings back.
+  opens only when the option answers the reason recorded then: a pending option that brings such paths back shows
+  them under `answers`, as the node that proposed it named them, each with where it went.
 - Coverage claims: a node of this level closed a proposal as covered by a node -- or a waiting option -- of another
   line, so nothing was opened for it. That node knew the other line only by what it wrote, at the time it decided;
   here both are in view. Give every claim below a verdict in `coverage`: read the covering node's conclusion (as it
   stands now, and whether it was revised since the claim) against the proposal's premise. `holds` when that research
-  answers the proposal -- say how; `reopen` when it does not -- `note` is the premise the proposal rests on that the
-  covering line does not, and the proposal then gets an outcome like a pending option: its id in a node's `options`
-  (with pending options that ask the same question, if any) or in `not_pursued`. A claim that holds may still call for
-  a join or a relation, as an option does.
+  answers the proposal -- say how; `reopen` when it does not -- say what that research leaves unanswered. `note` is the
+  record of the verdict; the proposal keeps its own premise. A reopened proposal gets an outcome like a pending
+  option: its id in a node's `options` -- that node opens under the node that raised the proposal, with pending
+  options that ask the same question, if any -- or in `not_pursued`. A claim that holds may still call for a join or
+  a relation, as an option does.
 - Finished nodes whose paths arrive at the same place -- the same state, the same sub-question, the same finding by
   different routes -- may be carried forward together: a join is a new node with each of them as a parent. It shares
   their future work; their histories, evidence and premises stay their own, and it may fork again. Conclusions that
@@ -1429,8 +1432,8 @@ def on_your_line(con, run, node):
         where = decided.get(issue["branch_id"]) or _decided_where(
             con, run, {"origin": "decide", "node_id": issue["branch_id"], "round": 1}, lineage)
         found.append({"id": issue["id"], "what": "proposal", "question": issue["question"],
-                      "decided_at": issue["branch_id"], "went": views._proposal_outcome(con, run, issue),
-                      "deliberation": where})
+                      "premise": views.proposal_premise(issue), "decided_at": issue["branch_id"],
+                      "went": views._proposal_outcome(con, run, issue), "deliberation": where})
     return found
 
 

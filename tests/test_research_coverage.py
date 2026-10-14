@@ -175,11 +175,13 @@ def test_every_claim_gets_one_verdict_and_a_reopened_one_an_outcome(level):
     assert resolved["nodes"][0]["parents"] == [a["id"]]
     child = runs.node(con, receipt["nodes"][0])
     assert child["depth"] == 2 and [p["id"] for p in runs.parents(con, child["id"])] == [a["id"]]
-    # The reopened proposal is now an option of a decision the reconciliation recorded at the node that raised it.
+    # The reopened proposal is now an option of a decision the reconciliation recorded at the node that raised it,
+    # on the proposal's own question and premise; the verdict's note is the record of why it was reopened.
     [option] = runs.origin_options(con, child["id"])
-    assert (option["decided_at"], option["decision_origin"], option["premise"]) == (
-        a["id"], "reconcile", "it reads the revolt from the villagers' norms")
+    assert (option["decided_at"], option["decision_origin"], option["label"], option["premise"]) == (
+        a["id"], "reconcile", "Moral economy", "Moral economy")
     issue = runs.issue(con, reopened)
+    assert issue["reason"].endswith("it reads the revolt from the villagers' norms")
     assert (issue["disposition"], issue["option_id"], issue["covered_by"]) == ("branch", option["id"], None)
     assert issue["coverage_review"]["verdict"] == "reopen" and issue["coverage_review"]["claimed"] == b["id"]
     assert receipt["reopened"] == {reopened: option["id"]}
@@ -343,8 +345,8 @@ def test_a_red_team_issue_declined_at_the_decision_stays_on_the_paths_list(level
     _decide(con, run, a, {"declined": [{"issue_id": issue, "disposition": "decline", "reason": "out of scope"}]},
             level.tmp)
     assert issue in [row["id"] for row in views.possibility_issues(con, run)]
-    assert f"`{issue}` proposal: The framework breaks → declined: another frame -- not opened: out of scope" in \
-        _paths(con, run)
+    assert (f"`{issue}` proposal: The framework breaks — premise: r → declined: another frame -- not opened: out of "
+            "scope") in _paths(con, run)
 
 
 def test_contracts_route_coverage_to_whoever_can_see_both_lines():
@@ -481,8 +483,8 @@ async def test_a_claim_across_lines_is_reopened_through_the_driver(driven):
                         "nodes": [{"question": "Villagers' norms?", "options": [norms["id"]], "rationale": "r"}]},
         refused=("needs a verdict", lambda m: {}))
     [claim] = material["coverage_claims"]
-    assert (claim["proposal"], claim["covered_by"]["node"], claim["covered_by"]["revised_since_claim"]) == (
-        norms["id"], b["id"], False)
+    assert (claim["proposal"], claim["premise"], claim["covered_by"]["node"], claim["covered_by"]["revised_since_claim"]) \
+        == (norms["id"], "Villagers' norms?", b["id"], False)
     assert any("1 coverage claim(s) reviewed (1 reopened)" in text for text in said)
     [c] = (runs.node(con, child["id"]) for child in runs.children(con, a["id"]))
     assert c["session_file"] and views.lineage(con, c) == [c["id"], a["id"], root["id"]]
@@ -494,8 +496,12 @@ async def test_a_claim_across_lines_is_reopened_through_the_driver(driven):
                       refused=("answers names nowhere", {"decisions": [_fork("Next?") | {"options": [
                           _fork("Next?")["options"][0], {**climate_back, "answers": ["nowhere"]}]}]}))
     assert "the root Last Order's conversation (reconciliation 2)" in prompt
-    [reopened] = [entry for entry in planner.on_your_line(con, run, c) if entry["went"] == "this node"]
+    line = planner.on_your_line(con, run, c)
+    [reopened] = [entry for entry in line if entry["went"] == "this node"]
     assert reopened["deliberation"]["session_file"] == run["root_session"]
+    # Premises, not labels, tell possibilities apart: the line gives a declined proposal's.
+    [declined] = [entry for entry in line if entry["id"] == climate["id"]]
+    assert (declined["premise"], declined["went"]) == ("Climate shock?", "declined: no harvest data survives")
     # Everything that reads the run renders it.
     run = runs.get(con, run["id"])
     assert "Villagers' norms?" in context.render(context.build(con, run, node=c))

@@ -299,8 +299,8 @@ class Coverage(Params):
         "holds: the covering node's research answers it. reopen: it does not -- the proposal is a possibility of "
         "its own and gets an outcome like a pending option: its id in a node's options, or in not_pursued."))
     note: str = Field(min_length=1, description=(
-        "holds: how that node's research answers it. reopen: the premise the proposal rests on that the covering "
-        "line does not -- a node opened for it reads it as its premise."))
+        "holds: how that node's research answers it. reopen: what that research leaves unanswered. The proposal "
+        "keeps its own premise; this note is the record of the verdict."))
 
 
 class Relation(Params):
