@@ -113,6 +113,7 @@ def engine(ctx=None):
             built = NativeLCMEngine(config=config_bridge.load_config(ctx=ctx), hermes_home="")
             try:
                 built._misaka_project = str(project)
+                built._misaka_source = storage.source(ctx)
                 built._misaka_cache = storage.current(project)
                 storage.namespace_ids(built._store._conn)
                 from .native import session_ids
@@ -272,7 +273,7 @@ def freeze_context(ctx, transcript):
     """Only the owner loop reads mutable session/model identity before queuing work."""
     session_id = ingest.session_id(ctx)
     return SimpleNamespace(
-        cwd=read_field(ctx, 'cwd'), lcm_project=str(storage.project(ctx)),
+        cwd=read_field(ctx, 'cwd'), lcm_project=str(storage.project(ctx)), lcm_source=storage.source(ctx),
         sessionManager=SimpleNamespace(getSessionId=lambda: session_id,
                                        getSessionFile=lambda: transcript.session_file,
                                        getEntries=lambda: transcript.entries,
@@ -522,7 +523,9 @@ def start(ctx) -> str:
         from . import carry
         carried = carry.receipt(snapshot(ctx)) if read_field(ctx.sessionManager, 'getEntries') else None
         continuity = ({'conversation_id': carried['details']['lcm']['carry']['conversation']} if carried else {})
-        built.on_session_start(session_id, platform="misaka", **continuity)
+        # Upstream's "which platform" is, for one project cache shared by Last Order and her
+        # Sisters, "which agent": it is what every row of this session stores as its `source`.
+        built.on_session_start(session_id, platform=storage.source(ctx), **continuity)
         built._ingest_cursor_needs_reconcile = True  # a fresh DB may still open an existing tree
         built._misaka_preflight_turn = None
         built._misaka_preanswer = None

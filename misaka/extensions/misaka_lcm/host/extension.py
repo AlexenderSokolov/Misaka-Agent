@@ -25,15 +25,16 @@ async def _off_loop(work, *args, signal=None, must_finish=False):
         work, *args, ctx=args[-1] if args else None, signal=signal, must_finish=must_finish)
 
 
-def register(harn, *, kind: str, workspace: str):
-    """Register the original tool surface and adapt MISAKA lifecycle events."""
+def register(harn, *, kind: str, workspace: str, source: str | None = None):
+    """Register the original tool surface and adapt MISAKA lifecycle events. ``source`` is the
+    session's address (``misaka_lcm.identity``), stored with every row it archives."""
 
     from .nous import flow
     harn.registerProvider('nous', {'oauth': flow})
 
     def scoped(handler):
         async def run(event, ctx):
-            return await handler(event, storage.context(ctx, workspace))
+            return await handler(event, storage.context(ctx, workspace, source))
         return run
 
     def on(name, handler):
@@ -148,7 +149,7 @@ def register(harn, *, kind: str, workspace: str):
             return None
 
     try:
-        tools.register(harn, workspace=workspace)
+        tools.register(harn, workspace=workspace, source=source)
     except Exception:
         logger.warning("LCM tools were not registered; this session runs without them.", exc_info=True)
 

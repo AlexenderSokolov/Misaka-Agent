@@ -94,6 +94,17 @@ skip-excluded-dirs = true
 [tool.hatch.build.targets.wheel]
 # Every importable package at the repo root (exposed by the editable install; replaces a hand-written .pth)
 packages = ["misaka"]
+# The pinned hermes-lcm tree is whole in the repository, where its tests run and its hashes are
+# checked. An install needs its runtime, its operator scripts, its skill and its prose -- not
+# 3.6 MB of tests, the benchmark harnesses, CI files, or 6 MB of documentation images.
+exclude = [
+  "misaka/extensions/misaka_lcm/vendor/tests",
+  "misaka/extensions/misaka_lcm/vendor/benchmarks",
+  "misaka/extensions/misaka_lcm/vendor/benchmarking",
+  "misaka/extensions/misaka_lcm/vendor/bench",
+  "misaka/extensions/misaka_lcm/vendor/.github",
+  "misaka/extensions/misaka_lcm/vendor/docs/*.png",
+]
 
 [tool.ruff]
 # Vendored verbatim from upstream hermes-lcm: linting it would be a diff against the pin.

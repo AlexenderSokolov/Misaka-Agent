@@ -29,8 +29,21 @@ Use existing context first. For exact old wording use `lcm_grep` then `lcm_expan
 for already-loaded cross-conversation history use `lcm_recall`. Summaries are
 navigation aids, not exact evidence. Do not claim a memory was permanently saved.
 
+Every stored row says who said it: its `source` is that session's address --
+`last-order`, a Sister's name, `name@<card id>` when she worked a card
+(`momo@t_3fa9c1`), `name/<agent id>` for a sub-agent. `lcm_grep(query,
+session_scope="all", source=...)` searches one of them (the value is exact: take
+it from a hit or build it from a card); a hit's `session_id` opens that
+conversation with `lcm_load_session`. One LCM result is at most 25k tokens: a
+larger transcript page comes back cut short with `has_more` and `next_cursor`,
+and any other oversized result asks for a smaller request.
+
 For tool recipes, read the relevant upstream reference under
 `../../../vendor/skills/hermes-lcm/references/`. Those references describe the
 inherited tool algorithms; MISAKA owns storage paths and lifecycle as described
-above. Tool names, argument schemas, `LCM_*` algorithm options, and upstream
-copyright notices are retained. `misaka lcm status` addresses the current project.
+above. Where they name Hermes's `session_search`, its configuration files or its
+chat platforms, MISAKA has none of them: use `lcm_recall` or
+`lcm_grep(session_scope="all")`, the `LCM_*` environment settings and
+`/lcm-settings`. Tool names, argument schemas, `LCM_*` algorithm options, and
+upstream copyright notices are retained. `misaka lcm status` addresses the
+current project.

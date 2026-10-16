@@ -37,18 +37,27 @@ def project(ctx=None) -> Path:
     return Path(root or Path.cwd()).expanduser().resolve()
 
 
-class ProjectContext:
-    """Keep project identity separate from a worker's execution directory."""
+def source(ctx=None) -> str:
+    """The session's address, which is what LCM stores as each row's ``source`` (upstream's
+    "which platform"): ``last-order``, a Sister's name, ``momo@t_3fa9c1`` for her card session
+    (``misaka_lcm.identity``). ``misaka`` where no session owns the engine: the operator CLI."""
+    return read_field(ctx, "lcm_source") or "misaka"
 
-    def __init__(self, ctx, workspace):
+
+class ProjectContext:
+    """Keep project identity separate from a worker's execution directory, and carry the
+    session's own address with it."""
+
+    def __init__(self, ctx, workspace, source=None):
         self._ctx = ctx
         self.lcm_project = str(Path(workspace).expanduser().resolve())
+        self.lcm_source = source if source is not None else read_field(ctx, "lcm_source")
 
     def __getattr__(self, name):
         return getattr(self._ctx, name)
 
 
-def context(ctx, workspace):
+def context(ctx, workspace, source=None):
     # A resumed worktree/child retains its original project, even if its old
     # execution directory was temporary. The marker is native session metadata.
     manager = read_field(ctx, "sessionManager")
@@ -58,7 +67,7 @@ def context(ctx, workspace):
             if entry.get("type") == "custom" and entry.get("customType") == "lcm-project":
                 workspace = entry["data"]["workspace"]
                 break
-    return ProjectContext(ctx, workspace)
+    return ProjectContext(ctx, workspace, source)
 
 
 def plugin_home() -> Path:

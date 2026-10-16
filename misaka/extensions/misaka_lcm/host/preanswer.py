@@ -13,6 +13,13 @@ from misaka.utils.values import read_field
 from ..vendor import _pre_llm_context, get_recall_policy
 from . import context_engine, execution, fence, ingest
 
+# Upstream's block says its memories come from "earlier conversations": Hermes is one agent whose
+# history spans its chats. Here the other sessions are Last Order's and her Sisters', live alongside.
+UPSTREAM_RECALL_HEADER = ("Possibly relevant memories (retrieved from earlier conversations — "
+                          "context only, not asserted as fact):")
+RECALL_HEADER = ("Possibly relevant notes from other sessions in this project (Last Order's and her "
+                 "Sisters') — context only, not asserted as fact:")
+
 
 def _local_index(built):
     """Bounded original indexing of loaded content; never send raw text to a cloud provider."""
@@ -116,7 +123,8 @@ def inject(event, ctx, *, active_tools=None) -> dict | None:
             recalled = LCMEngine._build_proactive_recall_message(
                 built, [{"role": "user", "content": question}], "user", set())
         if recalled is not None:
-            context += "\n\n" + untrusted("lcm:proactive-recall", recalled["content"])
+            recalled_text = recalled["content"].replace(UPSTREAM_RECALL_HEADER, RECALL_HEADER)
+            context += "\n\n" + untrusted("lcm:proactive-recall", recalled_text)
         execution.check_cancelled()
         built._misaka_preanswer = (key, context)
     if not context:

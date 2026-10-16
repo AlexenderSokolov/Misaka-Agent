@@ -1,5 +1,18 @@
 # MISAKA LCM fork 契约
 
+## 2026-10-17：表层——会话身份、工具文案、结果出口、未启用的工具
+
+核心源码未改：`vendor/`、`native/` 逐字节不变，改动全在 `host/`、`__init__.py`、技能文档和打包配置。
+
+- **会话身份写入 source 列。** 绑定引擎时传给上游的 `platform` 从常量 `misaka` 改为会话自己的地址（`host/context_engine.py`、`host/carry.py` 两处）：`last-order`、Sister 名字，卡片会话加 `@<卡号>`（`momo@t_3fa9c1`），子代理加 `/<agent id>`（父会话 `Agent` 调用返回的 id；子代理与父会话同名，不加就分不开）。上游把它写进每行的 `source` 列，所以每条命中都带上是谁说的，`lcm_grep(source=...)` 的精确过滤随之可用。地址由 `activate(spec)` 从 `SessionSpec` 取得（`misaka_lcm.identity`），经 `storage.ProjectContext.lcm_source` 传到引擎；`misaka lcm` CLI 没有会话，仍为 `misaka`。上游对 platform 的其余用途不变：会话匹配键（`LCM_IGNORE_SESSION_PATTERNS`、`LCM_STATELESS_SESSION_PATTERNS` 现在能按地址写）、前台重绑记账、辅助会话 bypass 集合；引擎只比较它在同一会话内是否变化，不判断取值。重放对账（`reconcile.py`）不看 source。
+- **工具文案。** 上游说明里有 7 处指向 Hermes 的 `session_search`（misaka 没有这个工具），`lcm_recall` 自称搜索"agent 的全部记忆、所有对话、所有时间"，`source`/`conversation_id` 参数举的是 cli/discord/telegram 和 Discord 频道。`host/tools.py` 的 `_REWRITES` 按上游原句逐句改写或删除，作用于工具说明、参数说明和召回规则；原来只替换工具说明里的 "Hermes"，参数说明里的 "Hermes-tracked" 漏掉了。每条原句由测试核对仍逐字存在于上游，换上游版本时改了措辞会直接失败，而不是悄悄漏改。召回规则前言改写为一段：缓存的真实范围，以及按 `source` 找别的会话的完整做法（原来的做法要求 `session_id`，Sister 拿不到）。
+- **结果出口 `_deliver`。** 所有工具结果先过这里再进 `fence.refence`：（1）JSON 以 `ensure_ascii=False` 重新序列化，中文不再是 `\uXXXX`（一个汉字 6 个字符）；含孤立代理项、无法编码为 UTF-8 时保留上游转义。（2）单次结果上限 25k token（`RESULT_BUDGET_TOKENS`），按模型实际收到的文本计：连同 fence 的外框，以及内容里每个标记被 defang 后加长的部分——抓了大量网页的会话，一页里可能有上百个标记。上游只限每一项（行数、每行字符、命中数），不限乘积，默认 `lcm_load_session` 一页就可能是 100 行 × 4000 字符。超限的 `lcm_load_session` 页保留能放下的前若干行，`has_more`/`next_cursor` 按上游游标约定指向下一行，并注明 `trimmed_to_budget`；其他工具超限时返回 `error`，提示缩小请求或分页。fence 的标记和精确引用都是 ASCII，重新序列化不影响围栏判断。
+- **自动召回的标题。** 上游块标题说记忆来自"earlier conversations"（Hermes 是一个 agent 跨聊天的记忆），这里改为"本项目其他会话（Last Order 和各 Sister）"（`host/preanswer.py`）。测试用上游真实构建器核对原标题。
+- **未启用的工具不注册。** `lcm_query_state`（`LCM_ASSERTIONS_ENABLED`）和 `lcm_retrieve`（`LCM_ADAPTIVE_RETRIEVAL_ENABLED`）在开关关闭时只会回答 `disabled`，不再注册；开关打开时与上游一样注册，配置读不出来时注册全部。其余工具说明里没有提到这两个工具。
+- **打包。** wheel 不再打包 `vendor/` 的测试、基准、CI 配置和文档图片（`pyproject.toml`）；`vendor/scripts`、`vendor/skills` 和 `vendor/docs/*.md` 保留，运维入口与技能引用不变。仓库内文件不变，完整性门照旧。
+- 技能文档（`host/skills/misaka-lcm/SKILL.md`）同步：地址格式、结果上限，以及上游参考文档里 `session_search`、Hermes 配置与平台在 misaka 中的对应做法。下方"路径与开关"里过时的默认路径说明一并改正。
+- 回归在 `tests/test_lcm_surface.py`（含真实会话端到端与随机化压测）。
+
 ## 2026-09-20：长检索输入的 SQLite 表达式深度修复
 
 - 固定上游版本与 `CORE_INTEGRITY.json.files` 的原始哈希保持不变；本次本地差异单独登记在 `documented_fixes`，不是声称与上游逐字节一致。
@@ -93,7 +106,7 @@ U07：retain-depth 删除中间摘要导致仍存活摘要的原文链路丢失�
 
 ## 路径与开关
 
-LCM 原文派生库默认 `~/.misaka/lcm.db`；`LCM_DATABASE_PATH` 优先于 MISAKA 的数据库配置。大结果 `lcm-large-outputs/` 和提取 `lcm-extractions/` 默认在该 DB 旁。显式 operator 路径按其原版 grammar。研究正文/证据仍在工作区，不新建 `.misaka/runs`。
+LCM 原文派生库在项目的 `<project>/.misaka/lcm/lcm.db`（项目目录就是主目录，或所在盘无法保持私有权限时，放在 `~/.misaka/state/plugins/misaka-lcm/` 下）。大结果 `lcm-large-outputs/` 和提取 `lcm-extractions/` 在该 DB 旁。显式 operator 路径按其原版 grammar。研究正文/证据仍在工作区，不新建 `.misaka/runs`。
 
 算法参数只用原版 `LCM_*`；删除旧 summary/retrieval/embedding 产品别名和临时 `os.environ` 修改。路径现由项目归属决定，`MISAKA_LCM_DB`、`LCM_DATABASE_PATH` 及内容侧文件路径覆盖均不再生效。`LCMConfig.from_env(host_config=...)` 接收 MISAKA 全局 settings，不读 Hermes YAML、profile secrets 或 auth.json。
 

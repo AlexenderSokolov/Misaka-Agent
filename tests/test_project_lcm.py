@@ -258,12 +258,25 @@ def test_carry_rejects_missing_modified_or_cross_project_sources(tmp_path, damag
         ce.sync(target)
 
 
+def _contract(value):
+    """A JSON Schema without its prose: what a call may and must carry."""
+    if isinstance(value, dict):
+        return {key: _contract(item) for key, item in value.items() if key != "description"}
+    if isinstance(value, list):
+        return [_contract(item) for item in value]
+    return value
+
+
 def test_core_tool_schemas_unchanged_and_product_guidance(tmp_path):
     from misaka.extensions.misaka_lcm.host import tools
     from misaka.extensions.misaka_lcm.vendor.engine import LCMEngine
     for schema in LCMEngine.get_tool_schemas():
         definition = tools._definition(schema, str(tmp_path))
-        assert definition.parameters == schema["parameters"]
+        # The contract is upstream's; only the prose is said in misaka's terms (2026-10-17).
+        assert _contract(definition.parameters) == _contract(schema["parameters"])
+        for key, spec in schema["parameters"].get("properties", {}).items():
+            if "description" in spec:
+                assert definition.parameters["properties"][key]["description"] == tools.misaka_text(spec["description"])
         assert definition.name == schema["name"]
     assert "MISAKA LCM" in tools.recall_guideline()
     assert "Hermes-LCM" not in tools.recall_guideline()
