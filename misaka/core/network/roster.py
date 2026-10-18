@@ -69,6 +69,12 @@ def _valid(sid):
     return bool(re.fullmatch(r"[\w][\w.-]*", sid or "")) and sid not in {"last-order", "last_order"}
 
 
+def _valid_new(sid):
+    # ``\w`` also matches Chinese, so text pasted into the ID prompt became a Sister. Existing
+    # IDs still pass ``_valid``; only a new one is held to the ASCII the message promises.
+    return _valid(sid) and sid.isascii()
+
+
 def roster_names(root=None):
     root = root or ROOT
     if not os.path.isdir(root):
@@ -97,7 +103,7 @@ def card_counts(sid, db_path=None):
 def create_sister(sid, root=None, specialty=None, model=None, thinking=None, runtime=None):
     """Create a Sister profile and return ``(success, message)``."""
     root = root or ROOT
-    if not _valid(sid):
+    if not _valid_new(sid):
         return False, f"Invalid Sister ID '{sid}'; use letters, numbers, '.', '_', or '-', but not last-order."
     prof = os.path.join(root, sid)
     if os.path.exists(prof):
@@ -290,7 +296,7 @@ def commands():
             if not sid:
                 ctx.ui.notify("Creation cancelled: no Sister ID was entered.", "info")
                 return
-        if not _valid(sid) or os.path.exists(os.path.join(ROOT, sid)):
+        if not _valid_new(sid) or os.path.exists(os.path.join(ROOT, sid)):
             ok, msg = create_sister(sid)
             ctx.ui.notify(msg, "error")
             return
