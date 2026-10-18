@@ -23,7 +23,8 @@ def catalog(tmp_path, monkeypatch):
               NS(provider="custom", id="vendor/model", name="Custom"),
               NS(provider="unconfigured", id="hidden", name="Hidden")]
     runtime = NS(getModels=lambda: models, getProviders=list,
-                 hasConfiguredAuth=lambda provider: provider != "unconfigured")
+                 hasConfiguredAuth=lambda provider: provider != "unconfigured",
+                 getProviderAuthStatus=lambda provider: NS(configured=provider != "unconfigured", source=None))
 
     async def create_runtime(**_kwargs):
         return NS(runtime=runtime, credentials=None)

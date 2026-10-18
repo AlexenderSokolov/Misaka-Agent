@@ -57,6 +57,8 @@ def _callbackPort():
     import socket
 
     probe = socket.socket()
+    # As asyncio.start_server binds: a callback answered a moment ago leaves the port in TIME_WAIT.
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         probe.bind(("127.0.0.1", 1455))
     except OSError as error:
@@ -293,3 +295,56 @@ async def test_a_busy_callback_port_fails_the_login_with_a_clear_message():
     finally:
         blocker.close()
         await blocker.wait_closed()
+
+
+async def _browserCallback(authorizeUrl: URL, clientId: str = "oaiapp_issued") -> tuple[int, str]:
+    """MISAKA regression: what the browser is shown when it follows the redirect to the loopback server."""
+    callback = URL(authorizeUrl.searchParams.get("redirect_uri") or "")
+    callback.searchParams.set("code", "authorization-code")
+    callback.searchParams.set("state", authorizeUrl.searchParams.get("state") or "")
+    callback.searchParams.set("client_id", clientId)
+    reader, writer = await asyncio.open_connection("127.0.0.1", 1455)
+    writer.write(f"GET {callback.pathname}{callback.search} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".encode())
+    await writer.drain()
+    raw = (await reader.read()).decode()
+    writer.close()
+    return int(raw.split()[1]), raw
+
+
+async def _loginThroughTheBrowser() -> tuple[tuple[int, str], BaseException | None]:
+    seen: dict[str, URL] = {}
+
+    async def neverPasted(_request: Any) -> str:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    login = asyncio.ensure_future(openaiChatGPTOAuth.login(
+        interaction(prompt=neverPasted, notify=lambda event: event.type == "auth_url" and seen.update(url=URL(event.url))),
+        LoginOptions(getDeviceId=lambda: DEVICE_ID)))
+    while "url" not in seen:
+        await asyncio.sleep(0.01)
+    page = await asyncio.wait_for(_browserCallback(seen["url"]), 10)
+    try:
+        await login
+    except Exception as error:  # noqa: BLE001 - the failing case is the point
+        return page, error
+    return page, None
+
+
+async def test_the_browser_is_told_completed_only_after_the_code_is_exchanged(monkeypatch):
+    """A refused code used to sit under "ChatGPT authentication completed": the page went out before the exchange."""
+    stubFetch(monkeypatch, openai_chatgpt, lambda *_args: jsonResponse({"error": "invalid_grant"}, status=400))
+
+    (status, page), error = await _loginThroughTheBrowser()
+
+    assert isinstance(error, RuntimeError) and "invalid_grant" in str(error)
+    assert status == 502 and "sign-in failed" in page and "completed" not in page
+
+
+async def test_an_exchanged_code_shows_the_completed_page(stubTokenEndpoint):
+    stubTokenEndpoint(tokenResponse())
+
+    (status, page), error = await _loginThroughTheBrowser()
+
+    assert error is None
+    assert status == 200 and "ChatGPT authentication completed" in page

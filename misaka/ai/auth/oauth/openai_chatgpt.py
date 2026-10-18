@@ -7,7 +7,8 @@ access token directly to api.openai.com.
 
 MISAKA fork (each is marked where it happens): ``fetch`` is ``_fetch.fetch``; the callback host variable is
 ``MISAKA_OAUTH_CALLBACK_HOST``; ``node:http`` becomes ``asyncio.start_server`` with a request-line reader and tracked
-connections for ``closeAllConnections``; a stored expiry is whole milliseconds; the busy-port message names misaka.
+connections for ``closeAllConnections``; a stored expiry is whole milliseconds; the busy-port message names misaka;
+the callback page waits for the token exchange, as ``callback-server.ts``'s does.
 """
 
 from __future__ import annotations
@@ -72,6 +73,8 @@ class _CallbackServer:
     result: asyncio.Future[_AuthorizationResult]
     # MISAKA fork: what `closeAllConnections` closes; asyncio's server does not track it.
     connections: set[asyncio.StreamWriter] = field(default_factory=set)
+    # MISAKA fork: the browser's callback, held open until the code is exchanged.
+    pending: list[asyncio.StreamWriter] = field(default_factory=list)
 
 
 class _TokenResponse(TypedDict, total=False):
@@ -135,6 +138,7 @@ async def _startCallbackServer(expectedState: str) -> _CallbackServer:
     # `Promise.race` observes the loser; a result nobody reads must not be reported.
     result.add_done_callback(lambda done: done.cancelled() or done.exception())
     connections: set[asyncio.StreamWriter] = set()
+    pending: list[asyncio.StreamWriter] = []
 
     def resolveResult(value: _AuthorizationResult) -> None:
         if not result.done():
@@ -180,13 +184,24 @@ async def _startCallbackServer(expectedState: str) -> _CallbackServer:
                 _sendHtml(response, 400, oauthErrorHtml(message))
                 return
 
-            _sendHtml(response, 200, oauthSuccessHtml("ChatGPT authentication completed. You can close this window."))
+            # MISAKA fork: the page waits for the token exchange, as callback-server.ts's does. Sent
+            # here, "completed" stood over a login whose code OpenAI then refused (invalid_grant).
+            if result.done():
+                _sendHtml(response, 409, oauthErrorHtml("This sign-in has already been handled."))
+                return
+            pending.append(response)
             resolveResult(authorizationResult)
         except Exception:  # noqa: BLE001 - a failing callback still gets an answer
             _sendHtml(response, 500, oauthErrorHtml("Internal error while processing the callback."))
 
     server = await asyncio.start_server(handle, _CALLBACK_HOST, _CALLBACK_PORT)
-    return _CallbackServer(server=server, result=result, connections=connections)
+    return _CallbackServer(server=server, result=result, connections=connections, pending=pending)
+
+
+def _answerCallback(callback: _CallbackServer, status: int, body: str) -> None:
+    """MISAKA fork: the held browser callback gets the page for how the login ended."""
+    while callback.pending:
+        _sendHtml(callback.pending.pop(), status, body)
 
 
 async def _requestToken(body: URLSearchParams, signal: Any) -> _TokenResponse:
@@ -361,12 +376,18 @@ async def _loginOpenAIChatGPT(
         done, _ = await asyncio.wait({callback.result, manualCode}, return_when=asyncio.FIRST_COMPLETED)
         result = (callback.result if callback.result in done else manualCode).result()
         interaction.notify(ProgressEvent(type="progress", message="Exchanging authorization code for tokens..."))
-        return await _exchangeAuthorizationCode(result.code, verifier, result.clientId, interaction.signal)
+        credential = await _exchangeAuthorizationCode(result.code, verifier, result.clientId, interaction.signal)
+        _answerCallback(callback, 200, oauthSuccessHtml("ChatGPT authentication completed. You can close this window."))
+        return credential
     except Exception as error:
+        # MISAKA fork: callback-server.ts's 502 page for a code the token endpoint refused.
+        _answerCallback(callback, 502, oauthErrorHtml("ChatGPT sign-in failed.", str(error)))
         if signal_aborted(interaction.signal):
             raise RuntimeError("Login cancelled") from error
         raise
     finally:
+        # MISAKA fork: a cancelled login still answers the browser instead of leaving it loading.
+        _answerCallback(callback, 400, oauthErrorHtml("ChatGPT was not connected."))
         manualAbort.abort()
         # MISAKA fork: also stop awaiting a prompt that ignores its signal. `asyncio.wait`, so
         # a cancellation of this login itself still propagates.

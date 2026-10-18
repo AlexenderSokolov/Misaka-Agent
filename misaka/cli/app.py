@@ -962,10 +962,16 @@ def main(argv=None):
         if interactive:
             from misaka.cli import setup_wizard as setup
             if not setup.configured_anywhere():
-                # A first run: no credential for the default provider anywhere. The wizard
-                # is the door, and the panel opens once it is done.
-                print("No provider credential is configured yet; starting `misaka setup`.")
-                if setup.run() != 0:
+                # No credential for the default provider anywhere. On a first run the wizard
+                # is the door; once a model was saved, only that section is unfinished, and the
+                # rest of the wizard (Sisters, documents, web) is not asked a second time.
+                if setup.model_saved():
+                    print("The default provider has no credential yet; starting `misaka setup model`.")
+                    code = setup.run("model")
+                else:
+                    print("No provider credential is configured yet; starting `misaka setup`.")
+                    code = setup.run()
+                if code != 0:
                     return 1
             from misaka.ui.panel import ghostty
             if reason := ghostty.unavailable():

@@ -31,6 +31,7 @@ Bare ``misaka`` runs the wizard by itself when no credential is configured anywh
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import platform
 import shlex
@@ -134,6 +135,8 @@ class Wizard:
         from misaka.core.model_resolver import findExactModelReferenceMatch
         from misaka.core.network import roster
         ui.print_header("Model & Provider")
+        for key in ("credential", "sdk", "verified"):
+            self.state.pop(key, None)       # ← back into this section starts it over
         cfg = current_config()
         auth_runtime = asyncio.run(create_auth_runtime(read_only=False, refresh=True))
         runtime = auth_runtime.runtime
@@ -173,9 +176,11 @@ class Wizard:
         extras = missing_sdk_extras(runtime, provider)
         if extras:
             ui.print_warning(f"The SDK for {provider} is not installed (misaka's {', '.join(extras)} extra).")
-            if prompt_yes_no("Install it now?", True):
-                self._add_extras(extras)
+            self._add_extras(extras)
         self._credential(runtime, auth_runtime.credentials, provider)
+        # A failed or skipped sign-in only prints a line; the summary reads this, not the choice.
+        with contextlib.suppress(Exception):     # unknown is left out of the summary, as before
+            self.state["credential"] = has_credential(provider)
         model_id = self._pick_model(runtime, provider, cfg)
         from misaka.core.settings_manager import SettingsManager
         try:
@@ -359,6 +364,13 @@ class Wizard:
         return kept or list(models)
 
     def _verify(self, runtime, provider: str, model_id: str) -> None:
+        if self.state.get("credential") is False:
+            ui.print_warning(f"No credential for {provider} was stored, so there is nothing to test.")
+            ui.print_info("Run `misaka setup model` to sign in again.")
+            return
+        if self.state.get("sdk"):
+            ui.print_info("The test request is skipped: it needs the SDK named above.")
+            return
         if not prompt_yes_no("Send one tiny request now to confirm the credential works?", True):
             return
         from misaka.ai.types import Context, SimpleStreamOptions, UserMessage
@@ -379,7 +391,7 @@ class Wizard:
             self.state["verified"] = True
         except Exception as error:  # noqa: BLE001 - the wizard reports and continues
             ui.print_error(f"The request failed: {error}")
-            ui.print_info("Check the key (or `misaka auth check`) and run `misaka setup model` again.")
+            ui.print_info("Check the credential (or `misaka auth check`) and run `misaka setup model` again.")
             self.state["verified"] = False
 
     # -- 3. sisters ---------------------------------------------------------------------------
@@ -617,15 +629,7 @@ class Wizard:
         from misaka.core.network import roster
         state = self.state
         ui.print_banner("✓ Setup complete")
-        # `verified` is None when the check was declined and False when the request failed.
-        # Ticking on "a provider was chosen" reported a broken key as a finished step, which is
-        # the one line of this screen a person actually reads.
-        verified = state.get("verified")
-        ui.print_check(bool(state.get("provider")) and verified is not False, "model",
-                       f"{state.get('provider')} / {state.get('model')}"
-                       + ("  (the test request failed; the key is stored but does not work)" if verified is False else
-                          "  (not tested)" if verified is None else "")
-                       if state.get("provider") else "run `misaka setup model`")
+        self._model_check()
         names = roster.roster_names()
         ui.print_check(bool(names), "sisters", ", ".join(names) if names else "none: run `misaka setup sisters`")
         for binary in ("git", "rg", "fd", "pdftotext"):
@@ -650,6 +654,25 @@ class Wizard:
                       "  misaka setup <section>                       revisit one section: " + " | ".join(SECTIONS),
                       "  misaka auth check                            credentials, per provider", "")
 
+    def _model_check(self) -> None:
+        """The summary's model row. Ticking on "a provider was chosen" reported a failed sign-in, a
+        skipped key and a broken key as a finished step, and this is the one row people read."""
+        state = self.state
+        if not state.get("provider"):
+            ui.print_check(False, "model", "run `misaka setup model`")
+            return
+        chosen = f"{state['provider']} / {state['model']}"
+        verified = state.get("verified")    # None: not tested; False: the request failed
+        if state.get("credential") is False:
+            ui.print_check(False, "model", f"{chosen}  (no credential stored: the sign-in failed or was skipped;"
+                                           " run `misaka setup model`)")
+        elif state.get("sdk"):
+            ui.print_check(False, "model", f"{chosen}  (its SDK is not installed: {state['sdk']})")
+        elif verified is False:
+            ui.print_check(False, "model", f"{chosen}  (the test request failed; the stored credential does not work)")
+        else:
+            ui.print_check(True, "model", chosen + ("  (not tested)" if verified is None else ""))
+
     # -- helpers ------------------------------------------------------------------------------
 
     @staticmethod
@@ -660,51 +683,79 @@ class Wizard:
         except (ImportError, ValueError):
             return False
 
-    @staticmethod
-    def _add_extras(extras: list[str]) -> None:
+    def _add_extras(self, extras: list[str]) -> None:
         """Install ``extras`` the way this install was made, keeping every extra it already has.
 
         uv and pipx own the environment this wizard runs in: replacing it underneath a running
-        process is theirs to do after it exits, so their command is printed, not run."""
+        process is theirs to do after it exits, so their command is printed, not run, and no
+        "Install it now?" is asked that a Yes could not keep. Whatever is left to run is kept in
+        ``state["sdk"]`` for the summary, since the line here scrolls away."""
         from misaka.cli import update
         install = update.describe()
         if install.kind == "bundle":
             # A release archive carries what it was built with (misaka[providers]) and no pip.
             ui.print_info(f"This MISAKA is a release archive, built without {', '.join(extras)}. To add it,",
                           "install MISAKA from the repository instead (README: Install).")
+            self.state["sdk"] = "install MISAKA from the repository (README: Install)"
             return
         command = update.adding_extras(install, extras)
         if command is None:
-            ui.print_info("Install it with:", f"  pip install 'misaka[{','.join(extras)}] @ git+{update.REPO_URL}'")
+            hint = f"pip install 'misaka[{','.join(extras)}] @ git+{update.REPO_URL}'"
+            ui.print_info("Install it with:", f"  {hint}")
+            self.state["sdk"] = hint
             return
         if install.installer in ("uv tool", "pipx"):
-            ui.print_info("Run this once setup is done, then start MISAKA again:", f"  {shlex.join(command)}")
+            ui.print_info("It cannot be installed while setup is running. Once setup is done, run this and",
+                          "start MISAKA again (signing in below works without it):", f"  {shlex.join(command)}")
+            self.state["sdk"] = shlex.join(command)
+            return
+        if not prompt_yes_no("Install it now?", True):
+            self.state["sdk"] = shlex.join(command)
             return
         ui.print_info(color_dim(shlex.join(command)))
         try:
             result = subprocess.run(command, check=False)
         except OSError as error:
             ui.print_error(f"{command[0]} could not start: {error}")
+            self.state["sdk"] = shlex.join(command)
             return
         (ui.print_success if result.returncode == 0 else ui.print_error)(
             "installed" if result.returncode == 0 else f"{command[0]} exited with {result.returncode}")
+        if result.returncode != 0:
+            self.state["sdk"] = shlex.join(command)
 
 
 def color_dim(text: str) -> str:
     return ui.color(text, ui.DIM)
 
 
+def has_credential(provider: str) -> bool:
+    """Whether ``provider`` has a credential, read as a new process reads it. A runtime made
+    before a sign-in keeps the status it read then, and would call a stored key missing."""
+    from misaka.cli.auth_overview import create_auth_runtime
+    runtime = asyncio.run(create_auth_runtime(read_only=True, refresh=True)).runtime
+    status = runtime.getProviderAuthStatus(provider)
+    return bool(status.configured or status.source)
+
+
 def configured_anywhere() -> bool:
     """Whether the default provider has a credential: the test bare ``misaka`` runs to decide
     whether to open the wizard first."""
     try:
-        from misaka.cli.auth_overview import create_auth_runtime
         from misaka.config import current_config
-        runtime = asyncio.run(create_auth_runtime(read_only=True, refresh=True)).runtime
-        status = runtime.getProviderAuthStatus(current_config()["provider"])
-        return bool(status.configured or status.source)
+        return has_credential(current_config()["provider"])
     except Exception:  # noqa: BLE001 - an unreadable store is not a reason to force the wizard
         return True
+
+
+def model_saved() -> bool:
+    """Whether the model section has saved a default before. A credential missing then is that
+    section left unfinished (a failed sign-in, a skipped key), not a first run of the wizard."""
+    from misaka.config.product import settings_document
+    try:
+        return bool(settings_document().get("defaultProvider"))
+    except Exception:  # noqa: BLE001 - an unreadable file falls back to the whole wizard
+        return False
 
 
 def run(section: str | None = None) -> int:
@@ -728,7 +779,11 @@ def run(section: str | None = None) -> int:
             label, action = by_key[section]
             ui.print_logo(f"Setup · {label}")
             ui.run_steps([(label, action)])
-            ui.print_success(f"{label} done.")
+            if section == "model":
+                ui.print_info("")
+                wizard._model_check()   # "done." stood under a sign-in that had just failed
+            else:
+                ui.print_success(f"{label} done.")
             return 0
         ui.print_logo("Setup", "Configure this install: model, roles, documents, web, project.",
                       "Enter keeps a current value · ← previous section · Esc or Ctrl+C exits.")

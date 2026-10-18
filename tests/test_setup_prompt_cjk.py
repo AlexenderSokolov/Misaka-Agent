@@ -26,8 +26,8 @@ def test_backspace_erases_a_whole_chinese_character():
     # A child on a real terminal answers the prompt; pytest's capture would swallow a fork's.
     fd, tty = pty.openpty()
     child = subprocess.Popen(
-        [sys.executable, "-c", "from misaka.cli.setup_ui import prompt; "
-                               "print('RESULT=' + repr(prompt('Sister ID', '10033')))"],
+        [sys.executable, "-c", ("from misaka.cli.setup_ui import prompt; "
+                                "print('RESULT=' + repr(prompt('Sister ID', '10033')))")],
         stdin=tty, stdout=tty, stderr=tty, close_fds=True)
     os.close(tty)
     out = b""
