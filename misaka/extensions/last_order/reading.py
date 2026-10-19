@@ -128,6 +128,10 @@ class _Window:
 
 
 def _describe(result: dict[str, Any]) -> str:
+    # `graph` returns the same run fields as `open`; only the map paths tell them apart,
+    # and calling a read-only command "已建立阅读" would claim it created something.
+    if result.get("graphMarkdownPath") or result.get("graphPath"):
+        return f"阅读 {result['runId']}：图 {result.get('graphMarkdownPath') or result.get('graphPath')}"
     if result.get("runId") and "runDirectory" in result:
         return (
             f"已建立阅读：{result['runId']}，入口节点 {result.get('currentNodeId')}。"
