@@ -45,7 +45,9 @@ misaka read open sources/luxun.html sources/dolls-house.txt \
 
 `/read say` 与 `/read stop` 属于窗口：say 把一句话交给这次阅读的领读，stop 结束本窗口启动的引擎。无论停不停，图与节点正文都留在磁盘上。Agent 写作时，进度显示在状态栏和输入框上方的小部件里；终端中 `misaka read chat` 同理，Ctrl+C 退出。
 
-窗口在多次命令之间复用一个引擎，而引擎的模型在启动时就固定了。指定另一个模型（`/read say RUN_ID --model provider/id`，或任一子命令加 `--model`）会按新的模型重启引擎；阅读从磁盘续上，已经写入的内容不会丢失。`graph` 只读文件，不接受 `--model`。
+窗口在多次命令之间复用一个引擎，而引擎的模型在启动时就固定了。指定另一个模型（`/read say --model provider/id RUN_ID ...`，或任一子命令加 `--model`）会按新的模型重启引擎；阅读从磁盘续上，已经写入的内容不会丢失。`graph` 只读文件，不接受 `--model`。
+
+在 `open` 或 `graph` 之后第一次 `/read say`，也会取得聊天窗口选中的模型。显式指定 `--workspace` 或 `--runs-dir` 会切换阅读位置，随后未指定位置的命令沿用该选择。
 
 ## 命令
 
@@ -170,9 +172,11 @@ flowchart TD
 
 ## 模型与限制
 
-领读和研读 Sister 都使用文本模型。在窗口里，`/read` 默认从当前对话使用的模型（`ctx.model`）出发，沿用同一套 provider 设置；也可以用 `--model` 另选。在终端里，使用 `--model` 或角色配置里固定的模型，否则用设置中已经可用的模型。Python 侧的 provider 对象不会被序列化：引擎收到的是 provider 名、模型 ID、base URL、API 风格、请求头与本次运行用的 key，只在本次运行里注册。key 不会写进图、笔记或日志。
+领读和研读 Sister 都使用文本模型。在窗口里，`/read` 默认从当前对话使用的模型（`ctx.model`）出发，沿用同一套 provider 设置；也可以用 `--model` 另选。在终端里，使用 `--model` 或角色配置里固定的模型，否则用当前进程环境中的 API 路由。Python 侧的 provider 对象不会被序列化：引擎收到的是 provider 名、模型 ID、base URL、API 风格、请求头与本次运行用的 key，只在本次运行里注册。key 不会写进图、笔记或日志。
 
-长材料按页读取：Agent 先要纲要，再要页段或某个章节，而不是一次收到整本书。首版信任模型自己说明用到的页段；对不上的页引用会被丢弃，不会当作引文显示。
+终端使用 API 路由时，设置 `MISAKA_READING_BASE_URL`、`MISAKA_READING_API_KEY`、`MISAKA_READING_MODEL`，必要时再指定 `MISAKA_READING_API`（例如 `openai-completions`）。Claude Code 内启动的命令可能继承其代理环境，另一个终端则没有；阅读模式不会自动加载 Claude Code 的配置。路由所用 API 需由 pi SDK 支持，Python 专有 provider 实现不会跨进程带入。
+
+长材料按页读取：Agent 先要纲要，再要页段或某个章节，而不是一次收到整本书。来源 ID 会匹配到已登记材料；页码仍是模型的声明，不会自动逐句核对引文。
 
 阅读模式不会自行启动研究。当你希望这些阅读成果变成文章时，带着笔记到 `/research` 中提出你自己的问题。
 

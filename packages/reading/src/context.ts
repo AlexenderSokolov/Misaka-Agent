@@ -35,7 +35,7 @@ import type {
 export const EXCERPT_CHARS = 8_000;
 /** At most this many materials are pre-read; the rest are reachable through the tools. */
 export const EXCERPT_SOURCES = 3;
-/** A prior node body longer than this is cut, with a pointer to the file. */
+/** Ordinary continuation uses a working excerpt; comparison and rereading carry full notes. */
 const PRIOR_BODY_CHARS = 12_000;
 
 export interface ContextInput {
@@ -116,7 +116,7 @@ async function excerptsFor(
   return out;
 }
 
-async function priorFor(paths: RunPaths, graph: ReadingGraph, nodeIds: string[]): Promise<PriorUnderstanding[]> {
+async function priorFor(paths: RunPaths, graph: ReadingGraph, nodeIds: string[], complete: boolean): Promise<PriorUnderstanding[]> {
   const out: PriorUnderstanding[] = [];
   for (const nodeId of nodeIds) {
     const node = graph.nodes.find((candidate) => candidate.id === nodeId);
@@ -135,7 +135,7 @@ async function priorFor(paths: RunPaths, graph: ReadingGraph, nodeIds: string[])
         body = node.summary;
       }
     }
-    const { text } = cut(body || node.summary, PRIOR_BODY_CHARS);
+    const text = complete ? (body || node.summary).trim() : cut(body || node.summary, PRIOR_BODY_CHARS).text;
     out.push({
       nodeId: node.id,
       question: node.question,
@@ -196,7 +196,7 @@ export async function buildActionContext(input: ContextInput): Promise<ActionCon
   const selection = nodesForMode(request, graph, sources);
   const [sourceExcerpts, priorUnderstandings] = await Promise.all([
     excerptsFor(bridge, sources, selection.refs),
-    priorFor(paths, graph, selection.nodeIds),
+    priorFor(paths, graph, selection.nodeIds, request.contextMode === "compare" || request.contextMode === "reread"),
   ]);
   return {
     question: request.question,

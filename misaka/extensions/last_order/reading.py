@@ -13,6 +13,7 @@ run's leader, and ``/read stop RUN_ID`` stops the engine this window started.
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 from typing import Any
 
@@ -55,24 +56,35 @@ class _Window:
     def session_for(
         self, args: Any, handover: dict[str, Any] | None, ui: Any = None
     ) -> host.ReadingSession:
+        current = self.session
+        workspace = os.path.realpath(os.path.abspath(os.path.expanduser(
+            getattr(args, "workspace", None) or (current.workspace if current else self.spec.workspace)
+        )))
+        runs_directory = getattr(args, "runs_dir", None)
+        if runs_directory:
+            runs_directory = os.path.realpath(os.path.abspath(os.path.expanduser(runs_directory)))
+        elif current is not None and current.workspace == workspace:
+            runs_directory = current.runs_directory
+        selected_model = handover if handover is not None else (current.handover if current else None)
+        reader_intent = getattr(args, "intent", None)
+        if reader_intent is None and current is not None:
+            reader_intent = current.reader_intent
         if (
-            self.session is not None
-            and handover is not None
-            and handover != self.session.handover
+            current is not None
+            and (workspace != current.workspace or runs_directory != current.runs_directory
+                 or selected_model != current.handover or reader_intent != current.reader_intent)
         ):
-            # The engine's model is fixed by the hello it starts with. A different
-            # --model therefore needs a new process; runs resume from disk, so the
-            # graph and node bodies survive, and only the live line is restarted.
-            self.session.terminate()
+            # Workspace, corpus roots and model belong to the process's initial hello.
+            current.terminate()
             self.session = None
             if ui is not None:
-                ui.notify("已按新的模型重启阅读引擎；阅读图与节点正文从磁盘续上。", "info")
+                ui.notify("已按新的阅读设置重启引擎；阅读图与节点正文从磁盘续上。", "info")
         if self.session is None:
             self.session = host.ReadingSession(
-                self.spec.workspace,
-                runs_directory=getattr(args, "runs_dir", None),
-                handover=handover,
-                reader_intent=getattr(args, "intent", None),
+                workspace,
+                runs_directory=runs_directory,
+                handover=selected_model,
+                reader_intent=reader_intent,
                 persona=host.persona_for(self.spec.profile_dir),
             )
         return self.session
@@ -293,7 +305,7 @@ async def _say(window: _Window, argv: list[str], ctx: Any) -> None:
     # has, the engine's model is fixed and a different choice restarts it (see session_for).
     while argv and argv[0].startswith("--"):
         flag = argv.pop(0)
-        if flag in {"--model", "--runs-dir", "--intent"} and argv:
+        if flag in {"--model", "--workspace", "--runs-dir", "--intent"} and argv:
             setattr(options, flag[2:].replace("-", "_"), argv.pop(0))
         else:
             ui.notify(f"/read say 不认得 {flag}", "warning")
@@ -305,15 +317,15 @@ async def _say(window: _Window, argv: list[str], ctx: Any) -> None:
     if not message:
         ui.notify("要在 /read say RUN_ID 后面写你说的话。", "warning")
         return
-    handover: dict[str, Any] | None = None
-    if window.session is None or options.model:
-        handover = await _handover(options, ctx, ui)
-        if handover is None:
-            return
-    window.session_for(options, handover, ui)
     if window.busy():
         ui.notify("这个窗口仍在阅读；等它完成再说话。", "warning")
         return
+    # open/graph do not need a model. The first say must still obtain the window's
+    # selected model, and later turns must notice a changed selection.
+    handover = await _handover(options, ctx, ui)
+    if handover is None:
+        return
+    window.session_for(options, handover, ui)
 
     session = window.session
     assert session is not None

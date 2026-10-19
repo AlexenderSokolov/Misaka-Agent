@@ -11,6 +11,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -109,6 +110,7 @@ interface OpenRun {
   paths: RunPaths;
   graph: ReadingGraph;
   outlines: Map<string, Outline>;
+  readerIntent: string;
   leader: CreatedSession | null;
   /** The map last handed to the leader, so a chat turn only re-sends it when it changed. */
   sharedMap: string;
@@ -209,6 +211,7 @@ export class ReadingEngine {
   private readonly options: EngineOptions;
   private readonly openRuns = new Map<string, OpenRun>();
   private readonly methods = new Map<ActionId, string>();
+  private readonly submitSinks = new WeakMap<CreatedSession["session"], SubmitSink>();
   private runtime: ReadingRuntime | null = null;
   private progress: Progress = QUIET;
   private activeRunId: string | null = null;
@@ -301,6 +304,7 @@ export class ReadingEngine {
       paths,
       graph,
       outlines,
+      readerIntent: this.options.readerIntent ?? "",
       leader: null,
       sharedMap: "",
       studySessions: new Map(),
@@ -322,12 +326,16 @@ export class ReadingEngine {
     for (const source of graph.sources) {
       outlines.set(source.docId, await this.options.bridge.outline(source.docId));
     }
+    const readerIntent = existsSync(paths.readerPath)
+      ? (await readFile(paths.readerPath, "utf8")).replace(/^# 读者关切\s*\r?\n/, "").trim()
+      : this.options.readerIntent ?? "";
     this.openRuns.set(graph.runId, {
       runId: graph.runId,
       runDirectory,
       paths,
       graph,
       outlines,
+      readerIntent,
       leader: null,
       sharedMap: "",
       studySessions: new Map(),
@@ -365,7 +373,7 @@ export class ReadingEngine {
       modelRuntime: runtime.runtime,
       model: runtime.model,
       systemPrompt:
-        `${this.persona.leader}\n\n## 读者关切\n\n${this.options.readerIntent?.trim() || "（尚未记录）"}\n\n` +
+        `${this.persona.leader}\n\n## 读者关切\n\n${run.readerIntent.trim() || "（尚未记录）"}\n\n` +
         `## 这次阅读\n\n- runId：${run.runId}\n- 问题：${run.graph.question}\n` +
         `- 目录：${run.runDirectory}\n\n## 材料\n\n${describeSources(run.graph.sources, run.outlines)}\n\n` +
         `${map}\n` +
@@ -564,9 +572,13 @@ export class ReadingEngine {
     priorSession: CreatedSession | null,
     context: Awaited<ReturnType<typeof buildActionContext>>,
     catalogue: string,
+    sessionFile?: string,
   ): Promise<{ result: ActionResult; session: CreatedSession }> {
     const runtime = await this.model();
-    const sink: SubmitSink = { value: null };
+    // A reused SDK session keeps its tools and their closures. Reset its own sink rather
+    // than reading a new sink that the existing reading_submit tool cannot write to.
+    const sink: SubmitSink = (priorSession && this.submitSinks.get(priorSession.session)) || { value: null };
+    sink.value = null;
     const prompt = renderActionPrompt(context, catalogue);
     const persona =
       role === "compare"
@@ -583,9 +595,12 @@ export class ReadingEngine {
       systemPrompt: persona,
       tools: ROLE_TOOLS,
       customTools: [...createSourceTools(this.options.bridge), createSubmitTool(sink)],
+      ...(sessionFile ? { sessionFile } : {}),
     };
 
     const created = priorSession ?? (role === "compare" ? await createCompareSession(spec) : await createStudySession(spec));
+    this.submitSinks.set(created.session, sink);
+    if (!priorSession && created.resumed) this.note(`resumed ${role} session ${created.sessionId}`);
     const streamed = await runTurn(created.session, prompt, (delta) =>
       this.progress.text(role, delta, node.id),
     );
@@ -615,7 +630,7 @@ export class ReadingEngine {
     run: OpenRun,
     parent: ReadingNode,
     request: ActionRequest,
-    contextMode: "compare" | "reread",
+    contextMode: "fork" | "compare" | "reread",
     refs: SourceRef[],
     parents: string[],
   ): Promise<ReadingNode> {
@@ -669,7 +684,7 @@ export class ReadingEngine {
       bridge: this.options.bridge,
       sources: run.graph.sources,
       methodInstructions: await this.method(request.action),
-      readerIntent: this.options.readerIntent ?? "",
+      readerIntent: run.readerIntent,
     });
     const catalogue = describeSources(run.graph.sources, run.outlines);
     const role = request.contextMode === "compare" ? "compare" : "study";
@@ -677,13 +692,16 @@ export class ReadingEngine {
     let node = parent;
     let prior: CreatedSession | null =
       request.contextMode === "continue" ? (run.studySessions.get(parent.lineId) ?? null) : null;
-    if (request.contextMode === "compare" || request.contextMode === "reread") {
+    const savedSession = request.contextMode === "continue" && !prior
+      ? run.graph.sessions.find((record) => record.sessionId === parent.sessionId)
+      : undefined;
+    if (request.contextMode === "independent" || request.contextMode === "compare" || request.contextMode === "reread") {
       const parents = (request.usingNodeIds ?? []).filter((id) => run.graph.nodes.some((n) => n.id === id));
       node = await this.successor(
         run,
         parent,
         request,
-        request.contextMode,
+        request.contextMode === "independent" ? "fork" : request.contextMode,
         context.sourceRefs,
         parents,
       );
@@ -698,6 +716,7 @@ export class ReadingEngine {
       prior,
       context,
       catalogue,
+      savedSession?.sessionFile,
     );
     await this.record(run, node, request, result, session, role);
     await saveGraph(run.paths, run.graph);
@@ -742,7 +761,7 @@ export class ReadingEngine {
         bridge: this.options.bridge,
         sources: run.graph.sources,
         methodInstructions: await this.method(branch.action),
-        readerIntent: this.options.readerIntent ?? "",
+        readerIntent: run.readerIntent,
       });
       plans.push({ node, request, context });
     }

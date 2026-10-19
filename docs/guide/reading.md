@@ -60,9 +60,13 @@ Progress appears on the status line and in a small widget above the input box as
 writes; `misaka read chat` does the same in a terminal, and Ctrl+C leaves it.
 
 The window keeps one engine across commands, and an engine's model is fixed when it starts.
-Naming a different model (`/read say RUN_ID --model provider/id`, or any subcommand with
+Naming a different model (`/read say --model provider/id RUN_ID ...`, or any subcommand with
 `--model`) restarts the engine with the new handover; the reading resumes from disk, so nothing
 already written is lost. `graph` reads files only and takes no `--model`.
+
+The first `/read say` after `open` or `graph` also resolves the chat's selected model.
+Explicit `--workspace` or `--runs-dir` selections switch the window to that reading location;
+following commands keep using it until another location is selected.
 
 ## The commands
 
@@ -220,14 +224,21 @@ remain, so the next command picks up from them.
 
 The leader and study Sisters use a text model. In a window, `/read` starts from the model the
 chat is using (`ctx.model`), through the same provider settings, unless you pass `--model`. In
-the terminal, `--model` or the profile's pinned model is used, falling back to a model your
-settings already provide. Provider objects from the Python side are not serialised; the engine
+the terminal, `--model` or the profile's pinned model is used, falling back to an API route
+configured in the process environment. Provider objects from the Python side are not serialised; the engine
 receives a provider, model id, base URL, API style, headers and a runtime key, and registers them
 for this run. The key is never written to the graph, a note or a log.
 
+For a terminal API route, set `MISAKA_READING_BASE_URL`, `MISAKA_READING_API_KEY`,
+`MISAKA_READING_MODEL` and, when needed, `MISAKA_READING_API` (for example,
+`openai-completions`). A command started inside Claude Code may inherit proxy settings that
+another terminal does not have; reading mode does not automatically load Claude Code's settings.
+The route's API must be supported by the pi SDK; Python-only provider implementations do not
+cross the process boundary.
+
 Long material is read in pages: the agent asks for an outline, then pages or a section, rather
-than receiving the whole book at once. The first version trusts the model to say which pages it
-used; a page reference it invents is dropped rather than shown as a citation.
+than receiving the whole book at once. Source identifiers are matched to the registered materials;
+page locations are the model's declarations, and quoted sentences are not automatically checked.
 
 Reading mode does not start a research run by itself. When you want the reading to become a
 paper, take the notes into `/research` yourself with your own question.
