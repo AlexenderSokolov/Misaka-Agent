@@ -6,7 +6,9 @@ over the line protocol, and this module answers with the repository's own corpus
 
 A file already inside the workspace is indexed where it sits. A single file outside it, or
 a URL, is first copied/downloaded into the run's ``sources/`` folder -- the original is
-never moved or rewritten, and its path or URL is remembered as the source's origin.
+never moved or rewritten, and its path or URL is remembered as the source's origin. When the
+runs tree itself is outside the workspace, those copies join a second corpus at the runs
+root (the project's corpus only holds paths under the workspace); both stay readable here.
 
 Nothing here writes credentials or model output. Downloaded bytes are bounded, vetted by
 the same SSRF-checked stream every other outbound fetch uses, and never decoded by this
@@ -19,6 +21,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import shutil
 import unicodedata
 from pathlib import Path, PurePosixPath
@@ -31,8 +34,10 @@ from misaka.core.web.bounded import open_checked_stream, read_bounded
 #: for a scanned monographic chapter while keeping a runaway transfer off the disk.
 MAX_MATERIAL_BYTES = 64 * 1024 * 1024
 
-#: ``read_pages`` appends this when the window ends before the selected pages do.
-_CONTINUE = "offset="
+#: ``read_pages`` appends this note when the window ends before the selected pages do.
+#: The offset is reported structurally instead (``truncated``/``nextOffset``), so the note
+#: itself is cut from the text rather than asked for twice.
+_CONTINUE = re.compile(r"\n… \(more; call again with offset=(\d+) to continue\)\s*\Z")
 
 _URL_SCHEMES = ("http://", "https://")
 
@@ -128,9 +133,44 @@ def _guess_suffix(content_type: str | None, url: str) -> str:
 class Materials:
     """Corpus access for one reading run, in one workspace."""
 
-    def __init__(self, workspace: str, run_directory: str | None = None) -> None:
+    def __init__(
+        self,
+        workspace: str,
+        run_directory: str | None = None,
+        *,
+        runs_root: str | None = None,
+    ) -> None:
         self.workspace = os.path.realpath(os.path.abspath(os.path.expanduser(workspace)))
         self.run_directory = run_directory
+        # Where runs are stored. The corpus only ingests a file under the workspace it is
+        # given, so a runs tree outside the project needs its own: see ``_import_workspace``.
+        self.runs_root = (
+            os.path.realpath(os.path.abspath(os.path.expanduser(runs_root)))
+            if runs_root
+            else None
+        )
+
+    def _import_workspace(self) -> str:
+        """The workspace a copy under the runs tree is indexed in.
+
+        A runs directory inside the project is covered by the project workspace, so copies
+        join the same ``.pageindex`` every ``misaka doc`` uses. A runs directory elsewhere
+        gets one corpus at ``<runs-root>/.pageindex``: a copy in ``<run>/sources`` must stay
+        under the workspace its corpus is given, and the project's own store cannot hold it.
+        """
+        for candidate in (self.runs_root, self.run_directory):
+            if candidate and not corpus.under(candidate, self.workspace):
+                return candidate
+        return self.workspace
+
+    def _workspace_for(self, doc_id: str) -> str:
+        """The workspace whose corpus owns ``doc_id``; the project's when neither does."""
+        if corpus.resolve_doc(doc_id, workspace=self.workspace):
+            return self.workspace
+        imported = self._import_workspace()
+        if imported != self.workspace and corpus.resolve_doc(doc_id, workspace=imported):
+            return imported
+        return self.workspace
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -162,9 +202,11 @@ class Materials:
             raise MaterialError("source_add needs a path or URL.")
         title = str(params.get("title") or "").strip() or None
         run_directory = str(params.get("runDirectory") or self.run_directory or "").strip() or None
+        workspace = self.workspace
 
         if is_url(path):
             local, origin = await self._download(path, run_directory)
+            workspace = self._import_workspace()
         else:
             local = os.path.abspath(os.path.expanduser(path))
             if not os.path.isfile(local):
@@ -172,11 +214,12 @@ class Materials:
             origin = local
             if not corpus.under(local, self.workspace):
                 local = await asyncio.to_thread(self._import, local, run_directory)
+                workspace = self._import_workspace()
 
         doc_id, pages = await asyncio.to_thread(
-            corpus.ingest, local, title=title, workspace=self.workspace
+            corpus.ingest, local, title=title, workspace=workspace
         )
-        meta = await asyncio.to_thread(_read_meta, doc_id, self.workspace)
+        meta = await asyncio.to_thread(_read_meta, doc_id, workspace)
         return {
             "docId": doc_id,
             "pages": int(pages),
@@ -185,27 +228,35 @@ class Materials:
         }
 
     def list(self, _params: dict) -> list[dict]:
-        """Every indexed document in this workspace, oldest first."""
+        """Every indexed document this run can read, oldest first."""
         out = []
-        for meta in corpus.docs(workspace=self.workspace):
-            doc_id = str(meta.get("doc_id") or "")
-            if not doc_id:
-                continue
-            out.append(
-                {
-                    "sourceId": doc_id,
-                    "docId": doc_id,
-                    "title": str(meta.get("title") or doc_id),
-                    "pages": int(meta.get("pages") or 0),
-                    **({"origin": str(meta["orig_path"])} if meta.get("orig_path") else {}),
-                }
-            )
+        seen: set[str] = set()
+        workspaces = [self.workspace]
+        imported = self._import_workspace()
+        if imported != self.workspace:
+            workspaces.append(imported)
+        for workspace in workspaces:
+            for meta in corpus.docs(workspace=workspace):
+                doc_id = str(meta.get("doc_id") or "")
+                if not doc_id or doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                out.append(
+                    {
+                        "sourceId": doc_id,
+                        "docId": doc_id,
+                        "title": str(meta.get("title") or doc_id),
+                        "pages": int(meta.get("pages") or 0),
+                        **({"origin": str(meta["orig_path"])} if meta.get("orig_path") else {}),
+                    }
+                )
         return out
 
     def outline(self, params: dict) -> dict:
         """The document's outline when the format has one, and the honest mode when not."""
         doc_id = self._doc_id(params)
-        structure = corpus.structure(doc_id, workspace=self.workspace)
+        workspace = self._workspace_for(doc_id)
+        structure = corpus.structure(doc_id, workspace=workspace)
         if not structure:
             raise MaterialError(f"No indexed material {doc_id!r} in this workspace.")
         title = structure.get("title")
@@ -232,11 +283,12 @@ class Materials:
         continues a window that stopped at ``maxChars``.
         """
         doc_id = self._doc_id(params)
+        workspace = self._workspace_for(doc_id)
         start = params.get("start")
         end = params.get("end")
         outline_node = str(params.get("outlineNode") or "").strip()
         if outline_node:
-            span = corpus.node_pages(doc_id, outline_node, workspace=self.workspace)
+            span = corpus.node_pages(doc_id, outline_node, workspace=workspace)
             if not span:
                 raise MaterialError(
                     f"No section {outline_node!r} in {doc_id}; ask for its outline first."
@@ -249,14 +301,12 @@ class Materials:
         offset = max(0, int(params.get("offset") or 0))
         max_chars = min(max(1000, int(params.get("maxChars") or 12000)), 60000)
         text = corpus.read_pages(
-            doc_id, start, end, max_chars=max_chars, offset=offset, workspace=self.workspace
+            doc_id, start, end, max_chars=max_chars, offset=offset, workspace=workspace
         )
-        more = text.rfind(_CONTINUE)
-        next_offset = None
-        if more >= 0:
-            digits = text[more + len(_CONTINUE):].split(")", 1)[0]
-            if digits.isdigit():
-                next_offset = int(digits)
+        match = _CONTINUE.search(text)
+        next_offset = int(match.group(1)) if match else None
+        if match:
+            text = text[: match.start()].rstrip()
         return {
             "docId": doc_id,
             "text": text,
@@ -273,7 +323,20 @@ class Materials:
             raise MaterialError("source_find needs a query.")
         doc_id = str(params.get("docId") or "").strip() or None
         limit = min(max(1, int(params.get("limit") or 10)), 50)
-        return corpus.search_literal(query, limit=limit, doc_id=doc_id, workspace=self.workspace)
+        if doc_id:
+            return corpus.search_literal(
+                query, limit=limit, doc_id=doc_id, workspace=self._workspace_for(doc_id)
+            )
+        # No docId means the whole corpus, and one corpus cannot see another's documents:
+        # a runs tree with its own ``.pageindex`` is searched too, so the materials this
+        # run imported are not silently left out.
+        hits = corpus.search_literal(query, limit=limit, workspace=self.workspace)
+        imported = self._import_workspace()
+        if imported != self.workspace and len(hits) < limit:
+            seen = {hit["doc_id"] for hit in hits}
+            more = corpus.search_literal(query, limit=limit, workspace=imported)
+            hits.extend(hit for hit in more if hit["doc_id"] not in seen)
+        return hits[:limit]
 
     # -- helpers ----------------------------------------------------------------
 

@@ -52,7 +52,21 @@ class _Window:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def session_for(self, args: Any, handover: dict[str, Any] | None) -> host.ReadingSession:
+    def session_for(
+        self, args: Any, handover: dict[str, Any] | None, ui: Any = None
+    ) -> host.ReadingSession:
+        if (
+            self.session is not None
+            and handover is not None
+            and handover != self.session.handover
+        ):
+            # The engine's model is fixed by the hello it starts with. A different
+            # --model therefore needs a new process; runs resume from disk, so the
+            # graph and node bodies survive, and only the live line is restarted.
+            self.session.terminate()
+            self.session = None
+            if ui is not None:
+                ui.notify("已按新的模型重启阅读引擎；阅读图与节点正文从磁盘续上。", "info")
         if self.session is None:
             self.session = host.ReadingSession(
                 self.spec.workspace,
@@ -209,13 +223,15 @@ async def _handle(window: _Window, harn: Any, argv: list[str], ctx: Any) -> None
         ui.notify(f"/read：{error}", "error")
         return
 
-    handover = await _handover(args, ctx, ui)
-    if args.operation in host.MODEL_METHODS and handover is None:
-        return
+    handover: dict[str, Any] | None = None
+    if args.operation in host.MODEL_METHODS:
+        handover = await _handover(args, ctx, ui)
+        if handover is None:
+            return
 
     window.stopping = False
     window.reset_progress()
-    session = window.session_for(args, handover)
+    session = window.session_for(args, handover, ui)
     if args.operation == "chat":
         _note_chat_only(ui)
         return
@@ -268,6 +284,16 @@ async def _handover(args: Any, ctx: Any, ui: Any) -> dict[str, Any] | None:
 
 async def _say(window: _Window, argv: list[str], ctx: Any) -> None:
     ui = ctx.ui
+    options = _SayArgs()
+    # A window that has not started an engine yet can be told which model to use; once it
+    # has, the engine's model is fixed and a different choice restarts it (see session_for).
+    while argv and argv[0].startswith("--"):
+        flag = argv.pop(0)
+        if flag in {"--model", "--runs-dir", "--intent"} and argv:
+            setattr(options, flag[2:].replace("-", "_"), argv.pop(0))
+        else:
+            ui.notify(f"/read say 不认得 {flag}", "warning")
+            return
     if not argv:
         ui.notify("/read say RUN_ID ...", "warning")
         return
@@ -275,11 +301,12 @@ async def _say(window: _Window, argv: list[str], ctx: Any) -> None:
     if not message:
         ui.notify("要在 /read say RUN_ID 后面写你说的话。", "warning")
         return
-    if window.session is None:
-        handover = await _handover(_SayArgs(), ctx, ui)
+    handover: dict[str, Any] | None = None
+    if window.session is None or options.model:
+        handover = await _handover(options, ctx, ui)
         if handover is None:
             return
-        window.session_for(_SayArgs(), handover)
+    window.session_for(options, handover, ui)
     if window.busy():
         ui.notify("这个窗口仍在阅读；等它完成再说话。", "warning")
         return

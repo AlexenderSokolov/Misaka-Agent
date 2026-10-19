@@ -59,11 +59,21 @@ chat, stop ends the engine this window started. The graph and the notes stay on 
 Progress appears on the status line and in a small widget above the input box as the agent
 writes; `misaka read chat` does the same in a terminal, and Ctrl+C leaves it.
 
+The window keeps one engine across commands, and an engine's model is fixed when it starts.
+Naming a different model (`/read say RUN_ID --model provider/id`, or any subcommand with
+`--model`) restarts the engine with the new handover; the reading resumes from disk, so nothing
+already written is lost. `graph` reads files only and takes no `--model`.
+
 ## The commands
 
 Every subcommand takes `--workspace DIR` (default: the current directory), `--runs-dir DIR`
 (default: `<workspace>/reading`), `--json` (print only the result object, for scripts) and, where
 it calls a model, `--model PROVIDER/ID`.
+
+A runs directory inside the workspace shares the project's document index, so a material you
+already added with `misaka doc add` is visible to the run. A runs directory outside the workspace
+gets its own index under `<runs-dir>/.pageindex`: files and URLs the run imports are copied into
+that run's `sources/` folder and indexed there, and the run still reads project documents too.
 
 | Command | What it does |
 |---|---|

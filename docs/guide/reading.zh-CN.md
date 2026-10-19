@@ -45,9 +45,13 @@ misaka read open sources/luxun.html sources/dolls-house.txt \
 
 `/read say` 与 `/read stop` 属于窗口：say 把一句话交给这次阅读的领读，stop 结束本窗口启动的引擎。无论停不停，图与节点正文都留在磁盘上。Agent 写作时，进度显示在状态栏和输入框上方的小部件里；终端中 `misaka read chat` 同理，Ctrl+C 退出。
 
+窗口在多次命令之间复用一个引擎，而引擎的模型在启动时就固定了。指定另一个模型（`/read say RUN_ID --model provider/id`，或任一子命令加 `--model`）会按新的模型重启引擎；阅读从磁盘续上，已经写入的内容不会丢失。`graph` 只读文件，不接受 `--model`。
+
 ## 命令
 
 每个子命令都接受 `--workspace DIR`（默认当前目录）、`--runs-dir DIR`（默认 `<workspace>/reading`）、`--json`（只打印结果对象，便于脚本接续）；需要模型的操作另有 `--model PROVIDER/ID`。
+
+阅读目录在工作区内时，与项目共用同一份文档索引，你用 `misaka doc add` 加过的材料读者也能看到。阅读目录在工作区外时，则在 `<runs-dir>/.pageindex` 下另有一份索引：本次阅读导入的文件与 URL 会先复制到该 run 的 `sources/`，再在那里建索引；项目里的文档同样照常可读。
 
 | 命令 | 作用 |
 |---|---|

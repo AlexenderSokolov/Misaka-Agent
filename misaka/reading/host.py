@@ -193,6 +193,12 @@ class ReadingClient:
             return self
         if not os.path.isdir(self.workspace):
             raise ReadingError(f"Workspace {self.workspace} is not a directory.")
+        # A client outlives one engine: the TUI keeps it across runs, and an engine that
+        # exited must not leave a stale readiness flag, error, or closed marker behind.
+        self._ready = asyncio.Event()
+        self._startup_error = None
+        self._closed = False
+        self._stderr_tail.clear()
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
             # No extra console window when the TUI starts the engine.
@@ -208,8 +214,8 @@ class ReadingClient:
             **kwargs,
         )
         self._write(self._hello())
-        self._spawn(self._read_stdout(), "reading stdout")
-        self._spawn(self._read_stderr(), "reading stderr")
+        self._spawn(self._read_stdout(self._proc), "reading stdout")
+        self._spawn(self._read_stderr(self._proc), "reading stderr")
         try:
             await asyncio.wait_for(self._ready.wait(), _READY_TIMEOUT)
         except TimeoutError:
@@ -243,9 +249,9 @@ class ReadingClient:
 
     # -- reading the child --------------------------------------------------
 
-    async def _read_stdout(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
-        stream = self._proc.stdout
+    async def _read_stdout(self, proc: asyncio.subprocess.Process) -> None:
+        assert proc.stdout is not None
+        stream = proc.stdout
         while True:
             try:
                 raw = await stream.readline()
@@ -264,11 +270,11 @@ class ReadingClient:
                 continue
             if isinstance(message, dict):
                 self._receive(message)
-        self._on_exit()
+        self._on_exit(proc)
 
-    async def _read_stderr(self) -> None:
-        assert self._proc is not None and self._proc.stderr is not None
-        stream = self._proc.stderr
+    async def _read_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        assert proc.stderr is not None
+        stream = proc.stderr
         while True:
             raw = await stream.readline()
             if not raw:
@@ -323,7 +329,9 @@ class ReadingClient:
             params = {}
         run_directory = params.get("runDirectory") or None
         try:
-            materials = Materials(self.workspace, run_directory)
+            materials = Materials(
+                self.workspace, run_directory, runs_root=self.runs_directory
+            )
             result = await materials.call(method, params)
             reply: dict[str, Any] = {"type": "source_result", "id": call_id, "result": result}
         except Exception as error:  # noqa: BLE001 - the engine needs a readable refusal
@@ -341,7 +349,13 @@ class ReadingClient:
         else:
             future.set_result(result)
 
-    def _on_exit(self) -> None:
+    def _on_exit(self, proc: asyncio.subprocess.Process | None = None) -> None:
+        if proc is not None and proc is not self._proc:
+            # A reader belonging to an engine this client already let go.
+            return
+        # The engine is gone; the next request must spawn a fresh one rather than reuse a
+        # process handle that can no longer answer.
+        self._proc = None
         self._ready.set()
         reason = f"The reading engine stopped unexpectedly.{self._tail()}"
         self._startup_error = self._startup_error or reason
@@ -905,10 +919,9 @@ async def _chat(client: ReadingClient, run_id: str, renderer: _Renderer) -> None
             if typed is None:
                 # End of input does not take back a turn already asked for: a piped message
                 # expects its reply. Only /stop cancels; the next command resumes from disk.
-                try:
-                    await turn
-                except ReadingError as error:
-                    print(f"阅读出错：{error}", file=sys.stderr, flush=True)
+                # A failed turn here is the whole reason this command ran, so it must reach
+                # the caller as a failure rather than a cheerful exit code.
+                await turn
                 renderer.finish()
                 return
             if typed.strip() in {"/stop", "/quit", "/exit"}:
