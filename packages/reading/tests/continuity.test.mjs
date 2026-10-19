@@ -56,6 +56,12 @@ function request(runId, overrides = {}) {
     contextMode: "continue", sourceRefs: [], ...overrides };
 }
 
+test("a provider error is reported instead of a successful empty leader reply", async (t) => {
+  const { engine, run, faux } = await fixture(t);
+  faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "401 Unauthorized" })]);
+  await assert.rejects(engine.chat(run.runId, "Read this passage"), /401 Unauthorized/);
+});
+
 test("a continued reading records the second structured submission", async (t) => {
   const { engine, run, faux } = await fixture(t);
   submit(faux, "First reading");

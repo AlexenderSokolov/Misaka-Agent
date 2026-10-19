@@ -162,6 +162,11 @@ export async function runTurn(
   try {
     await session.prompt(prompt, { expandPromptTemplates: false });
     await session.waitForIdle();
+    const lastAssistant = (session.messages as Array<{ role?: string; stopReason?: string }>)
+      .findLast((message) => message.role === "assistant");
+    if (lastAssistant?.stopReason === "error") {
+      throw new Error(lastStopReason(session));
+    }
   } finally {
     signal?.removeEventListener("abort", abortHandler);
     unsubscribe();
